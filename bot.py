@@ -19,8 +19,12 @@ TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 HIGHER_TIMEFRAME = os.getenv("HIGHER_TIMEFRAME", "1h")
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "74"))
+
+# v4.1 — больше проверяемых инструментов
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
+
+# v4.1 — чуть мягче качество, чтобы позиции приходили чаще
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "70"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 MIN_POSITION_PROFIT_PERCENT = float(os.getenv("MIN_POSITION_PROFIT_PERCENT", "10"))
@@ -94,7 +98,7 @@ async def send_telegram_message(session, text, button_url=None):
 
 async def send_heartbeat(session):
     text = f"""
-🤖 <b>BingX Signal Scanner v4 работает</b>
+🤖 <b>BingX Signal Scanner v4.1 работает</b>
 
 ⏱ Аптайм: <b>{uptime_text()}</b>
 🔎 Сканов всего: <b>{STATS["total_scans"]}</b>
@@ -321,7 +325,8 @@ def analyze_symbol(symbol, candles, candles_1h, btc_status):
 
     volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
 
-    if volume_ratio < 1.15:
+    # v4.1 — объёмный фильтр мягче, чтобы сигналов было больше
+    if volume_ratio < 1.05:
         return None
 
     signal = None
@@ -340,7 +345,7 @@ def analyze_symbol(symbol, candles, candles_1h, btc_status):
         bullish_structure
         and prev["low"] <= recent_low * 1.006
         and last_rsi < 50
-        and volume_ratio >= 1.15
+        and volume_ratio >= 1.05
     ):
         if btc_status == "BEARISH":
             return None
@@ -389,7 +394,7 @@ def analyze_symbol(symbol, candles, candles_1h, btc_status):
         bearish_structure
         and prev["high"] >= recent_high * 0.994
         and last_rsi > 50
-        and volume_ratio >= 1.15
+        and volume_ratio >= 1.05
     ):
         if btc_status == "BULLISH":
             return None
@@ -554,7 +559,7 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ BingX Signal Scanner v4 запущен.\nПлечо: {LEVERAGE}x\nЦель: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции."
+            f"✅ BingX Signal Scanner v4.1 запущен.\nПлечо: {LEVERAGE}x\nЦель: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции.\nПроверяю до {MAX_SYMBOLS} инструментов."
         )
 
         STATS["last_heartbeat"] = time.time()
