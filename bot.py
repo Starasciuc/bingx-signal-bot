@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import random
@@ -21,17 +22,36 @@ SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "60"))
 MIN_QUALITY = int(os.getenv("MIN_QUALITY", "72"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "10800"))  # 3 часа
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "10800"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "5"))
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "3600"))
 
 BTC_SYMBOL = "BTC-USDT"
 
 SENT_SIGNALS = {}
 SYMBOL_COOLDOWN = {}
 
+STATS = {
+    "started_at": time.time(),
+    "last_heartbeat": 0,
+    "total_scans": 0,
+    "signals_total": 0,
+    "signals_hour": 0,
+    "last_checked_symbols": 0,
+    "last_btc_status": "UNKNOWN",
+    "last_btc_change": 0.0,
+}
+
 
 def now_text():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def uptime_text():
+    seconds = int(time.time() - STATS["started_at"])
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{hours}ч {minutes}м"
 
 
 def is_on_cooldown(symbol):
@@ -67,6 +87,28 @@ async def send_telegram_message(session, text, button_url=None):
         if resp.status != 200:
             print("Telegram error:", resp.status, data)
         return data
+
+
+async def send_heartbeat(session):
+    text = f"""
+🤖 <b>BingX Signal Scanner v3 работает</b>
+
+⏱ Аптайм: <b>{uptime_text()}</b>
+🔎 Сканов всего: <b>{STATS["total_scans"]}</b>
+📊 Проверено пар в последнем скане: <b>{STATS["last_checked_symbols"]}</b>
+
+₿ BTC-фильтр: <b>{STATS["last_btc_status"]}</b>
+₿ BTC изменение: <b>{STATS["last_btc_change"]:.2f}%</b>
+
+🎯 Сигналов за последний час: <b>{STATS["signals_hour"]}</b>
+🎯 Сигналов всего: <b>{STATS["signals_total"]}</b>
+
+🕒 {now_text()}
+""".strip()
+
+    await send_telegram_message(session, text)
+    STATS["signals_hour"] = 0
+    STATS["last_heartbeat"] = time.time()
 
 
 async def get_symbols(session):
@@ -245,7 +287,6 @@ def analyze_symbol(symbol, candles, btc_status):
     strong_uptrend = ema20 > ema50 > ema100
     strong_downtrend = ema20 < ema50 < ema100
 
-    # LONG reversal / continuation from support
     if (
         bullish_structure
         and prev["low"] <= recent_low * 1.006
@@ -285,7 +326,6 @@ def analyze_symbol(symbol, candles, btc_status):
         tp1 = entry + atr * 1.8
         tp2 = entry + atr * 2.8
 
-    # SHORT reversal / continuation from resistance
     elif (
         bearish_structure
         and prev["high"] >= recent_high * 0.994
@@ -372,11 +412,10 @@ def format_price(x):
 
 def make_message(signal):
     emoji = "📈" if signal["side"] == "LONG" else "📉"
-
     reasons_text = "\n".join([f"• {r}" for r in signal["reasons"]])
 
     return f"""
-🎯 <b>Скринер точек входа v2</b>
+🎯 <b>Скринер точек входа v3</b>
 
 {emoji} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
@@ -419,8 +458,10 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            "✅ BingX Signal Scanner v2 запущен.\nФильтры: BTC trend, ATR SL/TP, volume, антиспам."
+            "✅ BingX Signal Scanner v3 запущен.\nДобавлен hourly status report."
         )
+
+        STATS["last_heartbeat"] = time.time()
 
         while True:
             try:
@@ -434,14 +475,21 @@ async def scan_loop():
                     continue
 
                 btc_status, btc_change = btc_market_filter(btc_candles)
+
+                STATS["last_btc_status"] = btc_status
+                STATS["last_btc_change"] = btc_change
+
                 print(f"BTC status: {btc_status}, change: {btc_change:.2f}%")
 
                 symbols = await get_symbols(session)
+                checked = 0
                 found = 0
 
                 for symbol in symbols:
                     if symbol == BTC_SYMBOL:
                         continue
+
+                    checked += 1
 
                     try:
                         candles = await get_klines(session, symbol, limit=150)
@@ -461,6 +509,9 @@ async def scan_loop():
                         )
 
                         found += 1
+                        STATS["signals_total"] += 1
+                        STATS["signals_hour"] += 1
+
                         await asyncio.sleep(2)
 
                         if found >= MAX_SIGNALS_PER_SCAN:
@@ -469,7 +520,14 @@ async def scan_loop():
                     except Exception as e:
                         print(f"Error with {symbol}:", e)
 
-                print(f"Scan finished. Signals found: {found}")
+                STATS["total_scans"] += 1
+                STATS["last_checked_symbols"] = checked
+
+                print(f"Scan finished. Checked: {checked}. Signals found: {found}")
+
+                if time.time() - STATS["last_heartbeat"] >= HEARTBEAT_SECONDS:
+                    await send_heartbeat(session)
+
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
             except Exception as e:
