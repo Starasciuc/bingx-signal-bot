@@ -4,7 +4,6 @@ import random
 from datetime import datetime, timezone
 
 import aiohttp
-import pandas as pd
 from dotenv import load_dotenv
 
 
@@ -14,11 +13,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BINGX_BASE_URL = "https://open-api.bingx.com"
+
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "40"))
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "75"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "70"))
 
 SENT_SIGNALS = set()
 
@@ -44,7 +44,7 @@ async def send_telegram_message(session, text, button_url=None):
             ]
         }
 
-    async with session.post(url, json=payload, timeout=20) as resp:
+    async with session.post(url, json=payload, timeout=30) as resp:
         data = await resp.text()
         if resp.status != 200:
             print("Telegram error:", resp.status, data)
@@ -54,16 +54,14 @@ async def send_telegram_message(session, text, button_url=None):
 async def get_symbols(session):
     url = f"{BINGX_BASE_URL}/openApi/swap/v2/quote/contracts"
 
-    async with session.get(url, timeout=20) as resp:
+    async with session.get(url, timeout=30) as resp:
         data = await resp.json()
 
     symbols = []
+
     for item in data.get("data", []):
         symbol = item.get("symbol")
-        if not symbol:
-            continue
-
-        if symbol.endswith("-USDT"):
+        if symbol and symbol.endswith("-USDT"):
             symbols.append(symbol)
 
     random.shuffle(symbols)
@@ -78,17 +76,18 @@ async def get_klines(session, symbol):
         "limit": 120,
     }
 
-    async with session.get(url, params=params, timeout=20) as resp:
+    async with session.get(url, params=params, timeout=30) as resp:
         data = await resp.json()
 
     raw = data.get("data", [])
     if not raw or len(raw) < 60:
         return None
 
-    rows = []
+    candles = []
+
     for candle in raw:
         try:
-            rows.append({
+            candles.append({
                 "time": int(candle["time"]),
                 "open": float(candle["open"]),
                 "high": float(candle["high"]),
@@ -99,44 +98,71 @@ async def get_klines(session, symbol):
         except Exception:
             continue
 
-    df = pd.DataFrame(rows)
-    df = df.sort_values("time").reset_index(drop=True)
-    return df
+    candles.sort(key=lambda x: x["time"])
+    return candles
 
 
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+def ema(values, period):
+    if not values:
+        return []
 
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
+    multiplier = 2 / (period + 1)
+    result = [values[0]]
+
+    for price in values[1:]:
+        result.append((price - result[-1]) * multiplier + result[-1])
+
+    return result
+
+
+def calculate_rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(abs(min(change, 0)))
+
+    recent_gains = gains[-period:]
+    recent_losses = losses[-period:]
+
+    avg_gain = sum(recent_gains) / period
+    avg_loss = sum(recent_losses) / period
+
+    if avg_loss == 0:
+        return 100
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
-def analyze_symbol(symbol, df):
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    volume = df["volume"]
+def analyze_symbol(symbol, candles):
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    volumes = [c["volume"] for c in candles]
 
-    df["ema_20"] = close.ewm(span=20).mean()
-    df["ema_50"] = close.ewm(span=50).mean()
-    df["rsi"] = rsi(close)
+    ema20_list = ema(closes, 20)
+    ema50_list = ema(closes, 50)
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last = candles[-1]
+    prev = candles[-2]
 
-    recent_high = high.tail(20).max()
-    recent_low = low.tail(20).min()
-    avg_volume = volume.tail(30).mean()
+    price = last["close"]
+    ema20 = ema20_list[-1]
+    ema50 = ema50_list[-1]
+    last_rsi = calculate_rsi(closes, 14)
 
-    price = float(last["close"])
-    last_rsi = float(last["rsi"])
-    ema20 = float(last["ema_20"])
-    ema50 = float(last["ema_50"])
+    if last_rsi is None:
+        return None
+
+    recent_high = max(highs[-20:])
+    recent_low = min(lows[-20:])
+    avg_volume = sum(volumes[-30:]) / 30
 
     signal = None
     quality = 50
@@ -157,6 +183,10 @@ def analyze_symbol(symbol, df):
         entry = price
         sl = recent_high * 1.003
         risk = sl - entry
+
+        if risk <= 0:
+            return None
+
         tp1 = entry - risk * 1.2
         tp2 = entry - risk * 2.0
 
@@ -176,6 +206,10 @@ def analyze_symbol(symbol, df):
         entry = price
         sl = recent_low * 0.997
         risk = entry - sl
+
+        if risk <= 0:
+            return None
+
         tp1 = entry + risk * 1.2
         tp2 = entry + risk * 2.0
 
@@ -247,6 +281,7 @@ def bingx_url(symbol):
 async def scan_loop():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+
     if not TELEGRAM_CHAT_ID:
         raise RuntimeError("TELEGRAM_CHAT_ID не задан")
 
@@ -259,24 +294,25 @@ async def scan_loop():
         while True:
             try:
                 print("Scanning...", now_text())
-                symbols = await get_symbols(session)
 
+                symbols = await get_symbols(session)
                 found = 0
 
                 for symbol in symbols:
                     try:
-                        df = await get_klines(session, symbol)
-                        if df is None:
+                        candles = await get_klines(session, symbol)
+
+                        if candles is None:
                             continue
 
-                        signal = analyze_symbol(symbol, df)
+                        signal = analyze_symbol(symbol, candles)
+
                         if not signal:
                             continue
 
-                        message = make_message(signal)
                         await send_telegram_message(
                             session,
-                            message,
+                            make_message(signal),
                             button_url=bingx_url(symbol)
                         )
 
