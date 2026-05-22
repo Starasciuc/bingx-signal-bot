@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import random
@@ -17,10 +16,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
+HIGHER_TIMEFRAME = os.getenv("HIGHER_TIMEFRAME", "1h")
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "60"))
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "72"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "74"))
+
+LEVERAGE = int(os.getenv("LEVERAGE", "20"))
+MIN_POSITION_PROFIT_PERCENT = float(os.getenv("MIN_POSITION_PROFIT_PERCENT", "10"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "10800"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "5"))
@@ -91,7 +94,7 @@ async def send_telegram_message(session, text, button_url=None):
 
 async def send_heartbeat(session):
     text = f"""
-🤖 <b>BingX Signal Scanner v3 работает</b>
+🤖 <b>BingX Signal Scanner v4 работает</b>
 
 ⏱ Аптайм: <b>{uptime_text()}</b>
 🔎 Сканов всего: <b>{STATS["total_scans"]}</b>
@@ -102,6 +105,9 @@ async def send_heartbeat(session):
 
 🎯 Сигналов за последний час: <b>{STATS["signals_hour"]}</b>
 🎯 Сигналов всего: <b>{STATS["signals_total"]}</b>
+
+⚙️ Плечо: <b>{LEVERAGE}x</b>
+🎯 Минимум TP1: <b>{MIN_POSITION_PROFIT_PERCENT:.0f}%+</b> по позиции
 
 🕒 {now_text()}
 """.strip()
@@ -132,11 +138,11 @@ async def get_symbols(session):
     return symbols[:MAX_SYMBOLS]
 
 
-async def get_klines(session, symbol, limit=150):
+async def get_klines(session, symbol, interval=None, limit=150):
     url = f"{BINGX_BASE_URL}/openApi/swap/v3/quote/klines"
     params = {
         "symbol": symbol,
-        "interval": TIMEFRAME,
+        "interval": interval or TIMEFRAME,
         "limit": limit,
     }
 
@@ -242,7 +248,46 @@ def btc_market_filter(btc_candles):
     return "NEUTRAL", btc_change
 
 
-def analyze_symbol(symbol, candles, btc_status):
+def higher_tf_filter(candles_1h):
+    closes = [c["close"] for c in candles_1h]
+
+    ema20_1h = ema(closes, 20)[-1]
+    ema50_1h = ema(closes, 50)[-1]
+    ema100_1h = ema(closes, 100)[-1]
+
+    price = closes[-1]
+
+    if price > ema20_1h > ema50_1h:
+        return "BULLISH"
+
+    if price < ema20_1h < ema50_1h:
+        return "BEARISH"
+
+    if price > ema100_1h:
+        return "SOFT_BULLISH"
+
+    if price < ema100_1h:
+        return "SOFT_BEARISH"
+
+    return "NEUTRAL"
+
+
+def position_profit_percent(entry, target, side):
+    if side == "LONG":
+        price_move = (target - entry) / entry * 100
+    else:
+        price_move = (entry - target) / entry * 100
+
+    return price_move * LEVERAGE
+
+
+def price_move_percent(entry, target, side):
+    if side == "LONG":
+        return (target - entry) / entry * 100
+    return (entry - target) / entry * 100
+
+
+def analyze_symbol(symbol, candles, candles_1h, btc_status):
     if is_on_cooldown(symbol):
         return None
 
@@ -268,6 +313,8 @@ def analyze_symbol(symbol, candles, btc_status):
     if last_rsi is None or atr is None:
         return None
 
+    trend_1h = higher_tf_filter(candles_1h)
+
     recent_high = max(highs[-24:])
     recent_low = min(lows[-24:])
     avg_volume = sum(volumes[-30:]) / 30
@@ -278,6 +325,7 @@ def analyze_symbol(symbol, candles, btc_status):
         return None
 
     signal = None
+    setup_type = None
     quality = 50
     reasons = []
 
@@ -287,21 +335,30 @@ def analyze_symbol(symbol, candles, btc_status):
     strong_uptrend = ema20 > ema50 > ema100
     strong_downtrend = ema20 < ema50 < ema100
 
+    # LONG Pullback / Reversal
     if (
         bullish_structure
         and prev["low"] <= recent_low * 1.006
-        and last_rsi < 48
+        and last_rsi < 50
         and volume_ratio >= 1.15
     ):
         if btc_status == "BEARISH":
             return None
 
+        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
+            return None
+
         signal = "LONG"
+        setup_type = "LONG Pullback"
         quality += 12
 
         if strong_uptrend:
             quality += 8
-            reasons.append("EMA trend bullish")
+            reasons.append("15m EMA trend bullish")
+
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+            quality += 10
+            reasons.append(f"1h trend: {trend_1h}")
 
         if btc_status == "BULLISH":
             quality += 8
@@ -309,7 +366,7 @@ def analyze_symbol(symbol, candles, btc_status):
 
         if last_rsi < 42:
             quality += 8
-            reasons.append(f"RSI низкий: {last_rsi:.1f}")
+            reasons.append(f"RSI остыл: {last_rsi:.1f}")
         else:
             quality += 4
             reasons.append(f"RSI: {last_rsi:.1f}")
@@ -322,25 +379,35 @@ def analyze_symbol(symbol, candles, btc_status):
             reasons.append(f"Объём x{volume_ratio:.2f}")
 
         entry = price
-        sl = entry - atr * 1.4
-        tp1 = entry + atr * 1.8
-        tp2 = entry + atr * 2.8
+        sl = entry - atr * 1.1
+        tp1 = entry * (1 + (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
+        tp2 = entry * (1 + (20 / LEVERAGE) / 100)
+        tp3 = entry * (1 + (30 / LEVERAGE) / 100)
 
+    # SHORT Pullback / Reversal
     elif (
         bearish_structure
         and prev["high"] >= recent_high * 0.994
-        and last_rsi > 52
+        and last_rsi > 50
         and volume_ratio >= 1.15
     ):
         if btc_status == "BULLISH":
             return None
 
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+            return None
+
         signal = "SHORT"
+        setup_type = "SHORT Pullback"
         quality += 12
 
         if strong_downtrend:
             quality += 8
-            reasons.append("EMA trend bearish")
+            reasons.append("15m EMA trend bearish")
+
+        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
+            quality += 10
+            reasons.append(f"1h trend: {trend_1h}")
 
         if btc_status == "BEARISH":
             quality += 8
@@ -361,21 +428,36 @@ def analyze_symbol(symbol, candles, btc_status):
             reasons.append(f"Объём x{volume_ratio:.2f}")
 
         entry = price
-        sl = entry + atr * 1.4
-        tp1 = entry - atr * 1.8
-        tp2 = entry - atr * 2.8
+        sl = entry + atr * 1.1
+        tp1 = entry * (1 - (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
+        tp2 = entry * (1 - (20 / LEVERAGE) / 100)
+        tp3 = entry * (1 - (30 / LEVERAGE) / 100)
 
     else:
         return None
 
-    quality = min(96, max(50, quality))
+    quality = min(97, max(50, quality))
 
     if quality < MIN_QUALITY:
         return None
 
-    risk_percent = abs(sl - entry) / entry * 100
+    tp1_position_profit = position_profit_percent(entry, tp1, signal)
+    tp2_position_profit = position_profit_percent(entry, tp2, signal)
+    tp3_position_profit = position_profit_percent(entry, tp3, signal)
 
-    if risk_percent > 5:
+    if tp1_position_profit < MIN_POSITION_PROFIT_PERCENT:
+        return None
+
+    risk_price_percent = abs(sl - entry) / entry * 100
+    risk_position_percent = risk_price_percent * LEVERAGE
+
+    if risk_position_percent > 18:
+        return None
+
+    reward_price_percent = price_move_percent(entry, tp1, signal)
+    rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
+
+    if rr < 0.65:
         return None
 
     signal_id = f"{symbol}:{TIMEFRAME}:{signal}:{round(entry, 6)}"
@@ -389,16 +471,24 @@ def analyze_symbol(symbol, candles, btc_status):
     return {
         "symbol": symbol,
         "side": signal,
+        "setup_type": setup_type,
         "quality": quality,
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
+        "tp3": tp3,
         "rsi": last_rsi,
         "volume_ratio": volume_ratio,
-        "risk_percent": risk_percent,
+        "risk_price_percent": risk_price_percent,
+        "risk_position_percent": risk_position_percent,
+        "tp1_position_profit": tp1_position_profit,
+        "tp2_position_profit": tp2_position_profit,
+        "tp3_position_profit": tp3_position_profit,
+        "rr": rr,
         "reasons": reasons,
         "btc_status": btc_status,
+        "trend_1h": trend_1h,
     }
 
 
@@ -411,33 +501,39 @@ def format_price(x):
 
 
 def make_message(signal):
-    emoji = "📈" if signal["side"] == "LONG" else "📉"
+    arrow = "📈" if signal["side"] == "LONG" else "📉"
+    fire = "🔥" if signal["quality"] >= 85 else "🎯"
     reasons_text = "\n".join([f"• {r}" for r in signal["reasons"]])
 
     return f"""
-🎯 <b>Скринер точек входа v3</b>
+{fire} <b>{signal["symbol"].replace("-", "/")}</b>
+{arrow} <b>{signal["side"]}</b>
 
-{emoji} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
+Сетап: <b>{signal["setup_type"]}</b>
 Качество: <b>{signal["quality"]}%</b>
 
-🎯 Зона входа: <code>{format_price(signal["entry"])}</code>
-🛑 SL: <code>{format_price(signal["sl"])}</code>
-✅ TP1: <code>{format_price(signal["tp1"])}</code>
-✅ TP2: <code>{format_price(signal["tp2"])}</code>
+Плечо: <b>{LEVERAGE}x</b>
 
+🎯 Вход: <code>{format_price(signal["entry"])}</code>
+🛑 SL: <code>{format_price(signal["sl"])}</code>
+
+✅ TP1: <code>{format_price(signal["tp1"])}</code> ≈ <b>+{signal["tp1_position_profit"]:.1f}%</b>
+✅ TP2: <code>{format_price(signal["tp2"])}</code> ≈ <b>+{signal["tp2_position_profit"]:.1f}%</b>
+✅ TP3: <code>{format_price(signal["tp3"])}</code> ≈ <b>+{signal["tp3_position_profit"]:.1f}%</b>
+
+📊 Риск до SL: <b>{signal["risk_price_percent"]:.2f}% цены</b> / около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
+📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
+
+₿ BTC: <b>{signal["btc_status"]}</b>
+⏱ 1h trend: <b>{signal["trend_1h"]}</b>
 📊 RSI: <b>{signal["rsi"]:.1f}</b>
 📊 Объём: <b>x{signal["volume_ratio"]:.2f}</b>
-📊 Риск до SL: <b>{signal["risk_percent"]:.2f}%</b>
-₿ BTC-фильтр: <b>{signal["btc_status"]}</b>
 
 <b>Почему сигнал:</b>
 {reasons_text}
 
-⚠️ Плечо max.: 10x
-⚠️ Риск до 0.5% от депозита
-
-Не финансовый совет.
-Фьючерсы несут высокий риск.
+⚠️ Риск-менеджмент: до 0.5% от депозита.
+⚠️ Не финансовый совет. Фьючерсы несут высокий риск.
 
 🕒 {now_text()}
 """.strip()
@@ -458,7 +554,7 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            "✅ BingX Signal Scanner v3 запущен.\nДобавлен hourly status report."
+            f"✅ BingX Signal Scanner v4 запущен.\nПлечо: {LEVERAGE}x\nЦель: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции."
         )
 
         STATS["last_heartbeat"] = time.time()
@@ -467,7 +563,7 @@ async def scan_loop():
             try:
                 print("Scanning...", now_text())
 
-                btc_candles = await get_klines(session, BTC_SYMBOL, limit=150)
+                btc_candles = await get_klines(session, BTC_SYMBOL, interval=TIMEFRAME, limit=150)
 
                 if not btc_candles:
                     print("BTC data unavailable")
@@ -492,12 +588,13 @@ async def scan_loop():
                     checked += 1
 
                     try:
-                        candles = await get_klines(session, symbol, limit=150)
+                        candles = await get_klines(session, symbol, interval=TIMEFRAME, limit=150)
+                        candles_1h = await get_klines(session, symbol, interval=HIGHER_TIMEFRAME, limit=150)
 
-                        if candles is None:
+                        if candles is None or candles_1h is None:
                             continue
 
-                        signal = analyze_symbol(symbol, candles, btc_status)
+                        signal = analyze_symbol(symbol, candles, candles_1h, btc_status)
 
                         if not signal:
                             continue
