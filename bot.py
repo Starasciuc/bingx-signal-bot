@@ -21,16 +21,17 @@ HIGHER_TIMEFRAME = os.getenv("HIGHER_TIMEFRAME", "1h")
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "250"))
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "58"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "70"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 MIN_POSITION_PROFIT_PERCENT = float(os.getenv("MIN_POSITION_PROFIT_PERCENT", "10"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "7200"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "8"))
+MIN_RR = float(os.getenv("MIN_RR", "1.2"))
 
-DAILY_TARGET_SIGNALS = int(os.getenv("DAILY_TARGET_SIGNALS", "2"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "4"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "10800"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "3"))
 
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "3600"))
 
@@ -108,7 +109,7 @@ async def send_telegram_message(session, text, button_url=None):
 
 async def send_heartbeat(session):
     text = f"""
-🤖 <b>BingX Signal Scanner v4.2 работает</b>
+🤖 <b>BingX Signal Scanner v4.3 Safe Mode работает</b>
 
 ⏱ Аптайм: <b>{uptime_text()}</b>
 🔎 Сканов всего: <b>{STATS["total_scans"]}</b>
@@ -119,11 +120,12 @@ async def send_heartbeat(session):
 
 🎯 Сигналов за последний час: <b>{STATS["signals_hour"]}</b>
 🎯 Сигналов сегодня: <b>{STATS["signals_today"]}</b>
-🎯 Цель в день: <b>{DAILY_TARGET_SIGNALS}</b>
 🎯 Максимум в день: <b>{DAILY_MAX_SIGNALS}</b>
 
 ⚙️ Плечо: <b>{LEVERAGE}x</b>
 💰 TP1 минимум: <b>{MIN_POSITION_PROFIT_PERCENT:.0f}%+</b> по позиции
+🛡 Риск максимум: <b>{MAX_RISK_POSITION_PERCENT:.1f}%</b> по позиции
+📊 RR минимум: <b>{MIN_RR}</b>
 
 🕒 {now_text()}
 """.strip()
@@ -273,17 +275,17 @@ def higher_tf_filter(candles_1h):
 
     price = closes[-1]
 
+    if price > ema20_1h > ema50_1h > ema100_1h:
+        return "STRONG_BULLISH"
+
+    if price < ema20_1h < ema50_1h < ema100_1h:
+        return "STRONG_BEARISH"
+
     if price > ema20_1h > ema50_1h:
         return "BULLISH"
 
     if price < ema20_1h < ema50_1h:
         return "BEARISH"
-
-    if price > ema100_1h:
-        return "SOFT_BULLISH"
-
-    if price < ema100_1h:
-        return "SOFT_BEARISH"
 
     return "NEUTRAL"
 
@@ -303,14 +305,14 @@ def price_move_percent(entry, target, side):
     return (entry - target) / entry * 100
 
 
-def build_signal(symbol, side, setup_type, price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, mode):
+def build_signal(symbol, side, setup_type, price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons):
     if side == "LONG":
-        sl = price - atr * 1.0
+        sl = price - atr * 0.75
         tp1 = price * (1 + (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
         tp2 = price * (1 + (20 / LEVERAGE) / 100)
         tp3 = price * (1 + (30 / LEVERAGE) / 100)
     else:
-        sl = price + atr * 1.0
+        sl = price + atr * 0.75
         tp1 = price * (1 - (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
         tp2 = price * (1 - (20 / LEVERAGE) / 100)
         tp3 = price * (1 - (30 / LEVERAGE) / 100)
@@ -318,17 +320,20 @@ def build_signal(symbol, side, setup_type, price, atr, rsi, volume_ratio, btc_st
     risk_price_percent = abs(sl - price) / price * 100
     risk_position_percent = risk_price_percent * LEVERAGE
 
-    if risk_position_percent > 25:
+    if risk_position_percent > MAX_RISK_POSITION_PERCENT:
         return None
 
     tp1_profit = position_profit_percent(price, tp1, side)
     tp2_profit = position_profit_percent(price, tp2, side)
     tp3_profit = position_profit_percent(price, tp3, side)
 
+    if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
+        return None
+
     reward_price_percent = price_move_percent(price, tp1, side)
     rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
 
-    if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
+    if rr < MIN_RR:
         return None
 
     signal_id = f"{symbol}:{TIMEFRAME}:{side}:{round(price, 6)}"
@@ -340,8 +345,8 @@ def build_signal(symbol, side, setup_type, price, atr, rsi, volume_ratio, btc_st
         "symbol": symbol,
         "side": side,
         "setup_type": setup_type,
-        "mode": mode,
-        "quality": min(97, max(40, quality)),
+        "mode": "SAFE",
+        "quality": min(98, max(50, quality)),
         "entry": price,
         "sl": sl,
         "tp1": tp1,
@@ -391,87 +396,98 @@ def analyze_symbol(symbol, candles, candles_1h, btc_status):
     avg_volume = sum(volumes[-30:]) / 30
     volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
 
-    bullish_15m = price > ema20 and ema20 > ema50
-    bearish_15m = price < ema20 and ema20 < ema50
+    if volume_ratio < 1.15:
+        return None
+
+    bullish_15m = price > ema20 > ema50
+    bearish_15m = price < ema20 < ema50
 
     strong_bullish_15m = ema20 > ema50 > ema100
     strong_bearish_15m = ema20 < ema50 < ema100
 
     candidates = []
 
-    # STRICT LONG
-    if bullish_15m and trend_1h in ["BULLISH", "SOFT_BULLISH"] and btc_status != "BEARISH" and volume_ratio >= 1.05 and rsi < 55:
-        quality = 60
-        reasons = ["15m trend bullish", f"1h trend: {trend_1h}", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
+    # SAFE LONG
+    if (
+        bullish_15m
+        and trend_1h in ["BULLISH", "STRONG_BULLISH"]
+        and btc_status != "BEARISH"
+        and 38 <= rsi <= 58
+        and volume_ratio >= 1.15
+    ):
+        quality = 62
+        reasons = [
+            "✅ Только основной SAFE-сигнал",
+            "15m trend bullish",
+            f"1h trend: {trend_1h}",
+            f"RSI: {rsi:.1f}",
+            f"Объём x{volume_ratio:.2f}",
+        ]
 
         if strong_bullish_15m:
             quality += 8
-            reasons.append("Сильная EMA структура")
+            reasons.append("Сильная EMA структура 15m")
+
+        if trend_1h == "STRONG_BULLISH":
+            quality += 8
+            reasons.append("Сильный 1h bullish trend")
 
         if btc_status == "BULLISH":
-            quality += 8
+            quality += 7
             reasons.append("BTC поддерживает LONG")
 
         if volume_ratio >= 1.5:
-            quality += 8
+            quality += 7
             reasons.append("Сильный объём")
 
-        signal = build_signal(symbol, "LONG", "LONG Pullback", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "STRICT")
+        signal = build_signal(
+            symbol, "LONG", "SAFE LONG Pullback",
+            price, atr, rsi, volume_ratio, btc_status, trend_1h,
+            quality, reasons
+        )
+
         if signal:
             candidates.append(signal)
 
-    # STRICT SHORT
-    if bearish_15m and trend_1h in ["BEARISH", "SOFT_BEARISH"] and btc_status != "BULLISH" and volume_ratio >= 1.05 and rsi > 45:
-        quality = 60
-        reasons = ["15m trend bearish", f"1h trend: {trend_1h}", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
+    # SAFE SHORT
+    if (
+        bearish_15m
+        and trend_1h in ["BEARISH", "STRONG_BEARISH"]
+        and btc_status != "BULLISH"
+        and 42 <= rsi <= 62
+        and volume_ratio >= 1.15
+    ):
+        quality = 62
+        reasons = [
+            "✅ Только основной SAFE-сигнал",
+            "15m trend bearish",
+            f"1h trend: {trend_1h}",
+            f"RSI: {rsi:.1f}",
+            f"Объём x{volume_ratio:.2f}",
+        ]
 
         if strong_bearish_15m:
             quality += 8
-            reasons.append("Сильная EMA структура")
+            reasons.append("Сильная EMA структура 15m")
+
+        if trend_1h == "STRONG_BEARISH":
+            quality += 8
+            reasons.append("Сильный 1h bearish trend")
 
         if btc_status == "BEARISH":
-            quality += 8
+            quality += 7
             reasons.append("BTC поддерживает SHORT")
 
         if volume_ratio >= 1.5:
-            quality += 8
+            quality += 7
             reasons.append("Сильный объём")
 
-        signal = build_signal(symbol, "SHORT", "SHORT Pullback", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "STRICT")
-        if signal:
-            candidates.append(signal)
+        signal = build_signal(
+            symbol, "SHORT", "SAFE SHORT Pullback",
+            price, atr, rsi, volume_ratio, btc_status, trend_1h,
+            quality, reasons
+        )
 
-    # AGGRESSIVE LONG
-    if price > ema20 and btc_status != "BEARISH" and rsi < 62 and volume_ratio >= 0.85:
-        quality = 50
-        reasons = ["⚡ Агрессивный LONG", "Цена выше EMA20", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
-
-        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
-            quality += 8
-            reasons.append(f"1h trend: {trend_1h}")
-
-        if btc_status == "BULLISH":
-            quality += 6
-            reasons.append("BTC помогает LONG")
-
-        signal = build_signal(symbol, "LONG", "Aggressive LONG", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "AGGRESSIVE")
-        if signal:
-            candidates.append(signal)
-
-    # AGGRESSIVE SHORT
-    if price < ema20 and btc_status != "BULLISH" and rsi > 38 and volume_ratio >= 0.85:
-        quality = 50
-        reasons = ["⚡ Агрессивный SHORT", "Цена ниже EMA20", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
-
-        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
-            quality += 8
-            reasons.append(f"1h trend: {trend_1h}")
-
-        if btc_status == "BEARISH":
-            quality += 6
-            reasons.append("BTC помогает SHORT")
-
-        signal = build_signal(symbol, "SHORT", "Aggressive SHORT", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "AGGRESSIVE")
         if signal:
             candidates.append(signal)
 
@@ -481,13 +497,10 @@ def analyze_symbol(symbol, candles, candles_1h, btc_status):
     candidates.sort(key=lambda x: x["quality"], reverse=True)
     best = candidates[0]
 
-    if best["mode"] == "STRICT" and best["quality"] >= MIN_QUALITY:
-        return best
+    if best["quality"] < MIN_QUALITY:
+        return None
 
-    if STATS["signals_today"] < DAILY_TARGET_SIGNALS and best["quality"] >= 48:
-        return best
-
-    return None
+    return best
 
 
 def format_price(x):
@@ -500,15 +513,14 @@ def format_price(x):
 
 def make_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
-    mode_text = "✅ Основной сигнал" if signal["mode"] == "STRICT" else "⚡ Агрессивный вход"
-    fire = "🔥" if signal["quality"] >= 75 else "🎯"
+    fire = "🔥" if signal["quality"] >= 80 else "🎯"
     reasons_text = "\n".join([f"• {r}" for r in signal["reasons"]])
 
     return f"""
 {fire} <b>{signal["symbol"].replace("-", "/")}</b>
 {arrow} <b>{signal["side"]}</b>
 
-Тип: <b>{mode_text}</b>
+Тип: <b>✅ SAFE основной сигнал</b>
 Сетап: <b>{signal["setup_type"]}</b>
 Качество: <b>{signal["quality"]}%</b>
 
@@ -521,7 +533,7 @@ def make_message(signal):
 ✅ TP2: <code>{format_price(signal["tp2"])}</code> ≈ <b>+{signal["tp2_position_profit"]:.1f}%</b>
 ✅ TP3: <code>{format_price(signal["tp3"])}</code> ≈ <b>+{signal["tp3_position_profit"]:.1f}%</b>
 
-📊 Риск до SL: <b>{signal["risk_price_percent"]:.2f}% цены</b> / около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
+🛡 Риск до SL: <b>{signal["risk_price_percent"]:.2f}% цены</b> / около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
 
 ₿ BTC: <b>{signal["btc_status"]}</b>
@@ -532,8 +544,9 @@ def make_message(signal):
 <b>Почему сигнал:</b>
 {reasons_text}
 
-⚠️ Риск-менеджмент: до 0.5% от депозита.
-⚠️ Не финансовый совет. 20x — высокий риск.
+⚠️ 20x — высокий риск. Убытки всё равно возможны.
+⚠️ Риск-менеджмент: не более 0.5% от депозита на сделку.
+⚠️ Не финансовый совет.
 
 🕒 {now_text()}
 """.strip()
@@ -554,7 +567,12 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ BingX Signal Scanner v4.2 запущен.\nРежим: 1–2 сделки в день.\nПлечо: {LEVERAGE}x\nTP1: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции."
+            f"✅ BingX Signal Scanner v4.3 SAFE MODE запущен.\n"
+            f"Только основные сигналы. Aggressive Mode отключён.\n"
+            f"Плечо: {LEVERAGE}x\n"
+            f"TP1: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции\n"
+            f"Максимальный риск: {MAX_RISK_POSITION_PERCENT:.1f}% по позиции\n"
+            f"RR минимум: {MIN_RR}"
         )
 
         STATS["last_heartbeat"] = time.time()
