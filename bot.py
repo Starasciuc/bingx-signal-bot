@@ -16,25 +16,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
 ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15m")
+CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "5m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "4h")
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "120"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "300"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "180"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 
-# Цель: минимум +20% по позиции
 MIN_POSITION_PROFIT_PERCENT = float(os.getenv("MIN_POSITION_PROFIT_PERCENT", "20"))
+MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "5"))
+MIN_RR = float(os.getenv("MIN_RR", "2.0"))
 
-# Профессиональные фильтры риска
-MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "6"))
-MIN_RR = float(os.getenv("MIN_RR", "1.8"))
+MIN_CONFLUENCE_SCORE = int(os.getenv("MIN_CONFLUENCE_SCORE", "9"))
 
-# Ограничения
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "14400"))  # 4 часа
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "14400"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "5"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "4"))
 
 BTC_SYMBOL = "BTC-USDT"
 
@@ -42,8 +41,8 @@ SENT_SIGNALS = {}
 SYMBOL_COOLDOWN = {}
 
 STATS = {
-    "signals_total": 0,
     "signals_today": 0,
+    "signals_total": 0,
     "current_day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
 }
 
@@ -115,7 +114,7 @@ async def get_symbols(session):
     return symbols[:MAX_SYMBOLS]
 
 
-async def get_klines(session, symbol, interval, limit=200):
+async def get_klines(session, symbol, interval, limit=220):
     url = f"{BINGX_BASE_URL}/openApi/swap/v3/quote/klines"
     params = {
         "symbol": symbol,
@@ -128,7 +127,7 @@ async def get_klines(session, symbol, interval, limit=200):
 
     raw = data.get("data", [])
 
-    if not raw or len(raw) < 80:
+    if not raw or len(raw) < 100:
         return None
 
     candles = []
@@ -161,6 +160,20 @@ def ema(values, period):
         result.append((price - result[-1]) * multiplier + result[-1])
 
     return result
+
+
+def sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def stddev(values, period):
+    if len(values) < period:
+        return None
+    mean = sma(values, period)
+    variance = sum((x - mean) ** 2 for x in values[-period:]) / period
+    return variance ** 0.5
 
 
 def calculate_rsi(values, period=14):
@@ -204,6 +217,105 @@ def calculate_atr(candles, period=14):
         true_ranges.append(tr)
 
     return sum(true_ranges[-period:]) / period
+
+
+def calculate_macd(values):
+    if len(values) < 35:
+        return None
+
+    ema12 = ema(values, 12)
+    ema26 = ema(values, 26)
+
+    macd_line = []
+
+    for i in range(len(values)):
+        macd_line.append(ema12[i] - ema26[i])
+
+    signal_line = ema(macd_line, 9)
+
+    return {
+        "macd": macd_line[-1],
+        "signal": signal_line[-1],
+        "hist": macd_line[-1] - signal_line[-1],
+        "prev_hist": macd_line[-2] - signal_line[-2],
+    }
+
+
+def calculate_bollinger(values, period=20, mult=2):
+    mid = sma(values, period)
+    sd = stddev(values, period)
+
+    if mid is None or sd is None:
+        return None
+
+    return {
+        "upper": mid + sd * mult,
+        "middle": mid,
+        "lower": mid - sd * mult,
+    }
+
+
+def calculate_vwap_like(candles, period=48):
+    if len(candles) < period:
+        return None
+
+    total_pv = 0
+    total_volume = 0
+
+    for c in candles[-period:]:
+        typical_price = (c["high"] + c["low"] + c["close"]) / 3
+        volume = c["volume"]
+        total_pv += typical_price * volume
+        total_volume += volume
+
+    if total_volume == 0:
+        return None
+
+    return total_pv / total_volume
+
+
+def calculate_adx(candles, period=14):
+    if len(candles) < period + 2:
+        return None
+
+    plus_dm = []
+    minus_dm = []
+    true_ranges = []
+
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_high = candles[i - 1]["high"]
+        prev_low = candles[i - 1]["low"]
+        prev_close = candles[i - 1]["close"]
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0)
+
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        true_ranges.append(tr)
+
+    atr_sum = sum(true_ranges[-period:])
+    if atr_sum == 0:
+        return None
+
+    plus_di = 100 * (sum(plus_dm[-period:]) / atr_sum)
+    minus_di = 100 * (sum(minus_dm[-period:]) / atr_sum)
+
+    dx = abs(plus_di - minus_di) / max(plus_di + minus_di, 1e-9) * 100
+
+    return {
+        "adx": dx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+    }
 
 
 def trend_filter(candles):
@@ -289,13 +401,13 @@ def format_price(x):
 def nearest_resistance(entry, candles_1h, candles_4h):
     highs = []
 
-    for c in candles_1h[-80:]:
+    for c in candles_1h[-100:]:
         highs.append(c["high"])
 
-    for c in candles_4h[-50:]:
+    for c in candles_4h[-60:]:
         highs.append(c["high"])
 
-    candidates = sorted(set([h for h in highs if h > entry * 1.002]))
+    candidates = sorted(set([h for h in highs if h > entry * 1.003]))
 
     if not candidates:
         return None
@@ -306,13 +418,13 @@ def nearest_resistance(entry, candles_1h, candles_4h):
 def nearest_support(entry, candles_1h, candles_4h):
     lows = []
 
-    for c in candles_1h[-80:]:
+    for c in candles_1h[-100:]:
         lows.append(c["low"])
 
-    for c in candles_4h[-50:]:
+    for c in candles_4h[-60:]:
         lows.append(c["low"])
 
-    candidates = sorted(set([l for l in lows if l < entry * 0.998]), reverse=True)
+    candidates = sorted(set([l for l in lows if l < entry * 0.997]), reverse=True)
 
     if not candidates:
         return None
@@ -328,36 +440,50 @@ def detect_large_danger_candle(candles, atr):
     if atr <= 0:
         return True
 
-    if full_range > atr * 2.5:
+    if full_range > atr * 2.2:
         return True
 
-    if body > atr * 1.8:
+    if body > atr * 1.6:
         return True
 
     return False
 
 
-def build_long_signal(symbol, candles_15m, candles_1h, candles_4h, btc_status):
-    closes = [c["close"] for c in candles_15m]
-    lows = [c["low"] for c in candles_15m]
-    volumes = [c["volume"] for c in candles_15m]
+def is_price_chasing(entry, target, side):
+    distance = abs(target - entry)
 
-    ema20_list = ema(closes, 20)
-    ema50_list = ema(closes, 50)
-    ema100_list = ema(closes, 100)
+    if distance <= 0:
+        return True
 
-    last = candles_15m[-1]
-    prev = candles_15m[-2]
+    if side == "LONG":
+        recent_move = target - entry
+    else:
+        recent_move = entry - target
 
-    price = last["close"]
-    ema20 = ema20_list[-1]
-    ema50 = ema50_list[-1]
-    ema100 = ema100_list[-1]
+    return recent_move <= 0
 
-    rsi = calculate_rsi(closes, 14)
+
+def build_signal(symbol, side, candles_15m, candles_5m, candles_1h, candles_4h, btc_status):
+    closes_15 = [c["close"] for c in candles_15m]
+    volumes_15 = [c["volume"] for c in candles_15m]
+
+    last_15 = candles_15m[-1]
+    prev_15 = candles_15m[-2]
+
+    price = last_15["close"]
+
+    ema20_15 = ema(closes_15, 20)[-1]
+    ema50_15 = ema(closes_15, 50)[-1]
+    ema100_15 = ema(closes_15, 100)[-1]
+
+    rsi = calculate_rsi(closes_15, 14)
     atr = calculate_atr(candles_15m, 14)
+    macd = calculate_macd(closes_15)
+    bb = calculate_bollinger(closes_15, 20, 2)
+    vwap = calculate_vwap_like(candles_15m, 48)
+    adx = calculate_adx(candles_15m, 14)
 
-    if rsi is None or atr is None:
+    if rsi is None or atr is None or macd is None or bb is None or vwap is None or adx is None:
         return None
 
     if detect_large_danger_candle(candles_15m, atr):
@@ -366,141 +492,239 @@ def build_long_signal(symbol, candles_15m, candles_1h, candles_4h, btc_status):
     trend_1h = trend_filter(candles_1h)
     trend_4h = trend_filter(candles_4h)
 
-    if trend_4h not in ["BULLISH", "STRONG_BULLISH"]:
-        return None
+    avg_volume = sum(volumes_15[-30:]) / 30
+    volume_ratio = last_15["volume"] / avg_volume if avg_volume > 0 else 0
 
-    if trend_1h not in ["BULLISH", "STRONG_BULLISH"]:
-        return None
+    closes_5 = [c["close"] for c in candles_5m]
+    last_5 = candles_5m[-1]
+    prev_5 = candles_5m[-2]
 
-    if btc_status in ["BEARISH", "STRONG_BEARISH"]:
-        return None
+    ema20_5 = ema(closes_5, 20)[-1]
+    ema50_5 = ema(closes_5, 50)[-1]
 
-    strong_15m = price > ema20 > ema50 > ema100
+    checks = []
+    reasons = []
 
-    if not strong_15m:
-        return None
+    if side == "LONG":
+        if trend_4h not in ["BULLISH", "STRONG_BULLISH"]:
+            return None
 
-    avg_volume = sum(volumes[-30:]) / 30
-    volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
+        if trend_1h not in ["BULLISH", "STRONG_BULLISH"]:
+            return None
 
-    if volume_ratio < 1.15:
-        return None
+        if btc_status in ["BEARISH", "STRONG_BEARISH"]:
+            return None
 
-    # Откат к EMA20/EMA50
-    touched_ema_zone = (
-        prev["low"] <= ema20 * 1.004
-        or prev["low"] <= ema50 * 1.004
-        or last["low"] <= ema20 * 1.004
-        or last["low"] <= ema50 * 1.004
-    )
+        if not (price > ema20_15 > ema50_15 > ema100_15):
+            return None
 
-    if not touched_ema_zone:
-        return None
+        resistance = nearest_resistance(price, candles_1h, candles_4h)
+        if resistance is None:
+            return None
 
-    # Подтверждение отскока
-    bullish_reaction = (
-        last["close"] > last["open"]
-        and last["close"] > ema20
-        and last["close"] > prev["close"]
-    )
+        tp1_profit = position_profit_percent(price, resistance, "LONG")
+        if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
+            return None
 
-    if not bullish_reaction:
-        return None
+        local_low = min(c["low"] for c in candles_15m[-12:])
+        natural_sl = local_low - atr * 0.15
 
-    if not (38 <= rsi <= 58):
-        return None
+        if natural_sl >= price:
+            return None
 
-    entry = price
+        risk_price_percent = abs(price - natural_sl) / price * 100
+        risk_position_percent = risk_price_percent * LEVERAGE
 
-    resistance = nearest_resistance(entry, candles_1h, candles_4h)
+        if risk_position_percent > MAX_RISK_POSITION_PERCENT:
+            return None
 
-    if resistance is None:
-        return None
+        reward_price_percent = price_move_percent(price, resistance, "LONG")
+        rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
 
-    tp1_profit = position_profit_percent(entry, resistance, "LONG")
+        if rr < MIN_RR:
+            return None
 
-    # До первого сопротивления должно быть минимум +20% по позиции
-    if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
-        return None
+        touched_ema_zone = (
+            prev_15["low"] <= ema20_15 * 1.004
+            or prev_15["low"] <= ema50_15 * 1.004
+            or last_15["low"] <= ema20_15 * 1.004
+            or last_15["low"] <= ema50_15 * 1.004
+        )
 
-    recent_local_low = min(lows[-12:])
-    natural_sl = recent_local_low - atr * 0.20
+        candle_confirmation = (
+            last_15["close"] > last_15["open"]
+            and last_15["close"] > prev_15["close"]
+            and last_15["close"] > ema20_15
+        )
 
-    if natural_sl >= entry:
-        return None
+        five_min_confirmation = (
+            last_5["close"] > last_5["open"]
+            and last_5["close"] > ema20_5
+            and ema20_5 > ema50_5
+            and last_5["close"] > prev_5["close"]
+        )
 
-    risk_price_percent = abs(entry - natural_sl) / entry * 100
-    risk_position_percent = risk_price_percent * LEVERAGE
+        checks.append(("4h bullish trend", True))
+        checks.append(("1h bullish trend", True))
+        checks.append(("BTC не против LONG", btc_status not in ["BEARISH", "STRONG_BEARISH"]))
+        checks.append(("15m EMA trend bullish", price > ema20_15 > ema50_15 > ema100_15))
+        checks.append(("откат к EMA20/EMA50", touched_ema_zone))
+        checks.append(("15m свеча отскока", candle_confirmation))
+        checks.append(("5m подтверждение входа", five_min_confirmation))
+        checks.append(("RSI рабочая зона", 40 <= rsi <= 58))
+        checks.append(("MACD подтверждает LONG", macd["hist"] > 0 and macd["hist"] >= macd["prev_hist"]))
+        checks.append(("цена выше VWAP", price > vwap))
+        checks.append(("Bollinger не перекуплен", price < bb["upper"]))
+        checks.append(("объём выше среднего", volume_ratio >= 1.20))
+        checks.append(("ADX тренд есть", adx["adx"] >= 18))
+        checks.append(("до сопротивления есть +20%+", tp1_profit >= MIN_POSITION_PROFIT_PERCENT))
+        checks.append(("RR хороший", rr >= MIN_RR))
 
-    if risk_position_percent > MAX_RISK_POSITION_PERCENT:
-        return None
+        passed = [name for name, ok in checks if ok]
 
-    reward_price_percent = price_move_percent(entry, resistance, "LONG")
-    rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
+        if len(passed) < MIN_CONFLUENCE_SCORE:
+            return None
 
-    if rr < MIN_RR:
-        return None
+        tp1 = resistance
+        tp2 = price * (1 + (35 / LEVERAGE) / 100)
+        tp3 = price * (1 + (60 / LEVERAGE) / 100)
 
-    tp1 = resistance
-    tp2 = entry * (1 + (30 / LEVERAGE) / 100)
-    tp3 = entry * (1 + (50 / LEVERAGE) / 100)
+        if tp2 <= tp1:
+            tp2 = tp1 * 1.005
 
-    if tp2 <= tp1:
-        tp2 = tp1 * 1.004
+        if tp3 <= tp2:
+            tp3 = tp2 * 1.008
 
-    if tp3 <= tp2:
-        tp3 = tp2 * 1.006
+        entry_zone_low = price - atr * 0.15
+        entry_zone_high = price + atr * 0.08
 
-    entry_zone_low = entry - atr * 0.15
-    entry_zone_high = entry + atr * 0.10
+        quality = min(99, 55 + len(passed) * 3)
 
-    quality = 72
-    reasons = [
-        "4h bullish trend",
-        "1h bullish trend",
-        "15m откат к EMA20/EMA50",
-        "свеча подтверждения отскока",
-        f"RSI в рабочей зоне: {rsi:.1f}",
-        f"объём x{volume_ratio:.2f}",
-        "до первого сопротивления есть +20%+ по позиции",
-    ]
+        reasons = passed
 
-    if trend_4h == "STRONG_BULLISH":
-        quality += 7
-        reasons.append("4h strong bullish")
+        level_name = "первое сопротивление"
 
-    if trend_1h == "STRONG_BULLISH":
-        quality += 7
-        reasons.append("1h strong bullish")
+        signal_id = f"{symbol}:V6:LONG:{round(price, 6)}"
 
-    if btc_status in ["BULLISH", "STRONG_BULLISH"]:
-        quality += 6
-        reasons.append("BTC поддерживает LONG")
+    else:
+        if trend_4h not in ["BEARISH", "STRONG_BEARISH"]:
+            return None
 
-    if volume_ratio >= 1.6:
-        quality += 6
-        reasons.append("сильный всплеск объёма")
+        if trend_1h not in ["BEARISH", "STRONG_BEARISH"]:
+            return None
 
-    signal_id = f"{symbol}:PRO_PULLBACK:LONG:{round(entry, 6)}"
+        if btc_status in ["BULLISH", "STRONG_BULLISH"]:
+            return None
+
+        if not (price < ema20_15 < ema50_15 < ema100_15):
+            return None
+
+        support = nearest_support(price, candles_1h, candles_4h)
+        if support is None:
+            return None
+
+        tp1_profit = position_profit_percent(price, support, "SHORT")
+        if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
+            return None
+
+        local_high = max(c["high"] for c in candles_15m[-12:])
+        natural_sl = local_high + atr * 0.15
+
+        if natural_sl <= price:
+            return None
+
+        risk_price_percent = abs(natural_sl - price) / price * 100
+        risk_position_percent = risk_price_percent * LEVERAGE
+
+        if risk_position_percent > MAX_RISK_POSITION_PERCENT:
+            return None
+
+        reward_price_percent = price_move_percent(price, support, "SHORT")
+        rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
+
+        if rr < MIN_RR:
+            return None
+
+        touched_ema_zone = (
+            prev_15["high"] >= ema20_15 * 0.996
+            or prev_15["high"] >= ema50_15 * 0.996
+            or last_15["high"] >= ema20_15 * 0.996
+            or last_15["high"] >= ema50_15 * 0.996
+        )
+
+        candle_confirmation = (
+            last_15["close"] < last_15["open"]
+            and last_15["close"] < prev_15["close"]
+            and last_15["close"] < ema20_15
+        )
+
+        five_min_confirmation = (
+            last_5["close"] < last_5["open"]
+            and last_5["close"] < ema20_5
+            and ema20_5 < ema50_5
+            and last_5["close"] < prev_5["close"]
+        )
+
+        checks.append(("4h bearish trend", True))
+        checks.append(("1h bearish trend", True))
+        checks.append(("BTC не против SHORT", btc_status not in ["BULLISH", "STRONG_BULLISH"]))
+        checks.append(("15m EMA trend bearish", price < ema20_15 < ema50_15 < ema100_15))
+        checks.append(("откат к EMA20/EMA50", touched_ema_zone))
+        checks.append(("15m свеча rejection", candle_confirmation))
+        checks.append(("5m подтверждение входа", five_min_confirmation))
+        checks.append(("RSI рабочая зона", 42 <= rsi <= 62))
+        checks.append(("MACD подтверждает SHORT", macd["hist"] < 0 and macd["hist"] <= macd["prev_hist"]))
+        checks.append(("цена ниже VWAP", price < vwap))
+        checks.append(("Bollinger не перепродан", price > bb["lower"]))
+        checks.append(("объём выше среднего", volume_ratio >= 1.20))
+        checks.append(("ADX тренд есть", adx["adx"] >= 18))
+        checks.append(("до поддержки есть +20%+", tp1_profit >= MIN_POSITION_PROFIT_PERCENT))
+        checks.append(("RR хороший", rr >= MIN_RR))
+
+        passed = [name for name, ok in checks if ok]
+
+        if len(passed) < MIN_CONFLUENCE_SCORE:
+            return None
+
+        tp1 = support
+        tp2 = price * (1 - (35 / LEVERAGE) / 100)
+        tp3 = price * (1 - (60 / LEVERAGE) / 100)
+
+        if tp2 >= tp1:
+            tp2 = tp1 * 0.995
+
+        if tp3 >= tp2:
+            tp3 = tp2 * 0.992
+
+        entry_zone_low = price - atr * 0.08
+        entry_zone_high = price + atr * 0.15
+
+        quality = min(99, 55 + len(passed) * 3)
+
+        reasons = passed
+
+        level_name = "первая поддержка"
+
+        signal_id = f"{symbol}:V6:SHORT:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
 
     return {
         "symbol": symbol,
-        "side": "LONG",
-        "setup_type": "Professional Pullback LONG",
-        "quality": min(99, quality),
-        "entry": entry,
+        "side": side,
+        "setup_type": "Professional Confluence Pullback",
+        "quality": quality,
+        "entry": price,
         "entry_zone_low": entry_zone_low,
         "entry_zone_high": entry_zone_high,
         "sl": natural_sl,
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "tp1_position_profit": tp1_profit,
-        "tp2_position_profit": position_profit_percent(entry, tp2, "LONG"),
-        "tp3_position_profit": position_profit_percent(entry, tp3, "LONG"),
+        "tp1_position_profit": position_profit_percent(price, tp1, side),
+        "tp2_position_profit": position_profit_percent(price, tp2, side),
+        "tp3_position_profit": position_profit_percent(price, tp3, side),
         "risk_price_percent": risk_price_percent,
         "risk_position_percent": risk_position_percent,
         "rr": rr,
@@ -509,202 +733,42 @@ def build_long_signal(symbol, candles_15m, candles_1h, candles_4h, btc_status):
         "btc_status": btc_status,
         "trend_1h": trend_1h,
         "trend_4h": trend_4h,
-        "level_name": "первое сопротивление",
+        "confluence_score": len(reasons),
+        "max_confluence_score": len(checks),
+        "level_name": level_name,
         "reasons": reasons,
         "signal_id": signal_id,
     }
 
 
-def build_short_signal(symbol, candles_15m, candles_1h, candles_4h, btc_status):
-    closes = [c["close"] for c in candles_15m]
-    highs = [c["high"] for c in candles_15m]
-    volumes = [c["volume"] for c in candles_15m]
-
-    ema20_list = ema(closes, 20)
-    ema50_list = ema(closes, 50)
-    ema100_list = ema(closes, 100)
-
-    last = candles_15m[-1]
-    prev = candles_15m[-2]
-
-    price = last["close"]
-    ema20 = ema20_list[-1]
-    ema50 = ema50_list[-1]
-    ema100 = ema100_list[-1]
-
-    rsi = calculate_rsi(closes, 14)
-    atr = calculate_atr(candles_15m, 14)
-
-    if rsi is None or atr is None:
-        return None
-
-    if detect_large_danger_candle(candles_15m, atr):
-        return None
-
-    trend_1h = trend_filter(candles_1h)
-    trend_4h = trend_filter(candles_4h)
-
-    if trend_4h not in ["BEARISH", "STRONG_BEARISH"]:
-        return None
-
-    if trend_1h not in ["BEARISH", "STRONG_BEARISH"]:
-        return None
-
-    if btc_status in ["BULLISH", "STRONG_BULLISH"]:
-        return None
-
-    strong_15m = price < ema20 < ema50 < ema100
-
-    if not strong_15m:
-        return None
-
-    avg_volume = sum(volumes[-30:]) / 30
-    volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
-
-    if volume_ratio < 1.15:
-        return None
-
-    # Откат к EMA20/EMA50 сверху
-    touched_ema_zone = (
-        prev["high"] >= ema20 * 0.996
-        or prev["high"] >= ema50 * 0.996
-        or last["high"] >= ema20 * 0.996
-        or last["high"] >= ema50 * 0.996
-    )
-
-    if not touched_ema_zone:
-        return None
-
-    # Подтверждение rejection вниз
-    bearish_reaction = (
-        last["close"] < last["open"]
-        and last["close"] < ema20
-        and last["close"] < prev["close"]
-    )
-
-    if not bearish_reaction:
-        return None
-
-    if not (42 <= rsi <= 62):
-        return None
-
-    entry = price
-
-    support = nearest_support(entry, candles_1h, candles_4h)
-
-    if support is None:
-        return None
-
-    tp1_profit = position_profit_percent(entry, support, "SHORT")
-
-    # До первой поддержки должно быть минимум +20% по позиции
-    if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
-        return None
-
-    recent_local_high = max(highs[-12:])
-    natural_sl = recent_local_high + atr * 0.20
-
-    if natural_sl <= entry:
-        return None
-
-    risk_price_percent = abs(natural_sl - entry) / entry * 100
-    risk_position_percent = risk_price_percent * LEVERAGE
-
-    if risk_position_percent > MAX_RISK_POSITION_PERCENT:
-        return None
-
-    reward_price_percent = price_move_percent(entry, support, "SHORT")
-    rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
-
-    if rr < MIN_RR:
-        return None
-
-    tp1 = support
-    tp2 = entry * (1 - (30 / LEVERAGE) / 100)
-    tp3 = entry * (1 - (50 / LEVERAGE) / 100)
-
-    if tp2 >= tp1:
-        tp2 = tp1 * 0.996
-
-    if tp3 >= tp2:
-        tp3 = tp2 * 0.994
-
-    entry_zone_low = entry - atr * 0.10
-    entry_zone_high = entry + atr * 0.15
-
-    quality = 72
-    reasons = [
-        "4h bearish trend",
-        "1h bearish trend",
-        "15m откат к EMA20/EMA50",
-        "свеча подтверждения rejection",
-        f"RSI в рабочей зоне: {rsi:.1f}",
-        f"объём x{volume_ratio:.2f}",
-        "до первой поддержки есть +20%+ по позиции",
-    ]
-
-    if trend_4h == "STRONG_BEARISH":
-        quality += 7
-        reasons.append("4h strong bearish")
-
-    if trend_1h == "STRONG_BEARISH":
-        quality += 7
-        reasons.append("1h strong bearish")
-
-    if btc_status in ["BEARISH", "STRONG_BEARISH"]:
-        quality += 6
-        reasons.append("BTC поддерживает SHORT")
-
-    if volume_ratio >= 1.6:
-        quality += 6
-        reasons.append("сильный всплеск объёма")
-
-    signal_id = f"{symbol}:PRO_PULLBACK:SHORT:{round(entry, 6)}"
-
-    if signal_id in SENT_SIGNALS:
-        return None
-
-    return {
-        "symbol": symbol,
-        "side": "SHORT",
-        "setup_type": "Professional Pullback SHORT",
-        "quality": min(99, quality),
-        "entry": entry,
-        "entry_zone_low": entry_zone_low,
-        "entry_zone_high": entry_zone_high,
-        "sl": natural_sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "tp1_position_profit": tp1_profit,
-        "tp2_position_profit": position_profit_percent(entry, tp2, "SHORT"),
-        "tp3_position_profit": position_profit_percent(entry, tp3, "SHORT"),
-        "risk_price_percent": risk_price_percent,
-        "risk_position_percent": risk_position_percent,
-        "rr": rr,
-        "rsi": rsi,
-        "volume_ratio": volume_ratio,
-        "btc_status": btc_status,
-        "trend_1h": trend_1h,
-        "trend_4h": trend_4h,
-        "level_name": "первая поддержка",
-        "reasons": reasons,
-        "signal_id": signal_id,
-    }
-
-
-def analyze_symbol(symbol, candles_15m, candles_1h, candles_4h, btc_status):
+def analyze_symbol(symbol, candles_15m, candles_5m, candles_1h, candles_4h, btc_status):
     if is_on_cooldown(symbol):
         return None
 
     candidates = []
 
-    long_signal = build_long_signal(symbol, candles_15m, candles_1h, candles_4h, btc_status)
+    long_signal = build_signal(
+        symbol,
+        "LONG",
+        candles_15m,
+        candles_5m,
+        candles_1h,
+        candles_4h,
+        btc_status,
+    )
 
     if long_signal:
         candidates.append(long_signal)
 
-    short_signal = build_short_signal(symbol, candles_15m, candles_1h, candles_4h, btc_status)
+    short_signal = build_signal(
+        symbol,
+        "SHORT",
+        candles_15m,
+        candles_5m,
+        candles_1h,
+        candles_4h,
+        btc_status,
+    )
 
     if short_signal:
         candidates.append(short_signal)
@@ -714,12 +778,12 @@ def analyze_symbol(symbol, candles_15m, candles_1h, candles_4h, btc_status):
 
     candidates.sort(
         key=lambda x: (
+            x["confluence_score"],
             x["quality"],
             x["rr"],
             x["tp1_position_profit"],
-            x["volume_ratio"],
         ),
-        reverse=True
+        reverse=True,
     )
 
     return candidates[0]
@@ -727,21 +791,24 @@ def analyze_symbol(symbol, candles_15m, candles_1h, candles_4h, btc_status):
 
 def make_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
-    fire = "🔥" if signal["quality"] >= 85 else "🎯"
-    reasons_text = "\n".join([f"• {r}" for r in signal["reasons"]])
+    fire = "🔥" if signal["quality"] >= 88 else "🎯"
+
+    reasons_text = "\n".join([f"✅ {r}" for r in signal["reasons"]])
 
     return f"""
 {fire} <b>{signal["symbol"].replace("-", "/")}</b>
 {arrow} <b>{signal["side"]}</b>
 
-Тип: <b>✅ Professional Pullback</b>
+Тип: <b>✅ Professional Confluence Signal</b>
 Сетап: <b>{signal["setup_type"]}</b>
 Качество: <b>{signal["quality"]}%</b>
+Проверка условий: <b>{signal["confluence_score"]}/{signal["max_confluence_score"]}</b>
 
 <b>Тренд:</b>
 4h: <b>{signal["trend_4h"]}</b>
 1h: <b>{signal["trend_1h"]}</b>
 15m: <b>откат по тренду</b>
+5m: <b>подтверждение входа</b>
 
 Плечо: <b>{LEVERAGE}x</b>
 
@@ -762,13 +829,14 @@ def make_message(signal):
 📊 RSI: <b>{signal["rsi"]:.1f}</b>
 📊 Объём: <b>x{signal["volume_ratio"]:.2f}</b>
 
-<b>Почему сигнал:</b>
+<b>Что подтвердилось:</b>
 {reasons_text}
 
 <b>План ведения:</b>
-• TP1: можно закрыть часть позиции
-• После TP1: разумно перенести SL в безубыток
+• TP1: закрыть часть позиции
+• После TP1: перенести SL в безубыток
 • TP2/TP3: держать остаток по ситуации
+• Если цена ушла далеко от зоны входа — сделку лучше пропустить
 
 ⚠️ 20x — высокий риск. Даже профессиональный фильтр не гарантирует прибыль.
 ⚠️ Риск-менеджмент: не более 0.5% от депозита на сделку.
@@ -793,12 +861,13 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ BingX Signal Scanner v5 Professional Pullback Mode запущен.\n"
-            f"Логика: 4h + 1h тренд, 15m откат, поддержка/сопротивление.\n"
+            f"✅ BingX Signal Scanner v6 Professional Confluence Mode запущен.\n"
+            f"Логика: 4h + 1h + 15m + 5m + EMA + RSI + MACD + Bollinger + VWAP + ATR + объём + уровни.\n"
             f"Плечо: {LEVERAGE}x\n"
             f"TP1 минимум: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции\n"
             f"Риск максимум: {MAX_RISK_POSITION_PERCENT:.1f}% по позиции\n"
             f"RR минимум: {MIN_RR}\n"
+            f"Минимум подтверждений: {MIN_CONFLUENCE_SCORE}\n"
             f"Ежечасные обновления отключены."
         )
 
@@ -808,7 +877,7 @@ async def scan_loop():
             try:
                 print("Scanning...", now_text())
 
-                btc_1h = await get_klines(session, BTC_SYMBOL, interval=TREND_TIMEFRAME, limit=200)
+                btc_1h = await get_klines(session, BTC_SYMBOL, interval=TREND_TIMEFRAME, limit=220)
 
                 if not btc_1h:
                     print("BTC data unavailable")
@@ -836,16 +905,23 @@ async def scan_loop():
                     checked += 1
 
                     try:
-                        candles_15m = await get_klines(session, symbol, interval=ENTRY_TIMEFRAME, limit=200)
-                        candles_1h = await get_klines(session, symbol, interval=TREND_TIMEFRAME, limit=200)
-                        candles_4h = await get_klines(session, symbol, interval=MACRO_TIMEFRAME, limit=200)
+                        candles_15m = await get_klines(session, symbol, interval=ENTRY_TIMEFRAME, limit=220)
+                        candles_5m = await get_klines(session, symbol, interval=CONFIRM_TIMEFRAME, limit=220)
+                        candles_1h = await get_klines(session, symbol, interval=TREND_TIMEFRAME, limit=220)
+                        candles_4h = await get_klines(session, symbol, interval=MACRO_TIMEFRAME, limit=220)
 
-                        if candles_15m is None or candles_1h is None or candles_4h is None:
+                        if (
+                            candles_15m is None
+                            or candles_5m is None
+                            or candles_1h is None
+                            or candles_4h is None
+                        ):
                             continue
 
                         signal = analyze_symbol(
                             symbol,
                             candles_15m,
+                            candles_5m,
                             candles_1h,
                             candles_4h,
                             btc_status,
