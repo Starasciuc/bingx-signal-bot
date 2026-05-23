@@ -18,19 +18,20 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 HIGHER_TIMEFRAME = os.getenv("HIGHER_TIMEFRAME", "1h")
 
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
 
-# v4.1 — больше проверяемых инструментов
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
-
-# v4.1 — чуть мягче качество, чтобы позиции приходили чаще
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "70"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "250"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "58"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 MIN_POSITION_PROFIT_PERCENT = float(os.getenv("MIN_POSITION_PROFIT_PERCENT", "10"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "10800"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "5"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "7200"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+
+DAILY_TARGET_SIGNALS = int(os.getenv("DAILY_TARGET_SIGNALS", "2"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "4"))
+
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "3600"))
 
 BTC_SYMBOL = "BTC-USDT"
@@ -44,10 +45,19 @@ STATS = {
     "total_scans": 0,
     "signals_total": 0,
     "signals_hour": 0,
+    "signals_today": 0,
+    "current_day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
     "last_checked_symbols": 0,
     "last_btc_status": "UNKNOWN",
     "last_btc_change": 0.0,
 }
+
+
+def reset_daily_stats_if_needed():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if STATS["current_day"] != today:
+        STATS["current_day"] = today
+        STATS["signals_today"] = 0
 
 
 def now_text():
@@ -98,7 +108,7 @@ async def send_telegram_message(session, text, button_url=None):
 
 async def send_heartbeat(session):
     text = f"""
-🤖 <b>BingX Signal Scanner v4.1 работает</b>
+🤖 <b>BingX Signal Scanner v4.2 работает</b>
 
 ⏱ Аптайм: <b>{uptime_text()}</b>
 🔎 Сканов всего: <b>{STATS["total_scans"]}</b>
@@ -108,10 +118,12 @@ async def send_heartbeat(session):
 ₿ BTC изменение: <b>{STATS["last_btc_change"]:.2f}%</b>
 
 🎯 Сигналов за последний час: <b>{STATS["signals_hour"]}</b>
-🎯 Сигналов всего: <b>{STATS["signals_total"]}</b>
+🎯 Сигналов сегодня: <b>{STATS["signals_today"]}</b>
+🎯 Цель в день: <b>{DAILY_TARGET_SIGNALS}</b>
+🎯 Максимум в день: <b>{DAILY_MAX_SIGNALS}</b>
 
 ⚙️ Плечо: <b>{LEVERAGE}x</b>
-🎯 Минимум TP1: <b>{MIN_POSITION_PROFIT_PERCENT:.0f}%+</b> по позиции
+💰 TP1 минимум: <b>{MIN_POSITION_PROFIT_PERCENT:.0f}%+</b> по позиции
 
 🕒 {now_text()}
 """.strip()
@@ -291,13 +303,70 @@ def price_move_percent(entry, target, side):
     return (entry - target) / entry * 100
 
 
+def build_signal(symbol, side, setup_type, price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, mode):
+    if side == "LONG":
+        sl = price - atr * 1.0
+        tp1 = price * (1 + (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
+        tp2 = price * (1 + (20 / LEVERAGE) / 100)
+        tp3 = price * (1 + (30 / LEVERAGE) / 100)
+    else:
+        sl = price + atr * 1.0
+        tp1 = price * (1 - (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
+        tp2 = price * (1 - (20 / LEVERAGE) / 100)
+        tp3 = price * (1 - (30 / LEVERAGE) / 100)
+
+    risk_price_percent = abs(sl - price) / price * 100
+    risk_position_percent = risk_price_percent * LEVERAGE
+
+    if risk_position_percent > 25:
+        return None
+
+    tp1_profit = position_profit_percent(price, tp1, side)
+    tp2_profit = position_profit_percent(price, tp2, side)
+    tp3_profit = position_profit_percent(price, tp3, side)
+
+    reward_price_percent = price_move_percent(price, tp1, side)
+    rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
+
+    if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
+        return None
+
+    signal_id = f"{symbol}:{TIMEFRAME}:{side}:{round(price, 6)}"
+
+    if signal_id in SENT_SIGNALS:
+        return None
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "setup_type": setup_type,
+        "mode": mode,
+        "quality": min(97, max(40, quality)),
+        "entry": price,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "rsi": rsi,
+        "volume_ratio": volume_ratio,
+        "risk_price_percent": risk_price_percent,
+        "risk_position_percent": risk_position_percent,
+        "tp1_position_profit": tp1_profit,
+        "tp2_position_profit": tp2_profit,
+        "tp3_position_profit": tp3_profit,
+        "rr": rr,
+        "reasons": reasons,
+        "btc_status": btc_status,
+        "trend_1h": trend_1h,
+        "signal_id": signal_id,
+    }
+
+
 def analyze_symbol(symbol, candles, candles_1h, btc_status):
     if is_on_cooldown(symbol):
         return None
 
     closes = [c["close"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
     volumes = [c["volume"] for c in candles]
 
     ema20_list = ema(closes, 20)
@@ -305,196 +374,120 @@ def analyze_symbol(symbol, candles, candles_1h, btc_status):
     ema100_list = ema(closes, 100)
 
     last = candles[-1]
-    prev = candles[-2]
 
     price = last["close"]
     ema20 = ema20_list[-1]
     ema50 = ema50_list[-1]
     ema100 = ema100_list[-1]
-    last_rsi = calculate_rsi(closes, 14)
+
+    rsi = calculate_rsi(closes, 14)
     atr = calculate_atr(candles, 14)
 
-    if last_rsi is None or atr is None:
+    if rsi is None or atr is None:
         return None
 
     trend_1h = higher_tf_filter(candles_1h)
 
-    recent_high = max(highs[-24:])
-    recent_low = min(lows[-24:])
     avg_volume = sum(volumes[-30:]) / 30
-
     volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
 
-    # v4.1 — объёмный фильтр мягче, чтобы сигналов было больше
-    if volume_ratio < 1.05:
-        return None
+    bullish_15m = price > ema20 and ema20 > ema50
+    bearish_15m = price < ema20 and ema20 < ema50
 
-    signal = None
-    setup_type = None
-    quality = 50
-    reasons = []
+    strong_bullish_15m = ema20 > ema50 > ema100
+    strong_bearish_15m = ema20 < ema50 < ema100
 
-    bullish_structure = price > ema20 and ema20 > ema50
-    bearish_structure = price < ema20 and ema20 < ema50
+    candidates = []
 
-    strong_uptrend = ema20 > ema50 > ema100
-    strong_downtrend = ema20 < ema50 < ema100
+    # STRICT LONG
+    if bullish_15m and trend_1h in ["BULLISH", "SOFT_BULLISH"] and btc_status != "BEARISH" and volume_ratio >= 1.05 and rsi < 55:
+        quality = 60
+        reasons = ["15m trend bullish", f"1h trend: {trend_1h}", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
 
-    # LONG Pullback / Reversal
-    if (
-        bullish_structure
-        and prev["low"] <= recent_low * 1.006
-        and last_rsi < 50
-        and volume_ratio >= 1.05
-    ):
-        if btc_status == "BEARISH":
-            return None
-
-        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
-            return None
-
-        signal = "LONG"
-        setup_type = "LONG Pullback"
-        quality += 12
-
-        if strong_uptrend:
+        if strong_bullish_15m:
             quality += 8
-            reasons.append("15m EMA trend bullish")
-
-        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
-            quality += 10
-            reasons.append(f"1h trend: {trend_1h}")
+            reasons.append("Сильная EMA структура")
 
         if btc_status == "BULLISH":
             quality += 8
             reasons.append("BTC поддерживает LONG")
 
-        if last_rsi < 42:
-            quality += 8
-            reasons.append(f"RSI остыл: {last_rsi:.1f}")
-        else:
-            quality += 4
-            reasons.append(f"RSI: {last_rsi:.1f}")
-
         if volume_ratio >= 1.5:
-            quality += 12
-            reasons.append(f"Сильный объём x{volume_ratio:.2f}")
-        else:
-            quality += 6
-            reasons.append(f"Объём x{volume_ratio:.2f}")
-
-        entry = price
-        sl = entry - atr * 1.1
-        tp1 = entry * (1 + (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
-        tp2 = entry * (1 + (20 / LEVERAGE) / 100)
-        tp3 = entry * (1 + (30 / LEVERAGE) / 100)
-
-    # SHORT Pullback / Reversal
-    elif (
-        bearish_structure
-        and prev["high"] >= recent_high * 0.994
-        and last_rsi > 50
-        and volume_ratio >= 1.05
-    ):
-        if btc_status == "BULLISH":
-            return None
-
-        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
-            return None
-
-        signal = "SHORT"
-        setup_type = "SHORT Pullback"
-        quality += 12
-
-        if strong_downtrend:
             quality += 8
-            reasons.append("15m EMA trend bearish")
+            reasons.append("Сильный объём")
 
-        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
-            quality += 10
-            reasons.append(f"1h trend: {trend_1h}")
+        signal = build_signal(symbol, "LONG", "LONG Pullback", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "STRICT")
+        if signal:
+            candidates.append(signal)
+
+    # STRICT SHORT
+    if bearish_15m and trend_1h in ["BEARISH", "SOFT_BEARISH"] and btc_status != "BULLISH" and volume_ratio >= 1.05 and rsi > 45:
+        quality = 60
+        reasons = ["15m trend bearish", f"1h trend: {trend_1h}", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
+
+        if strong_bearish_15m:
+            quality += 8
+            reasons.append("Сильная EMA структура")
 
         if btc_status == "BEARISH":
             quality += 8
             reasons.append("BTC поддерживает SHORT")
 
-        if last_rsi > 58:
-            quality += 8
-            reasons.append(f"RSI высокий: {last_rsi:.1f}")
-        else:
-            quality += 4
-            reasons.append(f"RSI: {last_rsi:.1f}")
-
         if volume_ratio >= 1.5:
-            quality += 12
-            reasons.append(f"Сильный объём x{volume_ratio:.2f}")
-        else:
+            quality += 8
+            reasons.append("Сильный объём")
+
+        signal = build_signal(symbol, "SHORT", "SHORT Pullback", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "STRICT")
+        if signal:
+            candidates.append(signal)
+
+    # AGGRESSIVE LONG
+    if price > ema20 and btc_status != "BEARISH" and rsi < 62 and volume_ratio >= 0.85:
+        quality = 50
+        reasons = ["⚡ Агрессивный LONG", "Цена выше EMA20", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
+
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+            quality += 8
+            reasons.append(f"1h trend: {trend_1h}")
+
+        if btc_status == "BULLISH":
             quality += 6
-            reasons.append(f"Объём x{volume_ratio:.2f}")
+            reasons.append("BTC помогает LONG")
 
-        entry = price
-        sl = entry + atr * 1.1
-        tp1 = entry * (1 - (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
-        tp2 = entry * (1 - (20 / LEVERAGE) / 100)
-        tp3 = entry * (1 - (30 / LEVERAGE) / 100)
+        signal = build_signal(symbol, "LONG", "Aggressive LONG", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "AGGRESSIVE")
+        if signal:
+            candidates.append(signal)
 
-    else:
+    # AGGRESSIVE SHORT
+    if price < ema20 and btc_status != "BULLISH" and rsi > 38 and volume_ratio >= 0.85:
+        quality = 50
+        reasons = ["⚡ Агрессивный SHORT", "Цена ниже EMA20", f"RSI: {rsi:.1f}", f"Объём x{volume_ratio:.2f}"]
+
+        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
+            quality += 8
+            reasons.append(f"1h trend: {trend_1h}")
+
+        if btc_status == "BEARISH":
+            quality += 6
+            reasons.append("BTC помогает SHORT")
+
+        signal = build_signal(symbol, "SHORT", "Aggressive SHORT", price, atr, rsi, volume_ratio, btc_status, trend_1h, quality, reasons, "AGGRESSIVE")
+        if signal:
+            candidates.append(signal)
+
+    if not candidates:
         return None
 
-    quality = min(97, max(50, quality))
+    candidates.sort(key=lambda x: x["quality"], reverse=True)
+    best = candidates[0]
 
-    if quality < MIN_QUALITY:
-        return None
+    if best["mode"] == "STRICT" and best["quality"] >= MIN_QUALITY:
+        return best
 
-    tp1_position_profit = position_profit_percent(entry, tp1, signal)
-    tp2_position_profit = position_profit_percent(entry, tp2, signal)
-    tp3_position_profit = position_profit_percent(entry, tp3, signal)
+    if STATS["signals_today"] < DAILY_TARGET_SIGNALS and best["quality"] >= 48:
+        return best
 
-    if tp1_position_profit < MIN_POSITION_PROFIT_PERCENT:
-        return None
-
-    risk_price_percent = abs(sl - entry) / entry * 100
-    risk_position_percent = risk_price_percent * LEVERAGE
-
-    if risk_position_percent > 18:
-        return None
-
-    reward_price_percent = price_move_percent(entry, tp1, signal)
-    rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
-
-    if rr < 0.65:
-        return None
-
-    signal_id = f"{symbol}:{TIMEFRAME}:{signal}:{round(entry, 6)}"
-
-    if signal_id in SENT_SIGNALS:
-        return None
-
-    SENT_SIGNALS[signal_id] = time.time()
-    set_cooldown(symbol)
-
-    return {
-        "symbol": symbol,
-        "side": signal,
-        "setup_type": setup_type,
-        "quality": quality,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rsi": last_rsi,
-        "volume_ratio": volume_ratio,
-        "risk_price_percent": risk_price_percent,
-        "risk_position_percent": risk_position_percent,
-        "tp1_position_profit": tp1_position_profit,
-        "tp2_position_profit": tp2_position_profit,
-        "tp3_position_profit": tp3_position_profit,
-        "rr": rr,
-        "reasons": reasons,
-        "btc_status": btc_status,
-        "trend_1h": trend_1h,
-    }
+    return None
 
 
 def format_price(x):
@@ -507,13 +500,15 @@ def format_price(x):
 
 def make_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
-    fire = "🔥" if signal["quality"] >= 85 else "🎯"
+    mode_text = "✅ Основной сигнал" if signal["mode"] == "STRICT" else "⚡ Агрессивный вход"
+    fire = "🔥" if signal["quality"] >= 75 else "🎯"
     reasons_text = "\n".join([f"• {r}" for r in signal["reasons"]])
 
     return f"""
 {fire} <b>{signal["symbol"].replace("-", "/")}</b>
 {arrow} <b>{signal["side"]}</b>
 
+Тип: <b>{mode_text}</b>
 Сетап: <b>{signal["setup_type"]}</b>
 Качество: <b>{signal["quality"]}%</b>
 
@@ -538,7 +533,7 @@ def make_message(signal):
 {reasons_text}
 
 ⚠️ Риск-менеджмент: до 0.5% от депозита.
-⚠️ Не финансовый совет. Фьючерсы несут высокий риск.
+⚠️ Не финансовый совет. 20x — высокий риск.
 
 🕒 {now_text()}
 """.strip()
@@ -559,12 +554,14 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ BingX Signal Scanner v4.1 запущен.\nПлечо: {LEVERAGE}x\nЦель: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции.\nПроверяю до {MAX_SYMBOLS} инструментов."
+            f"✅ BingX Signal Scanner v4.2 запущен.\nРежим: 1–2 сделки в день.\nПлечо: {LEVERAGE}x\nTP1: {MIN_POSITION_PROFIT_PERCENT:.0f}%+ по позиции."
         )
 
         STATS["last_heartbeat"] = time.time()
 
         while True:
+            reset_daily_stats_if_needed()
+
             try:
                 print("Scanning...", now_text())
 
@@ -580,15 +577,18 @@ async def scan_loop():
                 STATS["last_btc_status"] = btc_status
                 STATS["last_btc_change"] = btc_change
 
-                print(f"BTC status: {btc_status}, change: {btc_change:.2f}%")
-
                 symbols = await get_symbols(session)
                 checked = 0
                 found = 0
 
                 for symbol in symbols:
+                    reset_daily_stats_if_needed()
+
                     if symbol == BTC_SYMBOL:
                         continue
+
+                    if STATS["signals_today"] >= DAILY_MAX_SIGNALS:
+                        break
 
                     checked += 1
 
@@ -610,9 +610,13 @@ async def scan_loop():
                             button_url=bingx_url(symbol)
                         )
 
+                        SENT_SIGNALS[signal["signal_id"]] = time.time()
+                        set_cooldown(symbol)
+
                         found += 1
                         STATS["signals_total"] += 1
                         STATS["signals_hour"] += 1
+                        STATS["signals_today"] += 1
 
                         await asyncio.sleep(2)
 
@@ -625,7 +629,10 @@ async def scan_loop():
                 STATS["total_scans"] += 1
                 STATS["last_checked_symbols"] = checked
 
-                print(f"Scan finished. Checked: {checked}. Signals found: {found}")
+                print(
+                    f"Scan finished. Checked: {checked}. "
+                    f"Signals found: {found}. Today: {STATS['signals_today']}"
+                )
 
                 if time.time() - STATS["last_heartbeat"] >= HEARTBEAT_SECONDS:
                     await send_heartbeat(session)
