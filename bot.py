@@ -19,20 +19,25 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "5m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
+MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "4h")
 
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "120"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "250"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "90"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "300"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
 MIN_POSITION_PROFIT_PERCENT = float(os.getenv("MIN_POSITION_PROFIT_PERCENT", "20"))
 MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "18"))
-MIN_RR = float(os.getenv("MIN_RR", "1.2"))
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "85"))
+MIN_RR = float(os.getenv("MIN_RR", "1.25"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "88"))
+
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.50"))
+MIN_MOMENTUM_ATR = float(os.getenv("MIN_MOMENTUM_ATR", "0.25"))
+MAX_LATE_ENTRY_ATR = float(os.getenv("MAX_LATE_ENTRY_ATR", "0.95"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "10800"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "6"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "5"))
 
 BTC_SYMBOL = "BTC-USDT"
 
@@ -207,6 +212,7 @@ def sma(values, period):
 def stddev(values, period):
     if len(values) < period:
         return None
+
     mean = sma(values, period)
     variance = sum((x - mean) ** 2 for x in values[-period:]) / period
     return variance ** 0.5
@@ -454,26 +460,77 @@ def next_resistance_above(entry, candles_1h, candles_4h):
     return candidates[0]
 
 
+def candle_body(candle):
+    return abs(candle["close"] - candle["open"])
+
+
+def candle_range(candle):
+    return candle["high"] - candle["low"]
+
+
 def detect_large_danger_candle(candles, atr):
     last = candles[-1]
 
-    body = abs(last["close"] - last["open"])
-    full_range = last["high"] - last["low"]
+    body = candle_body(last)
+    full_range = candle_range(last)
 
     if atr <= 0:
         return True
 
-    if full_range > atr * 2.8:
+    if full_range > atr * 3.0:
         return True
 
-    if body > atr * 2.2:
+    if body > atr * 2.4:
         return True
 
     return False
 
 
-def candle_body(candle):
-    return abs(candle["close"] - candle["open"])
+def momentum_is_strong(candles_5m, direction):
+    last = candles_5m[-1]
+    prev = candles_5m[-2]
+    prev2 = candles_5m[-3]
+
+    last_body = candle_body(last)
+    prev_body = candle_body(prev)
+    prev2_body = candle_body(prev2)
+
+    if direction == "SHORT":
+        return (
+            last["close"] < last["open"]
+            and prev["close"] <= prev["open"]
+            and last["close"] < prev["close"]
+            and prev["close"] <= prev2["close"]
+            and last_body > prev_body * 0.8
+            and last_body > prev2_body * 0.6
+        )
+
+    return (
+        last["close"] > last["open"]
+        and prev["close"] >= prev["open"]
+        and last["close"] > prev["close"]
+        and prev["close"] >= prev2["close"]
+        and last_body > prev_body * 0.8
+        and last_body > prev2_body * 0.6
+    )
+
+
+def price_already_moved_from_level(price, level, atr, direction):
+    if atr <= 0:
+        return False
+
+    distance = abs(price - level)
+
+    if distance < atr * MIN_MOMENTUM_ATR:
+        return False
+
+    if distance > atr * MAX_LATE_ENTRY_ATR:
+        return False
+
+    if direction == "SHORT":
+        return price < level
+
+    return price > level
 
 
 def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, candles_4h, btc_status):
@@ -505,17 +562,8 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
     avg_volume = sum(volumes_15[-30:]) / 30
     volume_ratio = last_15["volume"] / avg_volume if avg_volume > 0 else 0
 
-    # Momentum filter: без сильного объёма сигнал не даём
-    if volume_ratio < 1.30:
+    if volume_ratio < MIN_VOLUME_RATIO:
         return None
-
-    closes_5 = [c["close"] for c in candles_5m]
-    last_5 = candles_5m[-1]
-    prev_5 = candles_5m[-2]
-    ema20_5 = ema(closes_5, 20)[-1]
-
-    last_5_body = candle_body(last_5)
-    prev_5_body = candle_body(prev_5)
 
     if side == "SHORT":
         resistance = get_resistance_near_price(price, candles_1h, candles_4h)
@@ -523,38 +571,35 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
         if resistance is None:
             return None
 
+        if not price_already_moved_from_level(price, resistance, atr, "SHORT"):
+            return None
+
+        if not momentum_is_strong(candles_5m, "SHORT"):
+            return None
+
         target = next_support_below(price, candles_1h, candles_4h)
 
         if target is None:
-            target = price * (1 - (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
+            return None
 
         tp1_profit = position_profit_percent(price, target, "SHORT")
 
         if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
-            target = price * (1 - (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
-            tp1_profit = position_profit_percent(price, target, "SHORT")
+            return None
 
         recent_high = max(highs_15[-20:])
-
-        near_resistance = abs(price - resistance) / price * 100 <= 0.80
 
         rejection_candle = (
             last_15["high"] >= resistance * 0.996
             and last_15["close"] < last_15["open"]
             and last_15["close"] < prev_15["close"]
+            and candle_body(last_15) >= atr * 0.30
         )
 
-        five_min_confirm = (
-            last_5["close"] < last_5["open"]
-            and last_5["close"] < ema20_5
-            and last_5["close"] < prev_5["close"]
-            and last_5_body > prev_5_body
-        )
-
-        rsi_ok = 55 <= rsi <= 80
-        macd_turn = macd["hist"] < macd["prev_hist"]
-        bollinger_ok = price >= bb["middle"] and price <= bb["upper"] * 1.02
-        vwap_ok = price >= vwap * 0.990
+        rsi_ok = 58 <= rsi <= 82
+        macd_turn = macd["hist"] < macd["prev_hist"] and macd["hist"] < 0
+        bollinger_ok = price >= bb["middle"] and price <= bb["upper"] * 1.025
+        vwap_ok = price >= vwap * 0.985
 
         sl = max(resistance + atr * 0.20, recent_high + atr * 0.10)
 
@@ -574,18 +619,19 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
             return None
 
         checks = [
-            ("цена у сопротивления", near_resistance),
+            ("цена отбилась от сопротивления", price < resistance),
             ("15m rejection-свеча", rejection_candle),
-            ("5m импульс вниз", five_min_confirm),
+            ("5m уже дал импульс вниз", True),
+            ("цена уже начала движение вниз", True),
             ("RSI высокий", rsi_ok),
-            ("MACD разворачивается вниз", macd_turn),
-            ("объём x1.30+", volume_ratio >= 1.30),
-            ("цена возле верхней зоны Bollinger", bollinger_ok),
-            ("цена выше/около VWAP", vwap_ok),
+            ("MACD уже вниз", macd_turn),
+            ("объём сильный", volume_ratio >= MIN_VOLUME_RATIO),
+            ("Bollinger зона подходит", bollinger_ok),
+            ("VWAP зона подходит", vwap_ok),
             ("BTC не против SHORT", btc_status != "BULLISH"),
             ("4h не сильный bullish", trend_4h != "STRONG_BULLISH"),
             ("1h не сильный bullish", trend_1h != "STRONG_BULLISH"),
-            ("до TP1 есть нужный потенциал", tp1_profit >= MIN_POSITION_PROFIT_PERCENT),
+            ("TP1 даёт нужный потенциал", tp1_profit >= MIN_POSITION_PROFIT_PERCENT),
             ("RR хороший", rr >= MIN_RR),
         ]
 
@@ -603,38 +649,35 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
         if support is None:
             return None
 
+        if not price_already_moved_from_level(price, support, atr, "LONG"):
+            return None
+
+        if not momentum_is_strong(candles_5m, "LONG"):
+            return None
+
         target = next_resistance_above(price, candles_1h, candles_4h)
 
         if target is None:
-            target = price * (1 + (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
+            return None
 
         tp1_profit = position_profit_percent(price, target, "LONG")
 
         if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
-            target = price * (1 + (MIN_POSITION_PROFIT_PERCENT / LEVERAGE) / 100)
-            tp1_profit = position_profit_percent(price, target, "LONG")
+            return None
 
         recent_low = min(lows_15[-20:])
-
-        near_support = abs(price - support) / price * 100 <= 0.80
 
         bounce_candle = (
             last_15["low"] <= support * 1.004
             and last_15["close"] > last_15["open"]
             and last_15["close"] > prev_15["close"]
+            and candle_body(last_15) >= atr * 0.30
         )
 
-        five_min_confirm = (
-            last_5["close"] > last_5["open"]
-            and last_5["close"] > ema20_5
-            and last_5["close"] > prev_5["close"]
-            and last_5_body > prev_5_body
-        )
-
-        rsi_ok = 20 <= rsi <= 48
-        macd_turn = macd["hist"] > macd["prev_hist"]
-        bollinger_ok = price <= bb["middle"] and price >= bb["lower"] * 0.98
-        vwap_ok = price <= vwap * 1.010
+        rsi_ok = 18 <= rsi <= 45
+        macd_turn = macd["hist"] > macd["prev_hist"] and macd["hist"] > 0
+        bollinger_ok = price <= bb["middle"] and price >= bb["lower"] * 0.975
+        vwap_ok = price <= vwap * 1.015
 
         sl = min(support - atr * 0.20, recent_low - atr * 0.10)
 
@@ -654,18 +697,19 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
             return None
 
         checks = [
-            ("цена у поддержки", near_support),
+            ("цена отбилась от поддержки", price > support),
             ("15m bounce-свеча", bounce_candle),
-            ("5m импульс вверх", five_min_confirm),
+            ("5m уже дал импульс вверх", True),
+            ("цена уже начала движение вверх", True),
             ("RSI низкий", rsi_ok),
-            ("MACD разворачивается вверх", macd_turn),
-            ("объём x1.30+", volume_ratio >= 1.30),
-            ("цена возле нижней зоны Bollinger", bollinger_ok),
-            ("цена ниже/около VWAP", vwap_ok),
+            ("MACD уже вверх", macd_turn),
+            ("объём сильный", volume_ratio >= MIN_VOLUME_RATIO),
+            ("Bollinger зона подходит", bollinger_ok),
+            ("VWAP зона подходит", vwap_ok),
             ("BTC не против LONG", btc_status != "BEARISH"),
             ("4h не сильный bearish", trend_4h != "STRONG_BEARISH"),
             ("1h не сильный bearish", trend_1h != "STRONG_BEARISH"),
-            ("до TP1 есть нужный потенциал", tp1_profit >= MIN_POSITION_PROFIT_PERCENT),
+            ("TP1 даёт нужный потенциал", tp1_profit >= MIN_POSITION_PROFIT_PERCENT),
             ("RR хороший", rr >= MIN_RR),
         ]
 
@@ -679,15 +723,15 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
 
     passed = [name for name, ok in checks if ok]
 
-    if len(passed) < 8:
+    if len(passed) < 11:
         return None
 
-    quality = min(95, 55 + len(passed) * 4)
+    quality = min(97, 50 + len(passed) * 4)
 
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:MOMENTUM_REVERSAL:{side}:{round(entry, 6)}"
+    signal_id = f"{symbol}:FAST_MOMENTUM_REVERSAL:{side}:{round(entry, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -748,6 +792,7 @@ def analyze_symbol(symbol, candles_15m, candles_5m, candles_1h, candles_4h, btc_
         key=lambda x: (
             x["quality"],
             x["rr"],
+            x["volume_ratio"],
         ),
         reverse=True,
     )
@@ -791,9 +836,9 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ Momentum Reversal Bot запущен.\n"
+            f"✅ Fast Momentum Reversal Bot запущен.\n"
             f"Формат сигналов как в примере.\n"
-            f"Фильтр: объём x1.30+ и 5m импульс.\n"
+            f"Фильтр: сильный объём x{MIN_VOLUME_RATIO}+ и движение уже началось.\n"
             f"Плечо max.: {LEVERAGE}x\n"
             f"Таймфрейм: {TIMEFRAME}"
         )
@@ -835,7 +880,7 @@ async def scan_loop():
                         candles_15m = await get_klines(session, symbol, interval=TIMEFRAME, limit=220)
                         candles_5m = await get_klines(session, symbol, interval=CONFIRM_TIMEFRAME, limit=220)
                         candles_1h = await get_klines(session, symbol, interval=TREND_TIMEFRAME, limit=220)
-                        candles_4h = await get_klines(session, symbol, interval="4h", limit=220)
+                        candles_4h = await get_klines(session, symbol, interval=MACRO_TIMEFRAME, limit=220)
 
                         if (
                             candles_15m is None
