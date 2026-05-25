@@ -21,23 +21,29 @@ CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "5m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "4h")
 
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "90"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "300"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "400"))
 
+# Лучше 10x для таких reversal-сигналов. 20x слишком опасно.
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-MIN_POSITION_PROFIT_PERCENT = float(os.getenv("MIN_POSITION_PROFIT_PERCENT", "20"))
-MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "18"))
-MIN_RR = float(os.getenv("MIN_RR", "1.25"))
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "88"))
+# Цели по позиции
+TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "12"))
+TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "25"))
+TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "45"))
 
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.50"))
-MIN_MOMENTUM_ATR = float(os.getenv("MIN_MOMENTUM_ATR", "0.25"))
-MAX_LATE_ENTRY_ATR = float(os.getenv("MAX_LATE_ENTRY_ATR", "0.95"))
+# Риск
+MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "12"))
+MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "1.0"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "10800"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "5"))
+# Фильтры
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "78"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.05"))
+LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.20"))
+
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "7200"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "8"))
 
 BTC_SYMBOL = "BTC-USDT"
 
@@ -168,7 +174,7 @@ async def get_klines(session, symbol, interval, limit=220):
 
     raw = data.get("data", [])
 
-    if not raw or len(raw) < 100:
+    if not raw or len(raw) < 80:
         return None
 
     candles = []
@@ -382,155 +388,125 @@ def price_move_percent(entry, target, side):
     return (entry - target) / entry * 100
 
 
-def get_resistance_near_price(price, candles_1h, candles_4h):
-    highs = []
-
-    for c in candles_1h[-120:]:
-        highs.append(c["high"])
-
-    for c in candles_4h[-80:]:
-        highs.append(c["high"])
-
-    near = []
-
-    for level in highs:
-        distance = abs(price - level) / price * 100
-        if distance <= 0.80 and level >= price * 0.996:
-            near.append(level)
-
-    if not near:
-        return None
-
-    return min(near, key=lambda x: abs(price - x))
-
-
-def get_support_near_price(price, candles_1h, candles_4h):
-    lows = []
-
-    for c in candles_1h[-120:]:
-        lows.append(c["low"])
-
-    for c in candles_4h[-80:]:
-        lows.append(c["low"])
-
-    near = []
-
-    for level in lows:
-        distance = abs(price - level) / price * 100
-        if distance <= 0.80 and level <= price * 1.004:
-            near.append(level)
-
-    if not near:
-        return None
-
-    return min(near, key=lambda x: abs(price - x))
-
-
-def next_support_below(entry, candles_1h, candles_4h):
-    lows = []
-
-    for c in candles_1h[-160:]:
-        lows.append(c["low"])
-
-    for c in candles_4h[-100:]:
-        lows.append(c["low"])
-
-    candidates = sorted(set([l for l in lows if l < entry * 0.995]), reverse=True)
-
-    if not candidates:
-        return None
-
-    return candidates[0]
-
-
-def next_resistance_above(entry, candles_1h, candles_4h):
-    highs = []
-
-    for c in candles_1h[-160:]:
-        highs.append(c["high"])
-
-    for c in candles_4h[-100:]:
-        highs.append(c["high"])
-
-    candidates = sorted(set([h for h in highs if h > entry * 1.005]))
-
-    if not candidates:
-        return None
-
-    return candidates[0]
-
-
 def candle_body(candle):
     return abs(candle["close"] - candle["open"])
 
 
-def candle_range(candle):
-    return candle["high"] - candle["low"]
+def upper_wick(candle):
+    return candle["high"] - max(candle["open"], candle["close"])
+
+
+def lower_wick(candle):
+    return min(candle["open"], candle["close"]) - candle["low"]
 
 
 def detect_large_danger_candle(candles, atr):
     last = candles[-1]
-
     body = candle_body(last)
-    full_range = candle_range(last)
+    full_range = last["high"] - last["low"]
 
     if atr <= 0:
         return True
 
-    if full_range > atr * 3.0:
+    if full_range > atr * 3.5:
         return True
 
-    if body > atr * 2.4:
+    if body > atr * 2.8:
         return True
 
     return False
 
 
-def momentum_is_strong(candles_5m, direction):
+def collect_levels(candles_1h, candles_4h):
+    highs = []
+    lows = []
+
+    for c in candles_1h[-140:]:
+        highs.append(c["high"])
+        lows.append(c["low"])
+
+    for c in candles_4h[-90:]:
+        highs.append(c["high"])
+        lows.append(c["low"])
+
+    return highs, lows
+
+
+def nearest_resistance(price, candles_1h, candles_4h):
+    highs, _ = collect_levels(candles_1h, candles_4h)
+
+    near = []
+    for level in highs:
+        distance = abs(price - level) / price * 100
+        if distance <= LEVEL_DISTANCE_PERCENT and level >= price * 0.992:
+            near.append(level)
+
+    if not near:
+        return None
+
+    return min(near, key=lambda x: abs(price - x))
+
+
+def nearest_support(price, candles_1h, candles_4h):
+    _, lows = collect_levels(candles_1h, candles_4h)
+
+    near = []
+    for level in lows:
+        distance = abs(price - level) / price * 100
+        if distance <= LEVEL_DISTANCE_PERCENT and level <= price * 1.008:
+            near.append(level)
+
+    if not near:
+        return None
+
+    return min(near, key=lambda x: abs(price - x))
+
+
+def target_support_below(price, candles_1h, candles_4h):
+    _, lows = collect_levels(candles_1h, candles_4h)
+
+    candidates = sorted(set([l for l in lows if l < price * 0.995]), reverse=True)
+
+    if not candidates:
+        return None
+
+    return candidates[0]
+
+
+def target_resistance_above(price, candles_1h, candles_4h):
+    highs, _ = collect_levels(candles_1h, candles_4h)
+
+    candidates = sorted(set([h for h in highs if h > price * 1.005]))
+
+    if not candidates:
+        return None
+
+    return candidates[0]
+
+
+def make_tp_by_percent(entry, side, position_percent):
+    price_move_percent_needed = position_percent / LEVERAGE
+
+    if side == "LONG":
+        return entry * (1 + price_move_percent_needed / 100)
+
+    return entry * (1 - price_move_percent_needed / 100)
+
+
+def momentum_confirm(candles_5m, side):
     last = candles_5m[-1]
     prev = candles_5m[-2]
-    prev2 = candles_5m[-3]
 
-    last_body = candle_body(last)
-    prev_body = candle_body(prev)
-    prev2_body = candle_body(prev2)
-
-    if direction == "SHORT":
+    if side == "SHORT":
         return (
             last["close"] < last["open"]
-            and prev["close"] <= prev["open"]
             and last["close"] < prev["close"]
-            and prev["close"] <= prev2["close"]
-            and last_body > prev_body * 0.8
-            and last_body > prev2_body * 0.6
         )
 
     return (
         last["close"] > last["open"]
-        and prev["close"] >= prev["open"]
         and last["close"] > prev["close"]
-        and prev["close"] >= prev2["close"]
-        and last_body > prev_body * 0.8
-        and last_body > prev2_body * 0.6
     )
-
-
-def price_already_moved_from_level(price, level, atr, direction):
-    if atr <= 0:
-        return False
-
-    distance = abs(price - level)
-
-    if distance < atr * MIN_MOMENTUM_ATR:
-        return False
-
-    if distance > atr * MAX_LATE_ENTRY_ATR:
-        return False
-
-    if direction == "SHORT":
-        return price < level
-
-    return price > level
 
 
 def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, candles_4h, btc_status):
@@ -539,10 +515,9 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
     lows_15 = [c["low"] for c in candles_15m]
     volumes_15 = [c["volume"] for c in candles_15m]
 
-    last_15 = candles_15m[-1]
-    prev_15 = candles_15m[-2]
-
-    price = last_15["close"]
+    last = candles_15m[-1]
+    prev = candles_15m[-2]
+    price = last["close"]
 
     rsi = calculate_rsi(closes_15, 14)
     atr = calculate_atr(candles_15m, 14)
@@ -560,178 +535,161 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
     trend_4h = trend_filter(candles_4h)
 
     avg_volume = sum(volumes_15[-30:]) / 30
-    volume_ratio = last_15["volume"] / avg_volume if avg_volume > 0 else 0
+    volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
 
     if volume_ratio < MIN_VOLUME_RATIO:
         return None
 
+    checks = []
+
     if side == "SHORT":
-        resistance = get_resistance_near_price(price, candles_1h, candles_4h)
+        resistance = nearest_resistance(price, candles_1h, candles_4h)
 
         if resistance is None:
             return None
 
-        if not price_already_moved_from_level(price, resistance, atr, "SHORT"):
-            return None
-
-        if not momentum_is_strong(candles_5m, "SHORT"):
-            return None
-
-        target = next_support_below(price, candles_1h, candles_4h)
-
-        if target is None:
-            return None
-
-        tp1_profit = position_profit_percent(price, target, "SHORT")
-
-        if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
-            return None
-
-        recent_high = max(highs_15[-20:])
-
-        rejection_candle = (
-            last_15["high"] >= resistance * 0.996
-            and last_15["close"] < last_15["open"]
-            and last_15["close"] < prev_15["close"]
-            and candle_body(last_15) >= atr * 0.30
+        level_touch = last["high"] >= resistance * 0.995
+        rejection = (
+            last["close"] < last["open"]
+            and upper_wick(last) >= candle_body(last) * 0.35
+            and last["close"] < prev["close"]
         )
 
-        rsi_ok = 58 <= rsi <= 82
-        macd_turn = macd["hist"] < macd["prev_hist"] and macd["hist"] < 0
-        bollinger_ok = price >= bb["middle"] and price <= bb["upper"] * 1.025
+        if not level_touch:
+            return None
+
+        if not rejection:
+            return None
+
+        if not momentum_confirm(candles_5m, "SHORT"):
+            return None
+
+        if btc_status == "BULLISH":
+            return None
+
+        if trend_4h == "STRONG_BULLISH" and trend_1h == "STRONG_BULLISH":
+            return None
+
+        rsi_ok = rsi >= 56
+        macd_ok = macd["hist"] < macd["prev_hist"]
+        bb_ok = price >= bb["middle"]
         vwap_ok = price >= vwap * 0.985
 
-        sl = max(resistance + atr * 0.20, recent_high + atr * 0.10)
+        sl = max(resistance + atr * 0.20, max(highs_15[-10:]) + atr * 0.05)
 
         if sl <= price:
             return None
 
-        risk_price_percent = abs(sl - price) / price * 100
-        risk_position_percent = risk_price_percent * LEVERAGE
+        tp1 = make_tp_by_percent(price, "SHORT", TP1_POSITION_PERCENT)
+        tp2 = make_tp_by_percent(price, "SHORT", TP2_POSITION_PERCENT)
+        tp3 = make_tp_by_percent(price, "SHORT", TP3_POSITION_PERCENT)
 
-        if risk_position_percent > MAX_RISK_POSITION_PERCENT:
-            return None
+        level_target = target_support_below(price, candles_1h, candles_4h)
+        if level_target is not None and level_target < price:
+            if position_profit_percent(price, level_target, "SHORT") >= TP2_POSITION_PERCENT:
+                tp2 = level_target
 
-        reward_price_percent = price_move_percent(price, target, "SHORT")
-        rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
-
-        if rr < MIN_RR:
-            return None
+        setup_name = "SHORT"
 
         checks = [
-            ("цена отбилась от сопротивления", price < resistance),
-            ("15m rejection-свеча", rejection_candle),
-            ("5m уже дал импульс вниз", True),
-            ("цена уже начала движение вниз", True),
-            ("RSI высокий", rsi_ok),
-            ("MACD уже вниз", macd_turn),
-            ("объём сильный", volume_ratio >= MIN_VOLUME_RATIO),
-            ("Bollinger зона подходит", bollinger_ok),
-            ("VWAP зона подходит", vwap_ok),
+            ("цена у сопротивления", True),
+            ("rejection-свеча", True),
+            ("5m подтвердил вниз", True),
+            ("RSI перекуплен/высокий", rsi_ok),
+            ("MACD разворачивается вниз", macd_ok),
+            ("цена выше средней Bollinger", bb_ok),
+            ("цена выше/около VWAP", vwap_ok),
+            ("объём выше среднего", volume_ratio >= MIN_VOLUME_RATIO),
             ("BTC не против SHORT", btc_status != "BULLISH"),
-            ("4h не сильный bullish", trend_4h != "STRONG_BULLISH"),
-            ("1h не сильный bullish", trend_1h != "STRONG_BULLISH"),
-            ("TP1 даёт нужный потенциал", tp1_profit >= MIN_POSITION_PROFIT_PERCENT),
-            ("RR хороший", rr >= MIN_RR),
+            ("старший тренд не запрещает SHORT", not (trend_4h == "STRONG_BULLISH" and trend_1h == "STRONG_BULLISH")),
         ]
 
-        tp1 = target
-        tp2 = price * (1 - (35 / LEVERAGE) / 100)
-
-        if tp2 >= tp1:
-            tp2 = tp1 * 0.995
-
-        entry = price
-
     else:
-        support = get_support_near_price(price, candles_1h, candles_4h)
+        support = nearest_support(price, candles_1h, candles_4h)
 
         if support is None:
             return None
 
-        if not price_already_moved_from_level(price, support, atr, "LONG"):
-            return None
-
-        if not momentum_is_strong(candles_5m, "LONG"):
-            return None
-
-        target = next_resistance_above(price, candles_1h, candles_4h)
-
-        if target is None:
-            return None
-
-        tp1_profit = position_profit_percent(price, target, "LONG")
-
-        if tp1_profit < MIN_POSITION_PROFIT_PERCENT:
-            return None
-
-        recent_low = min(lows_15[-20:])
-
-        bounce_candle = (
-            last_15["low"] <= support * 1.004
-            and last_15["close"] > last_15["open"]
-            and last_15["close"] > prev_15["close"]
-            and candle_body(last_15) >= atr * 0.30
+        level_touch = last["low"] <= support * 1.005
+        bounce = (
+            last["close"] > last["open"]
+            and lower_wick(last) >= candle_body(last) * 0.35
+            and last["close"] > prev["close"]
         )
 
-        rsi_ok = 18 <= rsi <= 45
-        macd_turn = macd["hist"] > macd["prev_hist"] and macd["hist"] > 0
-        bollinger_ok = price <= bb["middle"] and price >= bb["lower"] * 0.975
+        if not level_touch:
+            return None
+
+        if not bounce:
+            return None
+
+        if not momentum_confirm(candles_5m, "LONG"):
+            return None
+
+        if btc_status == "BEARISH":
+            return None
+
+        if trend_4h == "STRONG_BEARISH" and trend_1h == "STRONG_BEARISH":
+            return None
+
+        rsi_ok = rsi <= 46
+        macd_ok = macd["hist"] > macd["prev_hist"]
+        bb_ok = price <= bb["middle"]
         vwap_ok = price <= vwap * 1.015
 
-        sl = min(support - atr * 0.20, recent_low - atr * 0.10)
+        sl = min(support - atr * 0.20, min(lows_15[-10:]) - atr * 0.05)
 
         if sl >= price:
             return None
 
-        risk_price_percent = abs(price - sl) / price * 100
-        risk_position_percent = risk_price_percent * LEVERAGE
+        tp1 = make_tp_by_percent(price, "LONG", TP1_POSITION_PERCENT)
+        tp2 = make_tp_by_percent(price, "LONG", TP2_POSITION_PERCENT)
+        tp3 = make_tp_by_percent(price, "LONG", TP3_POSITION_PERCENT)
 
-        if risk_position_percent > MAX_RISK_POSITION_PERCENT:
-            return None
+        level_target = target_resistance_above(price, candles_1h, candles_4h)
+        if level_target is not None and level_target > price:
+            if position_profit_percent(price, level_target, "LONG") >= TP2_POSITION_PERCENT:
+                tp2 = level_target
 
-        reward_price_percent = price_move_percent(price, target, "LONG")
-        rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
-
-        if rr < MIN_RR:
-            return None
+        setup_name = "LONG"
 
         checks = [
-            ("цена отбилась от поддержки", price > support),
-            ("15m bounce-свеча", bounce_candle),
-            ("5m уже дал импульс вверх", True),
-            ("цена уже начала движение вверх", True),
-            ("RSI низкий", rsi_ok),
-            ("MACD уже вверх", macd_turn),
-            ("объём сильный", volume_ratio >= MIN_VOLUME_RATIO),
-            ("Bollinger зона подходит", bollinger_ok),
-            ("VWAP зона подходит", vwap_ok),
+            ("цена у поддержки", True),
+            ("bounce-свеча", True),
+            ("5m подтвердил вверх", True),
+            ("RSI перепродан/низкий", rsi_ok),
+            ("MACD разворачивается вверх", macd_ok),
+            ("цена ниже средней Bollinger", bb_ok),
+            ("цена ниже/около VWAP", vwap_ok),
+            ("объём выше среднего", volume_ratio >= MIN_VOLUME_RATIO),
             ("BTC не против LONG", btc_status != "BEARISH"),
-            ("4h не сильный bearish", trend_4h != "STRONG_BEARISH"),
-            ("1h не сильный bearish", trend_1h != "STRONG_BEARISH"),
-            ("TP1 даёт нужный потенциал", tp1_profit >= MIN_POSITION_PROFIT_PERCENT),
-            ("RR хороший", rr >= MIN_RR),
+            ("старший тренд не запрещает LONG", not (trend_4h == "STRONG_BEARISH" and trend_1h == "STRONG_BEARISH")),
         ]
 
-        tp1 = target
-        tp2 = price * (1 + (35 / LEVERAGE) / 100)
+    risk_price_percent = abs(price - sl) / price * 100
+    risk_position_percent = risk_price_percent * LEVERAGE
 
-        if tp2 <= tp1:
-            tp2 = tp1 * 1.005
+    if risk_position_percent > MAX_RISK_POSITION_PERCENT:
+        return None
 
-        entry = price
+    tp1_profit = position_profit_percent(price, tp1, side)
+    reward_price_percent = price_move_percent(price, tp1, side)
+    rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
+
+    if rr < MIN_RR_TO_TP1:
+        return None
 
     passed = [name for name, ok in checks if ok]
 
-    if len(passed) < 11:
+    if len(passed) < 7:
         return None
 
-    quality = min(97, 50 + len(passed) * 4)
+    quality = min(95, 55 + len(passed) * 5)
 
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:FAST_MOMENTUM_REVERSAL:{side}:{round(entry, 6)}"
+    signal_id = f"{symbol}:V11_LEVEL_REVERSAL:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -739,16 +697,21 @@ def build_reversal_signal(symbol, side, candles_15m, candles_5m, candles_1h, can
     return {
         "symbol": symbol,
         "side": side,
+        "setup_name": setup_name,
         "quality": quality,
-        "entry": entry,
+        "entry": price,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
+        "tp3": tp3,
         "rsi": rsi,
         "volume_ratio": volume_ratio,
         "rr": rr,
         "risk_price_percent": risk_price_percent,
         "risk_position_percent": risk_position_percent,
+        "tp1_position_profit": position_profit_percent(price, tp1, side),
+        "tp2_position_profit": position_profit_percent(price, tp2, side),
+        "tp3_position_profit": position_profit_percent(price, tp3, side),
         "signal_id": signal_id,
     }
 
@@ -813,6 +776,7 @@ def make_message(signal):
 🛑 SL: <code>{format_price(signal["sl"])}</code>
 ✅ TP1: <code>{format_price(signal["tp1"])}</code>
 ✅ TP2: <code>{format_price(signal["tp2"])}</code>
+✅ TP3: <code>{format_price(signal["tp3"])}</code>
 
 ⚠️Плечо max.: <b>{LEVERAGE}x</b>
 ⚠️Соблюдаем РМ до 0,5% от общего депозита.
@@ -836,10 +800,11 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ Fast Momentum Reversal Bot запущен.\n"
-            f"Формат сигналов как в примере.\n"
-            f"Фильтр: сильный объём x{MIN_VOLUME_RATIO}+ и движение уже началось.\n"
+            f"✅ Level Reversal Bot v11 запущен.\n"
+            f"Ищет отскоки от поддержки и отбои от сопротивления.\n"
             f"Плечо max.: {LEVERAGE}x\n"
+            f"TP1: {TP1_POSITION_PERCENT:.0f}% | TP2: {TP2_POSITION_PERCENT:.0f}% | TP3: {TP3_POSITION_PERCENT:.0f}% по позиции\n"
+            f"Риск максимум: {MAX_RISK_POSITION_PERCENT:.0f}% по позиции\n"
             f"Таймфрейм: {TIMEFRAME}"
         )
 
