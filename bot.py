@@ -21,34 +21,32 @@ CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "1m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "4h")
 
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "45"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "300"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "35"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "450"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "10"))
-TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "20"))
-TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "35"))
+TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "8"))
+TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "16"))
+TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "30"))
 
-MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "8"))
-MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "1.05"))
+MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "7"))
+MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "1.0"))
 
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "82"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.05"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "78"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.10"))
 
-MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.2"))
-MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.2"))
+MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.0"))
+MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.0"))
 
-LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.10"))
-MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("MAX_ALREADY_MOVED_POSITION_PERCENT", "2.0"))
+LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.20"))
+MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("MAX_ALREADY_MOVED_POSITION_PERCENT", "1.7"))
 
-WATCH_EXPIRE_SECONDS = int(os.getenv("WATCH_EXPIRE_SECONDS", "1800"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "5400"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "4"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "10"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "7200"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "8"))
-
-USE_LIQUID_ONLY = os.getenv("USE_LIQUID_ONLY", "true").lower() == "true"
+USE_LIQUID_ONLY = os.getenv("USE_LIQUID_ONLY", "false").lower() == "true"
 
 BTC_SYMBOL = "BTC-USDT"
 
@@ -56,12 +54,12 @@ LIQUID_BASES = {
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK",
     "INJ", "NEAR", "ARB", "OP", "APT", "SUI", "SEI", "DOT", "LTC",
     "BCH", "UNI", "AAVE", "FIL", "ATOM", "ETC", "TRX", "MATIC", "WLD",
-    "TIA", "ORDI", "FTM", "RUNE", "ENA", "JUP", "PYTH", "STRK", "DYDX"
+    "TIA", "ORDI", "FTM", "RUNE", "ENA", "JUP", "PYTH", "STRK", "DYDX",
+    "TON", "COMP", "STX", "TRB", "JTO", "DYM"
 }
 
 SENT_SIGNALS = {}
 SYMBOL_COOLDOWN = {}
-WATCHLIST = {}
 
 STATS = {
     "signals_today": 0,
@@ -444,12 +442,15 @@ def momentum_confirm(candles_confirm, side):
     return last["close"] < last["open"] and last["close"] < prev["close"]
 
 
-def detect_watch_setup(symbol, side, candles_15m, candles_1h, candles_4h, btc_status):
+def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
     closes_15 = [c["close"] for c in candles_15m]
+    highs_15 = [c["high"] for c in candles_15m]
+    lows_15 = [c["low"] for c in candles_15m]
     volumes_15 = [c["volume"] for c in candles_15m]
 
     last = candles_15m[-1]
     prev = candles_15m[-2]
+
     price = last["close"]
 
     rsi = calculate_rsi(closes_15, 14)
@@ -479,27 +480,55 @@ def detect_watch_setup(symbol, side, candles_15m, candles_1h, candles_4h, btc_st
         if support is None:
             return None
 
+        moved = moved_from_level_position_percent(price, support, "LONG")
+
+        if moved > MAX_ALREADY_MOVED_POSITION_PERCENT:
+            return None
+
+        level_touch = last["low"] <= support * 1.006
+
+        bounce_candle = (
+            last["close"] > last["open"]
+            and last["close"] > prev["close"]
+            and lower_wick(last) >= candle_body(last) * 0.12
+        )
+
+        if not level_touch or not bounce_candle:
+            return None
+
+        if not momentum_confirm(candles_confirm, "LONG"):
+            return None
+
         if btc_status == "BEARISH":
             return None
 
         if trend_4h == "BEARISH" and trend_1h == "BEARISH":
             return None
 
-        touched = last["low"] <= support * 1.006
-        rsi_ok = rsi <= 52
-        vwap_ok = price <= vwap * 1.018
+        rsi_ok = rsi <= 55
+        vwap_ok = price <= vwap * 1.020
 
-        if not (touched and rsi_ok and vwap_ok):
+        sl = min(support - atr * 0.18, min(lows_15[-8:]) - atr * 0.04)
+
+        if sl >= price:
             return None
 
-        return {
-            "symbol": symbol,
-            "side": "LONG",
-            "level": support,
-            "atr": atr,
-            "created_at": time.time(),
-            "expires_at": time.time() + WATCH_EXPIRE_SECONDS,
-        }
+        tp1 = make_tp_by_percent(price, "LONG", TP1_POSITION_PERCENT)
+        tp2 = make_tp_by_percent(price, "LONG", TP2_POSITION_PERCENT)
+        tp3 = make_tp_by_percent(price, "LONG", TP3_POSITION_PERCENT)
+
+        checks = [
+            recent_move <= -MIN_PREVIOUS_DROP_FOR_LONG,
+            level_touch,
+            bounce_candle,
+            rsi_ok,
+            vwap_ok,
+            volume_ratio >= MIN_VOLUME_RATIO,
+            btc_status != "BEARISH",
+            trend_1h != "BEARISH",
+            trend_4h != "BEARISH",
+            moved <= MAX_ALREADY_MOVED_POSITION_PERCENT,
+        ]
 
     else:
         if recent_move < MIN_PREVIOUS_RISE_FOR_SHORT:
@@ -510,125 +539,35 @@ def detect_watch_setup(symbol, side, candles_15m, candles_1h, candles_4h, btc_st
         if resistance is None:
             return None
 
-        if btc_status == "BULLISH":
+        moved = moved_from_level_position_percent(price, resistance, "SHORT")
+
+        if moved > MAX_ALREADY_MOVED_POSITION_PERCENT:
             return None
 
-        if trend_4h == "BULLISH" and trend_1h == "BULLISH":
-            return None
+        level_touch = last["high"] >= resistance * 0.994
 
-        touched = last["high"] >= resistance * 0.994
-        rsi_ok = rsi >= 48
-        vwap_ok = price >= vwap * 0.982
-
-        if not (touched and rsi_ok and vwap_ok):
-            return None
-
-        return {
-            "symbol": symbol,
-            "side": "SHORT",
-            "level": resistance,
-            "atr": atr,
-            "created_at": time.time(),
-            "expires_at": time.time() + WATCH_EXPIRE_SECONDS,
-        }
-
-
-def confirm_trade_from_watch(symbol, watch, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
-    side = watch["side"]
-    level = watch["level"]
-
-    closes_15 = [c["close"] for c in candles_15m]
-    highs_15 = [c["high"] for c in candles_15m]
-    lows_15 = [c["low"] for c in candles_15m]
-    volumes_15 = [c["volume"] for c in candles_15m]
-
-    last = candles_15m[-1]
-    prev = candles_15m[-2]
-    price = last["close"]
-
-    rsi = calculate_rsi(closes_15, 14)
-    atr = calculate_atr(candles_15m, 14)
-    vwap = calculate_vwap_like(candles_15m, 48)
-
-    if rsi is None or atr is None or vwap is None:
-        return None
-
-    trend_1h = trend_ema_50_200(candles_1h)
-    trend_4h = trend_ema_50_200(candles_4h)
-
-    avg_volume = sum(volumes_15[-30:]) / 30
-    volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
-
-    if volume_ratio < MIN_VOLUME_RATIO:
-        return None
-
-    moved = moved_from_level_position_percent(price, level, side)
-
-    if moved > MAX_ALREADY_MOVED_POSITION_PERCENT:
-        return None
-
-    if side == "LONG":
-        if btc_status == "BEARISH":
-            return None
-
-        if trend_4h == "BEARISH" and trend_1h == "BEARISH":
-            return None
-
-        retest = last["low"] <= level * 1.004
-        bounce = (
-            last["close"] > last["open"]
-            and last["close"] > prev["close"]
-            and lower_wick(last) >= candle_body(last) * 0.15
-        )
-
-        if not retest or not bounce:
-            return None
-
-        if not momentum_confirm(candles_confirm, "LONG"):
-            return None
-
-        sl = min(level - atr * 0.20, min(lows_15[-10:]) - atr * 0.05)
-
-        if sl >= price:
-            return None
-
-        tp1 = make_tp_by_percent(price, "LONG", TP1_POSITION_PERCENT)
-        tp2 = make_tp_by_percent(price, "LONG", TP2_POSITION_PERCENT)
-        tp3 = make_tp_by_percent(price, "LONG", TP3_POSITION_PERCENT)
-
-        checks = [
-            retest,
-            bounce,
-            rsi <= 55,
-            price <= vwap * 1.020,
-            volume_ratio >= MIN_VOLUME_RATIO,
-            btc_status != "BEARISH",
-            trend_1h != "BEARISH",
-            trend_4h != "BEARISH",
-            moved <= MAX_ALREADY_MOVED_POSITION_PERCENT,
-        ]
-
-    else:
-        if btc_status == "BULLISH":
-            return None
-
-        if trend_4h == "BULLISH" and trend_1h == "BULLISH":
-            return None
-
-        retest = last["high"] >= level * 0.996
-        rejection = (
+        rejection_candle = (
             last["close"] < last["open"]
             and last["close"] < prev["close"]
-            and upper_wick(last) >= candle_body(last) * 0.15
+            and upper_wick(last) >= candle_body(last) * 0.12
         )
 
-        if not retest or not rejection:
+        if not level_touch or not rejection_candle:
             return None
 
         if not momentum_confirm(candles_confirm, "SHORT"):
             return None
 
-        sl = max(level + atr * 0.20, max(highs_15[-10:]) + atr * 0.05)
+        if btc_status == "BULLISH":
+            return None
+
+        if trend_4h == "BULLISH" and trend_1h == "BULLISH":
+            return None
+
+        rsi_ok = rsi >= 45
+        vwap_ok = price >= vwap * 0.980
+
+        sl = max(resistance + atr * 0.18, max(highs_15[-8:]) + atr * 0.04)
 
         if sl <= price:
             return None
@@ -638,10 +577,11 @@ def confirm_trade_from_watch(symbol, watch, candles_15m, candles_confirm, candle
         tp3 = make_tp_by_percent(price, "SHORT", TP3_POSITION_PERCENT)
 
         checks = [
-            retest,
-            rejection,
-            rsi >= 45,
-            price >= vwap * 0.980,
+            recent_move >= MIN_PREVIOUS_RISE_FOR_SHORT,
+            level_touch,
+            rejection_candle,
+            rsi_ok,
+            vwap_ok,
             volume_ratio >= MIN_VOLUME_RATIO,
             btc_status != "BULLISH",
             trend_1h != "BULLISH",
@@ -663,15 +603,15 @@ def confirm_trade_from_watch(symbol, watch, candles_15m, candles_confirm, candle
 
     passed = sum(1 for ok in checks if ok)
 
-    if passed < 7:
+    if passed < 8:
         return None
 
-    quality = min(95, 58 + passed * 4)
+    quality = min(95, 55 + passed * 4)
 
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V14_RETEST_REVERSAL:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V15_FAST_SCALPING_REVERSAL:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -696,55 +636,47 @@ def analyze_symbol(symbol, candles_15m, candles_confirm, candles_1h, candles_4h,
     if is_on_cooldown(symbol):
         return None
 
-    current_time = time.time()
+    candidates = []
 
-    if symbol in WATCHLIST:
-        watch = WATCHLIST[symbol]
-
-        if current_time > watch["expires_at"]:
-            del WATCHLIST[symbol]
-        else:
-            signal = confirm_trade_from_watch(
-                symbol,
-                watch,
-                candles_15m,
-                candles_confirm,
-                candles_1h,
-                candles_4h,
-                btc_status,
-            )
-
-            if signal:
-                del WATCHLIST[symbol]
-                return signal
-
-    long_watch = detect_watch_setup(
-        symbol,
-        "LONG",
-        candles_15m,
-        candles_1h,
-        candles_4h,
-        btc_status,
-    )
-
-    if long_watch:
-        WATCHLIST[symbol] = long_watch
-        return None
-
-    short_watch = detect_watch_setup(
+    short_signal = build_fast_reversal_signal(
         symbol,
         "SHORT",
         candles_15m,
+        candles_confirm,
         candles_1h,
         candles_4h,
         btc_status,
     )
 
-    if short_watch:
-        WATCHLIST[symbol] = short_watch
+    if short_signal:
+        candidates.append(short_signal)
+
+    long_signal = build_fast_reversal_signal(
+        symbol,
+        "LONG",
+        candles_15m,
+        candles_confirm,
+        candles_1h,
+        candles_4h,
+        btc_status,
+    )
+
+    if long_signal:
+        candidates.append(long_signal)
+
+    if not candidates:
         return None
 
-    return None
+    candidates.sort(
+        key=lambda x: (
+            x["quality"],
+            x["rr"],
+            x["volume_ratio"],
+        ),
+        reverse=True,
+    )
+
+    return candidates[0]
 
 
 def make_message(signal):
@@ -784,12 +716,13 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ Professional Retest Reversal Bot v14 запущен.\n"
-            f"Логика: уровень → реакция → ретест → подтверждение → сигнал.\n"
+            f"✅ Fast Scalping Reversal Bot v15 запущен.\n"
+            f"Логика: быстрый рост/падение → уровень → отбой → 1m подтверждение → сигнал.\n"
             f"Индикаторы: EMA50/200 + VWAP + RSI + Volume + ATR.\n"
             f"Проверка: 4h + 1h + 15m + {CONFIRM_TIMEFRAME}.\n"
             f"Плечо max.: {LEVERAGE}x\n"
-            f"Защита от позднего входа: максимум {MAX_ALREADY_MOVED_POSITION_PERCENT}% по позиции."
+            f"TP1: {TP1_POSITION_PERCENT:.0f}% | TP2: {TP2_POSITION_PERCENT:.0f}% | TP3: {TP3_POSITION_PERCENT:.0f}% по позиции\n"
+            f"Риск максимум: {MAX_RISK_POSITION_PERCENT:.0f}% по позиции."
         )
 
         while True:
@@ -870,8 +803,7 @@ async def scan_loop():
 
                 print(
                     f"Scan finished. Checked: {checked}. "
-                    f"Signals found: {found}. Today: {STATS['signals_today']}. "
-                    f"Watchlist: {len(WATCHLIST)}"
+                    f"Signals found: {found}. Today: {STATS['signals_today']}"
                 )
 
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
