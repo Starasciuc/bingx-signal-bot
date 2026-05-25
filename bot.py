@@ -22,29 +22,33 @@ TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "4h")
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "35"))
+TRACK_INTERVAL_SECONDS = int(os.getenv("TRACK_INTERVAL_SECONDS", "30"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "450"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "8"))
-TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "16"))
-TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "30"))
+TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "7"))
+TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
+TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "25"))
 
-MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "7"))
+MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "6"))
 MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "1.0"))
 
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "78"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.10"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "80"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.20"))
 
-MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.0"))
-MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.0"))
+MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.5"))
+MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.5"))
 
-LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.20"))
-MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("MAX_ALREADY_MOVED_POSITION_PERCENT", "1.7"))
+LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.10"))
+MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("MAX_ALREADY_MOVED_POSITION_PERCENT", "1.2"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "5400"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "4"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "10"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "8"))
+
+ENABLE_LONG = os.getenv("ENABLE_LONG", "false").lower() == "true"
+ENABLE_SHORT = os.getenv("ENABLE_SHORT", "true").lower() == "true"
 
 USE_LIQUID_ONLY = os.getenv("USE_LIQUID_ONLY", "false").lower() == "true"
 
@@ -60,10 +64,15 @@ LIQUID_BASES = {
 
 SENT_SIGNALS = {}
 SYMBOL_COOLDOWN = {}
+ACTIVE_SIGNALS = {}
 
 STATS = {
     "signals_today": 0,
     "signals_total": 0,
+    "tp1": 0,
+    "tp2": 0,
+    "tp3": 0,
+    "sl": 0,
     "current_day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
 }
 
@@ -81,9 +90,9 @@ def now_text():
 
 def format_price(x):
     if x >= 100:
-        return f"{x:.2f}"
+        return f"{x:.3f}"
     if x >= 1:
-        return f"{x:.4f}"
+        return f"{x:.5f}"
     return f"{x:.8f}"
 
 
@@ -167,7 +176,6 @@ async def get_symbols(session):
             symbols.append(symbol)
 
     random.shuffle(symbols)
-
     return symbols[:MAX_SYMBOLS]
 
 
@@ -185,7 +193,7 @@ async def get_klines(session, symbol, interval, limit=260):
 
     raw = data.get("data", [])
 
-    min_len = 220 if interval in ["15m", "1h", "4h"] else 80
+    min_len = 220 if interval in ["15m", "1h", "4h"] else 60
 
     if not raw or len(raw) < min_len:
         return None
@@ -442,7 +450,7 @@ def momentum_confirm(candles_confirm, side):
     return last["close"] < last["open"] and last["close"] < prev["close"]
 
 
-def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
+def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
     closes_15 = [c["close"] for c in candles_15m]
     highs_15 = [c["high"] for c in candles_15m]
     lows_15 = [c["low"] for c in candles_15m]
@@ -472,6 +480,9 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
     recent_move = recent_move_percent(candles_15m, 12)
 
     if side == "LONG":
+        if not ENABLE_LONG:
+            return None
+
         if recent_move > -MIN_PREVIOUS_DROP_FOR_LONG:
             return None
 
@@ -490,7 +501,7 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
         bounce_candle = (
             last["close"] > last["open"]
             and last["close"] > prev["close"]
-            and lower_wick(last) >= candle_body(last) * 0.12
+            and lower_wick(last) >= candle_body(last) * 0.15
         )
 
         if not level_touch or not bounce_candle:
@@ -505,8 +516,8 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
         if trend_4h == "BEARISH" and trend_1h == "BEARISH":
             return None
 
-        rsi_ok = rsi <= 55
-        vwap_ok = price <= vwap * 1.020
+        rsi_ok = rsi <= 50
+        vwap_ok = price <= vwap * 1.015
 
         sl = min(support - atr * 0.18, min(lows_15[-8:]) - atr * 0.04)
 
@@ -531,6 +542,9 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
         ]
 
     else:
+        if not ENABLE_SHORT:
+            return None
+
         if recent_move < MIN_PREVIOUS_RISE_FOR_SHORT:
             return None
 
@@ -549,7 +563,7 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
         rejection_candle = (
             last["close"] < last["open"]
             and last["close"] < prev["close"]
-            and upper_wick(last) >= candle_body(last) * 0.12
+            and upper_wick(last) >= candle_body(last) * 0.15
         )
 
         if not level_touch or not rejection_candle:
@@ -564,8 +578,8 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
         if trend_4h == "BULLISH" and trend_1h == "BULLISH":
             return None
 
-        rsi_ok = rsi >= 45
-        vwap_ok = price >= vwap * 0.980
+        rsi_ok = rsi >= 50
+        vwap_ok = price >= vwap * 0.985
 
         sl = max(resistance + atr * 0.18, max(highs_15[-8:]) + atr * 0.04)
 
@@ -611,7 +625,7 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V15_FAST_SCALPING_REVERSAL:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V16_SIGNAL_TRACKER:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -629,6 +643,12 @@ def build_fast_reversal_signal(symbol, side, candles_15m, candles_confirm, candl
         "volume_ratio": volume_ratio,
         "risk_position_percent": risk_position_percent,
         "signal_id": signal_id,
+        "created_at": time.time(),
+        "created_at_ms": int(time.time() * 1000),
+        "status": "ACTIVE",
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
     }
 
 
@@ -638,7 +658,7 @@ def analyze_symbol(symbol, candles_15m, candles_confirm, candles_1h, candles_4h,
 
     candidates = []
 
-    short_signal = build_fast_reversal_signal(
+    short_signal = build_signal(
         symbol,
         "SHORT",
         candles_15m,
@@ -651,7 +671,7 @@ def analyze_symbol(symbol, candles_15m, candles_confirm, candles_1h, candles_4h,
     if short_signal:
         candidates.append(short_signal)
 
-    long_signal = build_fast_reversal_signal(
+    long_signal = build_signal(
         symbol,
         "LONG",
         candles_15m,
@@ -679,31 +699,165 @@ def analyze_symbol(symbol, candles_15m, candles_confirm, candles_1h, candles_4h,
     return candidates[0]
 
 
-def make_message(signal):
+def make_signal_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
 
     return f"""
-🎯 <b>Reversal-сетап</b>
+🎯 <b>V16 Signal + Tracker</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
 
-🎯 Зона входа: <code>{format_price(signal["entry"])}</code>
+🎯 Вход: <code>{format_price(signal["entry"])}</code>
 🛑 SL: <code>{format_price(signal["sl"])}</code>
 ✅ TP1: <code>{format_price(signal["tp1"])}</code>
 ✅ TP2: <code>{format_price(signal["tp2"])}</code>
 ✅ TP3: <code>{format_price(signal["tp3"])}</code>
 
-⚠️Плечо max.: <b>{LEVERAGE}x</b>
-⚠️Соблюдаем РМ до 0,5% от общего депозита.
+⚠️ Плечо max.: <b>{LEVERAGE}x</b>
+🛡 Риск до SL: около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
+📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
 
-Не финансовый совет. Фьючерсы несут высокий риск, особенно с плечом.
+Бот будет отслеживать этот сигнал и напишет, что сработало первым: TP или SL.
+
+⚠️ Тестируй маленькой суммой. Не финансовый совет.
+""".strip()
+
+
+def make_result_message(signal, result, price):
+    side = signal["side"]
+    symbol = signal["symbol"].replace("-", "/")
+
+    if result == "SL":
+        STATS["sl"] += 1
+        icon = "❌"
+        title = "SL сработал"
+    elif result == "TP1":
+        STATS["tp1"] += 1
+        icon = "✅"
+        title = "TP1 достигнут"
+    elif result == "TP2":
+        STATS["tp2"] += 1
+        icon = "✅✅"
+        title = "TP2 достигнут"
+    elif result == "TP3":
+        STATS["tp3"] += 1
+        icon = "🔥"
+        title = "TP3 достигнут"
+    else:
+        icon = "ℹ️"
+        title = result
+
+    total_closed = STATS["tp1"] + STATS["sl"]
+    winrate = (STATS["tp1"] / total_closed * 100) if total_closed > 0 else 0
+
+    return f"""
+{icon} <b>{title}</b>
+
+<b>{side} {symbol}</b>
+Вход: <code>{format_price(signal["entry"])}</code>
+Текущая цена: <code>{format_price(price)}</code>
+
+TP1: <code>{format_price(signal["tp1"])}</code>
+TP2: <code>{format_price(signal["tp2"])}</code>
+TP3: <code>{format_price(signal["tp3"])}</code>
+SL: <code>{format_price(signal["sl"])}</code>
+
+📊 Статистика после запуска:
+TP1: <b>{STATS["tp1"]}</b>
+TP2: <b>{STATS["tp2"]}</b>
+TP3: <b>{STATS["tp3"]}</b>
+SL: <b>{STATS["sl"]}</b>
+Winrate по TP1/SL: <b>{winrate:.1f}%</b>
 """.strip()
 
 
 def bingx_url(symbol):
     pair = symbol.replace("-", "")
     return f"https://bingx.com/en/futures/forward/{pair}"
+
+
+def check_hit(signal, candles):
+    side = signal["side"]
+
+    for c in candles:
+        if c["time"] < signal["created_at_ms"]:
+            continue
+
+        high = c["high"]
+        low = c["low"]
+        close = c["close"]
+
+        if side == "LONG":
+            if low <= signal["sl"]:
+                return "SL", signal["sl"]
+
+            if not signal["tp1_hit"] and high >= signal["tp1"]:
+                signal["tp1_hit"] = True
+                return "TP1", signal["tp1"]
+
+            if signal["tp1_hit"] and not signal["tp2_hit"] and high >= signal["tp2"]:
+                signal["tp2_hit"] = True
+                return "TP2", signal["tp2"]
+
+            if signal["tp2_hit"] and not signal["tp3_hit"] and high >= signal["tp3"]:
+                signal["tp3_hit"] = True
+                return "TP3", signal["tp3"]
+
+        else:
+            if high >= signal["sl"]:
+                return "SL", signal["sl"]
+
+            if not signal["tp1_hit"] and low <= signal["tp1"]:
+                signal["tp1_hit"] = True
+                return "TP1", signal["tp1"]
+
+            if signal["tp1_hit"] and not signal["tp2_hit"] and low <= signal["tp2"]:
+                signal["tp2_hit"] = True
+                return "TP2", signal["tp2"]
+
+            if signal["tp2_hit"] and not signal["tp3_hit"] and low <= signal["tp3"]:
+                signal["tp3_hit"] = True
+                return "TP3", signal["tp3"]
+
+    last_price = candles[-1]["close"]
+    return None, last_price
+
+
+async def track_active_signals(session):
+    if not ACTIVE_SIGNALS:
+        return
+
+    finished = []
+
+    for signal_id, signal in list(ACTIVE_SIGNALS.items()):
+        try:
+            candles = await get_klines(session, signal["symbol"], interval="1m", limit=120)
+
+            if candles is None:
+                continue
+
+            result, price = check_hit(signal, candles)
+
+            if not result:
+                continue
+
+            await send_telegram_message(
+                session,
+                make_result_message(signal, result, price),
+                button_url=bingx_url(signal["symbol"]),
+            )
+
+            if result == "SL" or result == "TP3":
+                finished.append(signal_id)
+
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            print("Tracker error:", e)
+
+    for signal_id in finished:
+        ACTIVE_SIGNALS.pop(signal_id, None)
 
 
 async def scan_loop():
@@ -716,19 +870,25 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ Fast Scalping Reversal Bot v15 запущен.\n"
-            f"Логика: быстрый рост/падение → уровень → отбой → 1m подтверждение → сигнал.\n"
-            f"Индикаторы: EMA50/200 + VWAP + RSI + Volume + ATR.\n"
-            f"Проверка: 4h + 1h + 15m + {CONFIRM_TIMEFRAME}.\n"
+            f"✅ V16 Signal + Tracker Bot запущен.\n"
+            f"Режим: {'SHORT only' if ENABLE_SHORT and not ENABLE_LONG else 'LONG + SHORT'}\n"
+            f"Логика: уровень + перегрев/перепроданность + отбой + 1m подтверждение.\n"
+            f"Бот будет отслеживать TP/SL и вести статистику.\n"
             f"Плечо max.: {LEVERAGE}x\n"
             f"TP1: {TP1_POSITION_PERCENT:.0f}% | TP2: {TP2_POSITION_PERCENT:.0f}% | TP3: {TP3_POSITION_PERCENT:.0f}% по позиции\n"
             f"Риск максимум: {MAX_RISK_POSITION_PERCENT:.0f}% по позиции."
         )
 
+        last_track_time = 0
+
         while True:
             reset_daily_stats_if_needed()
 
             try:
+                if time.time() - last_track_time >= TRACK_INTERVAL_SECONDS:
+                    await track_active_signals(session)
+                    last_track_time = time.time()
+
                 print("Scanning...", now_text())
 
                 btc_1h = await get_klines(session, BTC_SYMBOL, interval=TREND_TIMEFRAME, limit=260)
@@ -782,11 +942,12 @@ async def scan_loop():
 
                         await send_telegram_message(
                             session,
-                            make_message(signal),
+                            make_signal_message(signal),
                             button_url=bingx_url(symbol),
                         )
 
                         SENT_SIGNALS[signal["signal_id"]] = time.time()
+                        ACTIVE_SIGNALS[signal["signal_id"]] = signal
                         set_cooldown(symbol)
 
                         found += 1
@@ -803,7 +964,9 @@ async def scan_loop():
 
                 print(
                     f"Scan finished. Checked: {checked}. "
-                    f"Signals found: {found}. Today: {STATS['signals_today']}"
+                    f"Signals found: {found}. "
+                    f"Active signals: {len(ACTIVE_SIGNALS)}. "
+                    f"TP1: {STATS['tp1']} | SL: {STATS['sl']}"
                 )
 
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
