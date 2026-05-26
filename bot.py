@@ -73,6 +73,8 @@ STATS = {
     "tp2": 0,
     "tp3": 0,
     "sl": 0,
+    "profit_after_tp1": 0,
+    "profit_after_tp2": 0,
     "current_day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
 }
 
@@ -414,6 +416,7 @@ def nearest_resistance(price, candles_1h, candles_4h):
     highs, _ = collect_levels(candles_1h, candles_4h)
 
     near = []
+
     for level in highs:
         distance = abs(price - level) / price * 100
         if distance <= LEVEL_DISTANCE_PERCENT and level >= price * 0.990:
@@ -429,6 +432,7 @@ def nearest_support(price, candles_1h, candles_4h):
     _, lows = collect_levels(candles_1h, candles_4h)
 
     near = []
+
     for level in lows:
         distance = abs(price - level) / price * 100
         if distance <= LEVEL_DISTANCE_PERCENT and level <= price * 1.010:
@@ -625,7 +629,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V16_SIGNAL_TRACKER:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V16_SIGNAL_TRACKER_FIXED:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -645,6 +649,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         "signal_id": signal_id,
         "created_at": time.time(),
         "created_at_ms": int(time.time() * 1000),
+        "last_checked_ms": int(time.time() * 1000),
         "status": "ACTIVE",
         "tp1_hit": False,
         "tp2_hit": False,
@@ -703,7 +708,7 @@ def make_signal_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
 
     return f"""
-🎯 <b>V16 Signal + Tracker</b>
+🎯 <b>V16 Signal + Tracker FIXED</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
@@ -718,7 +723,8 @@ def make_signal_message(signal):
 🛡 Риск до SL: около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
 
-Бот будет отслеживать этот сигнал и напишет, что сработало первым: TP или SL.
+Бот будет отслеживать сигнал.
+Если TP1 достигнут, сделка уже считается позитивной.
 
 ⚠️ Тестируй маленькой суммой. Не финансовый совет.
 """.strip()
@@ -731,11 +737,11 @@ def make_result_message(signal, result, price):
     if result == "SL":
         STATS["sl"] += 1
         icon = "❌"
-        title = "SL сработал"
+        title = "SL сработал до TP1"
     elif result == "TP1":
         STATS["tp1"] += 1
         icon = "✅"
-        title = "TP1 достигнут"
+        title = "TP1 достигнут — сделка позитивная"
     elif result == "TP2":
         STATS["tp2"] += 1
         icon = "✅✅"
@@ -744,19 +750,35 @@ def make_result_message(signal, result, price):
         STATS["tp3"] += 1
         icon = "🔥"
         title = "TP3 достигнут"
+    elif result == "PROFIT_AFTER_TP1":
+        STATS["profit_after_tp1"] += 1
+        icon = "🟢"
+        title = "Возврат после TP1 — сделка закрыта как позитивная"
+    elif result == "PROFIT_AFTER_TP2":
+        STATS["profit_after_tp2"] += 1
+        icon = "🟢🟢"
+        title = "Возврат после TP2 — сделка закрыта как позитивная"
     else:
         icon = "ℹ️"
         title = result
 
-    total_closed = STATS["tp1"] + STATS["sl"]
-    winrate = (STATS["tp1"] / total_closed * 100) if total_closed > 0 else 0
+    positive = (
+        STATS["tp1"]
+        + STATS["tp2"]
+        + STATS["tp3"]
+        + STATS["profit_after_tp1"]
+        + STATS["profit_after_tp2"]
+    )
+    negative = STATS["sl"]
+    total = positive + negative
+    winrate = (positive / total * 100) if total > 0 else 0
 
     return f"""
 {icon} <b>{title}</b>
 
 <b>{side} {symbol}</b>
 Вход: <code>{format_price(signal["entry"])}</code>
-Текущая цена: <code>{format_price(price)}</code>
+Текущая/уровень: <code>{format_price(price)}</code>
 
 TP1: <code>{format_price(signal["tp1"])}</code>
 TP2: <code>{format_price(signal["tp2"])}</code>
@@ -764,11 +786,17 @@ TP3: <code>{format_price(signal["tp3"])}</code>
 SL: <code>{format_price(signal["sl"])}</code>
 
 📊 Статистика после запуска:
+Позитивные сделки: <b>{positive}</b>
+SL до TP1: <b>{negative}</b>
+Winrate: <b>{winrate:.1f}%</b>
+
+Детально:
 TP1: <b>{STATS["tp1"]}</b>
 TP2: <b>{STATS["tp2"]}</b>
 TP3: <b>{STATS["tp3"]}</b>
+Возврат после TP1: <b>{STATS["profit_after_tp1"]}</b>
+Возврат после TP2: <b>{STATS["profit_after_tp2"]}</b>
 SL: <b>{STATS["sl"]}</b>
-Winrate по TP1/SL: <b>{winrate:.1f}%</b>
 """.strip()
 
 
@@ -780,16 +808,29 @@ def bingx_url(symbol):
 def check_hit(signal, candles):
     side = signal["side"]
 
-    for c in candles:
-        if c["time"] < signal["created_at_ms"]:
-            continue
+    new_candles = []
 
+    for c in candles:
+        if c["time"] > signal.get("last_checked_ms", signal["created_at_ms"]):
+            new_candles.append(c)
+
+    if not new_candles:
+        return None, candles[-1]["close"]
+
+    for c in new_candles:
         high = c["high"]
         low = c["low"]
-        close = c["close"]
+
+        signal["last_checked_ms"] = c["time"]
 
         if side == "LONG":
-            if low <= signal["sl"]:
+            if signal["tp2_hit"] and low <= signal["entry"]:
+                return "PROFIT_AFTER_TP2", signal["entry"]
+
+            if signal["tp1_hit"] and low <= signal["entry"]:
+                return "PROFIT_AFTER_TP1", signal["entry"]
+
+            if not signal["tp1_hit"] and low <= signal["sl"]:
                 return "SL", signal["sl"]
 
             if not signal["tp1_hit"] and high >= signal["tp1"]:
@@ -805,7 +846,13 @@ def check_hit(signal, candles):
                 return "TP3", signal["tp3"]
 
         else:
-            if high >= signal["sl"]:
+            if signal["tp2_hit"] and high >= signal["entry"]:
+                return "PROFIT_AFTER_TP2", signal["entry"]
+
+            if signal["tp1_hit"] and high >= signal["entry"]:
+                return "PROFIT_AFTER_TP1", signal["entry"]
+
+            if not signal["tp1_hit"] and high >= signal["sl"]:
                 return "SL", signal["sl"]
 
             if not signal["tp1_hit"] and low <= signal["tp1"]:
@@ -820,7 +867,7 @@ def check_hit(signal, candles):
                 signal["tp3_hit"] = True
                 return "TP3", signal["tp3"]
 
-    last_price = candles[-1]["close"]
+    last_price = new_candles[-1]["close"]
     return None, last_price
 
 
@@ -848,7 +895,7 @@ async def track_active_signals(session):
                 button_url=bingx_url(signal["symbol"]),
             )
 
-            if result == "SL" or result == "TP3":
+            if result in ["SL", "TP3", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2"]:
                 finished.append(signal_id)
 
             await asyncio.sleep(1)
@@ -870,10 +917,10 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V16 Signal + Tracker Bot запущен.\n"
+            f"✅ V16 Signal + Tracker FIXED запущен.\n"
             f"Режим: {'SHORT only' if ENABLE_SHORT and not ENABLE_LONG else 'LONG + SHORT'}\n"
             f"Логика: уровень + перегрев/перепроданность + отбой + 1m подтверждение.\n"
-            f"Бот будет отслеживать TP/SL и вести статистику.\n"
+            f"Исправление: после TP1 сделка больше не считается отрицательной.\n"
             f"Плечо max.: {LEVERAGE}x\n"
             f"TP1: {TP1_POSITION_PERCENT:.0f}% | TP2: {TP2_POSITION_PERCENT:.0f}% | TP3: {TP3_POSITION_PERCENT:.0f}% по позиции\n"
             f"Риск максимум: {MAX_RISK_POSITION_PERCENT:.0f}% по позиции."
@@ -962,11 +1009,19 @@ async def scan_loop():
                     except Exception as e:
                         print(f"Error with {symbol}:", e)
 
+                positive = (
+                    STATS["tp1"]
+                    + STATS["tp2"]
+                    + STATS["tp3"]
+                    + STATS["profit_after_tp1"]
+                    + STATS["profit_after_tp2"]
+                )
+
                 print(
                     f"Scan finished. Checked: {checked}. "
                     f"Signals found: {found}. "
                     f"Active signals: {len(ACTIVE_SIGNALS)}. "
-                    f"TP1: {STATS['tp1']} | SL: {STATS['sl']}"
+                    f"Positive: {positive} | SL: {STATS['sl']}"
                 )
 
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
