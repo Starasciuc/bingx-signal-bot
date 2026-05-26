@@ -27,12 +27,12 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "450"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "7"))
-TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
-TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "25"))
+TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "10"))
+TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "18"))
+TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "30"))
 
-MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "6"))
-MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "1.0"))
+MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
+MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.9"))
 
 MIN_QUALITY = int(os.getenv("MIN_QUALITY", "80"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.20"))
@@ -629,7 +629,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V16_SIGNAL_TRACKER_FIXED:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V16_SIGNAL_TRACKER_SL10:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -708,7 +708,7 @@ def make_signal_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
 
     return f"""
-🎯 <b>V16 Signal + Tracker FIXED</b>
+🎯 <b>V16 Signal + Tracker SL 10%</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
@@ -917,13 +917,13 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V16 Signal + Tracker FIXED запущен.\n"
+            f"✅ V16 Signal + Tracker SL 10% запущен.\n"
             f"Режим: {'SHORT only' if ENABLE_SHORT and not ENABLE_LONG else 'LONG + SHORT'}\n"
             f"Логика: уровень + перегрев/перепроданность + отбой + 1m подтверждение.\n"
-            f"Исправление: после TP1 сделка больше не считается отрицательной.\n"
+            f"После TP1 сделка больше не считается отрицательной.\n"
             f"Плечо max.: {LEVERAGE}x\n"
             f"TP1: {TP1_POSITION_PERCENT:.0f}% | TP2: {TP2_POSITION_PERCENT:.0f}% | TP3: {TP3_POSITION_PERCENT:.0f}% по позиции\n"
-            f"Риск максимум: {MAX_RISK_POSITION_PERCENT:.0f}% по позиции."
+            f"SL максимум: {MAX_RISK_POSITION_PERCENT:.0f}% по позиции."
         )
 
         last_track_time = 0
