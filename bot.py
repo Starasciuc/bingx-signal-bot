@@ -27,30 +27,39 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "450"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "10"))
-TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "18"))
-TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "30"))
+ENABLE_LONG = os.getenv("ENABLE_LONG", "true").lower() == "true"
+ENABLE_SHORT = os.getenv("ENABLE_SHORT", "true").lower() == "true"
 
-MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
+LONG_TP1_POSITION_PERCENT = float(os.getenv("LONG_TP1_POSITION_PERCENT", "16"))
+LONG_TP2_POSITION_PERCENT = float(os.getenv("LONG_TP2_POSITION_PERCENT", "28"))
+LONG_TP3_POSITION_PERCENT = float(os.getenv("LONG_TP3_POSITION_PERCENT", "40"))
+LONG_MIN_RISK_POSITION_PERCENT = float(os.getenv("LONG_MIN_RISK_POSITION_PERCENT", "10"))
+LONG_MAX_RISK_POSITION_PERCENT = float(os.getenv("LONG_MAX_RISK_POSITION_PERCENT", "14"))
+
+SHORT_TP1_POSITION_PERCENT = float(os.getenv("SHORT_TP1_POSITION_PERCENT", "10"))
+SHORT_TP2_POSITION_PERCENT = float(os.getenv("SHORT_TP2_POSITION_PERCENT", "18"))
+SHORT_TP3_POSITION_PERCENT = float(os.getenv("SHORT_TP3_POSITION_PERCENT", "30"))
+SHORT_MIN_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MIN_RISK_POSITION_PERCENT", "8"))
+SHORT_MAX_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MAX_RISK_POSITION_PERCENT", "12"))
+
 MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.9"))
 
 MIN_QUALITY = int(os.getenv("MIN_QUALITY", "80"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.20"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.30"))
 
-MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.5"))
+MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.8"))
 MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.5"))
 
-LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.10"))
-MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("MAX_ALREADY_MOVED_POSITION_PERCENT", "1.2"))
+LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.15"))
+
+LONG_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("LONG_MAX_ALREADY_MOVED_POSITION_PERCENT", "2.0"))
+SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT", "1.5"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "5400"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "8"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "10"))
 
-ENABLE_LONG = os.getenv("ENABLE_LONG", "false").lower() == "true"
-ENABLE_SHORT = os.getenv("ENABLE_SHORT", "true").lower() == "true"
-
-USE_LIQUID_ONLY = os.getenv("USE_LIQUID_ONLY", "false").lower() == "true"
+USE_LIQUID_ONLY = os.getenv("USE_LIQUID_ONLY", "true").lower() == "true"
 
 BTC_SYMBOL = "BTC-USDT"
 
@@ -59,7 +68,7 @@ LIQUID_BASES = {
     "INJ", "NEAR", "ARB", "OP", "APT", "SUI", "SEI", "DOT", "LTC",
     "BCH", "UNI", "AAVE", "FIL", "ATOM", "ETC", "TRX", "MATIC", "WLD",
     "TIA", "ORDI", "FTM", "RUNE", "ENA", "JUP", "PYTH", "STRK", "DYDX",
-    "TON", "COMP", "STX", "TRB", "JTO", "DYM"
+    "TON", "COMP", "STX", "TRB", "JTO", "DYM", "ICP"
 }
 
 SENT_SIGNALS = {}
@@ -69,12 +78,21 @@ ACTIVE_SIGNALS = {}
 STATS = {
     "signals_today": 0,
     "signals_total": 0,
-    "tp1": 0,
-    "tp2": 0,
-    "tp3": 0,
-    "sl": 0,
-    "profit_after_tp1": 0,
-    "profit_after_tp2": 0,
+
+    "long_tp1": 0,
+    "long_tp2": 0,
+    "long_tp3": 0,
+    "long_sl": 0,
+    "long_profit_after_tp1": 0,
+    "long_profit_after_tp2": 0,
+
+    "short_tp1": 0,
+    "short_tp2": 0,
+    "short_tp3": 0,
+    "short_sl": 0,
+    "short_profit_after_tp1": 0,
+    "short_profit_after_tp2": 0,
+
     "current_day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
 }
 
@@ -385,6 +403,27 @@ def make_tp_by_percent(entry, side, position_percent):
     return entry * (1 - price_move_needed / 100)
 
 
+def apply_min_max_sl(entry, sl, side, min_risk_position_percent, max_risk_position_percent):
+    risk_price_percent = abs(entry - sl) / entry * 100
+    risk_position_percent = risk_price_percent * LEVERAGE
+
+    if risk_position_percent < min_risk_position_percent:
+        min_price_move = (min_risk_position_percent / LEVERAGE) / 100
+
+        if side == "LONG":
+            sl = entry * (1 - min_price_move)
+        else:
+            sl = entry * (1 + min_price_move)
+
+        risk_price_percent = abs(entry - sl) / entry * 100
+        risk_position_percent = risk_price_percent * LEVERAGE
+
+    if risk_position_percent > max_risk_position_percent:
+        return None, None
+
+    return sl, risk_position_percent
+
+
 def moved_from_level_position_percent(price, level, side):
     if level <= 0:
         return 999
@@ -497,7 +536,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
 
         moved = moved_from_level_position_percent(price, support, "LONG")
 
-        if moved > MAX_ALREADY_MOVED_POSITION_PERCENT:
+        if moved > LONG_MAX_ALREADY_MOVED_POSITION_PERCENT:
             return None
 
         level_touch = last["low"] <= support * 1.006
@@ -505,7 +544,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         bounce_candle = (
             last["close"] > last["open"]
             and last["close"] > prev["close"]
-            and lower_wick(last) >= candle_body(last) * 0.15
+            and lower_wick(last) >= candle_body(last) * 0.35
         )
 
         if not level_touch or not bounce_candle:
@@ -520,17 +559,28 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if trend_4h == "BEARISH" and trend_1h == "BEARISH":
             return None
 
-        rsi_ok = rsi <= 50
-        vwap_ok = price <= vwap * 1.015
+        rsi_ok = rsi <= 52
+        vwap_ok = price <= vwap * 1.018
 
         sl = min(support - atr * 0.18, min(lows_15[-8:]) - atr * 0.04)
 
         if sl >= price:
             return None
 
-        tp1 = make_tp_by_percent(price, "LONG", TP1_POSITION_PERCENT)
-        tp2 = make_tp_by_percent(price, "LONG", TP2_POSITION_PERCENT)
-        tp3 = make_tp_by_percent(price, "LONG", TP3_POSITION_PERCENT)
+        sl, risk_position_percent = apply_min_max_sl(
+            price,
+            sl,
+            "LONG",
+            LONG_MIN_RISK_POSITION_PERCENT,
+            LONG_MAX_RISK_POSITION_PERCENT,
+        )
+
+        if sl is None:
+            return None
+
+        tp1 = make_tp_by_percent(price, "LONG", LONG_TP1_POSITION_PERCENT)
+        tp2 = make_tp_by_percent(price, "LONG", LONG_TP2_POSITION_PERCENT)
+        tp3 = make_tp_by_percent(price, "LONG", LONG_TP3_POSITION_PERCENT)
 
         checks = [
             recent_move <= -MIN_PREVIOUS_DROP_FOR_LONG,
@@ -542,7 +592,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             btc_status != "BEARISH",
             trend_1h != "BEARISH",
             trend_4h != "BEARISH",
-            moved <= MAX_ALREADY_MOVED_POSITION_PERCENT,
+            moved <= LONG_MAX_ALREADY_MOVED_POSITION_PERCENT,
         ]
 
     else:
@@ -559,7 +609,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
 
         moved = moved_from_level_position_percent(price, resistance, "SHORT")
 
-        if moved > MAX_ALREADY_MOVED_POSITION_PERCENT:
+        if moved > SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT:
             return None
 
         level_touch = last["high"] >= resistance * 0.994
@@ -567,7 +617,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         rejection_candle = (
             last["close"] < last["open"]
             and last["close"] < prev["close"]
-            and upper_wick(last) >= candle_body(last) * 0.15
+            and upper_wick(last) >= candle_body(last) * 0.35
         )
 
         if not level_touch or not rejection_candle:
@@ -590,9 +640,20 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if sl <= price:
             return None
 
-        tp1 = make_tp_by_percent(price, "SHORT", TP1_POSITION_PERCENT)
-        tp2 = make_tp_by_percent(price, "SHORT", TP2_POSITION_PERCENT)
-        tp3 = make_tp_by_percent(price, "SHORT", TP3_POSITION_PERCENT)
+        sl, risk_position_percent = apply_min_max_sl(
+            price,
+            sl,
+            "SHORT",
+            SHORT_MIN_RISK_POSITION_PERCENT,
+            SHORT_MAX_RISK_POSITION_PERCENT,
+        )
+
+        if sl is None:
+            return None
+
+        tp1 = make_tp_by_percent(price, "SHORT", SHORT_TP1_POSITION_PERCENT)
+        tp2 = make_tp_by_percent(price, "SHORT", SHORT_TP2_POSITION_PERCENT)
+        tp3 = make_tp_by_percent(price, "SHORT", SHORT_TP3_POSITION_PERCENT)
 
         checks = [
             recent_move >= MIN_PREVIOUS_RISE_FOR_SHORT,
@@ -604,16 +665,11 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             btc_status != "BULLISH",
             trend_1h != "BULLISH",
             trend_4h != "BULLISH",
-            moved <= MAX_ALREADY_MOVED_POSITION_PERCENT,
+            moved <= SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT,
         ]
 
-    risk_price_percent = abs(price - sl) / price * 100
-    risk_position_percent = risk_price_percent * LEVERAGE
-
-    if risk_position_percent > MAX_RISK_POSITION_PERCENT:
-        return None
-
     reward_price_percent = price_move_percent(price, tp1, side)
+    risk_price_percent = abs(price - sl) / price * 100
     rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
 
     if rr < MIN_RR_TO_TP1:
@@ -629,7 +685,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V16_SIGNAL_TRACKER_SL10:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V17_COMBINED_PRO_REVERSAL_STRICT:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -708,12 +764,12 @@ def make_signal_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
 
     return f"""
-🎯 <b>V16 Signal + Tracker SL 10%</b>
+🎯 <b>V17 Combined Pro Reversal STRICT</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
 
-🎯 Вход: <code>{format_price(signal["entry"])}</code>
+🎯 Зона входа: <code>{format_price(signal["entry"])}</code>
 🛑 SL: <code>{format_price(signal["sl"])}</code>
 ✅ TP1: <code>{format_price(signal["tp1"])}</code>
 ✅ TP2: <code>{format_price(signal["tp2"])}</code>
@@ -723,55 +779,78 @@ def make_signal_message(signal):
 🛡 Риск до SL: около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
 
-Бот будет отслеживать сигнал.
-Если TP1 достигнут, сделка уже считается позитивной.
+После TP1 сделка уже считается позитивной.
+Бот сам отслеживает TP/SL и считает статистику отдельно по LONG и SHORT.
 
-⚠️ Тестируй маленькой суммой. Не финансовый совет.
+⚠️ Не финансовый совет. Фьючерсы несут высокий риск.
 """.strip()
+
+
+def add_stat(side, result):
+    prefix = "long" if side == "LONG" else "short"
+
+    if result == "SL":
+        STATS[f"{prefix}_sl"] += 1
+    elif result == "TP1":
+        STATS[f"{prefix}_tp1"] += 1
+    elif result == "TP2":
+        STATS[f"{prefix}_tp2"] += 1
+    elif result == "TP3":
+        STATS[f"{prefix}_tp3"] += 1
+    elif result == "PROFIT_AFTER_TP1":
+        STATS[f"{prefix}_profit_after_tp1"] += 1
+    elif result == "PROFIT_AFTER_TP2":
+        STATS[f"{prefix}_profit_after_tp2"] += 1
+
+
+def side_stats(side):
+    prefix = "long" if side == "LONG" else "short"
+
+    positive = (
+        STATS[f"{prefix}_tp1"]
+        + STATS[f"{prefix}_tp2"]
+        + STATS[f"{prefix}_tp3"]
+        + STATS[f"{prefix}_profit_after_tp1"]
+        + STATS[f"{prefix}_profit_after_tp2"]
+    )
+
+    negative = STATS[f"{prefix}_sl"]
+    total = positive + negative
+    winrate = (positive / total * 100) if total > 0 else 0
+
+    return positive, negative, winrate
 
 
 def make_result_message(signal, result, price):
     side = signal["side"]
     symbol = signal["symbol"].replace("-", "/")
 
+    add_stat(side, result)
+
     if result == "SL":
-        STATS["sl"] += 1
         icon = "❌"
         title = "SL сработал до TP1"
     elif result == "TP1":
-        STATS["tp1"] += 1
         icon = "✅"
         title = "TP1 достигнут — сделка позитивная"
     elif result == "TP2":
-        STATS["tp2"] += 1
         icon = "✅✅"
         title = "TP2 достигнут"
     elif result == "TP3":
-        STATS["tp3"] += 1
         icon = "🔥"
         title = "TP3 достигнут"
     elif result == "PROFIT_AFTER_TP1":
-        STATS["profit_after_tp1"] += 1
         icon = "🟢"
-        title = "Возврат после TP1 — сделка закрыта как позитивная"
+        title = "Возврат после TP1 — сделка позитивная"
     elif result == "PROFIT_AFTER_TP2":
-        STATS["profit_after_tp2"] += 1
         icon = "🟢🟢"
-        title = "Возврат после TP2 — сделка закрыта как позитивная"
+        title = "Возврат после TP2 — сделка позитивная"
     else:
         icon = "ℹ️"
         title = result
 
-    positive = (
-        STATS["tp1"]
-        + STATS["tp2"]
-        + STATS["tp3"]
-        + STATS["profit_after_tp1"]
-        + STATS["profit_after_tp2"]
-    )
-    negative = STATS["sl"]
-    total = positive + negative
-    winrate = (positive / total * 100) if total > 0 else 0
+    long_pos, long_neg, long_wr = side_stats("LONG")
+    short_pos, short_neg, short_wr = side_stats("SHORT")
 
     return f"""
 {icon} <b>{title}</b>
@@ -785,18 +864,17 @@ TP2: <code>{format_price(signal["tp2"])}</code>
 TP3: <code>{format_price(signal["tp3"])}</code>
 SL: <code>{format_price(signal["sl"])}</code>
 
-📊 Статистика после запуска:
-Позитивные сделки: <b>{positive}</b>
-SL до TP1: <b>{negative}</b>
-Winrate: <b>{winrate:.1f}%</b>
+📊 Статистика:
 
-Детально:
-TP1: <b>{STATS["tp1"]}</b>
-TP2: <b>{STATS["tp2"]}</b>
-TP3: <b>{STATS["tp3"]}</b>
-Возврат после TP1: <b>{STATS["profit_after_tp1"]}</b>
-Возврат после TP2: <b>{STATS["profit_after_tp2"]}</b>
-SL: <b>{STATS["sl"]}</b>
+📈 LONG:
+Позитивные: <b>{long_pos}</b>
+SL до TP1: <b>{long_neg}</b>
+Winrate: <b>{long_wr:.1f}%</b>
+
+📉 SHORT:
+Позитивные: <b>{short_pos}</b>
+SL до TP1: <b>{short_neg}</b>
+Winrate: <b>{short_wr:.1f}%</b>
 """.strip()
 
 
@@ -917,13 +995,14 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V16 Signal + Tracker SL 10% запущен.\n"
-            f"Режим: {'SHORT only' if ENABLE_SHORT and not ENABLE_LONG else 'LONG + SHORT'}\n"
-            f"Логика: уровень + перегрев/перепроданность + отбой + 1m подтверждение.\n"
-            f"После TP1 сделка больше не считается отрицательной.\n"
+            f"✅ V17 Combined Pro Reversal STRICT запущен.\n"
+            f"Режим: LONG + SHORT\n"
+            f"Фильтры усилены: объём x{MIN_VOLUME_RATIO}, wick 0.35, только ликвидные пары.\n"
+            f"LONG: от поддержки, широкий SL.\n"
+            f"SHORT: от сопротивления, быстрый TP.\n"
+            f"Проверка: 4h + 1h + 15m + {CONFIRM_TIMEFRAME}.\n"
             f"Плечо max.: {LEVERAGE}x\n"
-            f"TP1: {TP1_POSITION_PERCENT:.0f}% | TP2: {TP2_POSITION_PERCENT:.0f}% | TP3: {TP3_POSITION_PERCENT:.0f}% по позиции\n"
-            f"SL максимум: {MAX_RISK_POSITION_PERCENT:.0f}% по позиции."
+            f"Бот ведёт статистику отдельно по LONG и SHORT."
         )
 
         last_track_time = 0
@@ -1009,19 +1088,14 @@ async def scan_loop():
                     except Exception as e:
                         print(f"Error with {symbol}:", e)
 
-                positive = (
-                    STATS["tp1"]
-                    + STATS["tp2"]
-                    + STATS["tp3"]
-                    + STATS["profit_after_tp1"]
-                    + STATS["profit_after_tp2"]
-                )
+                long_pos, long_neg, long_wr = side_stats("LONG")
+                short_pos, short_neg, short_wr = side_stats("SHORT")
 
                 print(
                     f"Scan finished. Checked: {checked}. "
                     f"Signals found: {found}. "
-                    f"Active signals: {len(ACTIVE_SIGNALS)}. "
-                    f"Positive: {positive} | SL: {STATS['sl']}"
+                    f"Active: {len(ACTIVE_SIGNALS)}. "
+                    f"LONG WR: {long_wr:.1f}% | SHORT WR: {short_wr:.1f}%"
                 )
 
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
