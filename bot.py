@@ -29,7 +29,6 @@ LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
 ENABLE_LONG = os.getenv("ENABLE_LONG", "true").lower() == "true"
 ENABLE_SHORT = os.getenv("ENABLE_SHORT", "true").lower() == "true"
-
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
 LONG_TP1_POSITION_PERCENT = float(os.getenv("LONG_TP1_POSITION_PERCENT", "14"))
@@ -63,7 +62,7 @@ DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "10"))
 
 PAIR_MAX_SL_BEFORE_BLOCK = int(os.getenv("PAIR_MAX_SL_BEFORE_BLOCK", "2"))
 SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "3"))
-SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "21600"))  # 6 часов
+SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "21600"))
 MIN_CLOSED_TRADES_FOR_SIDE_CHECK = int(os.getenv("MIN_CLOSED_TRADES_FOR_SIDE_CHECK", "10"))
 MIN_SIDE_WINRATE = float(os.getenv("MIN_SIDE_WINRATE", "50"))
 
@@ -404,6 +403,42 @@ def btc_market_filter(btc_1h):
     return "NEUTRAL", change
 
 
+def market_regime_allows(side, btc_status, trend_1h, trend_4h, price, vwap):
+    """
+    Главный профессиональный фильтр:
+    - не шортим сильный bullish-рынок
+    - не лонгуем сильный bearish-рынок
+    """
+
+    if side == "SHORT":
+        strong_bull_market = (
+            btc_status == "BULLISH"
+            and trend_1h in ["BULLISH", "SOFT_BULLISH"]
+            and trend_4h in ["BULLISH", "SOFT_BULLISH"]
+            and price > vwap
+        )
+
+        if strong_bull_market:
+            return False
+
+        return True
+
+    if side == "LONG":
+        strong_bear_market = (
+            btc_status == "BEARISH"
+            and trend_1h in ["BEARISH", "SOFT_BEARISH"]
+            and trend_4h in ["BEARISH", "SOFT_BEARISH"]
+            and price < vwap
+        )
+
+        if strong_bear_market:
+            return False
+
+        return True
+
+    return False
+
+
 def candle_body(candle):
     return abs(candle["close"] - candle["open"])
 
@@ -559,6 +594,9 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
 
     trend_1h = trend_ema_50_200(candles_1h)
     trend_4h = trend_ema_50_200(candles_4h)
+
+    if not market_regime_allows(side, btc_status, trend_1h, trend_4h, price, vwap):
+        return None
 
     avg_volume = sum(volumes_15[-30:]) / 30
     volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
@@ -721,7 +759,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V18_ADAPTIVE_SAFETY_REVERSAL:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V19_MARKET_REGIME_ADAPTIVE:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -777,7 +815,7 @@ def make_signal_message(signal):
     mode_text = "TEST SIGNAL" if TEST_MODE else "TRADE SIGNAL"
 
     return f"""
-🎯 <b>V18 Adaptive Safety Reversal</b> · <b>{mode_text}</b>
+🎯 <b>V19 Market Regime Adaptive</b> · <b>{mode_text}</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
@@ -791,6 +829,10 @@ def make_signal_message(signal):
 ⚠️ Плечо max.: <b>{LEVERAGE}x</b>
 🛡 Риск до SL: около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
+
+Фильтр режима рынка включён:
+• не шортим сильный bullish-рынок
+• не лонгуем сильный bearish-рынок
 
 После TP1 сделка считается позитивной.
 Если направление или пара дают серию SL, бот сам их отключит.
@@ -1041,9 +1083,12 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V18 Adaptive Safety Reversal Bot запущен.\n"
+            f"✅ V19 Market Regime Adaptive Bot запущен.\n"
             f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
             f"LONG + SHORT включены, но бот сам отключит плохое направление.\n"
+            f"Главное улучшение: Market Regime Filter.\n"
+            f"SHORT запрещён в сильном bullish-рынке.\n"
+            f"LONG запрещён в сильном bearish-рынке.\n"
             f"Фильтры: volume x{MIN_VOLUME_RATIO}, wick 0.35, ликвидные пары.\n"
             f"Автозащита: пара блокируется после {PAIR_MAX_SL_BEFORE_BLOCK} SL.\n"
             f"Направление отключается после {SIDE_MAX_CONSECUTIVE_SL} SL подряд.\n"
