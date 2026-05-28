@@ -43,22 +43,22 @@ SHORT_TP3_POSITION_PERCENT = float(os.getenv("SHORT_TP3_POSITION_PERCENT", "30")
 SHORT_MIN_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MIN_RISK_POSITION_PERCENT", "8"))
 SHORT_MAX_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MAX_RISK_POSITION_PERCENT", "12"))
 
-MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.9"))
+MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.85"))
 
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "86"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.40"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "84"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.35"))
 
-MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.8"))
-MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.6"))
+MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.6"))
+MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.5"))
 
-LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.15"))
+LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.20"))
 
-LONG_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("LONG_MAX_ALREADY_MOVED_POSITION_PERCENT", "2.0"))
-SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT", "1.5"))
+LONG_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("LONG_MAX_ALREADY_MOVED_POSITION_PERCENT", "2.2"))
+SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT", "1.7"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "5400"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "10"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "12"))
 
 PAIR_MAX_SL_BEFORE_BLOCK = int(os.getenv("PAIR_MAX_SL_BEFORE_BLOCK", "1"))
 SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
@@ -169,6 +169,7 @@ def is_on_cooldown(symbol):
     last_time = SYMBOL_COOLDOWN.get(symbol)
     if not last_time:
         return False
+
     return time.time() - last_time < SIGNAL_COOLDOWN_SECONDS
 
 
@@ -461,6 +462,7 @@ def recent_move_percent(candles, lookback=12):
 def price_move_percent(entry, target, side):
     if side == "LONG":
         return (target - entry) / entry * 100
+
     return (entry - target) / entry * 100
 
 
@@ -553,39 +555,44 @@ def nearest_support(price, candles_1h, candles_4h):
     return min(near, key=lambda x: abs(price - x))
 
 
-def momentum_confirm(candles_confirm, side):
-    last = candles_confirm[-1]
-    prev = candles_confirm[-2]
-
-    if side == "LONG":
-        return last["close"] > last["open"] and last["close"] > prev["close"]
-
-    return last["close"] < last["open"] and last["close"] < prev["close"]
-
-
-def strong_1m_confirmation(candles_confirm, side):
+def balanced_1m_confirmation(candles_confirm, side):
     closes = [c["close"] for c in candles_confirm]
 
     if len(closes) < 20:
-        return False
+        return False, False
 
     ema9 = ema(closes, 9)[-1]
-
     last = candles_confirm[-1]
     prev = candles_confirm[-2]
 
     if side == "LONG":
-        return (
+        normal_confirm = (
+            last["close"] > last["open"]
+            and last["close"] > prev["close"]
+            and last["close"] > ema9
+        )
+
+        strong_confirm = (
             last["close"] > last["open"]
             and last["close"] > prev["high"]
             and last["close"] > ema9
         )
 
-    return (
+        return normal_confirm, strong_confirm
+
+    normal_confirm = (
+        last["close"] < last["open"]
+        and last["close"] < prev["close"]
+        and last["close"] < ema9
+    )
+
+    strong_confirm = (
         last["close"] < last["open"]
         and last["close"] < prev["low"]
         and last["close"] < ema9
     )
+
+    return normal_confirm, strong_confirm
 
 
 def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
@@ -624,16 +631,22 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         return None
 
     recent_move = recent_move_percent(candles_15m, 12)
+    normal_confirm, strong_confirm = balanced_1m_confirmation(candles_confirm, side)
+
+    if not normal_confirm:
+        return None
 
     if side == "LONG":
         if recent_move > -MIN_PREVIOUS_DROP_FOR_LONG:
             return None
 
         support = nearest_support(price, candles_1h, candles_4h)
+
         if support is None:
             return None
 
         moved = moved_from_level_position_percent(price, support, "LONG")
+
         if moved > LONG_MAX_ALREADY_MOVED_POSITION_PERCENT:
             return None
 
@@ -642,13 +655,10 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         bounce_candle = (
             last["close"] > last["open"]
             and last["close"] > prev["close"]
-            and lower_wick(last) >= candle_body(last) * 0.35
+            and lower_wick(last) >= candle_body(last) * 0.30
         )
 
         if not level_touch or not bounce_candle:
-            return None
-
-        if not strong_1m_confirmation(candles_confirm, "LONG"):
             return None
 
         if btc_status == "BEARISH":
@@ -657,11 +667,11 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if trend_4h == "BEARISH" and trend_1h == "BEARISH":
             return None
 
-        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
+        if trend_1h == "BEARISH":
             return None
 
-        rsi_ok = rsi <= 48
-        vwap_ok = price >= vwap * 0.985 and price <= vwap * 1.015
+        rsi_ok = rsi <= 50
+        vwap_ok = price >= vwap * 0.982 and price <= vwap * 1.018
 
         sl = min(support - atr * 0.18, min(lows_15[-8:]) - atr * 0.04)
 
@@ -691,9 +701,10 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             vwap_ok,
             volume_ratio >= MIN_VOLUME_RATIO,
             btc_status != "BEARISH",
-            trend_1h not in ["BEARISH", "SOFT_BEARISH"],
+            trend_1h != "BEARISH",
             trend_4h != "BEARISH",
             moved <= LONG_MAX_ALREADY_MOVED_POSITION_PERCENT,
+            normal_confirm,
         ]
 
     else:
@@ -701,10 +712,12 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             return None
 
         resistance = nearest_resistance(price, candles_1h, candles_4h)
+
         if resistance is None:
             return None
 
         moved = moved_from_level_position_percent(price, resistance, "SHORT")
+
         if moved > SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT:
             return None
 
@@ -713,13 +726,10 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         rejection_candle = (
             last["close"] < last["open"]
             and last["close"] < prev["close"]
-            and upper_wick(last) >= candle_body(last) * 0.35
+            and upper_wick(last) >= candle_body(last) * 0.30
         )
 
         if not level_touch or not rejection_candle:
-            return None
-
-        if not strong_1m_confirmation(candles_confirm, "SHORT"):
             return None
 
         if btc_status == "BULLISH":
@@ -728,11 +738,11 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if trend_4h == "BULLISH" and trend_1h == "BULLISH":
             return None
 
-        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+        if trend_1h == "BULLISH":
             return None
 
-        rsi_ok = rsi >= 55
-        vwap_ok = price <= vwap * 1.015 and price >= vwap * 0.985
+        rsi_ok = rsi >= 53
+        vwap_ok = price <= vwap * 1.018 and price >= vwap * 0.982
 
         sl = max(resistance + atr * 0.18, max(highs_15[-8:]) + atr * 0.04)
 
@@ -762,9 +772,10 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             vwap_ok,
             volume_ratio >= MIN_VOLUME_RATIO,
             btc_status != "BULLISH",
-            trend_1h not in ["BULLISH", "SOFT_BULLISH"],
+            trend_1h != "BULLISH",
             trend_4h != "BULLISH",
             moved <= SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT,
+            normal_confirm,
         ]
 
     reward_price_percent = price_move_percent(price, tp1, side)
@@ -776,15 +787,22 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
 
     passed = sum(1 for ok in checks if ok)
 
-    if passed < 8:
-        return None
+    quality = min(95, 52 + passed * 3)
 
-    quality = min(95, 55 + passed * 4)
+    if strong_confirm:
+        quality += 3
+
+    if volume_ratio >= 1.50:
+        quality += 2
+
+    quality = min(95, quality)
 
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V20_CONSERVATIVE_CONFIRMATION:{side}:{round(price, 6)}"
+    signal_grade = "A+" if strong_confirm and volume_ratio >= 1.50 and quality >= 88 else "B"
+
+    signal_id = f"{symbol}:V20_1_BALANCED_PRO:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -793,6 +811,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         "symbol": symbol,
         "side": side,
         "quality": quality,
+        "grade": signal_grade,
         "entry": price,
         "sl": sl,
         "tp1": tp1,
@@ -831,7 +850,7 @@ def analyze_symbol(symbol, candles_15m, candles_confirm, candles_1h, candles_4h,
     if not candidates:
         return None
 
-    candidates.sort(key=lambda x: (x["quality"], x["rr"], x["volume_ratio"]), reverse=True)
+    candidates.sort(key=lambda x: (x["grade"] == "A+", x["quality"], x["rr"], x["volume_ratio"]), reverse=True)
     return candidates[0]
 
 
@@ -839,8 +858,14 @@ def make_signal_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
     mode_text = "TEST SIGNAL" if TEST_MODE else "TRADE SIGNAL"
 
+    if signal["grade"] == "A+":
+        grade_text = "🔥 A+ SIGNAL"
+    else:
+        grade_text = "⚠️ B SIGNAL"
+
     return f"""
-🎯 <b>V20 Conservative Confirmation</b> · <b>{mode_text}</b>
+🎯 <b>V20.1 Balanced Professional</b> · <b>{mode_text}</b>
+{grade_text}
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
@@ -854,16 +879,14 @@ def make_signal_message(signal):
 ⚠️ Плечо max.: <b>{LEVERAGE}x</b>
 🛡 Риск до SL: около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
+📊 Volume: x<b>{signal["volume_ratio"]:.2f}</b>
 
-Фильтры усилены:
-• качество 86+
-• объём x1.40+
-• сильное 1m подтверждение
-• не входить против 1h тренда
-• пара блокируется после 1 SL
-• направление отключается после 2 SL подряд
+A+ — самый сильный сигнал.
+B — нормальный сигнал, но осторожнее и меньшим объёмом.
 
 После TP1 сделка считается позитивной.
+Пара блокируется после 1 SL.
+Направление отключается после 2 SL подряд.
 
 ⚠️ Не финансовый совет. Сначала тест/минимальная сумма.
 """.strip()
@@ -1111,11 +1134,13 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V20 Conservative Confirmation Bot запущен.\n"
+            f"✅ V20.1 Balanced Professional Bot запущен.\n"
             f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
-            f"LONG + SHORT включены, но входы стали строже.\n"
+            f"Цель: 1–2 качественные сделки в день, можно больше если рынок даёт.\n"
+            f"LONG + SHORT включены.\n"
             f"MIN_QUALITY: {MIN_QUALITY}\n"
             f"Volume filter: x{MIN_VOLUME_RATIO}\n"
+            f"Сигналы: A+ и B.\n"
             f"Пара блокируется после {PAIR_MAX_SL_BEFORE_BLOCK} SL.\n"
             f"Направление отключается после {SIDE_MAX_CONSECUTIVE_SL} SL подряд.\n"
             f"Плечо max.: {LEVERAGE}x."
