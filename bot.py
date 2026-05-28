@@ -31,6 +31,9 @@ ENABLE_LONG = os.getenv("ENABLE_LONG", "true").lower() == "true"
 ENABLE_SHORT = os.getenv("ENABLE_SHORT", "true").lower() == "true"
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
+# Главное правило доверия: торгуем только A+
+TRADE_ONLY_A_PLUS = os.getenv("TRADE_ONLY_A_PLUS", "true").lower() == "true"
+
 LONG_TP1_POSITION_PERCENT = float(os.getenv("LONG_TP1_POSITION_PERCENT", "14"))
 LONG_TP2_POSITION_PERCENT = float(os.getenv("LONG_TP2_POSITION_PERCENT", "24"))
 LONG_TP3_POSITION_PERCENT = float(os.getenv("LONG_TP3_POSITION_PERCENT", "36"))
@@ -43,10 +46,12 @@ SHORT_TP3_POSITION_PERCENT = float(os.getenv("SHORT_TP3_POSITION_PERCENT", "30")
 SHORT_MIN_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MIN_RISK_POSITION_PERCENT", "8"))
 SHORT_MAX_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MAX_RISK_POSITION_PERCENT", "12"))
 
-MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.85"))
+MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.9"))
 
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "84"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.35"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "86"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.40"))
+A_PLUS_VOLUME_RATIO = float(os.getenv("A_PLUS_VOLUME_RATIO", "1.50"))
+A_PLUS_MIN_QUALITY = int(os.getenv("A_PLUS_MIN_QUALITY", "88"))
 
 MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.6"))
 MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.5"))
@@ -58,7 +63,7 @@ SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("SHORT_MAX_ALREADY_MO
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "5400"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "12"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "8"))
 
 PAIR_MAX_SL_BEFORE_BLOCK = int(os.getenv("PAIR_MAX_SL_BEFORE_BLOCK", "1"))
 SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
@@ -738,11 +743,13 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if trend_4h == "BULLISH" and trend_1h == "BULLISH":
             return None
 
-        if trend_1h == "BULLISH":
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
             return None
 
-        rsi_ok = rsi >= 53
-        vwap_ok = price <= vwap * 1.018 and price >= vwap * 0.982
+        rsi_ok = rsi >= 55
+
+        # Для шорта цена не должна уверенно держаться выше VWAP
+        vwap_ok = price <= vwap * 1.005 and price >= vwap * 0.982
 
         sl = max(resistance + atr * 0.18, max(highs_15[-8:]) + atr * 0.04)
 
@@ -772,7 +779,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             vwap_ok,
             volume_ratio >= MIN_VOLUME_RATIO,
             btc_status != "BULLISH",
-            trend_1h != "BULLISH",
+            trend_1h not in ["BULLISH", "SOFT_BULLISH"],
             trend_4h != "BULLISH",
             moved <= SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT,
             normal_confirm,
@@ -792,7 +799,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     if strong_confirm:
         quality += 3
 
-    if volume_ratio >= 1.50:
+    if volume_ratio >= A_PLUS_VOLUME_RATIO:
         quality += 2
 
     quality = min(95, quality)
@@ -800,9 +807,14 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     if quality < MIN_QUALITY:
         return None
 
-    signal_grade = "A+" if strong_confirm and volume_ratio >= 1.50 and quality >= 88 else "B"
+    signal_grade = "A+" if strong_confirm and volume_ratio >= A_PLUS_VOLUME_RATIO and quality >= A_PLUS_MIN_QUALITY else "B"
 
-    signal_id = f"{symbol}:V20_1_BALANCED_PRO:{side}:{round(price, 6)}"
+    # Главное профессиональное правило:
+    # для реального доверия отправляем только A+.
+    if TRADE_ONLY_A_PLUS and signal_grade != "A+":
+        return None
+
+    signal_id = f"{symbol}:V20_2_A_PLUS_ONLY:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -850,7 +862,16 @@ def analyze_symbol(symbol, candles_15m, candles_confirm, candles_1h, candles_4h,
     if not candidates:
         return None
 
-    candidates.sort(key=lambda x: (x["grade"] == "A+", x["quality"], x["rr"], x["volume_ratio"]), reverse=True)
+    candidates.sort(
+        key=lambda x: (
+            x["grade"] == "A+",
+            x["quality"],
+            x["rr"],
+            x["volume_ratio"],
+        ),
+        reverse=True,
+    )
+
     return candidates[0]
 
 
@@ -858,14 +879,9 @@ def make_signal_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
     mode_text = "TEST SIGNAL" if TEST_MODE else "TRADE SIGNAL"
 
-    if signal["grade"] == "A+":
-        grade_text = "🔥 A+ SIGNAL"
-    else:
-        grade_text = "⚠️ B SIGNAL"
-
     return f"""
-🎯 <b>V20.1 Balanced Professional</b> · <b>{mode_text}</b>
-{grade_text}
+🎯 <b>V20.2 A+ Professional Only</b> · <b>{mode_text}</b>
+🔥 <b>A+ SIGNAL ONLY</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
@@ -881,8 +897,8 @@ def make_signal_message(signal):
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
 📊 Volume: x<b>{signal["volume_ratio"]:.2f}</b>
 
-A+ — самый сильный сигнал.
-B — нормальный сигнал, но осторожнее и меньшим объёмом.
+Бот отправляет только A+ сигналы.
+B-сигналы полностью отфильтрованы.
 
 После TP1 сделка считается позитивной.
 Пара блокируется после 1 SL.
@@ -1134,13 +1150,14 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V20.1 Balanced Professional Bot запущен.\n"
+            f"✅ V20.2 A+ Professional Only Bot запущен.\n"
             f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
-            f"Цель: 1–2 качественные сделки в день, можно больше если рынок даёт.\n"
-            f"LONG + SHORT включены.\n"
+            f"Бот отправляет только A+ сигналы.\n"
+            f"B-сигналы полностью отфильтрованы.\n"
             f"MIN_QUALITY: {MIN_QUALITY}\n"
+            f"A+ Quality: {A_PLUS_MIN_QUALITY}+\n"
             f"Volume filter: x{MIN_VOLUME_RATIO}\n"
-            f"Сигналы: A+ и B.\n"
+            f"A+ Volume: x{A_PLUS_VOLUME_RATIO}+\n"
             f"Пара блокируется после {PAIR_MAX_SL_BEFORE_BLOCK} SL.\n"
             f"Направление отключается после {SIDE_MAX_CONSECUTIVE_SL} SL подряд.\n"
             f"Плечо max.: {LEVERAGE}x."
