@@ -45,8 +45,8 @@ SHORT_MAX_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MAX_RISK_POSITION_PERCE
 
 MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.9"))
 
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "82"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.30"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "86"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.40"))
 
 MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.8"))
 MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.6"))
@@ -60,8 +60,8 @@ SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "5400"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
 DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "10"))
 
-PAIR_MAX_SL_BEFORE_BLOCK = int(os.getenv("PAIR_MAX_SL_BEFORE_BLOCK", "2"))
-SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "3"))
+PAIR_MAX_SL_BEFORE_BLOCK = int(os.getenv("PAIR_MAX_SL_BEFORE_BLOCK", "1"))
+SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
 SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "21600"))
 MIN_CLOSED_TRADES_FOR_SIDE_CHECK = int(os.getenv("MIN_CLOSED_TRADES_FOR_SIDE_CHECK", "10"))
 MIN_SIDE_WINRATE = float(os.getenv("MIN_SIDE_WINRATE", "50"))
@@ -404,12 +404,6 @@ def btc_market_filter(btc_1h):
 
 
 def market_regime_allows(side, btc_status, trend_1h, trend_4h, price, vwap):
-    """
-    Главный профессиональный фильтр:
-    - не шортим сильный bullish-рынок
-    - не лонгуем сильный bearish-рынок
-    """
-
     if side == "SHORT":
         strong_bull_market = (
             btc_status == "BULLISH"
@@ -569,6 +563,31 @@ def momentum_confirm(candles_confirm, side):
     return last["close"] < last["open"] and last["close"] < prev["close"]
 
 
+def strong_1m_confirmation(candles_confirm, side):
+    closes = [c["close"] for c in candles_confirm]
+
+    if len(closes) < 20:
+        return False
+
+    ema9 = ema(closes, 9)[-1]
+
+    last = candles_confirm[-1]
+    prev = candles_confirm[-2]
+
+    if side == "LONG":
+        return (
+            last["close"] > last["open"]
+            and last["close"] > prev["high"]
+            and last["close"] > ema9
+        )
+
+    return (
+        last["close"] < last["open"]
+        and last["close"] < prev["low"]
+        and last["close"] < ema9
+    )
+
+
 def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
     if not is_side_enabled(side):
         return None
@@ -629,7 +648,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if not level_touch or not bounce_candle:
             return None
 
-        if not momentum_confirm(candles_confirm, "LONG"):
+        if not strong_1m_confirmation(candles_confirm, "LONG"):
             return None
 
         if btc_status == "BEARISH":
@@ -638,8 +657,11 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if trend_4h == "BEARISH" and trend_1h == "BEARISH":
             return None
 
-        rsi_ok = rsi <= 52
-        vwap_ok = price <= vwap * 1.018
+        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
+            return None
+
+        rsi_ok = rsi <= 48
+        vwap_ok = price >= vwap * 0.985 and price <= vwap * 1.015
 
         sl = min(support - atr * 0.18, min(lows_15[-8:]) - atr * 0.04)
 
@@ -669,7 +691,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             vwap_ok,
             volume_ratio >= MIN_VOLUME_RATIO,
             btc_status != "BEARISH",
-            trend_1h != "BEARISH",
+            trend_1h not in ["BEARISH", "SOFT_BEARISH"],
             trend_4h != "BEARISH",
             moved <= LONG_MAX_ALREADY_MOVED_POSITION_PERCENT,
         ]
@@ -697,7 +719,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if not level_touch or not rejection_candle:
             return None
 
-        if not momentum_confirm(candles_confirm, "SHORT"):
+        if not strong_1m_confirmation(candles_confirm, "SHORT"):
             return None
 
         if btc_status == "BULLISH":
@@ -706,8 +728,11 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         if trend_4h == "BULLISH" and trend_1h == "BULLISH":
             return None
 
-        rsi_ok = rsi >= 50
-        vwap_ok = price >= vwap * 0.985
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+            return None
+
+        rsi_ok = rsi >= 55
+        vwap_ok = price <= vwap * 1.015 and price >= vwap * 0.985
 
         sl = max(resistance + atr * 0.18, max(highs_15[-8:]) + atr * 0.04)
 
@@ -737,7 +762,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             vwap_ok,
             volume_ratio >= MIN_VOLUME_RATIO,
             btc_status != "BULLISH",
-            trend_1h != "BULLISH",
+            trend_1h not in ["BULLISH", "SOFT_BULLISH"],
             trend_4h != "BULLISH",
             moved <= SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT,
         ]
@@ -759,7 +784,7 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     if quality < MIN_QUALITY:
         return None
 
-    signal_id = f"{symbol}:V19_MARKET_REGIME_ADAPTIVE:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V20_CONSERVATIVE_CONFIRMATION:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -815,7 +840,7 @@ def make_signal_message(signal):
     mode_text = "TEST SIGNAL" if TEST_MODE else "TRADE SIGNAL"
 
     return f"""
-🎯 <b>V19 Market Regime Adaptive</b> · <b>{mode_text}</b>
+🎯 <b>V20 Conservative Confirmation</b> · <b>{mode_text}</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
@@ -830,12 +855,15 @@ def make_signal_message(signal):
 🛡 Риск до SL: около <b>{signal["risk_position_percent"]:.1f}%</b> по позиции
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
 
-Фильтр режима рынка включён:
-• не шортим сильный bullish-рынок
-• не лонгуем сильный bearish-рынок
+Фильтры усилены:
+• качество 86+
+• объём x1.40+
+• сильное 1m подтверждение
+• не входить против 1h тренда
+• пара блокируется после 1 SL
+• направление отключается после 2 SL подряд
 
 После TP1 сделка считается позитивной.
-Если направление или пара дают серию SL, бот сам их отключит.
 
 ⚠️ Не финансовый совет. Сначала тест/минимальная сумма.
 """.strip()
@@ -872,7 +900,7 @@ def apply_adaptive_rules(signal, result):
 
         if STATS["pair_sl"][symbol] >= PAIR_MAX_SL_BEFORE_BLOCK:
             BLOCKED_SYMBOLS[symbol] = time.time() + 86400
-            notes.append(f"🚫 Пара {symbol.replace('-', '/')} заблокирована на 24ч: {STATS['pair_sl'][symbol]} SL.")
+            notes.append(f"🚫 Пара {symbol.replace('-', '/')} заблокирована на 24ч после SL.")
 
         if STATS[f"{prefix}_consecutive_sl"] >= SIDE_MAX_CONSECUTIVE_SL:
             SIDE_DISABLED_UNTIL[side] = time.time() + SIDE_DISABLE_SECONDS
@@ -1083,14 +1111,12 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V19 Market Regime Adaptive Bot запущен.\n"
+            f"✅ V20 Conservative Confirmation Bot запущен.\n"
             f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
-            f"LONG + SHORT включены, но бот сам отключит плохое направление.\n"
-            f"Главное улучшение: Market Regime Filter.\n"
-            f"SHORT запрещён в сильном bullish-рынке.\n"
-            f"LONG запрещён в сильном bearish-рынке.\n"
-            f"Фильтры: volume x{MIN_VOLUME_RATIO}, wick 0.35, ликвидные пары.\n"
-            f"Автозащита: пара блокируется после {PAIR_MAX_SL_BEFORE_BLOCK} SL.\n"
+            f"LONG + SHORT включены, но входы стали строже.\n"
+            f"MIN_QUALITY: {MIN_QUALITY}\n"
+            f"Volume filter: x{MIN_VOLUME_RATIO}\n"
+            f"Пара блокируется после {PAIR_MAX_SL_BEFORE_BLOCK} SL.\n"
             f"Направление отключается после {SIDE_MAX_CONSECUTIVE_SL} SL подряд.\n"
             f"Плечо max.: {LEVERAGE}x."
         )
