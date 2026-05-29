@@ -31,7 +31,6 @@ ENABLE_LONG = os.getenv("ENABLE_LONG", "true").lower() == "true"
 ENABLE_SHORT = os.getenv("ENABLE_SHORT", "true").lower() == "true"
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
-# Главное правило доверия: торгуем только A+
 TRADE_ONLY_A_PLUS = os.getenv("TRADE_ONLY_A_PLUS", "true").lower() == "true"
 
 LONG_TP1_POSITION_PERCENT = float(os.getenv("LONG_TP1_POSITION_PERCENT", "14"))
@@ -49,9 +48,10 @@ SHORT_MAX_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MAX_RISK_POSITION_PERCE
 MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.9"))
 
 MIN_QUALITY = int(os.getenv("MIN_QUALITY", "86"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.40"))
-A_PLUS_VOLUME_RATIO = float(os.getenv("A_PLUS_VOLUME_RATIO", "1.50"))
-A_PLUS_MIN_QUALITY = int(os.getenv("A_PLUS_MIN_QUALITY", "88"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.35"))
+
+A_PLUS_VOLUME_RATIO = float(os.getenv("A_PLUS_VOLUME_RATIO", "1.40"))
+A_PLUS_MIN_QUALITY = int(os.getenv("A_PLUS_MIN_QUALITY", "87"))
 
 MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.6"))
 MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.5"))
@@ -68,6 +68,7 @@ DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "8"))
 PAIR_MAX_SL_BEFORE_BLOCK = int(os.getenv("PAIR_MAX_SL_BEFORE_BLOCK", "1"))
 SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
 SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "21600"))
+
 MIN_CLOSED_TRADES_FOR_SIDE_CHECK = int(os.getenv("MIN_CLOSED_TRADES_FOR_SIDE_CHECK", "10"))
 MIN_SIDE_WINRATE = float(os.getenv("MIN_SIDE_WINRATE", "50"))
 
@@ -150,7 +151,6 @@ def is_side_enabled(side):
         return False
 
     disabled_until = SIDE_DISABLED_UNTIL.get(side, 0)
-
     if time.time() < disabled_until:
         return False
 
@@ -646,12 +646,10 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             return None
 
         support = nearest_support(price, candles_1h, candles_4h)
-
         if support is None:
             return None
 
         moved = moved_from_level_position_percent(price, support, "LONG")
-
         if moved > LONG_MAX_ALREADY_MOVED_POSITION_PERCENT:
             return None
 
@@ -717,12 +715,10 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             return None
 
         resistance = nearest_resistance(price, candles_1h, candles_4h)
-
         if resistance is None:
             return None
 
         moved = moved_from_level_position_percent(price, resistance, "SHORT")
-
         if moved > SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT:
             return None
 
@@ -747,8 +743,6 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
             return None
 
         rsi_ok = rsi >= 55
-
-        # Для шорта цена не должна уверенно держаться выше VWAP
         vwap_ok = price <= vwap * 1.005 and price >= vwap * 0.982
 
         sl = max(resistance + atr * 0.18, max(highs_15[-8:]) + atr * 0.04)
@@ -809,12 +803,10 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
 
     signal_grade = "A+" if strong_confirm and volume_ratio >= A_PLUS_VOLUME_RATIO and quality >= A_PLUS_MIN_QUALITY else "B"
 
-    # Главное профессиональное правило:
-    # для реального доверия отправляем только A+.
     if TRADE_ONLY_A_PLUS and signal_grade != "A+":
         return None
 
-    signal_id = f"{symbol}:V20_2_A_PLUS_ONLY:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V20_2_A_PLUS_SOFT:{side}:{round(price, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -880,7 +872,7 @@ def make_signal_message(signal):
     mode_text = "TEST SIGNAL" if TEST_MODE else "TRADE SIGNAL"
 
     return f"""
-🎯 <b>V20.2 A+ Professional Only</b> · <b>{mode_text}</b>
+🎯 <b>V20.2 A+ Professional Soft</b> · <b>{mode_text}</b>
 🔥 <b>A+ SIGNAL ONLY</b>
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
@@ -899,6 +891,10 @@ def make_signal_message(signal):
 
 Бот отправляет только A+ сигналы.
 B-сигналы полностью отфильтрованы.
+
+A+ условия смягчены:
+• качество {A_PLUS_MIN_QUALITY}+
+• объём x{A_PLUS_VOLUME_RATIO}+
 
 После TP1 сделка считается позитивной.
 Пара блокируется после 1 SL.
@@ -1150,7 +1146,7 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V20.2 A+ Professional Only Bot запущен.\n"
+            f"✅ V20.2 A+ Professional Soft Bot запущен.\n"
             f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
             f"Бот отправляет только A+ сигналы.\n"
             f"B-сигналы полностью отфильтрованы.\n"
