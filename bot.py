@@ -17,62 +17,47 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "1m")
+CONFIRM_1M = os.getenv("CONFIRM_1M", "1m")
+CONFIRM_5M = os.getenv("CONFIRM_5M", "5m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "4h")
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "35"))
-TRACK_INTERVAL_SECONDS = int(os.getenv("TRACK_INTERVAL_SECONDS", "30"))
+TRACK_INTERVAL_SECONDS = int(os.getenv("TRACK_INTERVAL_SECONDS", "25"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "450"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
 ENABLE_LONG = os.getenv("ENABLE_LONG", "true").lower() == "true"
 ENABLE_SHORT = os.getenv("ENABLE_SHORT", "true").lower() == "true"
-TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
-TRADE_ONLY_A_PLUS = os.getenv("TRADE_ONLY_A_PLUS", "true").lower() == "true"
+USE_LIQUID_ONLY = os.getenv("USE_LIQUID_ONLY", "true").lower() == "true"
 
-LONG_TP1_POSITION_PERCENT = float(os.getenv("LONG_TP1_POSITION_PERCENT", "14"))
-LONG_TP2_POSITION_PERCENT = float(os.getenv("LONG_TP2_POSITION_PERCENT", "24"))
-LONG_TP3_POSITION_PERCENT = float(os.getenv("LONG_TP3_POSITION_PERCENT", "36"))
-LONG_MIN_RISK_POSITION_PERCENT = float(os.getenv("LONG_MIN_RISK_POSITION_PERCENT", "9"))
-LONG_MAX_RISK_POSITION_PERCENT = float(os.getenv("LONG_MAX_RISK_POSITION_PERCENT", "13"))
-
-SHORT_TP1_POSITION_PERCENT = float(os.getenv("SHORT_TP1_POSITION_PERCENT", "10"))
-SHORT_TP2_POSITION_PERCENT = float(os.getenv("SHORT_TP2_POSITION_PERCENT", "18"))
-SHORT_TP3_POSITION_PERCENT = float(os.getenv("SHORT_TP3_POSITION_PERCENT", "30"))
-SHORT_MIN_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MIN_RISK_POSITION_PERCENT", "8"))
-SHORT_MAX_RISK_POSITION_PERCENT = float(os.getenv("SHORT_MAX_RISK_POSITION_PERCENT", "12"))
-
-MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.9"))
-
-MIN_QUALITY = int(os.getenv("MIN_QUALITY", "86"))
+MIN_QUALITY = int(os.getenv("MIN_QUALITY", "87"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.35"))
+A_PLUS_VOLUME_RATIO = float(os.getenv("A_PLUS_VOLUME_RATIO", "1.50"))
 
-A_PLUS_VOLUME_RATIO = float(os.getenv("A_PLUS_VOLUME_RATIO", "1.40"))
-A_PLUS_MIN_QUALITY = int(os.getenv("A_PLUS_MIN_QUALITY", "87"))
+TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "8"))
+TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
+TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "25"))
 
-MIN_PREVIOUS_DROP_FOR_LONG = float(os.getenv("MIN_PREVIOUS_DROP_FOR_LONG", "1.6"))
-MIN_PREVIOUS_RISE_FOR_SHORT = float(os.getenv("MIN_PREVIOUS_RISE_FOR_SHORT", "1.5"))
-
-LEVEL_DISTANCE_PERCENT = float(os.getenv("LEVEL_DISTANCE_PERCENT", "1.20"))
-
-LONG_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("LONG_MAX_ALREADY_MOVED_POSITION_PERCENT", "2.2"))
-SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT = float(os.getenv("SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT", "1.7"))
+MIN_RISK_POSITION_PERCENT = float(os.getenv("MIN_RISK_POSITION_PERCENT", "6"))
+MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
+MIN_RR_TO_TP1 = float(os.getenv("MIN_RR_TO_TP1", "0.85"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "5400"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "3"))
-DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "8"))
+DAILY_MAX_SIGNALS = int(os.getenv("DAILY_MAX_SIGNALS", "10"))
 
 PAIR_MAX_SL_BEFORE_BLOCK = int(os.getenv("PAIR_MAX_SL_BEFORE_BLOCK", "1"))
 SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
-SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "21600"))
+STRATEGY_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_SL", "2"))
 
-MIN_CLOSED_TRADES_FOR_SIDE_CHECK = int(os.getenv("MIN_CLOSED_TRADES_FOR_SIDE_CHECK", "10"))
-MIN_SIDE_WINRATE = float(os.getenv("MIN_SIDE_WINRATE", "50"))
+DISABLE_SECONDS = int(os.getenv("DISABLE_SECONDS", "21600"))
 
-USE_LIQUID_ONLY = os.getenv("USE_LIQUID_ONLY", "true").lower() == "true"
+MIN_CLOSED_TRADES_FOR_CHECK = int(os.getenv("MIN_CLOSED_TRADES_FOR_CHECK", "8"))
+MIN_WINRATE = float(os.getenv("MIN_WINRATE", "50"))
 
 BTC_SYMBOL = "BTC-USDT"
 
@@ -84,39 +69,37 @@ LIQUID_BASES = {
     "TON", "COMP", "STX", "TRB", "JTO", "DYM", "ICP"
 }
 
+STRATEGIES = [
+    "BREAKOUT_MOMENTUM",
+    "SWEEP_RETEST",
+    "REVERSAL_BOUNCE",
+]
+
 SENT_SIGNALS = {}
 SYMBOL_COOLDOWN = {}
 ACTIVE_SIGNALS = {}
 
 BLOCKED_SYMBOLS = {}
-SIDE_DISABLED_UNTIL = {
-    "LONG": 0,
-    "SHORT": 0,
-}
+SIDE_DISABLED_UNTIL = {"LONG": 0, "SHORT": 0}
+STRATEGY_DISABLED_UNTIL = {s: 0 for s in STRATEGIES}
 
 STATS = {
     "signals_today": 0,
     "signals_total": 0,
-
-    "long_positive": 0,
-    "long_sl": 0,
-    "long_tp1": 0,
-    "long_tp2": 0,
-    "long_tp3": 0,
-
-    "short_positive": 0,
-    "short_sl": 0,
-    "short_tp1": 0,
-    "short_tp2": 0,
-    "short_tp3": 0,
-
-    "long_consecutive_sl": 0,
-    "short_consecutive_sl": 0,
+    "current_day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
 
     "pair_sl": {},
     "pair_positive": {},
 
-    "current_day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+    "side": {
+        "LONG": {"positive": 0, "sl": 0, "consecutive_sl": 0},
+        "SHORT": {"positive": 0, "sl": 0, "consecutive_sl": 0},
+    },
+
+    "strategy": {
+        s: {"positive": 0, "sl": 0, "consecutive_sl": 0}
+        for s in STRATEGIES
+    }
 }
 
 
@@ -143,6 +126,10 @@ def base_from_symbol(symbol):
     return symbol.replace("-USDT", "").upper()
 
 
+def is_strategy_enabled(strategy):
+    return time.time() >= STRATEGY_DISABLED_UNTIL.get(strategy, 0)
+
+
 def is_side_enabled(side):
     if side == "LONG" and not ENABLE_LONG:
         return False
@@ -150,11 +137,7 @@ def is_side_enabled(side):
     if side == "SHORT" and not ENABLE_SHORT:
         return False
 
-    disabled_until = SIDE_DISABLED_UNTIL.get(side, 0)
-    if time.time() < disabled_until:
-        return False
-
-    return True
+    return time.time() >= SIDE_DISABLED_UNTIL.get(side, 0)
 
 
 def is_symbol_blocked(symbol):
@@ -174,7 +157,6 @@ def is_on_cooldown(symbol):
     last_time = SYMBOL_COOLDOWN.get(symbol)
     if not last_time:
         return False
-
     return time.time() - last_time < SIGNAL_COOLDOWN_SECONDS
 
 
@@ -401,54 +383,12 @@ def btc_market_filter(btc_1h):
     change = ((price - prev) / prev) * 100
 
     if price > ema50 > ema200 and change > 0.10:
-        return "BULLISH", change
+        return "BULLISH"
 
     if price < ema50 < ema200 and change < -0.10:
-        return "BEARISH", change
+        return "BEARISH"
 
-    return "NEUTRAL", change
-
-
-def market_regime_allows(side, btc_status, trend_1h, trend_4h, price, vwap):
-    if side == "SHORT":
-        strong_bull_market = (
-            btc_status == "BULLISH"
-            and trend_1h in ["BULLISH", "SOFT_BULLISH"]
-            and trend_4h in ["BULLISH", "SOFT_BULLISH"]
-            and price > vwap
-        )
-
-        if strong_bull_market:
-            return False
-
-        return True
-
-    if side == "LONG":
-        strong_bear_market = (
-            btc_status == "BEARISH"
-            and trend_1h in ["BEARISH", "SOFT_BEARISH"]
-            and trend_4h in ["BEARISH", "SOFT_BEARISH"]
-            and price < vwap
-        )
-
-        if strong_bear_market:
-            return False
-
-        return True
-
-    return False
-
-
-def candle_body(candle):
-    return abs(candle["close"] - candle["open"])
-
-
-def upper_wick(candle):
-    return candle["high"] - max(candle["open"], candle["close"])
-
-
-def lower_wick(candle):
-    return min(candle["open"], candle["close"]) - candle["low"]
+    return "NEUTRAL"
 
 
 def recent_move_percent(candles, lookback=12):
@@ -464,10 +404,56 @@ def recent_move_percent(candles, lookback=12):
     return ((new_price - old_price) / old_price) * 100
 
 
+def collect_levels(candles_1h, candles_4h):
+    highs = []
+    lows = []
+
+    for c in candles_1h[-140:]:
+        highs.append(c["high"])
+        lows.append(c["low"])
+
+    for c in candles_4h[-80:]:
+        highs.append(c["high"])
+        lows.append(c["low"])
+
+    return highs, lows
+
+
+def nearest_resistance(price, candles_1h, candles_4h, max_distance=1.25):
+    highs, _ = collect_levels(candles_1h, candles_4h)
+
+    levels = []
+
+    for level in highs:
+        distance = abs(price - level) / price * 100
+        if distance <= max_distance and level >= price * 0.985:
+            levels.append(level)
+
+    if not levels:
+        return None
+
+    return min(levels, key=lambda x: abs(price - x))
+
+
+def nearest_support(price, candles_1h, candles_4h, max_distance=1.25):
+    _, lows = collect_levels(candles_1h, candles_4h)
+
+    levels = []
+
+    for level in lows:
+        distance = abs(price - level) / price * 100
+        if distance <= max_distance and level <= price * 1.015:
+            levels.append(level)
+
+    if not levels:
+        return None
+
+    return min(levels, key=lambda x: abs(price - x))
+
+
 def price_move_percent(entry, target, side):
     if side == "LONG":
         return (target - entry) / entry * 100
-
     return (entry - target) / entry * 100
 
 
@@ -480,12 +466,12 @@ def make_tp_by_percent(entry, side, position_percent):
     return entry * (1 - price_move_needed / 100)
 
 
-def apply_min_max_sl(entry, sl, side, min_risk_position_percent, max_risk_position_percent):
+def apply_min_max_sl(entry, sl, side):
     risk_price_percent = abs(entry - sl) / entry * 100
     risk_position_percent = risk_price_percent * LEVERAGE
 
-    if risk_position_percent < min_risk_position_percent:
-        min_price_move = (min_risk_position_percent / LEVERAGE) / 100
+    if risk_position_percent < MIN_RISK_POSITION_PERCENT:
+        min_price_move = (MIN_RISK_POSITION_PERCENT / LEVERAGE) / 100
 
         if side == "LONG":
             sl = entry * (1 - min_price_move)
@@ -495,318 +481,84 @@ def apply_min_max_sl(entry, sl, side, min_risk_position_percent, max_risk_positi
         risk_price_percent = abs(entry - sl) / entry * 100
         risk_position_percent = risk_price_percent * LEVERAGE
 
-    if risk_position_percent > max_risk_position_percent:
+    if risk_position_percent > MAX_RISK_POSITION_PERCENT:
         return None, None
 
     return sl, risk_position_percent
 
 
-def moved_from_level_position_percent(price, level, side):
-    if level <= 0:
-        return 999
+def momentum_confirm(candles_1m, candles_5m, side):
+    closes_1m = [c["close"] for c in candles_1m]
+    closes_5m = [c["close"] for c in candles_5m]
+
+    if len(closes_1m) < 20 or len(closes_5m) < 20:
+        return False
+
+    ema9_1m = ema(closes_1m, 9)[-1]
+    ema9_5m = ema(closes_5m, 9)[-1]
+
+    last_1m = candles_1m[-1]
+    prev_1m = candles_1m[-2]
+    last_5m = candles_5m[-1]
+    prev_5m = candles_5m[-2]
 
     if side == "LONG":
-        move = (price - level) / level * 100
-    else:
-        move = (level - price) / level * 100
-
-    return move * LEVERAGE
-
-
-def collect_levels(candles_1h, candles_4h):
-    highs = []
-    lows = []
-
-    for c in candles_1h[-160:]:
-        highs.append(c["high"])
-        lows.append(c["low"])
-
-    for c in candles_4h[-100:]:
-        highs.append(c["high"])
-        lows.append(c["low"])
-
-    return highs, lows
-
-
-def nearest_resistance(price, candles_1h, candles_4h):
-    highs, _ = collect_levels(candles_1h, candles_4h)
-
-    near = []
-
-    for level in highs:
-        distance = abs(price - level) / price * 100
-        if distance <= LEVEL_DISTANCE_PERCENT and level >= price * 0.990:
-            near.append(level)
-
-    if not near:
-        return None
-
-    return min(near, key=lambda x: abs(price - x))
-
-
-def nearest_support(price, candles_1h, candles_4h):
-    _, lows = collect_levels(candles_1h, candles_4h)
-
-    near = []
-
-    for level in lows:
-        distance = abs(price - level) / price * 100
-        if distance <= LEVEL_DISTANCE_PERCENT and level <= price * 1.010:
-            near.append(level)
-
-    if not near:
-        return None
-
-    return min(near, key=lambda x: abs(price - x))
-
-
-def balanced_1m_confirmation(candles_confirm, side):
-    closes = [c["close"] for c in candles_confirm]
-
-    if len(closes) < 20:
-        return False, False
-
-    ema9 = ema(closes, 9)[-1]
-    last = candles_confirm[-1]
-    prev = candles_confirm[-2]
-
-    if side == "LONG":
-        normal_confirm = (
-            last["close"] > last["open"]
-            and last["close"] > prev["close"]
-            and last["close"] > ema9
+        return (
+            last_1m["close"] > last_1m["open"]
+            and last_1m["close"] > prev_1m["high"]
+            and last_1m["close"] > ema9_1m
+            and last_5m["close"] > last_5m["open"]
+            and last_5m["close"] > prev_5m["close"]
+            and last_5m["close"] > ema9_5m
         )
 
-        strong_confirm = (
-            last["close"] > last["open"]
-            and last["close"] > prev["high"]
-            and last["close"] > ema9
-        )
-
-        return normal_confirm, strong_confirm
-
-    normal_confirm = (
-        last["close"] < last["open"]
-        and last["close"] < prev["close"]
-        and last["close"] < ema9
+    return (
+        last_1m["close"] < last_1m["open"]
+        and last_1m["close"] < prev_1m["low"]
+        and last_1m["close"] < ema9_1m
+        and last_5m["close"] < last_5m["open"]
+        and last_5m["close"] < prev_5m["close"]
+        and last_5m["close"] < ema9_5m
     )
 
-    strong_confirm = (
-        last["close"] < last["open"]
-        and last["close"] < prev["low"]
-        and last["close"] < ema9
-    )
 
-    return normal_confirm, strong_confirm
+def side_stats(side):
+    s = STATS["side"][side]
+    total = s["positive"] + s["sl"]
+    winrate = (s["positive"] / total * 100) if total else 0
+    return s["positive"], s["sl"], total, winrate
 
 
-def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
-    if not is_side_enabled(side):
+def strategy_stats(strategy):
+    s = STATS["strategy"][strategy]
+    total = s["positive"] + s["sl"]
+    winrate = (s["positive"] / total * 100) if total else 0
+    return s["positive"], s["sl"], total, winrate
+
+
+def build_signal_base(symbol, side, strategy, entry, sl, volume_ratio, quality, rr_bonus=0):
+    sl, risk_position_percent = apply_min_max_sl(entry, sl, side)
+
+    if sl is None:
         return None
 
-    if is_symbol_blocked(symbol):
-        return None
+    tp1 = make_tp_by_percent(entry, side, TP1_POSITION_PERCENT)
+    tp2 = make_tp_by_percent(entry, side, TP2_POSITION_PERCENT)
+    tp3 = make_tp_by_percent(entry, side, TP3_POSITION_PERCENT)
 
-    closes_15 = [c["close"] for c in candles_15m]
-    highs_15 = [c["high"] for c in candles_15m]
-    lows_15 = [c["low"] for c in candles_15m]
-    volumes_15 = [c["volume"] for c in candles_15m]
-
-    last = candles_15m[-1]
-    prev = candles_15m[-2]
-    price = last["close"]
-
-    rsi = calculate_rsi(closes_15, 14)
-    atr = calculate_atr(candles_15m, 14)
-    vwap = calculate_vwap_like(candles_15m, 48)
-
-    if rsi is None or atr is None or vwap is None:
-        return None
-
-    trend_1h = trend_ema_50_200(candles_1h)
-    trend_4h = trend_ema_50_200(candles_4h)
-
-    if not market_regime_allows(side, btc_status, trend_1h, trend_4h, price, vwap):
-        return None
-
-    avg_volume = sum(volumes_15[-30:]) / 30
-    volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
-
-    if volume_ratio < MIN_VOLUME_RATIO:
-        return None
-
-    recent_move = recent_move_percent(candles_15m, 12)
-    normal_confirm, strong_confirm = balanced_1m_confirmation(candles_confirm, side)
-
-    if not normal_confirm:
-        return None
-
-    if side == "LONG":
-        if recent_move > -MIN_PREVIOUS_DROP_FOR_LONG:
-            return None
-
-        support = nearest_support(price, candles_1h, candles_4h)
-        if support is None:
-            return None
-
-        moved = moved_from_level_position_percent(price, support, "LONG")
-        if moved > LONG_MAX_ALREADY_MOVED_POSITION_PERCENT:
-            return None
-
-        level_touch = last["low"] <= support * 1.006
-
-        bounce_candle = (
-            last["close"] > last["open"]
-            and last["close"] > prev["close"]
-            and lower_wick(last) >= candle_body(last) * 0.30
-        )
-
-        if not level_touch or not bounce_candle:
-            return None
-
-        if btc_status == "BEARISH":
-            return None
-
-        if trend_4h == "BEARISH" and trend_1h == "BEARISH":
-            return None
-
-        if trend_1h == "BEARISH":
-            return None
-
-        rsi_ok = rsi <= 50
-        vwap_ok = price >= vwap * 0.982 and price <= vwap * 1.018
-
-        sl = min(support - atr * 0.18, min(lows_15[-8:]) - atr * 0.04)
-
-        if sl >= price:
-            return None
-
-        sl, risk_position_percent = apply_min_max_sl(
-            price,
-            sl,
-            "LONG",
-            LONG_MIN_RISK_POSITION_PERCENT,
-            LONG_MAX_RISK_POSITION_PERCENT,
-        )
-
-        if sl is None:
-            return None
-
-        tp1 = make_tp_by_percent(price, "LONG", LONG_TP1_POSITION_PERCENT)
-        tp2 = make_tp_by_percent(price, "LONG", LONG_TP2_POSITION_PERCENT)
-        tp3 = make_tp_by_percent(price, "LONG", LONG_TP3_POSITION_PERCENT)
-
-        checks = [
-            recent_move <= -MIN_PREVIOUS_DROP_FOR_LONG,
-            level_touch,
-            bounce_candle,
-            rsi_ok,
-            vwap_ok,
-            volume_ratio >= MIN_VOLUME_RATIO,
-            btc_status != "BEARISH",
-            trend_1h != "BEARISH",
-            trend_4h != "BEARISH",
-            moved <= LONG_MAX_ALREADY_MOVED_POSITION_PERCENT,
-            normal_confirm,
-        ]
-
-    else:
-        if recent_move < MIN_PREVIOUS_RISE_FOR_SHORT:
-            return None
-
-        resistance = nearest_resistance(price, candles_1h, candles_4h)
-        if resistance is None:
-            return None
-
-        moved = moved_from_level_position_percent(price, resistance, "SHORT")
-        if moved > SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT:
-            return None
-
-        level_touch = last["high"] >= resistance * 0.994
-
-        rejection_candle = (
-            last["close"] < last["open"]
-            and last["close"] < prev["close"]
-            and upper_wick(last) >= candle_body(last) * 0.30
-        )
-
-        if not level_touch or not rejection_candle:
-            return None
-
-        if btc_status == "BULLISH":
-            return None
-
-        if trend_4h == "BULLISH" and trend_1h == "BULLISH":
-            return None
-
-        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
-            return None
-
-        rsi_ok = rsi >= 55
-        vwap_ok = price <= vwap * 1.005 and price >= vwap * 0.982
-
-        sl = max(resistance + atr * 0.18, max(highs_15[-8:]) + atr * 0.04)
-
-        if sl <= price:
-            return None
-
-        sl, risk_position_percent = apply_min_max_sl(
-            price,
-            sl,
-            "SHORT",
-            SHORT_MIN_RISK_POSITION_PERCENT,
-            SHORT_MAX_RISK_POSITION_PERCENT,
-        )
-
-        if sl is None:
-            return None
-
-        tp1 = make_tp_by_percent(price, "SHORT", SHORT_TP1_POSITION_PERCENT)
-        tp2 = make_tp_by_percent(price, "SHORT", SHORT_TP2_POSITION_PERCENT)
-        tp3 = make_tp_by_percent(price, "SHORT", SHORT_TP3_POSITION_PERCENT)
-
-        checks = [
-            recent_move >= MIN_PREVIOUS_RISE_FOR_SHORT,
-            level_touch,
-            rejection_candle,
-            rsi_ok,
-            vwap_ok,
-            volume_ratio >= MIN_VOLUME_RATIO,
-            btc_status != "BULLISH",
-            trend_1h not in ["BULLISH", "SOFT_BULLISH"],
-            trend_4h != "BULLISH",
-            moved <= SHORT_MAX_ALREADY_MOVED_POSITION_PERCENT,
-            normal_confirm,
-        ]
-
-    reward_price_percent = price_move_percent(price, tp1, side)
-    risk_price_percent = abs(price - sl) / price * 100
+    reward_price_percent = price_move_percent(entry, tp1, side)
+    risk_price_percent = abs(entry - sl) / entry * 100
     rr = reward_price_percent / risk_price_percent if risk_price_percent > 0 else 0
 
     if rr < MIN_RR_TO_TP1:
         return None
 
-    passed = sum(1 for ok in checks if ok)
-
-    quality = min(95, 52 + passed * 3)
-
-    if strong_confirm:
-        quality += 3
-
-    if volume_ratio >= A_PLUS_VOLUME_RATIO:
-        quality += 2
-
-    quality = min(95, quality)
+    quality = min(95, quality + rr_bonus)
 
     if quality < MIN_QUALITY:
         return None
 
-    signal_grade = "A+" if strong_confirm and volume_ratio >= A_PLUS_VOLUME_RATIO and quality >= A_PLUS_MIN_QUALITY else "B"
-
-    if TRADE_ONLY_A_PLUS and signal_grade != "A+":
-        return None
-
-    signal_id = f"{symbol}:V20_2_A_PLUS_SOFT:{side}:{round(price, 6)}"
+    signal_id = f"{symbol}:V23:{strategy}:{side}:{round(entry, 6)}"
 
     if signal_id in SENT_SIGNALS:
         return None
@@ -814,9 +566,9 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     return {
         "symbol": symbol,
         "side": side,
+        "strategy": strategy,
         "quality": quality,
-        "grade": signal_grade,
-        "entry": price,
+        "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -828,7 +580,6 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
         "created_at": time.time(),
         "created_at_ms": int(time.time() * 1000),
         "last_checked_ms": int(time.time() * 1000),
-        "status": "ACTIVE",
         "tp1_hit": False,
         "tp2_hit": False,
         "tp3_hit": False,
@@ -837,26 +588,330 @@ def build_signal(symbol, side, candles_15m, candles_confirm, candles_1h, candles
     }
 
 
-def analyze_symbol(symbol, candles_15m, candles_confirm, candles_1h, candles_4h, btc_status):
-    if is_on_cooldown(symbol):
+def build_breakout_strategy(symbol, side, candles_15m, candles_1m, candles_5m, candles_1h, candles_4h, btc_status):
+    strategy = "BREAKOUT_MOMENTUM"
+
+    if not is_strategy_enabled(strategy) or not is_side_enabled(side):
+        return None
+
+    closes = [c["close"] for c in candles_15m]
+    highs = [c["high"] for c in candles_15m]
+    lows = [c["low"] for c in candles_15m]
+    volumes = [c["volume"] for c in candles_15m]
+
+    last = candles_15m[-1]
+    prev = candles_15m[-2]
+    price = last["close"]
+
+    rsi = calculate_rsi(closes)
+    atr = calculate_atr(candles_15m)
+    vwap = calculate_vwap_like(candles_15m)
+
+    if rsi is None or atr is None or vwap is None:
+        return None
+
+    trend_1h = trend_ema_50_200(candles_1h)
+    trend_4h = trend_ema_50_200(candles_4h)
+
+    avg_volume = sum(volumes[-30:]) / 30
+    volume_ratio = last["volume"] / avg_volume if avg_volume else 0
+
+    if volume_ratio < A_PLUS_VOLUME_RATIO:
+        return None
+
+    if not momentum_confirm(candles_1m, candles_5m, side):
+        return None
+
+    if side == "LONG":
+        if btc_status == "BEARISH":
+            return None
+
+        if trend_1h in ["BEARISH", "SOFT_BEARISH"]:
+            return None
+
+        if recent_move_percent(candles_15m, 12) < 0.7:
+            return None
+
+        resistance = nearest_resistance(prev["close"], candles_1h, candles_4h)
+
+        if resistance is None:
+            return None
+
+        breakout = price > resistance * 1.0018 and prev["close"] <= resistance * 1.002
+
+        if not breakout:
+            return None
+
+        if price < vwap:
+            return None
+
+        if rsi < 55 or rsi > 78:
+            return None
+
+        sl = min(resistance - atr * 0.12, min(lows[-6:]) - atr * 0.04)
+        quality = 88
+
+    else:
+        if btc_status == "BULLISH":
+            return None
+
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+            return None
+
+        if recent_move_percent(candles_15m, 12) > -0.7:
+            return None
+
+        support = nearest_support(prev["close"], candles_1h, candles_4h)
+
+        if support is None:
+            return None
+
+        breakout = price < support * 0.9982 and prev["close"] >= support * 0.998
+
+        if not breakout:
+            return None
+
+        if price > vwap:
+            return None
+
+        if rsi > 45 or rsi < 22:
+            return None
+
+        sl = max(support + atr * 0.12, max(highs[-6:]) + atr * 0.04)
+        quality = 88
+
+    if volume_ratio >= 2:
+        quality += 2
+
+    return build_signal_base(symbol, side, strategy, price, sl, volume_ratio, quality)
+
+
+def build_sweep_retest_strategy(symbol, side, candles_15m, candles_1m, candles_5m, candles_1h, candles_4h, btc_status):
+    strategy = "SWEEP_RETEST"
+
+    if not is_strategy_enabled(strategy) or not is_side_enabled(side):
+        return None
+
+    closes = [c["close"] for c in candles_15m]
+    highs = [c["high"] for c in candles_15m]
+    lows = [c["low"] for c in candles_15m]
+    volumes = [c["volume"] for c in candles_15m]
+
+    last = candles_15m[-1]
+    prev = candles_15m[-2]
+    price = last["close"]
+
+    rsi = calculate_rsi(closes)
+    atr = calculate_atr(candles_15m)
+    vwap = calculate_vwap_like(candles_15m)
+
+    if rsi is None or atr is None or vwap is None:
+        return None
+
+    trend_1h = trend_ema_50_200(candles_1h)
+    trend_4h = trend_ema_50_200(candles_4h)
+
+    avg_volume = sum(volumes[-30:]) / 30
+    volume_ratio = last["volume"] / avg_volume if avg_volume else 0
+
+    if volume_ratio < A_PLUS_VOLUME_RATIO:
+        return None
+
+    if not momentum_confirm(candles_1m, candles_5m, side):
+        return None
+
+    if side == "LONG":
+        if btc_status == "BEARISH":
+            return None
+
+        if trend_1h == "BEARISH":
+            return None
+
+        support = nearest_support(price, candles_1h, candles_4h)
+
+        if support is None:
+            return None
+
+        swept = prev["low"] < support * 0.998
+        reclaimed = prev["close"] > support
+        retest_hold = last["low"] >= support * 0.996 and last["close"] > support
+
+        if not swept or not reclaimed or not retest_hold:
+            return None
+
+        if rsi > 55:
+            return None
+
+        if price < vwap * 0.982:
+            return None
+
+        sl = min(prev["low"] - atr * 0.05, min(lows[-8:]) - atr * 0.04)
+        quality = 89
+
+    else:
+        if btc_status == "BULLISH":
+            return None
+
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+            return None
+
+        resistance = nearest_resistance(price, candles_1h, candles_4h)
+
+        if resistance is None:
+            return None
+
+        swept = prev["high"] > resistance * 1.002
+        reclaimed = prev["close"] < resistance
+        retest_hold = last["high"] <= resistance * 1.004 and last["close"] < resistance
+
+        if not swept or not reclaimed or not retest_hold:
+            return None
+
+        if rsi < 50:
+            return None
+
+        if price > vwap * 1.005:
+            return None
+
+        sl = max(prev["high"] + atr * 0.05, max(highs[-8:]) + atr * 0.04)
+        quality = 89
+
+    if volume_ratio >= 2:
+        quality += 2
+
+    return build_signal_base(symbol, side, strategy, price, sl, volume_ratio, quality)
+
+
+def build_reversal_strategy(symbol, side, candles_15m, candles_1m, candles_5m, candles_1h, candles_4h, btc_status):
+    strategy = "REVERSAL_BOUNCE"
+
+    if not is_strategy_enabled(strategy) or not is_side_enabled(side):
+        return None
+
+    closes = [c["close"] for c in candles_15m]
+    highs = [c["high"] for c in candles_15m]
+    lows = [c["low"] for c in candles_15m]
+    volumes = [c["volume"] for c in candles_15m]
+
+    last = candles_15m[-1]
+    prev = candles_15m[-2]
+    price = last["close"]
+
+    rsi = calculate_rsi(closes)
+    atr = calculate_atr(candles_15m)
+    vwap = calculate_vwap_like(candles_15m)
+
+    if rsi is None or atr is None or vwap is None:
+        return None
+
+    trend_1h = trend_ema_50_200(candles_1h)
+
+    avg_volume = sum(volumes[-30:]) / 30
+    volume_ratio = last["volume"] / avg_volume if avg_volume else 0
+
+    if volume_ratio < A_PLUS_VOLUME_RATIO:
+        return None
+
+    if not momentum_confirm(candles_1m, candles_5m, side):
+        return None
+
+    if side == "LONG":
+        if btc_status == "BEARISH":
+            return None
+
+        if trend_1h == "BEARISH":
+            return None
+
+        if recent_move_percent(candles_15m, 12) > -1.5:
+            return None
+
+        support = nearest_support(price, candles_1h, candles_4h)
+
+        if support is None:
+            return None
+
+        touch = last["low"] <= support * 1.004
+        bounce = last["close"] > last["open"] and last["close"] > prev["close"]
+
+        if not touch or not bounce:
+            return None
+
+        if rsi > 50:
+            return None
+
+        sl = min(support - atr * 0.10, min(lows[-8:]) - atr * 0.04)
+        quality = 87
+
+    else:
+        if btc_status == "BULLISH":
+            return None
+
+        if trend_1h in ["BULLISH", "SOFT_BULLISH"]:
+            return None
+
+        if recent_move_percent(candles_15m, 12) < 1.5:
+            return None
+
+        resistance = nearest_resistance(price, candles_1h, candles_4h)
+
+        if resistance is None:
+            return None
+
+        touch = last["high"] >= resistance * 0.996
+        rejection = last["close"] < last["open"] and last["close"] < prev["close"]
+
+        if not touch or not rejection:
+            return None
+
+        if rsi < 58:
+            return None
+
+        if price > vwap * 1.005:
+            return None
+
+        sl = max(resistance + atr * 0.10, max(highs[-8:]) + atr * 0.04)
+        quality = 87
+
+    if volume_ratio >= 2:
+        quality += 2
+
+    return build_signal_base(symbol, side, strategy, price, sl, volume_ratio, quality)
+
+
+def analyze_symbol(symbol, candles_15m, candles_1m, candles_5m, candles_1h, candles_4h, btc_status):
+    if is_symbol_blocked(symbol) or is_on_cooldown(symbol):
         return None
 
     candidates = []
 
-    short_signal = build_signal(symbol, "SHORT", candles_15m, candles_confirm, candles_1h, candles_4h, btc_status)
-    if short_signal:
-        candidates.append(short_signal)
+    for side in ["LONG", "SHORT"]:
+        if not is_side_enabled(side):
+            continue
 
-    long_signal = build_signal(symbol, "LONG", candles_15m, candles_confirm, candles_1h, candles_4h, btc_status)
-    if long_signal:
-        candidates.append(long_signal)
+        for builder in [
+            build_breakout_strategy,
+            build_sweep_retest_strategy,
+            build_reversal_strategy,
+        ]:
+            signal = builder(
+                symbol,
+                side,
+                candles_15m,
+                candles_1m,
+                candles_5m,
+                candles_1h,
+                candles_4h,
+                btc_status,
+            )
+
+            if signal:
+                candidates.append(signal)
 
     if not candidates:
         return None
 
     candidates.sort(
         key=lambda x: (
-            x["grade"] == "A+",
             x["quality"],
             x["rr"],
             x["volume_ratio"],
@@ -871,14 +926,22 @@ def make_signal_message(signal):
     arrow = "📈" if signal["side"] == "LONG" else "📉"
     mode_text = "TEST SIGNAL" if TEST_MODE else "TRADE SIGNAL"
 
+    strategy_icons = {
+        "BREAKOUT_MOMENTUM": "🚀 Breakout Momentum",
+        "SWEEP_RETEST": "🧲 Sweep + Retest",
+        "REVERSAL_BOUNCE": "🔁 Reversal Bounce",
+    }
+
+    strategy_name = strategy_icons.get(signal["strategy"], signal["strategy"])
+
     return f"""
-🎯 <b>V20.2 A+ Professional Soft</b> · <b>{mode_text}</b>
-🔥 <b>A+ SIGNAL ONLY</b>
+🎯 <b>V23 Adaptive Strategy Manager</b> · <b>{mode_text}</b>
+{strategy_name}
 
 {arrow} <b>{signal["side"]} {signal["symbol"].replace("-", "/")}</b> · {TIMEFRAME}
 Качество: <b>{signal["quality"]}%</b>
 
-🎯 Зона входа: <code>{format_price(signal["entry"])}</code>
+🎯 Вход: <code>{format_price(signal["entry"])}</code>
 🛑 SL: <code>{format_price(signal["sl"])}</code>
 ✅ TP1: <code>{format_price(signal["tp1"])}</code>
 ✅ TP2: <code>{format_price(signal["tp2"])}</code>
@@ -889,87 +952,82 @@ def make_signal_message(signal):
 📊 RR до TP1: <b>{signal["rr"]:.2f}</b>
 📊 Volume: x<b>{signal["volume_ratio"]:.2f}</b>
 
-Бот отправляет только A+ сигналы.
-B-сигналы полностью отфильтрованы.
-
-A+ условия смягчены:
-• качество {A_PLUS_MIN_QUALITY}+
-• объём x{A_PLUS_VOLUME_RATIO}+
-
 После TP1 сделка считается позитивной.
 Пара блокируется после 1 SL.
 Направление отключается после 2 SL подряд.
+Стратегия отключается после 2 SL подряд.
 
-⚠️ Не финансовый совет. Сначала тест/минимальная сумма.
+⚠️ Не финансовый совет. Сначала TEST/минимальная сумма.
 """.strip()
-
-
-def prefix_for_side(side):
-    return "long" if side == "LONG" else "short"
-
-
-def side_stats(side):
-    prefix = prefix_for_side(side)
-
-    positive = STATS[f"{prefix}_positive"]
-    negative = STATS[f"{prefix}_sl"]
-    total = positive + negative
-    winrate = (positive / total * 100) if total > 0 else 0
-
-    return positive, negative, total, winrate
 
 
 def apply_adaptive_rules(signal, result):
     side = signal["side"]
+    strategy = signal["strategy"]
     symbol = signal["symbol"]
-    prefix = prefix_for_side(side)
 
     notes = []
 
     if result == "SL" and not signal.get("counted_sl"):
         signal["counted_sl"] = True
 
-        STATS[f"{prefix}_sl"] += 1
-        STATS[f"{prefix}_consecutive_sl"] += 1
+        STATS["side"][side]["sl"] += 1
+        STATS["side"][side]["consecutive_sl"] += 1
+
+        STATS["strategy"][strategy]["sl"] += 1
+        STATS["strategy"][strategy]["consecutive_sl"] += 1
+
         STATS["pair_sl"][symbol] = STATS["pair_sl"].get(symbol, 0) + 1
 
         if STATS["pair_sl"][symbol] >= PAIR_MAX_SL_BEFORE_BLOCK:
             BLOCKED_SYMBOLS[symbol] = time.time() + 86400
             notes.append(f"🚫 Пара {symbol.replace('-', '/')} заблокирована на 24ч после SL.")
 
-        if STATS[f"{prefix}_consecutive_sl"] >= SIDE_MAX_CONSECUTIVE_SL:
-            SIDE_DISABLED_UNTIL[side] = time.time() + SIDE_DISABLE_SECONDS
-            notes.append(f"⛔ {side} отключён на 6 часов: {STATS[f'{prefix}_consecutive_sl']} SL подряд.")
+        if STATS["side"][side]["consecutive_sl"] >= SIDE_MAX_CONSECUTIVE_SL:
+            SIDE_DISABLED_UNTIL[side] = time.time() + DISABLE_SECONDS
+            notes.append(f"⛔ {side} отключён на 6 часов после серии SL.")
 
-    elif result in ["TP1", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2", "TP2", "TP3"]:
-        STATS[f"{prefix}_consecutive_sl"] = 0
+        if STATS["strategy"][strategy]["consecutive_sl"] >= STRATEGY_MAX_CONSECUTIVE_SL:
+            STRATEGY_DISABLED_UNTIL[strategy] = time.time() + DISABLE_SECONDS
+            notes.append(f"⛔ Стратегия {strategy} отключена на 6 часов после серии SL.")
+
+    elif result in ["TP1", "TP2", "TP3", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2"]:
+        STATS["side"][side]["consecutive_sl"] = 0
+        STATS["strategy"][strategy]["consecutive_sl"] = 0
 
         if not signal.get("counted_positive"):
             signal["counted_positive"] = True
-            STATS[f"{prefix}_positive"] += 1
+            STATS["side"][side]["positive"] += 1
+            STATS["strategy"][strategy]["positive"] += 1
             STATS["pair_positive"][symbol] = STATS["pair_positive"].get(symbol, 0) + 1
 
         if result == "TP1":
-            STATS[f"{prefix}_tp1"] += 1
+            STATS["side"][side].setdefault("tp1", 0)
         elif result == "TP2":
-            STATS[f"{prefix}_tp2"] += 1
+            STATS["side"][side].setdefault("tp2", 0)
         elif result == "TP3":
-            STATS[f"{prefix}_tp3"] += 1
+            STATS["side"][side].setdefault("tp3", 0)
 
-    positive, negative, total, winrate = side_stats(side)
+    side_pos, side_sl, side_total, side_wr = side_stats(side)
+    strat_pos, strat_sl, strat_total, strat_wr = strategy_stats(strategy)
 
-    if total >= MIN_CLOSED_TRADES_FOR_SIDE_CHECK and winrate < MIN_SIDE_WINRATE:
-        SIDE_DISABLED_UNTIL[side] = time.time() + SIDE_DISABLE_SECONDS
-        notes.append(f"⛔ {side} отключён на 6 часов: winrate {winrate:.1f}% после {total} закрытых сделок.")
+    if side_total >= MIN_CLOSED_TRADES_FOR_CHECK and side_wr < MIN_WINRATE:
+        SIDE_DISABLED_UNTIL[side] = time.time() + DISABLE_SECONDS
+        notes.append(f"⛔ {side} отключён: winrate {side_wr:.1f}% после {side_total} сделок.")
+
+    if strat_total >= MIN_CLOSED_TRADES_FOR_CHECK and strat_wr < MIN_WINRATE:
+        STRATEGY_DISABLED_UNTIL[strategy] = time.time() + DISABLE_SECONDS
+        notes.append(f"⛔ {strategy} отключена: winrate {strat_wr:.1f}% после {strat_total} сделок.")
 
     return notes
 
 
 def make_result_message(signal, result, price):
+    notes = apply_adaptive_rules(signal, result)
+
     side = signal["side"]
     symbol = signal["symbol"].replace("-", "/")
-
-    notes = apply_adaptive_rules(signal, result)
+    strategy = signal["strategy"]
 
     if result == "SL":
         icon = "❌"
@@ -993,8 +1051,14 @@ def make_result_message(signal, result, price):
         icon = "ℹ️"
         title = result
 
-    long_pos, long_neg, long_total, long_wr = side_stats("LONG")
-    short_pos, short_neg, short_total, short_wr = side_stats("SHORT")
+    long_pos, long_sl, long_total, long_wr = side_stats("LONG")
+    short_pos, short_sl, short_total, short_wr = side_stats("SHORT")
+
+    strategy_lines = []
+    for s in STRATEGIES:
+        p, sl, total, wr = strategy_stats(s)
+        status = "OFF" if time.time() < STRATEGY_DISABLED_UNTIL.get(s, 0) else "ON"
+        strategy_lines.append(f"{s}: {p}/{sl} WR {wr:.1f}% [{status}]")
 
     adaptive_text = ""
     if notes:
@@ -1004,6 +1068,8 @@ def make_result_message(signal, result, price):
 {icon} <b>{title}</b>
 
 <b>{side} {symbol}</b>
+Стратегия: <b>{strategy}</b>
+
 Вход: <code>{format_price(signal["entry"])}</code>
 Текущая/уровень: <code>{format_price(price)}</code>
 
@@ -1012,17 +1078,12 @@ TP2: <code>{format_price(signal["tp2"])}</code>
 TP3: <code>{format_price(signal["tp3"])}</code>
 SL: <code>{format_price(signal["sl"])}</code>
 
-📊 <b>Статистика:</b>
+📊 <b>Направления:</b>
+📈 LONG: {long_pos} позитив / {long_sl} SL / WR {long_wr:.1f}%
+📉 SHORT: {short_pos} позитив / {short_sl} SL / WR {short_wr:.1f}%
 
-📈 LONG:
-Позитивные: <b>{long_pos}</b>
-SL до TP1: <b>{long_neg}</b>
-Winrate: <b>{long_wr:.1f}%</b>
-
-📉 SHORT:
-Позитивные: <b>{short_pos}</b>
-SL до TP1: <b>{short_neg}</b>
-Winrate: <b>{short_wr:.1f}%</b>
+🧠 <b>Стратегии:</b>
+{chr(10).join(strategy_lines)}
 
 🚫 Заблокировано пар: <b>{len(BLOCKED_SYMBOLS)}</b>
 {adaptive_text}
@@ -1096,8 +1157,7 @@ def check_hit(signal, candles):
                 signal["tp3_hit"] = True
                 return "TP3", signal["tp3"]
 
-    last_price = new_candles[-1]["close"]
-    return None, last_price
+    return None, new_candles[-1]["close"]
 
 
 async def track_active_signals(session):
@@ -1146,17 +1206,16 @@ async def scan_loop():
     async with aiohttp.ClientSession() as session:
         await send_telegram_message(
             session,
-            f"✅ V20.2 A+ Professional Soft Bot запущен.\n"
+            f"✅ V23 Adaptive Strategy Manager Bot запущен.\n"
             f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
-            f"Бот отправляет только A+ сигналы.\n"
-            f"B-сигналы полностью отфильтрованы.\n"
-            f"MIN_QUALITY: {MIN_QUALITY}\n"
-            f"A+ Quality: {A_PLUS_MIN_QUALITY}+\n"
-            f"Volume filter: x{MIN_VOLUME_RATIO}\n"
-            f"A+ Volume: x{A_PLUS_VOLUME_RATIO}+\n"
+            f"Стратегии: Breakout Momentum, Sweep + Retest, Reversal Bounce.\n"
+            f"Бот сам отключает слабые стратегии, направления и пары.\n"
+            f"После TP1 сделка считается позитивной.\n"
             f"Пара блокируется после {PAIR_MAX_SL_BEFORE_BLOCK} SL.\n"
             f"Направление отключается после {SIDE_MAX_CONSECUTIVE_SL} SL подряд.\n"
-            f"Плечо max.: {LEVERAGE}x."
+            f"Стратегия отключается после {STRATEGY_MAX_CONSECUTIVE_SL} SL подряд.\n"
+            f"Плечо max.: {LEVERAGE}x.\n"
+            f"Сначала тестируй минимальной суммой."
         )
 
         last_track_time = 0
@@ -1178,9 +1237,7 @@ async def scan_loop():
                     await asyncio.sleep(60)
                     continue
 
-                btc_status, btc_change = btc_market_filter(btc_1h)
-                print(f"BTC status: {btc_status}, change: {btc_change:.2f}%")
-
+                btc_status = btc_market_filter(btc_1h)
                 symbols = await get_symbols(session)
 
                 checked = 0
@@ -1198,14 +1255,16 @@ async def scan_loop():
                     checked += 1
 
                     try:
-                        candles_15m = await get_klines(session, symbol, interval=TIMEFRAME, limit=260)
-                        candles_confirm = await get_klines(session, symbol, interval=CONFIRM_TIMEFRAME, limit=260)
-                        candles_1h = await get_klines(session, symbol, interval=TREND_TIMEFRAME, limit=260)
-                        candles_4h = await get_klines(session, symbol, interval=MACRO_TIMEFRAME, limit=260)
+                        candles_15m = await get_klines(session, symbol, TIMEFRAME, 260)
+                        candles_1m = await get_klines(session, symbol, CONFIRM_1M, 120)
+                        candles_5m = await get_klines(session, symbol, CONFIRM_5M, 160)
+                        candles_1h = await get_klines(session, symbol, TREND_TIMEFRAME, 260)
+                        candles_4h = await get_klines(session, symbol, MACRO_TIMEFRAME, 260)
 
                         if (
                             candles_15m is None
-                            or candles_confirm is None
+                            or candles_1m is None
+                            or candles_5m is None
                             or candles_1h is None
                             or candles_4h is None
                         ):
@@ -1214,7 +1273,8 @@ async def scan_loop():
                         signal = analyze_symbol(
                             symbol,
                             candles_15m,
-                            candles_confirm,
+                            candles_1m,
+                            candles_5m,
                             candles_1h,
                             candles_4h,
                             btc_status,
@@ -1233,9 +1293,10 @@ async def scan_loop():
                         ACTIVE_SIGNALS[signal["signal_id"]] = signal
                         set_cooldown(symbol)
 
-                        found += 1
                         STATS["signals_total"] += 1
                         STATS["signals_today"] += 1
+
+                        found += 1
 
                         await asyncio.sleep(2)
 
@@ -1245,14 +1306,10 @@ async def scan_loop():
                     except Exception as e:
                         print(f"Error with {symbol}:", e)
 
-                long_pos, long_neg, long_total, long_wr = side_stats("LONG")
-                short_pos, short_neg, short_total, short_wr = side_stats("SHORT")
-
                 print(
                     f"Scan finished. Checked: {checked}. "
-                    f"Signals found: {found}. Active: {len(ACTIVE_SIGNALS)}. "
-                    f"LONG WR: {long_wr:.1f}% | SHORT WR: {short_wr:.1f}% | "
-                    f"Blocked: {len(BLOCKED_SYMBOLS)}"
+                    f"Found: {found}. Active: {len(ACTIVE_SIGNALS)}. "
+                    f"Blocked: {len(BLOCKED_SYMBOLS)}."
                 )
 
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
