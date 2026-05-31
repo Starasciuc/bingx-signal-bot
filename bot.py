@@ -2,6 +2,7 @@ import os
 import time
 import json
 import random
+import asyncio
 import requests
 from typing import Optional, Dict, List
 
@@ -9,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -44,6 +45,12 @@ STRATEGY_DISABLE_SECONDS = int(os.getenv("STRATEGY_DISABLE_SECONDS", "21600"))
 PAIR_MAX_SL = int(os.getenv("PAIR_MAX_SL", "1"))
 SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
 STRATEGY_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_SL", "2"))
+
+AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
+AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
+
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "1500"))   # 25 минут
+AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "120"))  # 2 минуты
 
 STATE_FILE = "bot_state.json"
 
@@ -116,6 +123,12 @@ def default_state():
             },
             "pair_sl": {},
             "pair_positive": {},
+        },
+        "auto": {
+            "last_scan_time": 0,
+            "last_track_time": 0,
+            "last_scan_result": None,
+            "last_track_result": None,
         }
     }
 
@@ -133,6 +146,9 @@ def load_state():
         for key, value in base.items():
             if key not in state:
                 state[key] = value
+
+        if "auto" not in state:
+            state["auto"] = base["auto"]
 
         return state
 
@@ -968,6 +984,13 @@ def send_telegram_message(text: str) -> dict:
         }
 
 
+def save_signal(signal: dict):
+    STATE["active_signals"][signal["id"]] = signal
+    STATE["sent_signals"][signal["id"]] = now_ts()
+    set_cooldown(signal["symbol"])
+    save_state(STATE)
+
+
 def apply_result(signal: dict, result: str):
     side = signal["direction"]
     strategy = signal["strategy"]
@@ -1130,93 +1153,7 @@ SL: <code>{signal['sl']}</code>
 """.strip()
 
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Professional Adaptive Futures Bot</title>
-</head>
-<body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot работает</h1>
-    <pre>
-GET /health
-GET /scan?send_to_telegram=false
-GET /auto-signal?symbol=NEAR/USDT
-GET /track
-GET /stats
-GET /test-telegram
-GET /reset-state
-    </pre>
-    <p>Start Command:</p>
-    <pre>uvicorn bot:app --host 0.0.0.0 --port $PORT</pre>
-</body>
-</html>
-"""
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "Professional Adaptive Futures Bot",
-        "test_mode": TEST_MODE,
-        "min_score": MIN_SCORE,
-        "min_volume_ratio": MIN_VOLUME_RATIO,
-        "active_signals": len(STATE["active_signals"]),
-        "blocked_symbols": len(STATE["blocked_symbols"]),
-    }
-
-
-@app.get("/test-telegram")
-def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot подключён к Telegram.")
-
-
-@app.get("/auto-signal")
-def auto_signal(
-    symbol: str = Query(default="NEAR/USDT"),
-    direction: Optional[str] = Query(default=None),
-    deposit: float = Query(default=DEFAULT_DEPOSIT),
-    risk_percent: float = Query(default=DEFAULT_RISK_PERCENT),
-    send_to_telegram: bool = Query(default=False)
-):
-    signal = analyze_symbol(symbol, direction, deposit, risk_percent)
-
-    if not signal:
-        return {
-            "ok": False,
-            "symbol": display_symbol(symbol),
-            "direction": direction,
-            "message": "Сильного сигнала нет. Вход запрещён."
-        }
-
-    message = build_message(signal)
-
-    telegram = None
-
-    if send_to_telegram:
-        telegram = send_telegram_message(message)
-        STATE["active_signals"][signal["id"]] = signal
-        STATE["sent_signals"][signal["id"]] = now_ts()
-        set_cooldown(signal["symbol"])
-        save_state(STATE)
-
-    return {
-        "ok": True,
-        "signal": signal,
-        "message": message,
-        "telegram": telegram,
-    }
-
-
-@app.get("/scan")
-def scan(
-    send_to_telegram: bool = Query(default=False),
-    deposit: float = Query(default=DEFAULT_DEPOSIT),
-    risk_percent: float = Query(default=DEFAULT_RISK_PERCENT)
-):
+def scan_best_signal(deposit: float, risk_percent: float) -> dict:
     symbols = get_symbols()
 
     best = None
@@ -1246,32 +1183,21 @@ def scan(
             "message": "Сильных сигналов сейчас нет."
         }
 
-    message = build_message(best)
-
-    telegram = None
-
-    if send_to_telegram:
-        telegram = send_telegram_message(message)
-        STATE["active_signals"][best["id"]] = best
-        STATE["sent_signals"][best["id"]] = now_ts()
-        set_cooldown(best["symbol"])
-        save_state(STATE)
-
     return {
         "ok": True,
         "checked": checked,
         "signal": best,
-        "message": message,
-        "telegram": telegram,
+        "message": build_message(best),
     }
 
 
-@app.get("/track")
-def track(send_to_telegram: bool = Query(default=True)):
+def track_active_signals(send_to_telegram: bool = True) -> dict:
     if not STATE["active_signals"]:
         return {
             "ok": True,
-            "message": "Активных сигналов нет."
+            "message": "Активных сигналов нет.",
+            "results": [],
+            "active_left": 0,
         }
 
     results = []
@@ -1321,6 +1247,180 @@ def track(send_to_telegram: bool = Query(default=True)):
         "results": results,
         "active_left": len(STATE["active_signals"]),
     }
+
+
+async def auto_worker():
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            current_time = now_ts()
+
+            if AUTO_TRACK_ENABLED:
+                last_track = STATE["auto"].get("last_track_time", 0)
+
+                if current_time - last_track >= AUTO_TRACK_SECONDS:
+                    result = track_active_signals(send_to_telegram=True)
+                    STATE["auto"]["last_track_time"] = current_time
+                    STATE["auto"]["last_track_result"] = result
+                    save_state(STATE)
+
+            if AUTO_SCAN_ENABLED:
+                last_scan = STATE["auto"].get("last_scan_time", 0)
+
+                if current_time - last_scan >= AUTO_SCAN_SECONDS:
+                    result = scan_best_signal(DEFAULT_DEPOSIT, DEFAULT_RISK_PERCENT)
+                    STATE["auto"]["last_scan_time"] = current_time
+                    STATE["auto"]["last_scan_result"] = result
+
+                    if result.get("ok"):
+                        signal = result["signal"]
+                        message = result["message"]
+
+                        telegram = send_telegram_message(message)
+                        result["telegram"] = telegram
+
+                        save_signal(signal)
+
+                    save_state(STATE)
+
+            await asyncio.sleep(15)
+
+        except Exception as e:
+            STATE["auto"]["last_error"] = str(e)
+            save_state(STATE)
+            await asyncio.sleep(30)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(auto_worker())
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Professional Adaptive Futures Bot AUTO</title>
+</head>
+<body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
+    <h1>✅ Professional Adaptive Futures Bot AUTO работает</h1>
+    <pre>
+GET /health
+GET /scan?send_to_telegram=false
+GET /auto-signal?symbol=NEAR/USDT
+GET /track
+GET /stats
+GET /auto-status
+GET /test-telegram
+GET /reset-state
+    </pre>
+    <p>Автоматический режим:</p>
+    <pre>
+AUTO_SCAN_ENABLED=true
+AUTO_TRACK_ENABLED=true
+AUTO_SCAN_SECONDS=1500
+AUTO_TRACK_SECONDS=120
+    </pre>
+    <p>Start Command:</p>
+    <pre>uvicorn bot:app --host 0.0.0.0 --port $PORT</pre>
+</body>
+</html>
+"""
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "Professional Adaptive Futures Bot AUTO",
+        "test_mode": TEST_MODE,
+        "min_score": MIN_SCORE,
+        "min_volume_ratio": MIN_VOLUME_RATIO,
+        "auto_scan_enabled": AUTO_SCAN_ENABLED,
+        "auto_track_enabled": AUTO_TRACK_ENABLED,
+        "auto_scan_seconds": AUTO_SCAN_SECONDS,
+        "auto_track_seconds": AUTO_TRACK_SECONDS,
+        "active_signals": len(STATE["active_signals"]),
+        "blocked_symbols": len(STATE["blocked_symbols"]),
+    }
+
+
+@app.get("/auto-status")
+def auto_status():
+    return {
+        "ok": True,
+        "auto": STATE.get("auto", {}),
+        "active_signals": len(STATE["active_signals"]),
+        "blocked_symbols": len(STATE["blocked_symbols"]),
+    }
+
+
+@app.get("/test-telegram")
+def test_telegram():
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO подключён к Telegram.")
+
+
+@app.get("/auto-signal")
+def auto_signal(
+    symbol: str = Query(default="NEAR/USDT"),
+    direction: Optional[str] = Query(default=None),
+    deposit: float = Query(default=DEFAULT_DEPOSIT),
+    risk_percent: float = Query(default=DEFAULT_RISK_PERCENT),
+    send_to_telegram: bool = Query(default=False)
+):
+    signal = analyze_symbol(symbol, direction, deposit, risk_percent)
+
+    if not signal:
+        return {
+            "ok": False,
+            "symbol": display_symbol(symbol),
+            "direction": direction,
+            "message": "Сильного сигнала нет. Вход запрещён."
+        }
+
+    message = build_message(signal)
+
+    telegram = None
+
+    if send_to_telegram:
+        telegram = send_telegram_message(message)
+        save_signal(signal)
+
+    return {
+        "ok": True,
+        "signal": signal,
+        "message": message,
+        "telegram": telegram,
+    }
+
+
+@app.get("/scan")
+def scan(
+    send_to_telegram: bool = Query(default=False),
+    deposit: float = Query(default=DEFAULT_DEPOSIT),
+    risk_percent: float = Query(default=DEFAULT_RISK_PERCENT)
+):
+    result = scan_best_signal(deposit, risk_percent)
+
+    if not result.get("ok"):
+        return result
+
+    telegram = None
+
+    if send_to_telegram:
+        telegram = send_telegram_message(result["message"])
+        save_signal(result["signal"])
+
+    result["telegram"] = telegram
+    return result
+
+
+@app.get("/track")
+def track(send_to_telegram: bool = Query(default=True)):
+    return track_active_signals(send_to_telegram=send_to_telegram)
 
 
 @app.get("/stats")
