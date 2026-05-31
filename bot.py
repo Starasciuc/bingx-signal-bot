@@ -10,13 +10,26 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="BingX Fast Futures Signal Bot")
 
 
+# =========================
+# TELEGRAM CONFIG
+# =========================
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+AUTO_SEND_STARTUP_SIGNAL = os.getenv("AUTO_SEND_STARTUP_SIGNAL", "true").lower()
 
+
+# =========================
+# TYPES
+# =========================
 
 Direction = Literal["LONG", "SHORT"]
 SignalStatus = Literal["ACTIVE", "WAIT", "FAKEOUT_RISK", "CANCELLED"]
 
+
+# =========================
+# INPUT MODEL
+# =========================
 
 class SignalInput(BaseModel):
     symbol: str = Field(default="NEAR/USDT")
@@ -56,6 +69,10 @@ class SignalInput(BaseModel):
 
     send_to_telegram: bool = Field(default=False)
 
+
+# =========================
+# SCORE LOGIC
+# =========================
 
 def calculate_score(data: SignalInput) -> int:
     score = 0
@@ -113,6 +130,10 @@ def detect_status(data: SignalInput, score: int) -> SignalStatus:
     return "CANCELLED"
 
 
+# =========================
+# RISK LOGIC
+# =========================
+
 def calculate_position(data: SignalInput) -> dict:
     avg_entry = (data.entry_min + data.entry_max) / 2
     risk_amount = data.deposit * data.risk_percent / 100
@@ -163,6 +184,10 @@ def calculate_tps(data: SignalInput) -> dict:
         "tp3": round(tp3, 6),
     }
 
+
+# =========================
+# MESSAGE FORMAT
+# =========================
 
 def status_emoji(status: str) -> str:
     if status == "ACTIVE":
@@ -246,11 +271,21 @@ Price back behind entry level / BTC against / CVD opposite / absorption detected
     return message
 
 
+# =========================
+# TELEGRAM
+# =========================
+
 def send_telegram_message(text: str) -> dict:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN:
         return {
             "ok": False,
-            "error": "TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не указаны"
+            "error": "TELEGRAM_BOT_TOKEN не указан в Render Environment Variables"
+        }
+
+    if not TELEGRAM_CHAT_ID:
+        return {
+            "ok": False,
+            "error": "TELEGRAM_CHAT_ID не указан в Render Environment Variables"
         }
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -270,6 +305,44 @@ def send_telegram_message(text: str) -> dict:
             "error": str(e)
         }
 
+
+# =========================
+# AUTO SEND ON STARTUP
+# =========================
+
+@app.on_event("startup")
+def send_startup_signal():
+    print("Bot startup started.")
+
+    if AUTO_SEND_STARTUP_SIGNAL != "true":
+        print("AUTO_SEND_STARTUP_SIGNAL is disabled.")
+        return
+
+    data = SignalInput(
+        symbol="NEAR/USDT",
+        direction="LONG",
+        entry_min=7.10,
+        entry_max=7.15,
+        stop_loss=7.03,
+        tp1_percent=4,
+        tp2_percent=8,
+        tp3_percent=15,
+        deposit=1000,
+        risk_percent=0.5,
+        leverage_min=5,
+        leverage_max=10,
+        send_to_telegram=False
+    )
+
+    message = build_message(data)
+    result = send_telegram_message(message)
+
+    print("Startup Telegram result:", result)
+
+
+# =========================
+# ROUTES
+# =========================
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -387,6 +460,10 @@ def create_signal(data: SignalInput):
         "telegram": telegram_result
     }
 
+
+# =========================
+# RUN SERVER
+# =========================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
