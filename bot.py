@@ -4,7 +4,7 @@ import json
 import random
 import asyncio
 import requests
-from typing import Optional, Dict, List
+from typing import Optional, List
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
@@ -49,8 +49,8 @@ STRATEGY_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_SL", "2"))
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "1500"))   # 25 минут
-AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "120"))  # 2 минуты
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "1500"))
+AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "120"))
 
 STATE_FILE = "bot_state.json"
 
@@ -129,6 +129,7 @@ def default_state():
             "last_track_time": 0,
             "last_scan_result": None,
             "last_track_result": None,
+            "last_error": None,
         }
     }
 
@@ -1294,6 +1295,18 @@ async def auto_worker():
 
 @app.on_event("startup")
 async def startup_event():
+    text = (
+        "✅ Professional Adaptive Futures Bot AUTO запущен.\n\n"
+        f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
+        f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
+        f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
+        f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
+        f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
+        "Бот будет сам искать сигналы и отслеживать TP/SL."
+    )
+
+    send_telegram_message(text)
+
     asyncio.create_task(auto_worker())
 
 
