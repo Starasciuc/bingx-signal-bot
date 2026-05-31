@@ -1,42 +1,30 @@
 import os
-from typing import Literal, Optional
-
 import requests
+import uvicorn
+from typing import Literal
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="Fast Futures Signal Bot")
+app = FastAPI(title="BingX Fast Futures Signal Bot")
 
-
-# =========================
-# TELEGRAM CONFIG
-# =========================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
-# =========================
-# TYPES
-# =========================
-
 Direction = Literal["LONG", "SHORT"]
 SignalStatus = Literal["ACTIVE", "WAIT", "FAKEOUT_RISK", "CANCELLED"]
 
 
-# =========================
-# INPUT MODEL
-# =========================
-
-class FuturesSignalInput(BaseModel):
+class SignalInput(BaseModel):
     symbol: str = Field(default="NEAR/USDT")
     direction: Direction = Field(default="LONG")
 
-    entry_min: float = Field(default=0.0)
-    entry_max: float = Field(default=0.0)
-    stop_loss: float = Field(default=0.0)
+    entry_min: float = Field(default=7.10)
+    entry_max: float = Field(default=7.15)
+    stop_loss: float = Field(default=7.03)
 
     tp1_percent: float = Field(default=4.0)
     tp2_percent: float = Field(default=8.0)
@@ -67,110 +55,67 @@ class FuturesSignalInput(BaseModel):
     volume_weak: bool = Field(default=False)
 
     send_to_telegram: bool = Field(default=False)
-    compact: bool = Field(default=True)
 
 
-# =========================
-# SCORE LOGIC
-# =========================
-
-def calculate_score(data: FuturesSignalInput) -> int:
+def calculate_score(data: SignalInput) -> int:
     score = 0
 
     if data.trend_confirmed:
         score += 20
-
     if data.volume_confirmed:
         score += 15
-
     if data.cvd_confirmed:
         score += 15
-
     if data.btc_confirmed:
         score += 15
-
     if data.orderbook_clear:
         score += 10
-
     if data.oi_confirmed:
         score += 10
-
     if data.funding_ok:
         score += 5
-
     if not data.fakeout_detected:
         score += 5
-
     if not data.absorption_detected:
         score += 5
 
     if data.btc_opposite_move:
         score -= 20
-
     if data.cvd_opposite:
         score -= 20
-
     if data.volume_weak:
         score -= 15
-
     if data.candle_closed_against_signal:
         score -= 30
 
     return max(0, min(score, 100))
 
 
-def detect_status(data: FuturesSignalInput, score: int) -> SignalStatus:
-    if data.candle_closed_against_signal:
-        return "CANCELLED"
-
+def detect_status(data: SignalInput, score: int) -> SignalStatus:
     if data.fakeout_detected:
         return "FAKEOUT_RISK"
-
     if data.absorption_detected:
         return "FAKEOUT_RISK"
-
     if data.btc_opposite_move:
         return "FAKEOUT_RISK"
-
     if data.cvd_opposite:
         return "FAKEOUT_RISK"
-
+    if data.candle_closed_against_signal:
+        return "CANCELLED"
     if data.volume_weak:
         return "WAIT"
 
     if score >= 80:
         return "ACTIVE"
-
     if score >= 65:
         return "WAIT"
 
     return "CANCELLED"
 
 
-# =========================
-# RISK / TP LOGIC
-# =========================
-
-def calculate_position(data: FuturesSignalInput) -> dict:
-    avg_entry = 0.0
-
-    if data.entry_min > 0 and data.entry_max > 0:
-        avg_entry = (data.entry_min + data.entry_max) / 2
-
+def calculate_position(data: SignalInput) -> dict:
+    avg_entry = (data.entry_min + data.entry_max) / 2
     risk_amount = data.deposit * data.risk_percent / 100
-
-    if avg_entry <= 0 or data.stop_loss <= 0:
-        return {
-            "avg_entry": round(avg_entry, 8),
-            "risk_amount": round(risk_amount, 2),
-            "stop_distance_percent": None,
-            "position_size_usdt": None,
-            "coin_amount": None,
-            "margin_5x": None,
-            "margin_10x": None,
-            "margin_20x": None,
-            "error": "Entry или Stop Loss не указаны"
-        }
 
     if data.direction == "LONG":
         stop_distance = avg_entry - data.stop_loss
@@ -179,42 +124,28 @@ def calculate_position(data: FuturesSignalInput) -> dict:
 
     if stop_distance <= 0:
         return {
-            "avg_entry": round(avg_entry, 8),
+            "error": "Stop Loss стоит неправильно для выбранного направления",
             "risk_amount": round(risk_amount, 2),
-            "stop_distance_percent": None,
-            "position_size_usdt": None,
-            "coin_amount": None,
-            "margin_5x": None,
-            "margin_10x": None,
-            "margin_20x": None,
-            "error": "Stop Loss стоит неправильно для выбранного направления"
         }
 
-    stop_distance_percent = abs(stop_distance / avg_entry) * 100
     coin_amount = risk_amount / stop_distance
     position_size_usdt = coin_amount * avg_entry
+    stop_distance_percent = abs(stop_distance / avg_entry) * 100
 
     return {
-        "avg_entry": round(avg_entry, 8),
+        "error": None,
+        "avg_entry": round(avg_entry, 6),
         "risk_amount": round(risk_amount, 2),
         "stop_distance_percent": round(stop_distance_percent, 2),
         "position_size_usdt": round(position_size_usdt, 2),
-        "coin_amount": round(coin_amount, 8),
+        "coin_amount": round(coin_amount, 6),
         "margin_5x": round(position_size_usdt / 5, 2),
         "margin_10x": round(position_size_usdt / 10, 2),
         "margin_20x": round(position_size_usdt / 20, 2),
-        "error": None
     }
 
 
-def calculate_tps(data: FuturesSignalInput) -> dict:
-    if data.entry_min <= 0 or data.entry_max <= 0:
-        return {
-            "tp1": 0.0,
-            "tp2": 0.0,
-            "tp3": 0.0
-        }
-
+def calculate_tps(data: SignalInput) -> dict:
     if data.direction == "LONG":
         base = data.entry_max
         tp1 = base * (1 + data.tp1_percent / 100)
@@ -227,73 +158,60 @@ def calculate_tps(data: FuturesSignalInput) -> dict:
         tp3 = base * (1 - data.tp3_percent / 100)
 
     return {
-        "tp1": round(tp1, 8),
-        "tp2": round(tp2, 8),
-        "tp3": round(tp3, 8)
+        "tp1": round(tp1, 6),
+        "tp2": round(tp2, 6),
+        "tp3": round(tp3, 6),
     }
 
 
-# =========================
-# MESSAGE HELPERS
-# =========================
-
-def status_emoji(status: SignalStatus) -> str:
+def status_emoji(status: str) -> str:
     if status == "ACTIVE":
         return "🟢"
-
     if status == "WAIT":
         return "🟡"
-
     if status == "FAKEOUT_RISK":
         return "⚠️"
-
     return "🔴"
 
 
-def direction_emoji(direction: Direction) -> str:
+def direction_emoji(direction: str) -> str:
     return "📈" if direction == "LONG" else "📉"
 
 
-def bool_icon(value: bool) -> str:
+def icon(value: bool) -> str:
     return "✅" if value else "❌"
 
 
-def build_verdict(status: SignalStatus) -> str:
+def verdict(status: str) -> str:
     if status == "ACTIVE":
         return "Вход разрешён. Сигнал подтверждён."
-
     if status == "WAIT":
         return "Ждём подтверждения. Вход пока запрещён."
-
     if status == "FAKEOUT_RISK":
         return "Вход запрещён. Есть риск ложного движения / откупа."
-
     return "Сигнал отменён. Условия входа сломаны."
 
 
-def build_compact_message(data: FuturesSignalInput) -> str:
+def build_message(data: SignalInput) -> str:
     score = calculate_score(data)
     status = detect_status(data, score)
     pos = calculate_position(data)
     tps = calculate_tps(data)
 
-    emoji = status_emoji(status)
-    dir_emoji = direction_emoji(data.direction)
-
-    if pos["error"]:
-        risk_line = f"⚠️ RM Error: {pos['error']}"
-        size_line = ""
+    if pos.get("error"):
+        risk_text = f"⚠️ RM Error: {pos['error']}"
+        size_text = ""
     else:
-        risk_line = f"⚠️ Risk: {data.risk_percent}% = {pos['risk_amount']} USDT"
-        size_line = (
+        risk_text = f"⚠️ Risk: {data.risk_percent}% = {pos['risk_amount']} USDT"
+        size_text = (
             f"📦 Position: {pos['position_size_usdt']} USDT\n"
             f"💵 Margin: {pos['margin_5x']} USDT x5 / "
             f"{pos['margin_10x']} USDT x10 / "
             f"{pos['margin_20x']} USDT x20"
         )
 
-    return f"""
-{emoji} #{data.symbol} {data.direction} {dir_emoji}
+    message = f"""
+{status_emoji(status)} #{data.symbol} {data.direction} {direction_emoji(data.direction)}
 
 📊 Status: {status}
 🎯 Score: {score}/100
@@ -308,133 +226,25 @@ def build_compact_message(data: FuturesSignalInput) -> str:
 🚀 TP3: {tps['tp3']}  (+{data.tp3_percent}%+)
 
 ⚙️ Leverage: x{data.leverage_min}–x{data.leverage_max}
-{risk_line}
-{size_line}
+{risk_text}
+{size_text}
 
 ✅ Confirm:
-Trend {bool_icon(data.trend_confirmed)} | Volume {bool_icon(data.volume_confirmed)} | CVD {bool_icon(data.cvd_confirmed)}
-BTC {bool_icon(data.btc_confirmed)} | OI {bool_icon(data.oi_confirmed)} | OB {bool_icon(data.orderbook_clear)}
+Trend {icon(data.trend_confirmed)} | Volume {icon(data.volume_confirmed)} | CVD {icon(data.cvd_confirmed)}
+BTC {icon(data.btc_confirmed)} | OI {icon(data.oi_confirmed)} | OB {icon(data.orderbook_clear)}
 
 🛡 Fakeout:
 Fakeout {"❌" if data.fakeout_detected else "✅"} | Absorption {"❌" if data.absorption_detected else "✅"} | BTC Opposite {"❌" if data.btc_opposite_move else "✅"}
 
 🧠 Verdict:
-{build_verdict(status)}
+{verdict(status)}
 
 ❌ Cancel:
 Price back behind entry level / BTC against / CVD opposite / absorption detected
 """.strip()
 
+    return message
 
-def build_full_message(data: FuturesSignalInput) -> str:
-    score = calculate_score(data)
-    status = detect_status(data, score)
-    pos = calculate_position(data)
-    tps = calculate_tps(data)
-
-    emoji = status_emoji(status)
-    dir_emoji = direction_emoji(data.direction)
-
-    if pos["error"]:
-        risk_block = f"""
-🧮 Риск-менеджмент:
-• Депозит: {data.deposit} USDT
-• Риск: {data.risk_percent}%
-• Максимальная потеря: {pos['risk_amount']} USDT
-• Ошибка: {pos['error']}
-"""
-    else:
-        risk_block = f"""
-🧮 Риск-менеджмент:
-• Депозит: {data.deposit} USDT
-• Риск на сделку: {data.risk_percent}%
-• Максимальная потеря: {pos['risk_amount']} USDT
-• Средний вход: {pos['avg_entry']}
-• Дистанция до SL: {pos['stop_distance_percent']}%
-• Размер позиции: {pos['position_size_usdt']} USDT
-• Количество монет: {pos['coin_amount']}
-
-💵 Маржа:
-• x5: {pos['margin_5x']} USDT
-• x10: {pos['margin_10x']} USDT
-• x20: {pos['margin_20x']} USDT
-"""
-
-    return f"""
-━━━━━━━━━━━━━━━━━━━━
-{emoji} {data.symbol} — {data.direction} {dir_emoji}
-━━━━━━━━━━━━━━━━━━━━
-
-📊 Статус: {status}
-🎯 Score: {score}/100
-⏱ Входной TF: {data.timeframe_entry}
-🔎 Фильтр тренда: {data.timeframe_filter}
-
-📍 Зона входа:
-{data.entry_min} — {data.entry_max}
-
-🛑 Stop Loss:
-{data.stop_loss}
-
-🎯 Take Profit:
-TP1: {tps['tp1']}  (+{data.tp1_percent}%)
-TP2: {tps['tp2']}  (+{data.tp2_percent}%)
-TP3: {tps['tp3']}  (+{data.tp3_percent}%+)
-
-⚙️ Плечо:
-Рекомендовано: x{data.leverage_min}–x{data.leverage_max}
-
-{risk_block}
-
-━━━━━━━━━━━━━━━━━━━━
-✅ Подтверждения:
-━━━━━━━━━━━━━━━━━━━━
-{bool_icon(data.trend_confirmed)} Тренд подтверждает {data.direction}
-{bool_icon(data.volume_confirmed)} Объём подтверждает движение
-{bool_icon(data.cvd_confirmed)} CVD / Delta подтверждает направление
-{bool_icon(data.btc_confirmed)} BTC / рынок не против сигнала
-{bool_icon(data.orderbook_clear)} В стакане нет сильного встречного давления
-{bool_icon(data.funding_ok)} Funding не перегрет
-{bool_icon(data.oi_confirmed)} Open Interest подтверждает движение
-
-━━━━━━━━━━━━━━━━━━━━
-🛡 Защита от ложного сигнала:
-━━━━━━━━━━━━━━━━━━━━
-{"❌" if data.fakeout_detected else "✅"} Ложный пробой не обнаружен
-{"❌" if data.absorption_detected else "✅"} Откуп / absorption не обнаружен
-{"❌" if data.candle_closed_against_signal else "✅"} Свеча не закрылась против сигнала
-{"❌" if data.btc_opposite_move else "✅"} BTC не идёт против сигнала
-{"❌" if data.cvd_opposite else "✅"} CVD не идёт против сигнала
-{"❌" if data.volume_weak else "✅"} Объём не слабый
-
-━━━━━━━━━━━━━━━━━━━━
-🧠 Решение бота:
-━━━━━━━━━━━━━━━━━━━━
-{build_verdict(status)}
-
-━━━━━━━━━━━━━━━━━━━━
-❌ Условия отмены:
-━━━━━━━━━━━━━━━━━━━━
-• Цена возвращается за пробитый уровень
-• CVD разворачивается против сделки
-• BTC резко идёт против направления
-• Появляется сильный откуп / absorption
-• Объём не подтверждает движение
-• Свеча закрывается против сигнала
-━━━━━━━━━━━━━━━━━━━━
-""".strip()
-
-
-def build_message(data: FuturesSignalInput) -> str:
-    if data.compact:
-        return build_compact_message(data)
-
-    return build_full_message(data)
-
-
-# =========================
-# TELEGRAM
-# =========================
 
 def send_telegram_message(text: str) -> dict:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -448,20 +258,12 @@ def send_telegram_message(text: str) -> dict:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
     }
 
     try:
         response = requests.post(url, json=payload, timeout=15)
-
-        try:
-            return response.json()
-        except Exception:
-            return {
-                "ok": False,
-                "error": response.text
-            }
-
+        return response.json()
     except Exception as e:
         return {
             "ok": False,
@@ -469,17 +271,13 @@ def send_telegram_message(text: str) -> dict:
         }
 
 
-# =========================
-# ROUTES
-# =========================
-
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Fast Futures Signal Bot</title>
+    <title>BingX Signal Bot</title>
     <style>
         body {
             background: #020617;
@@ -494,14 +292,9 @@ def home():
             border: 1px solid #334155;
             border-radius: 20px;
             padding: 30px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.45);
         }
-        h1 {
-            color: #22c55e;
-        }
-        h2 {
-            color: #38bdf8;
-        }
+        h1 { color: #22c55e; }
+        h2 { color: #38bdf8; }
         pre {
             background: #020617;
             border: 1px solid #1e293b;
@@ -510,30 +303,34 @@ def home():
             overflow-x: auto;
             color: #cbd5e1;
         }
-        .ok {
-            color: #22c55e;
-            font-weight: bold;
-        }
-        .warn {
-            color: #facc15;
-            font-weight: bold;
-        }
+        .ok { color: #22c55e; font-weight: bold; }
+        .warn { color: #facc15; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>Fast Futures Signal Bot</h1>
-        <p class="ok">✅ Бот работает</p>
-        <p>Это API-фильтр сигнала. Он принимает данные, считает score, TP/SL, риск и может отправлять сигнал в Telegram.</p>
+        <h1>BingX Fast Futures Signal Bot</h1>
+        <p class="ok">✅ Бот запущен</p>
 
-        <h2>Endpoints</h2>
-        <pre>GET /health
-GET /preview
-GET /preview-text
-POST /signal</pre>
+        <h2>Проверка</h2>
+        <pre>/health
+/preview
+/preview-text</pre>
 
-        <h2>Start Command для Render</h2>
-        <pre>uvicorn bot:app --host 0.0.0.0 --port $PORT</pre>
+        <h2>Основной endpoint</h2>
+        <pre>POST /signal</pre>
+
+        <h2>Пример JSON</h2>
+        <pre>{
+  "symbol": "NEAR/USDT",
+  "direction": "LONG",
+  "entry_min": 7.10,
+  "entry_max": 7.15,
+  "stop_loss": 7.03,
+  "send_to_telegram": true
+}</pre>
+
+        <p class="warn">Если fakeout, absorption, BTC opposite или CVD opposite = true, сигнал не станет ACTIVE.</p>
     </div>
 </body>
 </html>
@@ -544,90 +341,38 @@ POST /signal</pre>
 def health():
     return {
         "status": "ok",
-        "service": "Fast Futures Signal Bot",
-        "file": "bot.py"
+        "message": "Bot is running"
     }
 
 
 @app.get("/preview")
 def preview():
-    data = FuturesSignalInput(
-        symbol="NEAR/USDT",
-        direction="LONG",
-        entry_min=7.10,
-        entry_max=7.15,
-        stop_loss=7.03,
-        tp1_percent=4,
-        tp2_percent=8,
-        tp3_percent=15,
-        deposit=1000,
-        risk_percent=0.5,
-        leverage_min=5,
-        leverage_max=10,
-        timeframe_entry="5m / 15m",
-        timeframe_filter="1H",
-        trend_confirmed=True,
-        volume_confirmed=True,
-        cvd_confirmed=True,
-        btc_confirmed=True,
-        orderbook_clear=True,
-        funding_ok=True,
-        oi_confirmed=True,
-        fakeout_detected=False,
-        absorption_detected=False,
-        candle_closed_against_signal=False,
-        btc_opposite_move=False,
-        cvd_opposite=False,
-        volume_weak=False,
-        send_to_telegram=False,
-        compact=True
-    )
-
+    data = SignalInput()
     score = calculate_score(data)
     status = detect_status(data, score)
 
     return {
-        "symbol": data.symbol,
-        "direction": data.direction,
         "status": status,
         "score": score,
+        "message": build_message(data),
         "risk": calculate_position(data),
-        "take_profits": calculate_tps(data),
-        "message": build_message(data)
+        "take_profits": calculate_tps(data)
     }
 
 
 @app.get("/preview-text", response_class=PlainTextResponse)
 def preview_text():
-    data = FuturesSignalInput(
-        symbol="NEAR/USDT",
-        direction="LONG",
-        entry_min=7.10,
-        entry_max=7.15,
-        stop_loss=7.03,
-        tp1_percent=4,
-        tp2_percent=8,
-        tp3_percent=15,
-        deposit=1000,
-        risk_percent=0.5,
-        leverage_min=5,
-        leverage_max=10,
-        compact=True
-    )
-
+    data = SignalInput()
     return build_message(data)
 
 
 @app.post("/signal")
-def create_signal(data: FuturesSignalInput):
+def create_signal(data: SignalInput):
     score = calculate_score(data)
     status = detect_status(data, score)
-    risk = calculate_position(data)
-    tps = calculate_tps(data)
     message = build_message(data)
 
-    telegram_result: Optional[dict] = None
-
+    telegram_result = None
     if data.send_to_telegram:
         telegram_result = send_telegram_message(message)
 
@@ -636,24 +381,13 @@ def create_signal(data: FuturesSignalInput):
         "direction": data.direction,
         "status": status,
         "score": score,
-        "entry": {
-            "min": data.entry_min,
-            "max": data.entry_max
-        },
-        "stop_loss": data.stop_loss,
-        "take_profits": tps,
-        "risk": risk,
         "message": message,
+        "risk": calculate_position(data),
+        "take_profits": calculate_tps(data),
         "telegram": telegram_result
     }
 
 
-# =========================
-# LOCAL / RENDER FALLBACK
-# =========================
-
 if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "10000"))
     uvicorn.run("bot:app", host="0.0.0.0", port=port)
