@@ -1,6 +1,7 @@
 import os
+from typing import Literal, Optional
+
 import requests
-from typing import Literal
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
@@ -70,8 +71,7 @@ class FuturesSignalInput(BaseModel):
     # Отправка в Telegram
     send_to_telegram: bool = Field(default=False)
 
-    # True = короткий формат сигнала
-    # False = полный формат сигнала
+    # True = короткий формат, False = полный формат
     compact: bool = Field(default=True)
 
 
@@ -126,14 +126,14 @@ def calculate_score(data: FuturesSignalInput) -> int:
 
 
 def detect_status(data: FuturesSignalInput, score: int) -> SignalStatus:
+    if data.candle_closed_against_signal:
+        return "CANCELLED"
+
     if data.fakeout_detected:
         return "FAKEOUT_RISK"
 
     if data.absorption_detected:
         return "FAKEOUT_RISK"
-
-    if data.candle_closed_against_signal:
-        return "CANCELLED"
 
     if data.btc_opposite_move:
         return "FAKEOUT_RISK"
@@ -167,7 +167,7 @@ def calculate_position(data: FuturesSignalInput) -> dict:
 
     if avg_entry <= 0 or data.stop_loss <= 0:
         return {
-            "avg_entry": round(avg_entry, 6),
+            "avg_entry": round(avg_entry, 8),
             "risk_amount": round(risk_amount, 2),
             "stop_distance_percent": None,
             "position_size_usdt": None,
@@ -185,7 +185,7 @@ def calculate_position(data: FuturesSignalInput) -> dict:
 
     if stop_distance <= 0:
         return {
-            "avg_entry": round(avg_entry, 6),
+            "avg_entry": round(avg_entry, 8),
             "risk_amount": round(risk_amount, 2),
             "stop_distance_percent": None,
             "position_size_usdt": None,
@@ -205,11 +205,11 @@ def calculate_position(data: FuturesSignalInput) -> dict:
     margin_20x = position_size_usdt / 20
 
     return {
-        "avg_entry": round(avg_entry, 6),
+        "avg_entry": round(avg_entry, 8),
         "risk_amount": round(risk_amount, 2),
         "stop_distance_percent": round(stop_distance_percent, 2),
         "position_size_usdt": round(position_size_usdt, 2),
-        "coin_amount": round(coin_amount, 6),
+        "coin_amount": round(coin_amount, 8),
         "margin_5x": round(margin_5x, 2),
         "margin_10x": round(margin_10x, 2),
         "margin_20x": round(margin_20x, 2),
@@ -218,6 +218,13 @@ def calculate_position(data: FuturesSignalInput) -> dict:
 
 
 def calculate_tps(data: FuturesSignalInput) -> dict:
+    if data.entry_min <= 0 or data.entry_max <= 0:
+        return {
+            "tp1": 0.0,
+            "tp2": 0.0,
+            "tp3": 0.0
+        }
+
     if data.direction == "LONG":
         base = data.entry_max
         tp1 = base * (1 + data.tp1_percent / 100)
@@ -230,9 +237,9 @@ def calculate_tps(data: FuturesSignalInput) -> dict:
         tp3 = base * (1 - data.tp3_percent / 100)
 
     return {
-        "tp1": round(tp1, 6),
-        "tp2": round(tp2, 6),
-        "tp3": round(tp3, 6)
+        "tp1": round(tp1, 8),
+        "tp2": round(tp2, 8),
+        "tp3": round(tp3, 8)
     }
 
 
@@ -452,14 +459,21 @@ def send_telegram_message(text: str) -> dict:
         "disable_web_page_preview": True
     }
 
-    response = requests.post(url, json=payload, timeout=15)
-
     try:
-        return response.json()
-    except Exception:
+        response = requests.post(url, json=payload, timeout=15)
+
+        try:
+            return response.json()
+        except Exception:
+            return {
+                "ok": False,
+                "error": response.text
+            }
+
+    except Exception as e:
         return {
             "ok": False,
-            "error": response.text
+            "error": str(e)
         }
 
 
@@ -518,7 +532,7 @@ def home():
     <div class="card">
         <h1>Fast Futures Signal Bot</h1>
         <p class="ok">✅ Бот работает на Render</p>
-        <p>Бот создаёт быстрые сигналы для фьючерсов с фильтром ложных движений.</p>
+        <p>Это API-фильтр сигнала. Он принимает данные, считает score, риск, TP/SL и может отправлять результат в Telegram.</p>
 
         <h2>Endpoints</h2>
         <pre>GET /health
@@ -618,6 +632,7 @@ def preview():
         "status": status,
         "score": score,
         "risk": calculate_position(data),
+        "take_profits": calculate_tps(data),
         "message": build_message(data)
     }
 
@@ -637,6 +652,22 @@ def preview_text():
         risk_percent=0.5,
         leverage_min=5,
         leverage_max=10,
+        timeframe_entry="5m / 15m",
+        timeframe_filter="1H",
+        trend_confirmed=True,
+        volume_confirmed=True,
+        cvd_confirmed=True,
+        btc_confirmed=True,
+        orderbook_clear=True,
+        funding_ok=True,
+        oi_confirmed=True,
+        fakeout_detected=False,
+        absorption_detected=False,
+        candle_closed_against_signal=False,
+        btc_opposite_move=False,
+        cvd_opposite=False,
+        volume_weak=False,
+        send_to_telegram=False,
         compact=True
     )
 
@@ -651,7 +682,7 @@ def create_signal(data: FuturesSignalInput):
     tps = calculate_tps(data)
     message = build_message(data)
 
-    telegram_result = None
+    telegram_result: Optional[dict] = None
 
     if data.send_to_telegram:
         telegram_result = send_telegram_message(message)
