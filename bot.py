@@ -51,7 +51,6 @@ class FuturesSignalInput(BaseModel):
     timeframe_entry: str = Field(default="5m / 15m")
     timeframe_filter: str = Field(default="1H")
 
-    # Подтверждения сигнала
     trend_confirmed: bool = Field(default=True)
     volume_confirmed: bool = Field(default=True)
     cvd_confirmed: bool = Field(default=True)
@@ -60,7 +59,6 @@ class FuturesSignalInput(BaseModel):
     funding_ok: bool = Field(default=True)
     oi_confirmed: bool = Field(default=True)
 
-    # Защита от ложных сигналов
     fakeout_detected: bool = Field(default=False)
     absorption_detected: bool = Field(default=False)
     candle_closed_against_signal: bool = Field(default=False)
@@ -68,10 +66,7 @@ class FuturesSignalInput(BaseModel):
     cvd_opposite: bool = Field(default=False)
     volume_weak: bool = Field(default=False)
 
-    # Отправка в Telegram
     send_to_telegram: bool = Field(default=False)
-
-    # True = короткий формат, False = полный формат
     compact: bool = Field(default=True)
 
 
@@ -109,7 +104,6 @@ def calculate_score(data: FuturesSignalInput) -> int:
     if not data.absorption_detected:
         score += 5
 
-    # Штрафы
     if data.btc_opposite_move:
         score -= 20
 
@@ -147,14 +141,14 @@ def detect_status(data: FuturesSignalInput, score: int) -> SignalStatus:
     if score >= 80:
         return "ACTIVE"
 
-    if 65 <= score < 80:
+    if score >= 65:
         return "WAIT"
 
     return "CANCELLED"
 
 
 # =========================
-# RISK LOGIC
+# RISK / TP LOGIC
 # =========================
 
 def calculate_position(data: FuturesSignalInput) -> dict:
@@ -200,19 +194,15 @@ def calculate_position(data: FuturesSignalInput) -> dict:
     coin_amount = risk_amount / stop_distance
     position_size_usdt = coin_amount * avg_entry
 
-    margin_5x = position_size_usdt / 5
-    margin_10x = position_size_usdt / 10
-    margin_20x = position_size_usdt / 20
-
     return {
         "avg_entry": round(avg_entry, 8),
         "risk_amount": round(risk_amount, 2),
         "stop_distance_percent": round(stop_distance_percent, 2),
         "position_size_usdt": round(position_size_usdt, 2),
         "coin_amount": round(coin_amount, 8),
-        "margin_5x": round(margin_5x, 2),
-        "margin_10x": round(margin_10x, 2),
-        "margin_20x": round(margin_20x, 2),
+        "margin_5x": round(position_size_usdt / 5, 2),
+        "margin_10x": round(position_size_usdt / 10, 2),
+        "margin_20x": round(position_size_usdt / 20, 2),
         "error": None
     }
 
@@ -244,16 +234,19 @@ def calculate_tps(data: FuturesSignalInput) -> dict:
 
 
 # =========================
-# MESSAGE FORMAT
+# MESSAGE HELPERS
 # =========================
 
 def status_emoji(status: SignalStatus) -> str:
     if status == "ACTIVE":
         return "🟢"
+
     if status == "WAIT":
         return "🟡"
+
     if status == "FAKEOUT_RISK":
         return "⚠️"
+
     return "🔴"
 
 
@@ -268,10 +261,13 @@ def bool_icon(value: bool) -> str:
 def build_verdict(status: SignalStatus) -> str:
     if status == "ACTIVE":
         return "Вход разрешён. Сигнал подтверждён."
+
     if status == "WAIT":
         return "Ждём подтверждения. Вход пока запрещён."
+
     if status == "FAKEOUT_RISK":
         return "Вход запрещён. Есть риск ложного движения / откупа."
+
     return "Сигнал отменён. Условия входа сломаны."
 
 
@@ -296,7 +292,7 @@ def build_compact_message(data: FuturesSignalInput) -> str:
             f"{pos['margin_20x']} USDT x20"
         )
 
-    msg = f"""
+    return f"""
 {emoji} #{data.symbol} {data.direction} {dir_emoji}
 
 📊 Status: {status}
@@ -328,8 +324,6 @@ Fakeout {"❌" if data.fakeout_detected else "✅"} | Absorption {"❌" if data.
 ❌ Cancel:
 Price back behind entry level / BTC against / CVD opposite / absorption detected
 """.strip()
-
-    return msg
 
 
 def build_full_message(data: FuturesSignalInput) -> str:
@@ -366,7 +360,7 @@ def build_full_message(data: FuturesSignalInput) -> str:
 • x20: {pos['margin_20x']} USDT
 """
 
-    msg = f"""
+    return f"""
 ━━━━━━━━━━━━━━━━━━━━
 {emoji} {data.symbol} — {data.direction} {dir_emoji}
 ━━━━━━━━━━━━━━━━━━━━
@@ -389,7 +383,6 @@ TP3: {tps['tp3']}  (+{data.tp3_percent}%+)
 
 ⚙️ Плечо:
 Рекомендовано: x{data.leverage_min}–x{data.leverage_max}
-x20: только если риск позиции не выше {data.risk_percent}% депозита
 
 {risk_block}
 
@@ -431,12 +424,11 @@ x20: только если риск позиции не выше {data.risk_perc
 ━━━━━━━━━━━━━━━━━━━━
 """.strip()
 
-    return msg
-
 
 def build_message(data: FuturesSignalInput) -> str:
     if data.compact:
         return build_compact_message(data)
+
     return build_full_message(data)
 
 
@@ -448,7 +440,7 @@ def send_telegram_message(text: str) -> dict:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return {
             "ok": False,
-            "error": "TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не указаны в Render Environment Variables"
+            "error": "TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не указаны"
         }
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -531,8 +523,8 @@ def home():
 <body>
     <div class="card">
         <h1>Fast Futures Signal Bot</h1>
-        <p class="ok">✅ Бот работает на Render</p>
-        <p>Это API-фильтр сигнала. Он принимает данные, считает score, риск, TP/SL и может отправлять результат в Telegram.</p>
+        <p class="ok">✅ Бот работает</p>
+        <p>Это API-фильтр сигнала. Он принимает данные, считает score, TP/SL, риск и может отправлять сигнал в Telegram.</p>
 
         <h2>Endpoints</h2>
         <pre>GET /health
@@ -540,40 +532,8 @@ GET /preview
 GET /preview-text
 POST /signal</pre>
 
-        <h2>Пример POST /signal</h2>
-        <pre>{
-  "symbol": "NEAR/USDT",
-  "direction": "LONG",
-  "entry_min": 7.10,
-  "entry_max": 7.15,
-  "stop_loss": 7.03,
-  "tp1_percent": 4,
-  "tp2_percent": 8,
-  "tp3_percent": 15,
-  "deposit": 1000,
-  "risk_percent": 0.5,
-  "leverage_min": 5,
-  "leverage_max": 10,
-  "timeframe_entry": "5m / 15m",
-  "timeframe_filter": "1H",
-  "trend_confirmed": true,
-  "volume_confirmed": true,
-  "cvd_confirmed": true,
-  "btc_confirmed": true,
-  "orderbook_clear": true,
-  "funding_ok": true,
-  "oi_confirmed": true,
-  "fakeout_detected": false,
-  "absorption_detected": false,
-  "candle_closed_against_signal": false,
-  "btc_opposite_move": false,
-  "cvd_opposite": false,
-  "volume_weak": false,
-  "send_to_telegram": true,
-  "compact": true
-}</pre>
-
-        <p class="warn">Важно: если fakeout, absorption, BTC против или CVD против — сигнал не станет ACTIVE.</p>
+        <h2>Start Command для Render</h2>
+        <pre>uvicorn bot:app --host 0.0.0.0 --port $PORT</pre>
     </div>
 </body>
 </html>
@@ -652,22 +612,6 @@ def preview_text():
         risk_percent=0.5,
         leverage_min=5,
         leverage_max=10,
-        timeframe_entry="5m / 15m",
-        timeframe_filter="1H",
-        trend_confirmed=True,
-        volume_confirmed=True,
-        cvd_confirmed=True,
-        btc_confirmed=True,
-        orderbook_clear=True,
-        funding_ok=True,
-        oi_confirmed=True,
-        fakeout_detected=False,
-        absorption_detected=False,
-        candle_closed_against_signal=False,
-        btc_opposite_move=False,
-        cvd_opposite=False,
-        volume_weak=False,
-        send_to_telegram=False,
         compact=True
     )
 
@@ -702,3 +646,14 @@ def create_signal(data: FuturesSignalInput):
         "message": message,
         "telegram": telegram_result
     }
+
+
+# =========================
+# LOCAL / RENDER FALLBACK
+# =========================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("bot:app", host="0.0.0.0", port=port)
