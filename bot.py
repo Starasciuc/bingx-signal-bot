@@ -5,30 +5,38 @@ import random
 import asyncio
 import requests
 import xml.etree.ElementTree as ET
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V3 PRO")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4 Balanced PRO")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 BINGX_BASE_URL = "https://open-api.bingx.com"
+STATE_FILE = "bot_state.json"
 
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-MIN_SCORE = int(os.getenv("MIN_SCORE", "84"))
-MIN_RR = float(os.getenv("MIN_RR", "0.75"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.25"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "84"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "78"))
+
+A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "1.25"))
+B_MIN_VOLUME_RATIO = float(os.getenv("B_MIN_VOLUME_RATIO", "1.15"))
+
+A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.75"))
+B_MIN_RR = float(os.getenv("B_MIN_RR", "0.65"))
+
+A_PLUS_RISK_MULTIPLIER = float(os.getenv("A_PLUS_RISK_MULTIPLIER", "1.0"))
+B_RISK_MULTIPLIER = float(os.getenv("B_RISK_MULTIPLIER", "0.5"))
 
 TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "8"))
 TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
 TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "25"))
-
 TP1_CLOSE_PERCENT = float(os.getenv("TP1_CLOSE_PERCENT", "50"))
 
 MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
@@ -36,7 +44,7 @@ MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
 DEFAULT_DEPOSIT = float(os.getenv("DEFAULT_DEPOSIT", "1000"))
 DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "3600"))
@@ -52,7 +60,7 @@ STRATEGY_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_SL", "2"))
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "1500"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "900"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "120"))
 
 ENABLE_NEWS_FILTER = os.getenv("ENABLE_NEWS_FILTER", "true").lower() == "true"
@@ -60,13 +68,12 @@ ENABLE_FUNDING_FILTER = os.getenv("ENABLE_FUNDING_FILTER", "true").lower() == "t
 ENABLE_OI_FILTER = os.getenv("ENABLE_OI_FILTER", "true").lower() == "true"
 ENABLE_LATE_ENTRY_FILTER = os.getenv("ENABLE_LATE_ENTRY_FILTER", "true").lower() == "true"
 
-MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "4.5"))
-MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "3.5"))
+MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "4.8"))
+MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "3.8"))
 
 MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0008"))
 FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0015"))
 
-NEWS_MAX_AGE_SECONDS = int(os.getenv("NEWS_MAX_AGE_SECONDS", "21600"))
 NEWS_CACHE_SECONDS = int(os.getenv("NEWS_CACHE_SECONDS", "900"))
 
 NEWS_RSS_URLS = os.getenv(
@@ -75,8 +82,6 @@ NEWS_RSS_URLS = os.getenv(
     "https://www.cnbc.com/id/100003114/device/rss/rss.html,"
     "https://www.coindesk.com/arc/outboundfeeds/rss/"
 ).split(",")
-
-STATE_FILE = "bot_state.json"
 
 STRATEGIES = [
     "BREAKOUT_MOMENTUM",
@@ -90,7 +95,7 @@ LIQUID_BASES = {
     "BCH", "UNI", "AAVE", "FIL", "ATOM", "ETC", "TRX", "MATIC", "WLD",
     "TIA", "ORDI", "FTM", "RUNE", "ENA", "JUP", "PYTH", "STRK", "DYDX",
     "TON", "COMP", "STX", "TRB", "JTO", "DYM", "ICP", "GALA", "FET",
-    "RNDR", "IMX", "APE"
+    "RNDR", "IMX", "APE", "AR", "MKR", "SNX", "LDO", "CRV", "GMT"
 }
 
 
@@ -111,39 +116,17 @@ def default_state():
         },
         "stats": {
             "side": {
-                "LONG": {
-                    "positive": 0,
-                    "sl": 0,
-                    "consecutive_sl": 0,
-                    "tp1": 0,
-                    "tp2": 0,
-                    "tp3": 0,
-                },
-                "SHORT": {
-                    "positive": 0,
-                    "sl": 0,
-                    "consecutive_sl": 0,
-                    "tp1": 0,
-                    "tp2": 0,
-                    "tp3": 0,
-                },
+                "LONG": {"positive": 0, "sl": 0, "consecutive_sl": 0, "tp1": 0, "tp2": 0, "tp3": 0},
+                "SHORT": {"positive": 0, "sl": 0, "consecutive_sl": 0, "tp1": 0, "tp2": 0, "tp3": 0},
             },
             "strategy": {
-                "BREAKOUT_MOMENTUM": {
-                    "positive": 0,
-                    "sl": 0,
-                    "consecutive_sl": 0,
-                },
-                "TREND_PULLBACK": {
-                    "positive": 0,
-                    "sl": 0,
-                    "consecutive_sl": 0,
-                },
-                "SWEEP_RECLAIM": {
-                    "positive": 0,
-                    "sl": 0,
-                    "consecutive_sl": 0,
-                },
+                "BREAKOUT_MOMENTUM": {"positive": 0, "sl": 0, "consecutive_sl": 0},
+                "TREND_PULLBACK": {"positive": 0, "sl": 0, "consecutive_sl": 0},
+                "SWEEP_RECLAIM": {"positive": 0, "sl": 0, "consecutive_sl": 0},
+            },
+            "grade": {
+                "A+": {"positive": 0, "sl": 0},
+                "B": {"positive": 0, "sl": 0},
             },
             "pair_sl": {},
             "pair_positive": {},
@@ -179,11 +162,9 @@ def load_state():
             if key not in state:
                 state[key] = value
 
-        if "auto" not in state:
-            state["auto"] = base["auto"]
-
-        if "news" not in state:
-            state["news"] = base["news"]
+        for key, value in base["stats"].items():
+            if key not in state["stats"]:
+                state["stats"][key] = value
 
         return state
 
@@ -695,11 +676,11 @@ def analyze_funding_oi(symbol: str, direction: str) -> dict:
             reason.append(f"Funding экстремальный: {funding:.6f}")
 
         elif direction == "LONG" and funding > MAX_ABS_FUNDING_RATE:
-            score_adjustment -= 5
+            score_adjustment -= 4
             reason.append(f"Funding перегрет для LONG: {funding:.6f}")
 
         elif direction == "SHORT" and funding < -MAX_ABS_FUNDING_RATE:
-            score_adjustment -= 5
+            score_adjustment -= 4
             reason.append(f"Funding перегрет для SHORT: {funding:.6f}")
 
         else:
@@ -825,10 +806,10 @@ def analyze_news_filter(direction: str) -> dict:
         score_adjustment += 4
 
     if direction == "LONG" and bias == "BEARISH":
-        score_adjustment -= 6
+        score_adjustment -= 5
 
     if direction == "SHORT" and bias == "BULLISH":
-        score_adjustment -= 6
+        score_adjustment -= 5
 
     STATE["news"] = {
         "last_checked": now_ts(),
@@ -849,6 +830,73 @@ def analyze_news_filter(direction: str) -> dict:
     }
 
 
+def combine_extra_filters(symbol: str, direction: str, btc_status: str) -> dict:
+    funding_oi = analyze_funding_oi(symbol, direction)
+    news = analyze_news_filter(direction)
+
+    btc_against = (
+        (direction == "LONG" and btc_status == "BEARISH")
+        or (direction == "SHORT" and btc_status == "BULLISH")
+    )
+
+    blocked = funding_oi.get("blocked", False) or news.get("blocked", False) or btc_against
+
+    score_adjustment = (
+        funding_oi.get("score_adjustment", 0)
+        + news.get("score_adjustment", 0)
+    )
+
+    return {
+        "blocked": blocked,
+        "score_adjustment": score_adjustment,
+        "funding": funding_oi,
+        "news": news,
+        "btc_status": btc_status,
+        "btc_against": btc_against,
+    }
+
+
+def classify_signal(score: int, rr: float, volume: float, filters: dict) -> Optional[dict]:
+    if filters.get("blocked"):
+        return None
+
+    news = filters.get("news", {})
+    funding = filters.get("funding", {})
+
+    if (
+        score >= A_PLUS_MIN_SCORE
+        and rr >= A_PLUS_MIN_RR
+        and volume >= A_PLUS_MIN_VOLUME_RATIO
+        and news.get("risk") != "HIGH"
+        and not funding.get("blocked")
+    ):
+        return {
+            "grade": "A+",
+            "risk_multiplier": A_PLUS_RISK_MULTIPLIER,
+            "min_score": A_PLUS_MIN_SCORE,
+            "min_rr": A_PLUS_MIN_RR,
+            "min_volume": A_PLUS_MIN_VOLUME_RATIO,
+        }
+
+    if (
+        score >= B_MIN_SCORE
+        and rr >= B_MIN_RR
+        and volume >= B_MIN_VOLUME_RATIO
+        and news.get("risk") not in ["HIGH"]
+        and not funding.get("blocked")
+        and not filters.get("btc_against")
+    ):
+        return {
+            "grade": "B",
+            "risk_multiplier": B_RISK_MULTIPLIER,
+            "min_score": B_MIN_SCORE,
+            "min_rr": B_MIN_RR,
+            "min_volume": B_MIN_VOLUME_RATIO,
+        }
+
+    return None
+
+
 def build_signal(
     symbol: str,
     direction: str,
@@ -867,9 +915,6 @@ def build_signal(
     if risk_pos > MAX_RISK_POSITION_PERCENT:
         return None
 
-    if extra_filters.get("blocked"):
-        return None
-
     score += extra_filters.get("score_adjustment", 0)
 
     tp1 = make_tp(entry, direction, TP1_POSITION_PERCENT)
@@ -880,18 +925,21 @@ def build_signal(
     risk_price = abs(entry - sl) / entry * 100
     rr = reward / risk_price if risk_price > 0 else 0
 
-    if rr < MIN_RR:
+    grade_data = classify_signal(score, rr, vol_ratio, extra_filters)
+
+    if grade_data is None:
         return None
 
-    if score < MIN_SCORE:
-        return None
+    grade = grade_data["grade"]
+    risk_multiplier = grade_data["risk_multiplier"]
+    adjusted_risk_percent = risk_percent * risk_multiplier
 
-    signal_id = f"{normalize_symbol(symbol)}:{strategy}:{direction}:{round(entry, 8)}"
+    signal_id = f"{normalize_symbol(symbol)}:{strategy}:{direction}:{grade}:{round(entry, 8)}"
 
     if signal_id in STATE["sent_signals"]:
         return None
 
-    pos = calculate_position(entry, sl, deposit, risk_percent)
+    pos = calculate_position(entry, sl, deposit, adjusted_risk_percent)
 
     return {
         "id": signal_id,
@@ -899,6 +947,8 @@ def build_signal(
         "display_symbol": display_symbol(symbol),
         "direction": direction,
         "strategy": strategy,
+        "grade": grade,
+        "risk_multiplier": risk_multiplier,
         "status": "ACTIVE",
         "score": min(score, 95),
         "entry": round(entry, 8),
@@ -909,6 +959,7 @@ def build_signal(
         "rr": round(rr, 2),
         "volume_ratio": round(vol_ratio, 2),
         "risk_position_percent": round(risk_pos, 2),
+        "risk_percent": adjusted_risk_percent,
         "position": pos,
         "reason": reason,
         "filters": extra_filters,
@@ -919,25 +970,6 @@ def build_signal(
         "tp3_hit": False,
         "counted_positive": False,
         "counted_sl": False,
-    }
-
-
-def combine_extra_filters(symbol: str, direction: str) -> dict:
-    funding_oi = analyze_funding_oi(symbol, direction)
-    news = analyze_news_filter(direction)
-
-    blocked = funding_oi.get("blocked", False) or news.get("blocked", False)
-
-    score_adjustment = (
-        funding_oi.get("score_adjustment", 0)
-        + news.get("score_adjustment", 0)
-    )
-
-    return {
-        "blocked": blocked,
-        "score_adjustment": score_adjustment,
-        "funding": funding_oi,
-        "news": news,
     }
 
 
@@ -969,11 +1001,14 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 
     score = 60
 
-    if vr >= MIN_VOLUME_RATIO:
-        score += 10
+    if vr >= B_MIN_VOLUME_RATIO:
+        score += 8
+
+    if vr >= A_PLUS_MIN_VOLUME_RATIO:
+        score += 4
 
     if vr >= 1.6:
-        score += 5
+        score += 4
 
     if momentum_confirm(c1, c5, direction):
         score += 10
@@ -1043,7 +1078,7 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         reason="Пробой уровня с объёмом и подтверждением 1m/5m.",
         deposit=deposit,
         risk_percent=risk_percent,
-        extra_filters=combine_extra_filters(symbol, direction),
+        extra_filters=combine_extra_filters(symbol, direction, btc_status),
     )
 
 
@@ -1072,8 +1107,11 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 
     score = 60
 
-    if vr >= MIN_VOLUME_RATIO:
-        score += 8
+    if vr >= B_MIN_VOLUME_RATIO:
+        score += 7
+
+    if vr >= A_PLUS_MIN_VOLUME_RATIO:
+        score += 3
 
     if momentum_confirm(c1, c5, direction):
         score += 12
@@ -1131,7 +1169,7 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         reason="Откат к VWAP по направлению 1h-тренда.",
         deposit=deposit,
         risk_percent=risk_percent,
-        extra_filters=combine_extra_filters(symbol, direction),
+        extra_filters=combine_extra_filters(symbol, direction, btc_status),
     )
 
 
@@ -1162,8 +1200,11 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
 
     score = 62
 
-    if vr >= MIN_VOLUME_RATIO:
-        score += 8
+    if vr >= B_MIN_VOLUME_RATIO:
+        score += 7
+
+    if vr >= A_PLUS_MIN_VOLUME_RATIO:
+        score += 3
 
     if momentum_confirm(c1, c5, direction):
         score += 12
@@ -1223,7 +1264,7 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
         reason="Снятие ликвидности за уровень и возврат обратно.",
         deposit=deposit,
         risk_percent=risk_percent,
-        extra_filters=combine_extra_filters(symbol, direction),
+        extra_filters=combine_extra_filters(symbol, direction, btc_status),
     )
 
 
@@ -1263,7 +1304,12 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
         return None
 
     candidates.sort(
-        key=lambda x: (x["score"], x["rr"], x["volume_ratio"]),
+        key=lambda x: (
+            1 if x["grade"] == "A+" else 0,
+            x["score"],
+            x["rr"],
+            x["volume_ratio"]
+        ),
         reverse=True
     )
 
@@ -1288,7 +1334,7 @@ def build_message(signal: dict) -> str:
         risk_text = f"⚠️ Ошибка RM: {pos['error']}"
     else:
         risk_text = (
-            f"Риск: {DEFAULT_RISK_PERCENT}% депозита\n"
+            f"Риск: {signal['risk_percent']:.2f}% депозита\n"
             f"Размер позиции: {pos['position_size_usdt']} USDT\n"
             f"Маржа x10: {pos['margin_10x']} USDT"
         )
@@ -1305,10 +1351,16 @@ def build_message(signal: dict) -> str:
     )
 
     if news.get("headline"):
-        news_text += f"\nГлавная новость: {news.get('headline')[:180]}"
+        news_text += f"\nГлавная новость: {news.get('headline')[:160]}"
+
+    grade_text = "A+ SIGNAL" if signal["grade"] == "A+" else "B SIGNAL"
+
+    caution = ""
+    if signal["grade"] == "B":
+        caution = "\n⚠️ B-сигнал: вход осторожнее, риск уменьшен в 2 раза."
 
     return f"""
-🎯 <b>{mode} SIGNAL</b>
+🎯 <b>{mode} {grade_text}</b>
 
 {arrow} <b>{signal['direction']} {signal['display_symbol']}</b>
 
@@ -1334,6 +1386,7 @@ TP3: <code>{signal['tp3']}</code>
 <b>Риск до SL:</b> {signal['risk_position_percent']}% по позиции
 
 {risk_text}
+{caution}
 
 <b>После TP1:</b>
 Закрыть примерно {TP1_CLOSE_PERCENT:.0f}% позиции и перенести SL в безубыток.
@@ -1379,6 +1432,7 @@ def apply_result(signal: dict, result: str):
     side = signal["direction"]
     strategy = signal["strategy"]
     symbol = normalize_symbol(signal["symbol"])
+    grade = signal.get("grade", "A+")
 
     notes = []
 
@@ -1390,6 +1444,8 @@ def apply_result(signal: dict, result: str):
 
         STATE["stats"]["strategy"][strategy]["sl"] += 1
         STATE["stats"]["strategy"][strategy]["consecutive_sl"] += 1
+
+        STATE["stats"]["grade"][grade]["sl"] += 1
 
         STATE["stats"]["pair_sl"][symbol] = STATE["stats"]["pair_sl"].get(symbol, 0) + 1
 
@@ -1413,6 +1469,7 @@ def apply_result(signal: dict, result: str):
             signal["counted_positive"] = True
             STATE["stats"]["side"][side]["positive"] += 1
             STATE["stats"]["strategy"][strategy]["positive"] += 1
+            STATE["stats"]["grade"][grade]["positive"] += 1
             STATE["stats"]["pair_positive"][symbol] = STATE["stats"]["pair_positive"].get(symbol, 0) + 1
 
         if result == "TP1":
@@ -1521,7 +1578,7 @@ def build_result_message(signal: dict, result: str, price: float, notes: List[st
     return f"""
 {title}
 
-<b>{signal['direction']} {signal['display_symbol']}</b>
+<b>{signal.get('grade', 'A+')} · {signal['direction']} {signal['display_symbol']}</b>
 Стратегия: <b>{signal['strategy']}</b>
 
 Вход: <code>{signal['entry']}</code>
@@ -1554,8 +1611,18 @@ def scan_best_signal(deposit: float, risk_percent: float) -> dict:
         if best is None:
             best = signal
         else:
-            current_key = (signal["score"], signal["rr"], signal["volume_ratio"])
-            best_key = (best["score"], best["rr"], best["volume_ratio"])
+            current_key = (
+                1 if signal["grade"] == "A+" else 0,
+                signal["score"],
+                signal["rr"],
+                signal["volume_ratio"]
+            )
+            best_key = (
+                1 if best["grade"] == "A+" else 0,
+                best["score"],
+                best["rr"],
+                best["volume_ratio"]
+            )
 
             if current_key > best_key:
                 best = signal
@@ -1610,6 +1677,7 @@ def track_active_signals(send_to_telegram: bool = True) -> dict:
         results.append({
             "signal_id": signal_id,
             "symbol": signal["display_symbol"],
+            "grade": signal.get("grade", "A+"),
             "direction": signal["direction"],
             "strategy": signal["strategy"],
             "result": result,
@@ -1679,17 +1747,20 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V3 PRO запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V4 Balanced PRO запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
-        f"News Filter: {'ON' if ENABLE_NEWS_FILTER else 'OFF'}\n"
-        f"Funding Filter: {'ON' if ENABLE_FUNDING_FILTER else 'OFF'}\n"
-        f"OI Filter: {'ON' if ENABLE_OI_FILTER else 'OFF'}\n"
-        f"Late Entry Filter: {'ON' if ENABLE_LATE_ENTRY_FILTER else 'OFF'}\n"
+        f"A+ score: {A_PLUS_MIN_SCORE}+\n"
+        f"B score: {B_MIN_SCORE}+\n"
+        f"A+ volume: x{A_PLUS_MIN_VOLUME_RATIO}\n"
+        f"B volume: x{B_MIN_VOLUME_RATIO}\n"
+        f"A+ RR: {A_PLUS_MIN_RR}\n"
+        f"B RR: {B_MIN_RR}\n"
+        f"B risk: x{B_RISK_MULTIPLIER}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
-        "Бот будет сам искать сигналы, фильтровать новости/funding/OI и отслеживать TP/SL."
+        "Бот будет искать A+ и B сигналы, отслеживать TP/SL и адаптироваться."
     )
 
     send_telegram_message(text)
@@ -1703,10 +1774,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V3 PRO</title>
+    <title>Professional Adaptive Futures Bot AUTO V4 Balanced PRO</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V3 PRO работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V4 Balanced PRO работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -1729,18 +1800,16 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V3 PRO",
+        "service": "Professional Adaptive Futures Bot AUTO V4 Balanced PRO",
         "test_mode": TEST_MODE,
-        "min_score": MIN_SCORE,
-        "min_volume_ratio": MIN_VOLUME_RATIO,
-        "news_filter": ENABLE_NEWS_FILTER,
-        "funding_filter": ENABLE_FUNDING_FILTER,
-        "oi_filter": ENABLE_OI_FILTER,
-        "late_entry_filter": ENABLE_LATE_ENTRY_FILTER,
+        "a_plus_min_score": A_PLUS_MIN_SCORE,
+        "b_min_score": B_MIN_SCORE,
+        "a_plus_min_volume_ratio": A_PLUS_MIN_VOLUME_RATIO,
+        "b_min_volume_ratio": B_MIN_VOLUME_RATIO,
+        "a_plus_min_rr": A_PLUS_MIN_RR,
+        "b_min_rr": B_MIN_RR,
         "auto_scan_enabled": AUTO_SCAN_ENABLED,
         "auto_track_enabled": AUTO_TRACK_ENABLED,
-        "auto_scan_seconds": AUTO_SCAN_SECONDS,
-        "auto_track_seconds": AUTO_TRACK_SECONDS,
         "active_signals": len(STATE["active_signals"]),
         "blocked_symbols": len(STATE["blocked_symbols"]),
     }
@@ -1767,7 +1836,7 @@ def news_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V3 PRO подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4 Balanced PRO подключён к Telegram.")
 
 
 @app.get("/auto-signal")
