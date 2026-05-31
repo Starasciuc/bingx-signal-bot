@@ -4,13 +4,14 @@ import json
 import random
 import asyncio
 import requests
-from typing import Optional, List
+import xml.etree.ElementTree as ET
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V3 PRO")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -27,6 +28,8 @@ MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.25"))
 TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "8"))
 TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
 TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "25"))
+
+TP1_CLOSE_PERCENT = float(os.getenv("TP1_CLOSE_PERCENT", "50"))
 
 MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
 
@@ -51,6 +54,27 @@ AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 
 AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "1500"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "120"))
+
+ENABLE_NEWS_FILTER = os.getenv("ENABLE_NEWS_FILTER", "true").lower() == "true"
+ENABLE_FUNDING_FILTER = os.getenv("ENABLE_FUNDING_FILTER", "true").lower() == "true"
+ENABLE_OI_FILTER = os.getenv("ENABLE_OI_FILTER", "true").lower() == "true"
+ENABLE_LATE_ENTRY_FILTER = os.getenv("ENABLE_LATE_ENTRY_FILTER", "true").lower() == "true"
+
+MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "4.5"))
+MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "3.5"))
+
+MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0008"))
+FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0015"))
+
+NEWS_MAX_AGE_SECONDS = int(os.getenv("NEWS_MAX_AGE_SECONDS", "21600"))
+NEWS_CACHE_SECONDS = int(os.getenv("NEWS_CACHE_SECONDS", "900"))
+
+NEWS_RSS_URLS = os.getenv(
+    "NEWS_RSS_URLS",
+    "https://feeds.bloomberg.com/markets/news.rss,"
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html,"
+    "https://www.coindesk.com/arc/outboundfeeds/rss/"
+).split(",")
 
 STATE_FILE = "bot_state.json"
 
@@ -130,6 +154,13 @@ def default_state():
             "last_scan_result": None,
             "last_track_result": None,
             "last_error": None,
+        },
+        "news": {
+            "last_checked": 0,
+            "risk": "UNKNOWN",
+            "bias": "NEUTRAL",
+            "headline": "",
+            "score_adjustment": 0,
         }
     }
 
@@ -151,6 +182,9 @@ def load_state():
         if "auto" not in state:
             state["auto"] = base["auto"]
 
+        if "news" not in state:
+            state["news"] = base["news"]
+
         return state
 
     except Exception:
@@ -166,6 +200,10 @@ def save_state(state):
 
 
 STATE = load_state()
+
+
+def now_ts():
+    return time.time()
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -213,10 +251,6 @@ def is_good_symbol(symbol: str) -> bool:
         return False
 
     return True
-
-
-def now_ts():
-    return time.time()
 
 
 def is_on_cooldown(symbol: str) -> bool:
@@ -324,6 +358,90 @@ def get_klines(symbol: str, interval: str, limit: int = 260) -> Optional[List[di
         return None
 
     return candles
+
+
+def extract_float_from_nested(data: Any, keys: List[str]) -> Optional[float]:
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k in keys:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+
+            nested = extract_float_from_nested(v, keys)
+            if nested is not None:
+                return nested
+
+    if isinstance(data, list):
+        for item in data:
+            nested = extract_float_from_nested(item, keys)
+            if nested is not None:
+                return nested
+
+    return None
+
+
+def get_funding_rate(symbol: str) -> Optional[float]:
+    if not ENABLE_FUNDING_FILTER:
+        return None
+
+    symbol = normalize_symbol(symbol)
+
+    endpoints = [
+        "/openApi/swap/v2/quote/premiumIndex",
+        "/openApi/swap/v2/quote/fundingRate",
+    ]
+
+    for endpoint in endpoints:
+        data = get_json(
+            f"{BINGX_BASE_URL}{endpoint}",
+            params={"symbol": symbol}
+        )
+
+        if not data:
+            continue
+
+        value = extract_float_from_nested(
+            data,
+            ["lastFundingRate", "fundingRate", "funding_rate", "rate"]
+        )
+
+        if value is not None:
+            return value
+
+    return None
+
+
+def get_open_interest(symbol: str) -> Optional[float]:
+    if not ENABLE_OI_FILTER:
+        return None
+
+    symbol = normalize_symbol(symbol)
+
+    endpoints = [
+        "/openApi/swap/v2/quote/openInterest",
+        "/openApi/swap/v2/quote/openInterestStat",
+    ]
+
+    for endpoint in endpoints:
+        data = get_json(
+            f"{BINGX_BASE_URL}{endpoint}",
+            params={"symbol": symbol}
+        )
+
+        if not data:
+            continue
+
+        value = extract_float_from_nested(
+            data,
+            ["openInterest", "open_interest", "sumOpenInterest", "value"]
+        )
+
+        if value is not None:
+            return value
+
+    return None
 
 
 def ema(values: List[float], period: int) -> List[float]:
@@ -440,6 +558,45 @@ def volume_ratio(candles: List[dict], period: int = 30) -> float:
     return candles[-1]["volume"] / avg
 
 
+def recent_move_percent(candles: List[dict], lookback: int = 8) -> float:
+    if len(candles) < lookback + 1:
+        return 0.0
+
+    old_price = candles[-lookback]["close"]
+    new_price = candles[-1]["close"]
+
+    if old_price <= 0:
+        return 0.0
+
+    return (new_price - old_price) / old_price * 100
+
+
+def distance_from_vwap_percent(price: float, vwap_value: float) -> float:
+    if vwap_value <= 0:
+        return 0.0
+
+    return abs(price - vwap_value) / vwap_value * 100
+
+
+def late_entry_blocked(direction: str, candles: List[dict], price: float, vwap_value: float) -> bool:
+    if not ENABLE_LATE_ENTRY_FILTER:
+        return False
+
+    move = recent_move_percent(candles, lookback=8)
+    vwap_distance = distance_from_vwap_percent(price, vwap_value)
+
+    if direction == "LONG" and move > MAX_RECENT_MOVE_PERCENT:
+        return True
+
+    if direction == "SHORT" and move < -MAX_RECENT_MOVE_PERCENT:
+        return True
+
+    if vwap_distance > MAX_DISTANCE_FROM_VWAP_PERCENT:
+        return True
+
+    return False
+
+
 def make_tp(entry: float, direction: str, position_percent: float) -> float:
     price_move = position_percent / LEVERAGE / 100
 
@@ -524,6 +681,174 @@ def momentum_confirm(c1: List[dict], c5: List[dict], direction: str) -> bool:
     )
 
 
+def analyze_funding_oi(symbol: str, direction: str) -> dict:
+    funding = get_funding_rate(symbol)
+    oi = get_open_interest(symbol)
+
+    blocked = False
+    score_adjustment = 0
+    reason = []
+
+    if funding is not None:
+        if abs(funding) >= FUNDING_EXTREME_RATE:
+            blocked = True
+            reason.append(f"Funding экстремальный: {funding:.6f}")
+
+        elif direction == "LONG" and funding > MAX_ABS_FUNDING_RATE:
+            score_adjustment -= 5
+            reason.append(f"Funding перегрет для LONG: {funding:.6f}")
+
+        elif direction == "SHORT" and funding < -MAX_ABS_FUNDING_RATE:
+            score_adjustment -= 5
+            reason.append(f"Funding перегрет для SHORT: {funding:.6f}")
+
+        else:
+            score_adjustment += 2
+            reason.append(f"Funding нормальный: {funding:.6f}")
+
+    else:
+        reason.append("Funding недоступен")
+
+    if oi is not None:
+        score_adjustment += 2
+        reason.append(f"OI доступен: {round(oi, 2)}")
+    else:
+        reason.append("OI недоступен")
+
+    return {
+        "blocked": blocked,
+        "score_adjustment": score_adjustment,
+        "funding": funding,
+        "open_interest": oi,
+        "reason": "; ".join(reason),
+    }
+
+
+def parse_rss_headlines(url: str) -> List[str]:
+    headlines = []
+
+    try:
+        response = requests.get(url.strip(), timeout=REQUEST_TIMEOUT)
+        root = ET.fromstring(response.content)
+
+        for item in root.findall(".//item")[:10]:
+            title = item.findtext("title") or ""
+            description = item.findtext("description") or ""
+
+            text = f"{title} {description}".strip()
+
+            if text:
+                headlines.append(text)
+
+    except Exception:
+        pass
+
+    return headlines
+
+
+def analyze_news_filter(direction: str) -> dict:
+    if not ENABLE_NEWS_FILTER:
+        return {
+            "risk": "OFF",
+            "bias": "NEUTRAL",
+            "blocked": False,
+            "score_adjustment": 0,
+            "headline": "",
+        }
+
+    cached = STATE.get("news", {})
+    last_checked = cached.get("last_checked", 0)
+
+    if now_ts() - last_checked < NEWS_CACHE_SECONDS:
+        risk = cached.get("risk", "UNKNOWN")
+        bias = cached.get("bias", "NEUTRAL")
+
+        return {
+            "risk": risk,
+            "bias": bias,
+            "blocked": risk == "HIGH",
+            "score_adjustment": cached.get("score_adjustment", 0),
+            "headline": cached.get("headline", ""),
+        }
+
+    bearish_words = [
+        "sec", "lawsuit", "hack", "exploit", "outflow", "selloff", "crash",
+        "liquidation", "fraud", "ban", "probe", "investigation", "hawkish",
+        "inflation hotter", "rate hike", "recession", "risk-off", "default",
+        "bankruptcy", "shutdown", "delist", "sanction"
+    ]
+
+    bullish_words = [
+        "etf inflow", "approval", "rate cut", "dovish", "rally", "breakout",
+        "institutional", "blackrock", "accumulation", "record inflow",
+        "bullish", "adoption", "partnership", "treasury buying"
+    ]
+
+    high_risk_words = [
+        "hack", "exploit", "sec lawsuit", "fraud", "bankruptcy", "liquidation",
+        "ban", "investigation", "emergency", "crash"
+    ]
+
+    headlines = []
+
+    for url in NEWS_RSS_URLS:
+        headlines.extend(parse_rss_headlines(url))
+
+    combined = " ".join(headlines).lower()
+
+    risk = "LOW"
+    bias = "NEUTRAL"
+    score_adjustment = 0
+    headline = headlines[0] if headlines else ""
+
+    bearish_hits = sum(1 for word in bearish_words if word in combined)
+    bullish_hits = sum(1 for word in bullish_words if word in combined)
+    high_hits = sum(1 for word in high_risk_words if word in combined)
+
+    if high_hits >= 1:
+        risk = "HIGH"
+        score_adjustment = -20
+
+    elif bearish_hits >= 3 or bullish_hits >= 3:
+        risk = "MEDIUM"
+
+    if bullish_hits > bearish_hits:
+        bias = "BULLISH"
+
+    elif bearish_hits > bullish_hits:
+        bias = "BEARISH"
+
+    if direction == "LONG" and bias == "BULLISH" and risk != "HIGH":
+        score_adjustment += 4
+
+    if direction == "SHORT" and bias == "BEARISH" and risk != "HIGH":
+        score_adjustment += 4
+
+    if direction == "LONG" and bias == "BEARISH":
+        score_adjustment -= 6
+
+    if direction == "SHORT" and bias == "BULLISH":
+        score_adjustment -= 6
+
+    STATE["news"] = {
+        "last_checked": now_ts(),
+        "risk": risk,
+        "bias": bias,
+        "headline": headline,
+        "score_adjustment": score_adjustment,
+    }
+
+    save_state(STATE)
+
+    return {
+        "risk": risk,
+        "bias": bias,
+        "blocked": risk == "HIGH",
+        "score_adjustment": score_adjustment,
+        "headline": headline,
+    }
+
+
 def build_signal(
     symbol: str,
     direction: str,
@@ -534,12 +859,18 @@ def build_signal(
     vol_ratio: float,
     reason: str,
     deposit: float,
-    risk_percent: float
+    risk_percent: float,
+    extra_filters: dict
 ) -> Optional[dict]:
     risk_pos = calc_risk_position(entry, sl)
 
     if risk_pos > MAX_RISK_POSITION_PERCENT:
         return None
+
+    if extra_filters.get("blocked"):
+        return None
+
+    score += extra_filters.get("score_adjustment", 0)
 
     tp1 = make_tp(entry, direction, TP1_POSITION_PERCENT)
     tp2 = make_tp(entry, direction, TP2_POSITION_PERCENT)
@@ -580,6 +911,7 @@ def build_signal(
         "risk_position_percent": round(risk_pos, 2),
         "position": pos,
         "reason": reason,
+        "filters": extra_filters,
         "created_at": now_ts(),
         "last_checked_time": int(now_ts() * 1000),
         "tp1_hit": False,
@@ -587,6 +919,25 @@ def build_signal(
         "tp3_hit": False,
         "counted_positive": False,
         "counted_sl": False,
+    }
+
+
+def combine_extra_filters(symbol: str, direction: str) -> dict:
+    funding_oi = analyze_funding_oi(symbol, direction)
+    news = analyze_news_filter(direction)
+
+    blocked = funding_oi.get("blocked", False) or news.get("blocked", False)
+
+    score_adjustment = (
+        funding_oi.get("score_adjustment", 0)
+        + news.get("score_adjustment", 0)
+    )
+
+    return {
+        "blocked": blocked,
+        "score_adjustment": score_adjustment,
+        "funding": funding_oi,
+        "news": news,
     }
 
 
@@ -605,6 +956,9 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
     vr = volume_ratio(c15)
 
     if a is None or vw is None or rs is None:
+        return None
+
+    if late_entry_blocked(direction, c15, price, vw):
         return None
 
     trend1h = trend_state(c1h)
@@ -689,6 +1043,7 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         reason="Пробой уровня с объёмом и подтверждением 1m/5m.",
         deposit=deposit,
         risk_percent=risk_percent,
+        extra_filters=combine_extra_filters(symbol, direction),
     )
 
 
@@ -707,6 +1062,9 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
     vr = volume_ratio(c15)
 
     if a is None or vw is None or rs is None:
+        return None
+
+    if late_entry_blocked(direction, c15, price, vw):
         return None
 
     trend1h = trend_state(c1h)
@@ -773,6 +1131,7 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         reason="Откат к VWAP по направлению 1h-тренда.",
         deposit=deposit,
         risk_percent=risk_percent,
+        extra_filters=combine_extra_filters(symbol, direction),
     )
 
 
@@ -791,6 +1150,9 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
     vr = volume_ratio(c15)
 
     if a is None or vw is None or rs is None:
+        return None
+
+    if late_entry_blocked(direction, c15, price, vw):
         return None
 
     trend1h = trend_state(c1h)
@@ -861,6 +1223,7 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
         reason="Снятие ликвидности за уровень и возврат обратно.",
         deposit=deposit,
         risk_percent=risk_percent,
+        extra_filters=combine_extra_filters(symbol, direction),
     )
 
 
@@ -930,6 +1293,20 @@ def build_message(signal: dict) -> str:
             f"Маржа x10: {pos['margin_10x']} USDT"
         )
 
+    filters = signal.get("filters", {})
+    funding = filters.get("funding", {})
+    news = filters.get("news", {})
+
+    funding_text = funding.get("reason", "Funding/OI: нет данных")
+
+    news_text = (
+        f"Новости: риск {news.get('risk', 'UNKNOWN')}, "
+        f"фон {news.get('bias', 'NEUTRAL')}"
+    )
+
+    if news.get("headline"):
+        news_text += f"\nГлавная новость: {news.get('headline')[:180]}"
+
     return f"""
 🎯 <b>{mode} SIGNAL</b>
 
@@ -947,6 +1324,10 @@ TP3: <code>{signal['tp3']}</code>
 {strategy_text}
 {signal['reason']}
 
+<b>Фильтры:</b>
+{funding_text}
+{news_text}
+
 <b>Качество:</b> {signal['score']}/100
 <b>RR до TP1:</b> {signal['rr']}
 <b>Объём:</b> x{signal['volume_ratio']}
@@ -954,7 +1335,9 @@ TP3: <code>{signal['tp3']}</code>
 
 {risk_text}
 
-После TP1 сделка считается позитивной.
+<b>После TP1:</b>
+Закрыть примерно {TP1_CLOSE_PERCENT:.0f}% позиции и перенести SL в безубыток.
+
 ⚠️ Не финансовый совет.
 """.strip()
 
@@ -1113,7 +1496,7 @@ def build_result_message(signal: dict, result: str, price: float, notes: List[st
         status_text = "SL сработал до TP1. Сделка отрицательная."
     elif result == "TP1":
         title = "✅ TP1 достигнут"
-        status_text = "Сделка уже считается позитивной."
+        status_text = f"Сделка позитивная. Закрыть ~{TP1_CLOSE_PERCENT:.0f}% позиции и SL в безубыток."
     elif result == "TP2":
         title = "✅ TP2 достигнут"
         status_text = "Хорошее движение. Сделка позитивная."
@@ -1296,13 +1679,17 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V3 PRO запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
+        f"News Filter: {'ON' if ENABLE_NEWS_FILTER else 'OFF'}\n"
+        f"Funding Filter: {'ON' if ENABLE_FUNDING_FILTER else 'OFF'}\n"
+        f"OI Filter: {'ON' if ENABLE_OI_FILTER else 'OFF'}\n"
+        f"Late Entry Filter: {'ON' if ENABLE_LATE_ENTRY_FILTER else 'OFF'}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
-        "Бот будет сам искать сигналы и отслеживать TP/SL."
+        "Бот будет сам искать сигналы, фильтровать новости/funding/OI и отслеживать TP/SL."
     )
 
     send_telegram_message(text)
@@ -1316,10 +1703,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO</title>
+    <title>Professional Adaptive Futures Bot AUTO V3 PRO</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V3 PRO работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -1327,15 +1714,9 @@ GET /auto-signal?symbol=NEAR/USDT
 GET /track
 GET /stats
 GET /auto-status
+GET /news-status
 GET /test-telegram
 GET /reset-state
-    </pre>
-    <p>Автоматический режим:</p>
-    <pre>
-AUTO_SCAN_ENABLED=true
-AUTO_TRACK_ENABLED=true
-AUTO_SCAN_SECONDS=1500
-AUTO_TRACK_SECONDS=120
     </pre>
     <p>Start Command:</p>
     <pre>uvicorn bot:app --host 0.0.0.0 --port $PORT</pre>
@@ -1348,10 +1729,14 @@ AUTO_TRACK_SECONDS=120
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO",
+        "service": "Professional Adaptive Futures Bot AUTO V3 PRO",
         "test_mode": TEST_MODE,
         "min_score": MIN_SCORE,
         "min_volume_ratio": MIN_VOLUME_RATIO,
+        "news_filter": ENABLE_NEWS_FILTER,
+        "funding_filter": ENABLE_FUNDING_FILTER,
+        "oi_filter": ENABLE_OI_FILTER,
+        "late_entry_filter": ENABLE_LATE_ENTRY_FILTER,
         "auto_scan_enabled": AUTO_SCAN_ENABLED,
         "auto_track_enabled": AUTO_TRACK_ENABLED,
         "auto_scan_seconds": AUTO_SCAN_SECONDS,
@@ -1371,9 +1756,18 @@ def auto_status():
     }
 
 
+@app.get("/news-status")
+def news_status():
+    return {
+        "ok": True,
+        "news": STATE.get("news", {}),
+        "rss_urls": NEWS_RSS_URLS,
+    }
+
+
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V3 PRO подключён к Telegram.")
 
 
 @app.get("/auto-signal")
