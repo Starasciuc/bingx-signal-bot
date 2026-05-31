@@ -1,16 +1,15 @@
 import os
 import time
-import math
+import json
 import random
 import requests
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Futures Signal Bot")
+app = FastAPI(title="Professional Adaptive Futures Bot")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -29,6 +28,7 @@ TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
 TP3_POSITION_PERCENT = float(os.getenv("TP3_POSITION_PERCENT", "25"))
 
 MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
+
 DEFAULT_DEPOSIT = float(os.getenv("DEFAULT_DEPOSIT", "1000"))
 DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 
@@ -37,47 +37,129 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "3600"))
 
-SYMBOL_COOLDOWN: Dict[str, float] = {}
-BLOCKED_SYMBOLS: Dict[str, float] = {}
+PAIR_BLOCK_SECONDS = int(os.getenv("PAIR_BLOCK_SECONDS", "86400"))
+SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "21600"))
+STRATEGY_DISABLE_SECONDS = int(os.getenv("STRATEGY_DISABLE_SECONDS", "21600"))
+
+PAIR_MAX_SL = int(os.getenv("PAIR_MAX_SL", "1"))
+SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
+STRATEGY_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_SL", "2"))
+
+STATE_FILE = "bot_state.json"
+
+STRATEGIES = [
+    "BREAKOUT_MOMENTUM",
+    "TREND_PULLBACK",
+    "SWEEP_RECLAIM",
+]
 
 LIQUID_BASES = {
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK",
     "INJ", "NEAR", "ARB", "OP", "APT", "SUI", "SEI", "DOT", "LTC",
     "BCH", "UNI", "AAVE", "FIL", "ATOM", "ETC", "TRX", "MATIC", "WLD",
     "TIA", "ORDI", "FTM", "RUNE", "ENA", "JUP", "PYTH", "STRK", "DYDX",
-    "TON", "COMP", "STX", "TRB", "JTO", "DYM", "ICP", "APT", "GALA",
-    "PEPE", "1000PEPE", "FET", "RNDR", "IMX", "APE"
+    "TON", "COMP", "STX", "TRB", "JTO", "DYM", "ICP", "GALA", "FET",
+    "RNDR", "IMX", "APE"
 }
 
 
-class ManualSignalInput(BaseModel):
-    symbol: str = Field(default="NEAR/USDT")
-    direction: str = Field(default="LONG")
+def default_state():
+    return {
+        "active_signals": {},
+        "sent_signals": {},
+        "symbol_cooldown": {},
+        "blocked_symbols": {},
+        "side_disabled_until": {
+            "LONG": 0,
+            "SHORT": 0,
+        },
+        "strategy_disabled_until": {
+            "BREAKOUT_MOMENTUM": 0,
+            "TREND_PULLBACK": 0,
+            "SWEEP_RECLAIM": 0,
+        },
+        "stats": {
+            "side": {
+                "LONG": {
+                    "positive": 0,
+                    "sl": 0,
+                    "consecutive_sl": 0,
+                    "tp1": 0,
+                    "tp2": 0,
+                    "tp3": 0,
+                },
+                "SHORT": {
+                    "positive": 0,
+                    "sl": 0,
+                    "consecutive_sl": 0,
+                    "tp1": 0,
+                    "tp2": 0,
+                    "tp3": 0,
+                },
+            },
+            "strategy": {
+                "BREAKOUT_MOMENTUM": {
+                    "positive": 0,
+                    "sl": 0,
+                    "consecutive_sl": 0,
+                },
+                "TREND_PULLBACK": {
+                    "positive": 0,
+                    "sl": 0,
+                    "consecutive_sl": 0,
+                },
+                "SWEEP_RECLAIM": {
+                    "positive": 0,
+                    "sl": 0,
+                    "consecutive_sl": 0,
+                },
+            },
+            "pair_sl": {},
+            "pair_positive": {},
+        }
+    }
 
-    entry_min: float = Field(default=0.0)
-    entry_max: float = Field(default=0.0)
-    stop_loss: float = Field(default=0.0)
 
-    deposit: float = Field(default=1000.0)
-    risk_percent: float = Field(default=0.5)
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return default_state()
 
-    trend_confirmed: bool = Field(default=True)
-    volume_confirmed: bool = Field(default=True)
-    btc_confirmed: bool = Field(default=True)
-    momentum_confirmed: bool = Field(default=True)
-    vwap_confirmed: bool = Field(default=True)
-    fakeout_detected: bool = Field(default=False)
-    candle_closed_against_signal: bool = Field(default=False)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
 
-    send_to_telegram: bool = Field(default=False)
+        base = default_state()
+
+        for key, value in base.items():
+            if key not in state:
+                state[key] = value
+
+        return state
+
+    except Exception:
+        return default_state()
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+STATE = load_state()
 
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.upper().replace("/", "-").strip()
+
     if symbol.endswith("USDT") and "-" not in symbol:
         symbol = symbol.replace("USDT", "-USDT")
+
     if not symbol.endswith("-USDT"):
         symbol = symbol.replace("-", "") + "-USDT"
+
     return symbol
 
 
@@ -85,53 +167,77 @@ def display_symbol(symbol: str) -> str:
     return normalize_symbol(symbol).replace("-", "/")
 
 
-def normalize_direction(direction: str) -> str:
-    direction = direction.upper().strip()
-    if direction not in ["LONG", "SHORT"]:
-        return "LONG"
-    return direction
-
-
 def base_from_symbol(symbol: str) -> str:
     return normalize_symbol(symbol).replace("-USDT", "")
+
+
+def normalize_direction(direction: Optional[str]) -> Optional[str]:
+    if direction is None:
+        return None
+
+    direction = direction.upper().strip()
+
+    if direction not in ["LONG", "SHORT"]:
+        return None
+
+    return direction
 
 
 def is_good_symbol(symbol: str) -> bool:
     symbol = normalize_symbol(symbol)
     base = base_from_symbol(symbol)
 
-    if not symbol.endswith("-USDT"):
-        return False
-
     if base not in LIQUID_BASES:
         return False
 
     bad = ["USD", "EUR", "GBP", "JPY", "AAPL", "TSLA", "NVDA", "META", "GOOG"]
+
     if any(x in base for x in bad):
         return False
 
     return True
 
 
+def now_ts():
+    return time.time()
+
+
 def is_on_cooldown(symbol: str) -> bool:
-    last = SYMBOL_COOLDOWN.get(symbol)
+    symbol = normalize_symbol(symbol)
+    last = STATE["symbol_cooldown"].get(symbol)
+
     if not last:
         return False
-    return time.time() - last < SIGNAL_COOLDOWN_SECONDS
+
+    return now_ts() - last < SIGNAL_COOLDOWN_SECONDS
 
 
 def set_cooldown(symbol: str):
-    SYMBOL_COOLDOWN[symbol] = time.time()
+    STATE["symbol_cooldown"][normalize_symbol(symbol)] = now_ts()
+    save_state(STATE)
 
 
 def is_blocked(symbol: str) -> bool:
-    until = BLOCKED_SYMBOLS.get(symbol)
+    symbol = normalize_symbol(symbol)
+    until = STATE["blocked_symbols"].get(symbol)
+
     if not until:
         return False
-    if time.time() > until:
-        BLOCKED_SYMBOLS.pop(symbol, None)
+
+    if now_ts() > until:
+        STATE["blocked_symbols"].pop(symbol, None)
+        save_state(STATE)
         return False
+
     return True
+
+
+def is_side_enabled(side: str) -> bool:
+    return now_ts() >= STATE["side_disabled_until"].get(side, 0)
+
+
+def is_strategy_enabled(strategy: str) -> bool:
+    return now_ts() >= STATE["strategy_disabled_until"].get(strategy, 0)
 
 
 def get_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
@@ -153,6 +259,7 @@ def get_symbols() -> List[str]:
 
     for item in data.get("data", []):
         symbol = item.get("symbol")
+
         if symbol and is_good_symbol(symbol):
             result.append(normalize_symbol(symbol))
 
@@ -166,7 +273,7 @@ def get_klines(symbol: str, interval: str, limit: int = 260) -> Optional[List[di
     params = {
         "symbol": normalize_symbol(symbol),
         "interval": interval,
-        "limit": limit
+        "limit": limit,
     }
 
     data = get_json(url, params=params)
@@ -205,10 +312,13 @@ def get_klines(symbol: str, interval: str, limit: int = 260) -> Optional[List[di
 def ema(values: List[float], period: int) -> List[float]:
     if not values:
         return []
+
     k = 2 / (period + 1)
     result = [values[0]]
+
     for price in values[1:]:
         result.append(price * k + result[-1] * (1 - k))
+
     return result
 
 
@@ -248,7 +358,7 @@ def atr(candles: List[dict], period: int = 14) -> Optional[float]:
         tr = max(
             high - low,
             abs(high - prev_close),
-            abs(low - prev_close)
+            abs(low - prev_close),
         )
 
         trs.append(tr)
@@ -266,6 +376,7 @@ def vwap_like(candles: List[dict], period: int = 48) -> Optional[float]:
     for c in candles[-period:]:
         typical = (c["high"] + c["low"] + c["close"]) / 3
         volume = c["volume"]
+
         total_pv += typical * volume
         total_v += volume
 
@@ -312,19 +423,6 @@ def volume_ratio(candles: List[dict], period: int = 30) -> float:
     return candles[-1]["volume"] / avg
 
 
-def recent_move(candles: List[dict], lookback: int = 12) -> float:
-    if len(candles) < lookback + 1:
-        return 0.0
-
-    old = candles[-lookback]["close"]
-    new = candles[-1]["close"]
-
-    if old <= 0:
-        return 0.0
-
-    return (new - old) / old * 100
-
-
 def make_tp(entry: float, direction: str, position_percent: float) -> float:
     price_move = position_percent / LEVERAGE / 100
 
@@ -337,10 +435,11 @@ def make_tp(entry: float, direction: str, position_percent: float) -> float:
 def price_move_percent(entry: float, target: float, direction: str) -> float:
     if direction == "LONG":
         return (target - entry) / entry * 100
+
     return (entry - target) / entry * 100
 
 
-def calc_risk(entry: float, sl: float) -> float:
+def calc_risk_position(entry: float, sl: float) -> float:
     return abs(entry - sl) / entry * 100 * LEVERAGE
 
 
@@ -354,7 +453,7 @@ def calculate_position(entry: float, sl: float, deposit: float, risk_percent: fl
             "position_size_usdt": None,
             "coin_amount": None,
             "margin_10x": None,
-            "error": "Неверный entry или SL"
+            "error": "Неверный entry или SL",
         }
 
     coin_amount = risk_amount / stop_distance
@@ -365,28 +464,8 @@ def calculate_position(entry: float, sl: float, deposit: float, risk_percent: fl
         "position_size_usdt": round(position_size, 2),
         "coin_amount": round(coin_amount, 8),
         "margin_10x": round(position_size / 10, 2),
-        "error": None
+        "error": None,
     }
-
-
-def status_from_score(score: int, fakeout: bool) -> str:
-    if fakeout:
-        return "FAKEOUT_RISK"
-    if score >= MIN_SCORE:
-        return "ACTIVE"
-    if score >= 70:
-        return "WAIT"
-    return "CANCELLED"
-
-
-def status_emoji(status: str) -> str:
-    if status == "ACTIVE":
-        return "🟢"
-    if status == "WAIT":
-        return "🟡"
-    if status == "FAKEOUT_RISK":
-        return "⚠️"
-    return "🔴"
 
 
 def detect_btc_status() -> str:
@@ -436,26 +515,44 @@ def build_signal(
     sl: float,
     score: int,
     vol_ratio: float,
-    rr: float,
     reason: str,
     deposit: float,
     risk_percent: float
-) -> dict:
+) -> Optional[dict]:
+    risk_pos = calc_risk_position(entry, sl)
+
+    if risk_pos > MAX_RISK_POSITION_PERCENT:
+        return None
+
     tp1 = make_tp(entry, direction, TP1_POSITION_PERCENT)
     tp2 = make_tp(entry, direction, TP2_POSITION_PERCENT)
     tp3 = make_tp(entry, direction, TP3_POSITION_PERCENT)
 
-    risk_position_percent = calc_risk(entry, sl)
+    reward = price_move_percent(entry, tp1, direction)
+    risk_price = abs(entry - sl) / entry * 100
+    rr = reward / risk_price if risk_price > 0 else 0
+
+    if rr < MIN_RR:
+        return None
+
+    if score < MIN_SCORE:
+        return None
+
+    signal_id = f"{normalize_symbol(symbol)}:{strategy}:{direction}:{round(entry, 8)}"
+
+    if signal_id in STATE["sent_signals"]:
+        return None
+
     pos = calculate_position(entry, sl, deposit, risk_percent)
 
-    status = status_from_score(score, fakeout=False)
-
     return {
-        "symbol": display_symbol(symbol),
+        "id": signal_id,
+        "symbol": normalize_symbol(symbol),
+        "display_symbol": display_symbol(symbol),
         "direction": direction,
         "strategy": strategy,
-        "status": status,
-        "score": score,
+        "status": "ACTIVE",
+        "score": min(score, 95),
         "entry": round(entry, 8),
         "sl": round(sl, 8),
         "tp1": round(tp1, 8),
@@ -463,13 +560,23 @@ def build_signal(
         "tp3": round(tp3, 8),
         "rr": round(rr, 2),
         "volume_ratio": round(vol_ratio, 2),
-        "risk_position_percent": round(risk_position_percent, 2),
+        "risk_position_percent": round(risk_pos, 2),
         "position": pos,
         "reason": reason,
+        "created_at": now_ts(),
+        "last_checked_time": int(now_ts() * 1000),
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "counted_positive": False,
+        "counted_sl": False,
     }
 
 
 def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    if not is_strategy_enabled("BREAKOUT_MOMENTUM"):
+        return None
+
     closes15 = [c["close"] for c in c15]
     last = c15[-1]
     prev = c15[-2]
@@ -493,8 +600,10 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 
     if vr >= MIN_VOLUME_RATIO:
         score += 10
+
     if vr >= 1.6:
         score += 5
+
     if momentum_confirm(c1, c5, direction):
         score += 10
 
@@ -552,35 +661,24 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 
         sl = max(level + a * 0.18, max(c["high"] for c in c15[-8:]) + a * 0.05)
 
-    risk_pos = calc_risk(price, sl)
-
-    if risk_pos > MAX_RISK_POSITION_PERCENT:
-        return None
-
-    tp1 = make_tp(price, direction, TP1_POSITION_PERCENT)
-    reward = price_move_percent(price, tp1, direction)
-    risk_price = abs(price - sl) / price * 100
-    rr = reward / risk_price if risk_price > 0 else 0
-
-    if rr < MIN_RR:
-        return None
-
     return build_signal(
         symbol=symbol,
         direction=direction,
-        strategy="🚀 Breakout Momentum",
+        strategy="BREAKOUT_MOMENTUM",
         entry=price,
         sl=sl,
-        score=min(score, 95),
+        score=score,
         vol_ratio=vr,
-        rr=rr,
-        reason="Пробой уровня с объёмом и подтверждением 1m/5m",
+        reason="Пробой уровня с объёмом и подтверждением 1m/5m.",
         deposit=deposit,
-        risk_percent=risk_percent
+        risk_percent=risk_percent,
     )
 
 
 def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    if not is_strategy_enabled("TREND_PULLBACK"):
+        return None
+
     closes15 = [c["close"] for c in c15]
     last = c15[-1]
     prev = c15[-2]
@@ -601,6 +699,7 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 
     if vr >= MIN_VOLUME_RATIO:
         score += 8
+
     if momentum_confirm(c1, c5, direction):
         score += 12
 
@@ -646,35 +745,24 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 
         sl = max(last["high"] + a * 0.2, max(c["high"] for c in c15[-8:]) + a * 0.05)
 
-    risk_pos = calc_risk(price, sl)
-
-    if risk_pos > MAX_RISK_POSITION_PERCENT:
-        return None
-
-    tp1 = make_tp(price, direction, TP1_POSITION_PERCENT)
-    reward = price_move_percent(price, tp1, direction)
-    risk_price = abs(price - sl) / price * 100
-    rr = reward / risk_price if risk_price > 0 else 0
-
-    if rr < MIN_RR:
-        return None
-
     return build_signal(
         symbol=symbol,
         direction=direction,
-        strategy="📌 Trend Pullback",
+        strategy="TREND_PULLBACK",
         entry=price,
         sl=sl,
-        score=min(score, 95),
+        score=score,
         vol_ratio=vr,
-        rr=rr,
-        reason="Откат к VWAP/зоне по направлению 1h-тренда",
+        reason="Откат к VWAP по направлению 1h-тренда.",
         deposit=deposit,
-        risk_percent=risk_percent
+        risk_percent=risk_percent,
     )
 
 
 def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    if not is_strategy_enabled("SWEEP_RECLAIM"):
+        return None
+
     closes15 = [c["close"] for c in c15]
     last = c15[-1]
     prev = c15[-2]
@@ -697,6 +785,7 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
 
     if vr >= MIN_VOLUME_RATIO:
         score += 8
+
     if momentum_confirm(c1, c5, direction):
         score += 12
 
@@ -744,31 +833,17 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
 
         sl = max(prev["high"] + a * 0.08, max(c["high"] for c in c15[-8:]) + a * 0.05)
 
-    risk_pos = calc_risk(price, sl)
-
-    if risk_pos > MAX_RISK_POSITION_PERCENT:
-        return None
-
-    tp1 = make_tp(price, direction, TP1_POSITION_PERCENT)
-    reward = price_move_percent(price, tp1, direction)
-    risk_price = abs(price - sl) / price * 100
-    rr = reward / risk_price if risk_price > 0 else 0
-
-    if rr < MIN_RR:
-        return None
-
     return build_signal(
         symbol=symbol,
         direction=direction,
-        strategy="🧲 Sweep Reclaim",
+        strategy="SWEEP_RECLAIM",
         entry=price,
         sl=sl,
-        score=min(score, 95),
+        score=score,
         vol_ratio=vr,
-        rr=rr,
-        reason="Снятие ликвидности за уровень и возврат обратно",
+        reason="Снятие ликвидности за уровень и возврат обратно.",
         deposit=deposit,
-        risk_percent=risk_percent
+        risk_percent=risk_percent,
     )
 
 
@@ -789,13 +864,18 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
 
     btc_status = detect_btc_status()
 
-    directions = [normalize_direction(direction)] if direction else ["LONG", "SHORT"]
+    normalized_direction = normalize_direction(direction)
+    directions = [normalized_direction] if normalized_direction else ["LONG", "SHORT"]
 
     candidates = []
 
     for d in directions:
+        if not is_side_enabled(d):
+            continue
+
         for func in [evaluate_breakout, evaluate_pullback, evaluate_sweep]:
             signal = func(symbol, d, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent)
+
             if signal:
                 candidates.append(signal)
 
@@ -811,47 +891,54 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
 
 
 def build_message(signal: dict) -> str:
-    emoji = status_emoji(signal["status"])
     arrow = "📈" if signal["direction"] == "LONG" else "📉"
-    mode = "TEST SIGNAL" if TEST_MODE else "TRADE SIGNAL"
+    mode = "TEST" if TEST_MODE else "TRADE"
+
+    strategy_names = {
+        "BREAKOUT_MOMENTUM": "Пробой уровня",
+        "TREND_PULLBACK": "Откат по тренду",
+        "SWEEP_RECLAIM": "Снятие ликвидности"
+    }
+
+    strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
 
     pos = signal["position"]
 
-    if pos["error"]:
-        pos_text = f"⚠️ RM Error: {pos['error']}"
+    if pos.get("error"):
+        risk_text = f"⚠️ Ошибка RM: {pos['error']}"
     else:
-        pos_text = (
-            f"⚠️ Risk: {DEFAULT_RISK_PERCENT}% = {pos['risk_amount']} USDT\n"
-            f"📦 Position: {pos['position_size_usdt']} USDT\n"
-            f"💵 Margin x10: {pos['margin_10x']} USDT"
+        risk_text = (
+            f"Риск: {DEFAULT_RISK_PERCENT}% депозита\n"
+            f"Размер позиции: {pos['position_size_usdt']} USDT\n"
+            f"Маржа x10: {pos['margin_10x']} USDT"
         )
 
     return f"""
-{emoji} <b>Professional Futures Signal Bot</b> · <b>{mode}</b>
+🎯 <b>{mode} SIGNAL</b>
 
-{arrow} <b>{signal['direction']} {signal['symbol']}</b>
-Стратегия: <b>{signal['strategy']}</b>
+{arrow} <b>{signal['direction']} {signal['display_symbol']}</b>
 
-🎯 Score: <b>{signal['score']}/100</b>
-📊 Status: <b>{signal['status']}</b>
+<b>Вход:</b> <code>{signal['entry']}</code>
+<b>Stop Loss:</b> <code>{signal['sl']}</code>
 
-🎯 Entry: <code>{signal['entry']}</code>
-🛑 SL: <code>{signal['sl']}</code>
+<b>Take Profit:</b>
+TP1: <code>{signal['tp1']}</code>
+TP2: <code>{signal['tp2']}</code>
+TP3: <code>{signal['tp3']}</code>
 
-✅ TP1: <code>{signal['tp1']}</code>
-✅ TP2: <code>{signal['tp2']}</code>
-✅ TP3: <code>{signal['tp3']}</code>
-
-📊 RR до TP1: <b>{signal['rr']}</b>
-📊 Volume: x<b>{signal['volume_ratio']}</b>
-🛡 Risk до SL: <b>{signal['risk_position_percent']}%</b> по позиции
-
-{pos_text}
-
-🧠 Причина:
+<b>Почему вход:</b>
+{strategy_text}
 {signal['reason']}
 
-⚠️ Не финансовый совет. Сначала TEST/минимальная сумма.
+<b>Качество:</b> {signal['score']}/100
+<b>RR до TP1:</b> {signal['rr']}
+<b>Объём:</b> x{signal['volume_ratio']}
+<b>Риск до SL:</b> {signal['risk_position_percent']}% по позиции
+
+{risk_text}
+
+После TP1 сделка считается позитивной.
+⚠️ Не финансовый совет.
 """.strip()
 
 
@@ -868,7 +955,7 @@ def send_telegram_message(text: str) -> dict:
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
     }
 
     try:
@@ -877,8 +964,170 @@ def send_telegram_message(text: str) -> dict:
     except Exception as e:
         return {
             "ok": False,
-            "error": str(e)
+            "error": str(e),
         }
+
+
+def apply_result(signal: dict, result: str):
+    side = signal["direction"]
+    strategy = signal["strategy"]
+    symbol = normalize_symbol(signal["symbol"])
+
+    notes = []
+
+    if result == "SL" and not signal.get("counted_sl"):
+        signal["counted_sl"] = True
+
+        STATE["stats"]["side"][side]["sl"] += 1
+        STATE["stats"]["side"][side]["consecutive_sl"] += 1
+
+        STATE["stats"]["strategy"][strategy]["sl"] += 1
+        STATE["stats"]["strategy"][strategy]["consecutive_sl"] += 1
+
+        STATE["stats"]["pair_sl"][symbol] = STATE["stats"]["pair_sl"].get(symbol, 0) + 1
+
+        if STATE["stats"]["pair_sl"][symbol] >= PAIR_MAX_SL:
+            STATE["blocked_symbols"][symbol] = now_ts() + PAIR_BLOCK_SECONDS
+            notes.append(f"🚫 {display_symbol(symbol)} заблокирован на 24ч после SL.")
+
+        if STATE["stats"]["side"][side]["consecutive_sl"] >= SIDE_MAX_CONSECUTIVE_SL:
+            STATE["side_disabled_until"][side] = now_ts() + SIDE_DISABLE_SECONDS
+            notes.append(f"⛔ {side} отключён на 6 часов после серии SL.")
+
+        if STATE["stats"]["strategy"][strategy]["consecutive_sl"] >= STRATEGY_MAX_CONSECUTIVE_SL:
+            STATE["strategy_disabled_until"][strategy] = now_ts() + STRATEGY_DISABLE_SECONDS
+            notes.append(f"⛔ Стратегия {strategy} отключена на 6 часов после серии SL.")
+
+    elif result in ["TP1", "TP2", "TP3", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2"]:
+        STATE["stats"]["side"][side]["consecutive_sl"] = 0
+        STATE["stats"]["strategy"][strategy]["consecutive_sl"] = 0
+
+        if not signal.get("counted_positive"):
+            signal["counted_positive"] = True
+            STATE["stats"]["side"][side]["positive"] += 1
+            STATE["stats"]["strategy"][strategy]["positive"] += 1
+            STATE["stats"]["pair_positive"][symbol] = STATE["stats"]["pair_positive"].get(symbol, 0) + 1
+
+        if result == "TP1":
+            STATE["stats"]["side"][side]["tp1"] += 1
+
+        if result == "TP2":
+            STATE["stats"]["side"][side]["tp2"] += 1
+
+        if result == "TP3":
+            STATE["stats"]["side"][side]["tp3"] += 1
+
+    save_state(STATE)
+    return notes
+
+
+def check_signal_hit(signal: dict, candles: List[dict]):
+    side = signal["direction"]
+
+    last_checked_time = signal.get("last_checked_time", 0)
+    new_candles = [c for c in candles if c["time"] > last_checked_time]
+
+    if not new_candles:
+        return None, candles[-1]["close"]
+
+    for c in new_candles:
+        high = c["high"]
+        low = c["low"]
+
+        signal["last_checked_time"] = c["time"]
+
+        if side == "LONG":
+            if signal.get("tp2_hit") and low <= signal["entry"]:
+                return "PROFIT_AFTER_TP2", signal["entry"]
+
+            if signal.get("tp1_hit") and low <= signal["entry"]:
+                return "PROFIT_AFTER_TP1", signal["entry"]
+
+            if not signal.get("tp1_hit") and low <= signal["sl"]:
+                return "SL", signal["sl"]
+
+            if not signal.get("tp1_hit") and high >= signal["tp1"]:
+                signal["tp1_hit"] = True
+                return "TP1", signal["tp1"]
+
+            if signal.get("tp1_hit") and not signal.get("tp2_hit") and high >= signal["tp2"]:
+                signal["tp2_hit"] = True
+                return "TP2", signal["tp2"]
+
+            if signal.get("tp2_hit") and not signal.get("tp3_hit") and high >= signal["tp3"]:
+                signal["tp3_hit"] = True
+                return "TP3", signal["tp3"]
+
+        else:
+            if signal.get("tp2_hit") and high >= signal["entry"]:
+                return "PROFIT_AFTER_TP2", signal["entry"]
+
+            if signal.get("tp1_hit") and high >= signal["entry"]:
+                return "PROFIT_AFTER_TP1", signal["entry"]
+
+            if not signal.get("tp1_hit") and high >= signal["sl"]:
+                return "SL", signal["sl"]
+
+            if not signal.get("tp1_hit") and low <= signal["tp1"]:
+                signal["tp1_hit"] = True
+                return "TP1", signal["tp1"]
+
+            if signal.get("tp1_hit") and not signal.get("tp2_hit") and low <= signal["tp2"]:
+                signal["tp2_hit"] = True
+                return "TP2", signal["tp2"]
+
+            if signal.get("tp2_hit") and not signal.get("tp3_hit") and low <= signal["tp3"]:
+                signal["tp3_hit"] = True
+                return "TP3", signal["tp3"]
+
+    return None, new_candles[-1]["close"]
+
+
+def build_result_message(signal: dict, result: str, price: float, notes: List[str]) -> str:
+    if result == "SL":
+        title = "❌ Stop Loss"
+        status_text = "SL сработал до TP1. Сделка отрицательная."
+    elif result == "TP1":
+        title = "✅ TP1 достигнут"
+        status_text = "Сделка уже считается позитивной."
+    elif result == "TP2":
+        title = "✅ TP2 достигнут"
+        status_text = "Хорошее движение. Сделка позитивная."
+    elif result == "TP3":
+        title = "🔥 TP3 достигнут"
+        status_text = "Отличная сделка. Полная цель достигнута."
+    elif result == "PROFIT_AFTER_TP1":
+        title = "🟢 Возврат после TP1"
+        status_text = "Цена вернулась после TP1, но сделка уже позитивная."
+    elif result == "PROFIT_AFTER_TP2":
+        title = "🟢 Возврат после TP2"
+        status_text = "Цена вернулась после TP2, сделка позитивная."
+    else:
+        title = f"ℹ️ {result}"
+        status_text = "Обновление по сделке."
+
+    adaptive_text = ""
+
+    if notes:
+        adaptive_text = "\n\n<b>Адаптация бота:</b>\n" + "\n".join(notes)
+
+    return f"""
+{title}
+
+<b>{signal['direction']} {signal['display_symbol']}</b>
+Стратегия: <b>{signal['strategy']}</b>
+
+Вход: <code>{signal['entry']}</code>
+Текущая цена: <code>{round(price, 8)}</code>
+
+TP1: <code>{signal['tp1']}</code>
+TP2: <code>{signal['tp2']}</code>
+TP3: <code>{signal['tp3']}</code>
+SL: <code>{signal['sl']}</code>
+
+{status_text}
+{adaptive_text}
+""".strip()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -887,17 +1136,18 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Futures Signal Bot</title>
+    <title>Professional Adaptive Futures Bot</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Futures Signal Bot работает</h1>
-    <p>Endpoints:</p>
+    <h1>✅ Professional Adaptive Futures Bot работает</h1>
     <pre>
 GET /health
-GET /auto-signal?symbol=NEAR/USDT
-GET /auto-signal?symbol=NEAR/USDT&direction=LONG
 GET /scan?send_to_telegram=false
+GET /auto-signal?symbol=NEAR/USDT
+GET /track
+GET /stats
 GET /test-telegram
+GET /reset-state
     </pre>
     <p>Start Command:</p>
     <pre>uvicorn bot:app --host 0.0.0.0 --port $PORT</pre>
@@ -910,17 +1160,18 @@ GET /test-telegram
 def health():
     return {
         "status": "ok",
-        "service": "Professional Futures Signal Bot",
+        "service": "Professional Adaptive Futures Bot",
         "test_mode": TEST_MODE,
         "min_score": MIN_SCORE,
         "min_volume_ratio": MIN_VOLUME_RATIO,
-        "leverage": LEVERAGE
+        "active_signals": len(STATE["active_signals"]),
+        "blocked_symbols": len(STATE["blocked_symbols"]),
     }
 
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Futures Signal Bot подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot подключён к Telegram.")
 
 
 @app.get("/auto-signal")
@@ -944,15 +1195,19 @@ def auto_signal(
     message = build_message(signal)
 
     telegram = None
+
     if send_to_telegram:
         telegram = send_telegram_message(message)
-        set_cooldown(normalize_symbol(symbol))
+        STATE["active_signals"][signal["id"]] = signal
+        STATE["sent_signals"][signal["id"]] = now_ts()
+        set_cooldown(signal["symbol"])
+        save_state(STATE)
 
     return {
         "ok": True,
         "signal": signal,
         "message": message,
-        "telegram": telegram
+        "telegram": telegram,
     }
 
 
@@ -994,16 +1249,105 @@ def scan(
     message = build_message(best)
 
     telegram = None
+
     if send_to_telegram:
         telegram = send_telegram_message(message)
-        set_cooldown(normalize_symbol(best["symbol"]))
+        STATE["active_signals"][best["id"]] = best
+        STATE["sent_signals"][best["id"]] = now_ts()
+        set_cooldown(best["symbol"])
+        save_state(STATE)
 
     return {
         "ok": True,
         "checked": checked,
         "signal": best,
         "message": message,
-        "telegram": telegram
+        "telegram": telegram,
+    }
+
+
+@app.get("/track")
+def track(send_to_telegram: bool = Query(default=True)):
+    if not STATE["active_signals"]:
+        return {
+            "ok": True,
+            "message": "Активных сигналов нет."
+        }
+
+    results = []
+    finished = []
+
+    for signal_id, signal in list(STATE["active_signals"].items()):
+        candles = get_klines(signal["symbol"], "1m", 120)
+
+        if not candles:
+            continue
+
+        result, price = check_signal_hit(signal, candles)
+        STATE["active_signals"][signal_id] = signal
+
+        if not result:
+            continue
+
+        notes = apply_result(signal, result)
+        message = build_result_message(signal, result, price, notes)
+
+        telegram = None
+
+        if send_to_telegram:
+            telegram = send_telegram_message(message)
+
+        results.append({
+            "signal_id": signal_id,
+            "symbol": signal["display_symbol"],
+            "direction": signal["direction"],
+            "strategy": signal["strategy"],
+            "result": result,
+            "price": price,
+            "telegram": telegram,
+        })
+
+        if result in ["SL", "TP3", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2"]:
+            finished.append(signal_id)
+
+    for signal_id in finished:
+        STATE["active_signals"].pop(signal_id, None)
+
+    save_state(STATE)
+
+    return {
+        "ok": True,
+        "checked": len(STATE["active_signals"]) + len(finished),
+        "results": results,
+        "active_left": len(STATE["active_signals"]),
+    }
+
+
+@app.get("/stats")
+def stats():
+    return {
+        "ok": True,
+        "stats": STATE["stats"],
+        "active_signals": len(STATE["active_signals"]),
+        "blocked_symbols": {
+            display_symbol(k): int(v - now_ts())
+            for k, v in STATE["blocked_symbols"].items()
+            if v > now_ts()
+        },
+        "side_disabled_until": STATE["side_disabled_until"],
+        "strategy_disabled_until": STATE["strategy_disabled_until"],
+    }
+
+
+@app.get("/reset-state")
+def reset_state():
+    global STATE
+    STATE = default_state()
+    save_state(STATE)
+
+    return {
+        "ok": True,
+        "message": "State reset completed."
     }
 
 
