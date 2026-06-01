@@ -4,14 +4,13 @@ import json
 import random
 import asyncio
 import requests
-import xml.etree.ElementTree as ET
 from typing import Optional, List, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4 Balanced PRO")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -22,17 +21,17 @@ STATE_FILE = "bot_state.json"
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
+# A+ строгий
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "84"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "78"))
-
 A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "1.25"))
-B_MIN_VOLUME_RATIO = float(os.getenv("B_MIN_VOLUME_RATIO", "1.15"))
-
 A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.75"))
-B_MIN_RR = float(os.getenv("B_MIN_RR", "0.65"))
-
 A_PLUS_RISK_MULTIPLIER = float(os.getenv("A_PLUS_RISK_MULTIPLIER", "1.0"))
-B_RISK_MULTIPLIER = float(os.getenv("B_RISK_MULTIPLIER", "0.5"))
+
+# B мягче, но риск ниже
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "74"))
+B_MIN_VOLUME_RATIO = float(os.getenv("B_MIN_VOLUME_RATIO", "1.05"))
+B_MIN_RR = float(os.getenv("B_MIN_RR", "0.55"))
+B_RISK_MULTIPLIER = float(os.getenv("B_RISK_MULTIPLIER", "0.35"))
 
 TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "8"))
 TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
@@ -44,49 +43,40 @@ MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
 DEFAULT_DEPOSIT = float(os.getenv("DEFAULT_DEPOSIT", "1000"))
 DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "180"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "3600"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "2400"))
 
-PAIR_BLOCK_SECONDS = int(os.getenv("PAIR_BLOCK_SECONDS", "86400"))
-SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "21600"))
-STRATEGY_DISABLE_SECONDS = int(os.getenv("STRATEGY_DISABLE_SECONDS", "21600"))
+PAIR_BLOCK_SECONDS = int(os.getenv("PAIR_BLOCK_SECONDS", "43200"))
+SIDE_DISABLE_SECONDS = int(os.getenv("SIDE_DISABLE_SECONDS", "10800"))
+STRATEGY_DISABLE_SECONDS = int(os.getenv("STRATEGY_DISABLE_SECONDS", "10800"))
 
-PAIR_MAX_SL = int(os.getenv("PAIR_MAX_SL", "1"))
-SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "2"))
-STRATEGY_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_SL", "2"))
+PAIR_MAX_SL = int(os.getenv("PAIR_MAX_SL", "2"))
+SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("SIDE_MAX_CONSECUTIVE_SL", "3"))
+STRATEGY_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_SL", "3"))
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "900"))
-AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "120"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "300"))
+AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "60"))
 
-ENABLE_NEWS_FILTER = os.getenv("ENABLE_NEWS_FILTER", "true").lower() == "true"
 ENABLE_FUNDING_FILTER = os.getenv("ENABLE_FUNDING_FILTER", "true").lower() == "true"
 ENABLE_OI_FILTER = os.getenv("ENABLE_OI_FILTER", "true").lower() == "true"
 ENABLE_LATE_ENTRY_FILTER = os.getenv("ENABLE_LATE_ENTRY_FILTER", "true").lower() == "true"
 
-MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "4.8"))
-MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "3.8"))
+MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "5.5"))
+MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "4.5"))
 
-MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0008"))
-FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0015"))
-
-NEWS_CACHE_SECONDS = int(os.getenv("NEWS_CACHE_SECONDS", "900"))
-
-NEWS_RSS_URLS = os.getenv(
-    "NEWS_RSS_URLS",
-    "https://feeds.bloomberg.com/markets/news.rss,"
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html,"
-    "https://www.coindesk.com/arc/outboundfeeds/rss/"
-).split(",")
+MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0010"))
+FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0020"))
 
 STRATEGIES = [
     "BREAKOUT_MOMENTUM",
     "TREND_PULLBACK",
     "SWEEP_RECLAIM",
+    "MOMENTUM_SCALPER",
 ]
 
 LIQUID_BASES = {
@@ -95,7 +85,8 @@ LIQUID_BASES = {
     "BCH", "UNI", "AAVE", "FIL", "ATOM", "ETC", "TRX", "MATIC", "WLD",
     "TIA", "ORDI", "FTM", "RUNE", "ENA", "JUP", "PYTH", "STRK", "DYDX",
     "TON", "COMP", "STX", "TRB", "JTO", "DYM", "ICP", "GALA", "FET",
-    "RNDR", "IMX", "APE", "AR", "MKR", "SNX", "LDO", "CRV", "GMT"
+    "RNDR", "IMX", "APE", "AR", "MKR", "SNX", "LDO", "CRV", "GMT",
+    "PEPE", "1000PEPE", "WIF", "BONK"
 }
 
 
@@ -113,6 +104,7 @@ def default_state():
             "BREAKOUT_MOMENTUM": 0,
             "TREND_PULLBACK": 0,
             "SWEEP_RECLAIM": 0,
+            "MOMENTUM_SCALPER": 0,
         },
         "stats": {
             "side": {
@@ -123,6 +115,7 @@ def default_state():
                 "BREAKOUT_MOMENTUM": {"positive": 0, "sl": 0, "consecutive_sl": 0},
                 "TREND_PULLBACK": {"positive": 0, "sl": 0, "consecutive_sl": 0},
                 "SWEEP_RECLAIM": {"positive": 0, "sl": 0, "consecutive_sl": 0},
+                "MOMENTUM_SCALPER": {"positive": 0, "sl": 0, "consecutive_sl": 0},
             },
             "grade": {
                 "A+": {"positive": 0, "sl": 0},
@@ -137,13 +130,6 @@ def default_state():
             "last_scan_result": None,
             "last_track_result": None,
             "last_error": None,
-        },
-        "news": {
-            "last_checked": 0,
-            "risk": "UNKNOWN",
-            "bias": "NEUTRAL",
-            "headline": "",
-            "score_adjustment": 0,
         }
     }
 
@@ -165,6 +151,14 @@ def load_state():
         for key, value in base["stats"].items():
             if key not in state["stats"]:
                 state["stats"][key] = value
+
+        for key, value in base["strategy_disabled_until"].items():
+            if key not in state["strategy_disabled_until"]:
+                state["strategy_disabled_until"][key] = value
+
+        for key, value in base["stats"]["strategy"].items():
+            if key not in state["stats"]["strategy"]:
+                state["stats"]["strategy"][key] = value
 
         return state
 
@@ -291,7 +285,6 @@ def get_symbols() -> List[str]:
 
     for item in data.get("data", []):
         symbol = item.get("symbol")
-
         if symbol and is_good_symbol(symbol):
             result.append(normalize_symbol(symbol))
 
@@ -367,18 +360,13 @@ def get_funding_rate(symbol: str) -> Optional[float]:
     if not ENABLE_FUNDING_FILTER:
         return None
 
-    symbol = normalize_symbol(symbol)
-
     endpoints = [
         "/openApi/swap/v2/quote/premiumIndex",
         "/openApi/swap/v2/quote/fundingRate",
     ]
 
     for endpoint in endpoints:
-        data = get_json(
-            f"{BINGX_BASE_URL}{endpoint}",
-            params={"symbol": symbol}
-        )
+        data = get_json(f"{BINGX_BASE_URL}{endpoint}", params={"symbol": normalize_symbol(symbol)})
 
         if not data:
             continue
@@ -398,18 +386,13 @@ def get_open_interest(symbol: str) -> Optional[float]:
     if not ENABLE_OI_FILTER:
         return None
 
-    symbol = normalize_symbol(symbol)
-
     endpoints = [
         "/openApi/swap/v2/quote/openInterest",
         "/openApi/swap/v2/quote/openInterestStat",
     ]
 
     for endpoint in endpoints:
-        data = get_json(
-            f"{BINGX_BASE_URL}{endpoint}",
-            params={"symbol": symbol}
-        )
+        data = get_json(f"{BINGX_BASE_URL}{endpoint}", params={"symbol": normalize_symbol(symbol)})
 
         if not data:
             continue
@@ -676,12 +659,12 @@ def analyze_funding_oi(symbol: str, direction: str) -> dict:
             reason.append(f"Funding экстремальный: {funding:.6f}")
 
         elif direction == "LONG" and funding > MAX_ABS_FUNDING_RATE:
-            score_adjustment -= 4
-            reason.append(f"Funding перегрет для LONG: {funding:.6f}")
+            score_adjustment -= 3
+            reason.append(f"Funding немного перегрет для LONG: {funding:.6f}")
 
         elif direction == "SHORT" and funding < -MAX_ABS_FUNDING_RATE:
-            score_adjustment -= 4
-            reason.append(f"Funding перегрет для SHORT: {funding:.6f}")
+            score_adjustment -= 3
+            reason.append(f"Funding немного перегрет для SHORT: {funding:.6f}")
 
         else:
             score_adjustment += 2
@@ -705,152 +688,22 @@ def analyze_funding_oi(symbol: str, direction: str) -> dict:
     }
 
 
-def parse_rss_headlines(url: str) -> List[str]:
-    headlines = []
-
-    try:
-        response = requests.get(url.strip(), timeout=REQUEST_TIMEOUT)
-        root = ET.fromstring(response.content)
-
-        for item in root.findall(".//item")[:10]:
-            title = item.findtext("title") or ""
-            description = item.findtext("description") or ""
-
-            text = f"{title} {description}".strip()
-
-            if text:
-                headlines.append(text)
-
-    except Exception:
-        pass
-
-    return headlines
-
-
-def analyze_news_filter(direction: str) -> dict:
-    if not ENABLE_NEWS_FILTER:
-        return {
-            "risk": "OFF",
-            "bias": "NEUTRAL",
-            "blocked": False,
-            "score_adjustment": 0,
-            "headline": "",
-        }
-
-    cached = STATE.get("news", {})
-    last_checked = cached.get("last_checked", 0)
-
-    if now_ts() - last_checked < NEWS_CACHE_SECONDS:
-        risk = cached.get("risk", "UNKNOWN")
-        bias = cached.get("bias", "NEUTRAL")
-
-        return {
-            "risk": risk,
-            "bias": bias,
-            "blocked": risk == "HIGH",
-            "score_adjustment": cached.get("score_adjustment", 0),
-            "headline": cached.get("headline", ""),
-        }
-
-    bearish_words = [
-        "sec", "lawsuit", "hack", "exploit", "outflow", "selloff", "crash",
-        "liquidation", "fraud", "ban", "probe", "investigation", "hawkish",
-        "inflation hotter", "rate hike", "recession", "risk-off", "default",
-        "bankruptcy", "shutdown", "delist", "sanction"
-    ]
-
-    bullish_words = [
-        "etf inflow", "approval", "rate cut", "dovish", "rally", "breakout",
-        "institutional", "blackrock", "accumulation", "record inflow",
-        "bullish", "adoption", "partnership", "treasury buying"
-    ]
-
-    high_risk_words = [
-        "hack", "exploit", "sec lawsuit", "fraud", "bankruptcy", "liquidation",
-        "ban", "investigation", "emergency", "crash"
-    ]
-
-    headlines = []
-
-    for url in NEWS_RSS_URLS:
-        headlines.extend(parse_rss_headlines(url))
-
-    combined = " ".join(headlines).lower()
-
-    risk = "LOW"
-    bias = "NEUTRAL"
-    score_adjustment = 0
-    headline = headlines[0] if headlines else ""
-
-    bearish_hits = sum(1 for word in bearish_words if word in combined)
-    bullish_hits = sum(1 for word in bullish_words if word in combined)
-    high_hits = sum(1 for word in high_risk_words if word in combined)
-
-    if high_hits >= 1:
-        risk = "HIGH"
-        score_adjustment = -20
-
-    elif bearish_hits >= 3 or bullish_hits >= 3:
-        risk = "MEDIUM"
-
-    if bullish_hits > bearish_hits:
-        bias = "BULLISH"
-
-    elif bearish_hits > bullish_hits:
-        bias = "BEARISH"
-
-    if direction == "LONG" and bias == "BULLISH" and risk != "HIGH":
-        score_adjustment += 4
-
-    if direction == "SHORT" and bias == "BEARISH" and risk != "HIGH":
-        score_adjustment += 4
-
-    if direction == "LONG" and bias == "BEARISH":
-        score_adjustment -= 5
-
-    if direction == "SHORT" and bias == "BULLISH":
-        score_adjustment -= 5
-
-    STATE["news"] = {
-        "last_checked": now_ts(),
-        "risk": risk,
-        "bias": bias,
-        "headline": headline,
-        "score_adjustment": score_adjustment,
-    }
-
-    save_state(STATE)
-
-    return {
-        "risk": risk,
-        "bias": bias,
-        "blocked": risk == "HIGH",
-        "score_adjustment": score_adjustment,
-        "headline": headline,
-    }
-
-
 def combine_extra_filters(symbol: str, direction: str, btc_status: str) -> dict:
     funding_oi = analyze_funding_oi(symbol, direction)
-    news = analyze_news_filter(direction)
 
     btc_against = (
         (direction == "LONG" and btc_status == "BEARISH")
         or (direction == "SHORT" and btc_status == "BULLISH")
     )
 
-    blocked = funding_oi.get("blocked", False) or news.get("blocked", False) or btc_against
+    blocked = funding_oi.get("blocked", False) or btc_against
 
-    score_adjustment = (
-        funding_oi.get("score_adjustment", 0)
-        + news.get("score_adjustment", 0)
-    )
+    score_adjustment = funding_oi.get("score_adjustment", 0)
 
     return {
         "blocked": blocked,
         "score_adjustment": score_adjustment,
         "funding": funding_oi,
-        "news": news,
         "btc_status": btc_status,
         "btc_against": btc_against,
     }
@@ -860,38 +713,29 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict) -> Opti
     if filters.get("blocked"):
         return None
 
-    news = filters.get("news", {})
     funding = filters.get("funding", {})
 
     if (
         score >= A_PLUS_MIN_SCORE
         and rr >= A_PLUS_MIN_RR
         and volume >= A_PLUS_MIN_VOLUME_RATIO
-        and news.get("risk") != "HIGH"
         and not funding.get("blocked")
     ):
         return {
             "grade": "A+",
             "risk_multiplier": A_PLUS_RISK_MULTIPLIER,
-            "min_score": A_PLUS_MIN_SCORE,
-            "min_rr": A_PLUS_MIN_RR,
-            "min_volume": A_PLUS_MIN_VOLUME_RATIO,
         }
 
     if (
         score >= B_MIN_SCORE
         and rr >= B_MIN_RR
         and volume >= B_MIN_VOLUME_RATIO
-        and news.get("risk") not in ["HIGH"]
         and not funding.get("blocked")
         and not filters.get("btc_against")
     ):
         return {
             "grade": "B",
             "risk_multiplier": B_RISK_MULTIPLIER,
-            "min_score": B_MIN_SCORE,
-            "min_rr": B_MIN_RR,
-            "min_volume": B_MIN_VOLUME_RATIO,
         }
 
     return None
@@ -1029,7 +873,7 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         if price < vw * 0.995:
             return None
 
-        if not (52 <= rs <= 82):
+        if not (50 <= rs <= 84):
             return None
 
         if trend1h in ["BULLISH", "SOFT_BULLISH"]:
@@ -1056,7 +900,7 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         if price > vw * 1.005:
             return None
 
-        if not (18 <= rs <= 48):
+        if not (16 <= rs <= 50):
             return None
 
         if trend1h in ["BEARISH", "SOFT_BEARISH"]:
@@ -1123,13 +967,13 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         if trend1h not in ["BULLISH", "SOFT_BULLISH"]:
             return None
 
-        pulled_to_vwap = price >= vw * 0.985 and price <= vw * 1.015
+        pulled_to_vwap = price >= vw * 0.982 and price <= vw * 1.018
         bounce = last["close"] > last["open"] and last["close"] > prev["close"]
 
         if not pulled_to_vwap or not bounce:
             return None
 
-        if rs > 62:
+        if rs > 66:
             return None
 
         if trend4h in ["BULLISH", "SOFT_BULLISH"]:
@@ -1144,13 +988,13 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
         if trend1h not in ["BEARISH", "SOFT_BEARISH"]:
             return None
 
-        pulled_to_vwap = price >= vw * 0.985 and price <= vw * 1.015
+        pulled_to_vwap = price >= vw * 0.982 and price <= vw * 1.018
         rejection = last["close"] < last["open"] and last["close"] < prev["close"]
 
         if not pulled_to_vwap or not rejection:
             return None
 
-        if rs < 38:
+        if rs < 34:
             return None
 
         if trend4h in ["BEARISH", "SOFT_BEARISH"]:
@@ -1223,10 +1067,10 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
         if trend1h == "BEARISH":
             return None
 
-        if price < vw * 0.975:
+        if price < vw * 0.970:
             return None
 
-        if rs > 58:
+        if rs > 62:
             return None
 
         sl = min(prev["low"] - a * 0.08, min(c["low"] for c in c15[-8:]) - a * 0.05)
@@ -1245,10 +1089,10 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
         if trend1h == "BULLISH":
             return None
 
-        if price > vw * 1.025:
+        if price > vw * 1.030:
             return None
 
-        if rs < 42:
+        if rs < 38:
             return None
 
         sl = max(prev["high"] + a * 0.08, max(c["high"] for c in c15[-8:]) + a * 0.05)
@@ -1262,6 +1106,134 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
         score=score,
         vol_ratio=vr,
         reason="Снятие ликвидности за уровень и возврат обратно.",
+        deposit=deposit,
+        risk_percent=risk_percent,
+        extra_filters=combine_extra_filters(symbol, direction, btc_status),
+    )
+
+
+def evaluate_momentum_scalper(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    if not is_strategy_enabled("MOMENTUM_SCALPER"):
+        return None
+
+    closes1 = [c["close"] for c in c1]
+    closes5 = [c["close"] for c in c5]
+    closes15 = [c["close"] for c in c15]
+
+    if len(closes1) < 50 or len(closes5) < 50 or len(closes15) < 50:
+        return None
+
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    last5 = c5[-1]
+    last15 = c15[-1]
+    price = last5["close"]
+
+    a = atr(c5)
+    vw = vwap_like(c15)
+    rs5 = rsi(closes5)
+    rs15 = rsi(closes15)
+    vr5 = volume_ratio(c5, period=24)
+
+    if a is None or vw is None or rs5 is None or rs15 is None:
+        return None
+
+    if late_entry_blocked(direction, c5, price, vw):
+        return None
+
+    ema9_1 = ema(closes1, 9)[-1]
+    ema21_5 = ema(closes5, 21)[-1]
+    ema50_15 = ema(closes15, 50)[-1]
+
+    trend1h = trend_state(c1h)
+
+    score = 58
+
+    if vr5 >= 1.0:
+        score += 8
+
+    if vr5 >= 1.25:
+        score += 5
+
+    if direction == "LONG":
+        if btc_status == "BEARISH":
+            return None
+
+        if trend1h == "BEARISH":
+            return None
+
+        impulse = (
+            last1["close"] > last1["open"]
+            and last1["close"] > prev1["close"]
+            and last1["close"] > ema9_1
+            and price > ema21_5
+            and price > ema50_15
+            and last5["close"] > last5["open"]
+        )
+
+        if not impulse:
+            return None
+
+        if not (48 <= rs5 <= 72):
+            return None
+
+        if not (45 <= rs15 <= 72):
+            return None
+
+        if price < vw * 0.992:
+            return None
+
+        score += 14
+
+        if trend1h in ["BULLISH", "SOFT_BULLISH"]:
+            score += 7
+
+        sl = min(last5["low"] - a * 0.25, min(c["low"] for c in c5[-10:]) - a * 0.05)
+
+    else:
+        if btc_status == "BULLISH":
+            return None
+
+        if trend1h == "BULLISH":
+            return None
+
+        impulse = (
+            last1["close"] < last1["open"]
+            and last1["close"] < prev1["close"]
+            and last1["close"] < ema9_1
+            and price < ema21_5
+            and price < ema50_15
+            and last5["close"] < last5["open"]
+        )
+
+        if not impulse:
+            return None
+
+        if not (28 <= rs5 <= 52):
+            return None
+
+        if not (28 <= rs15 <= 55):
+            return None
+
+        if price > vw * 1.008:
+            return None
+
+        score += 14
+
+        if trend1h in ["BEARISH", "SOFT_BEARISH"]:
+            score += 7
+
+        sl = max(last5["high"] + a * 0.25, max(c["high"] for c in c5[-10:]) + a * 0.05)
+
+    return build_signal(
+        symbol=symbol,
+        direction=direction,
+        strategy="MOMENTUM_SCALPER",
+        entry=price,
+        sl=sl,
+        score=score,
+        vol_ratio=vr5,
+        reason="Короткий импульс 1m/5m по направлению 15m/1h, без позднего входа.",
         deposit=deposit,
         risk_percent=risk_percent,
         extra_filters=combine_extra_filters(symbol, direction, btc_status),
@@ -1294,7 +1266,12 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
         if not is_side_enabled(d):
             continue
 
-        for func in [evaluate_breakout, evaluate_pullback, evaluate_sweep]:
+        for func in [
+            evaluate_breakout,
+            evaluate_pullback,
+            evaluate_sweep,
+            evaluate_momentum_scalper,
+        ]:
             signal = func(symbol, d, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent)
 
             if signal:
@@ -1323,7 +1300,8 @@ def build_message(signal: dict) -> str:
     strategy_names = {
         "BREAKOUT_MOMENTUM": "Пробой уровня",
         "TREND_PULLBACK": "Откат по тренду",
-        "SWEEP_RECLAIM": "Снятие ликвидности"
+        "SWEEP_RECLAIM": "Снятие ликвидности",
+        "MOMENTUM_SCALPER": "Импульсный скальпинг",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -1341,23 +1319,13 @@ def build_message(signal: dict) -> str:
 
     filters = signal.get("filters", {})
     funding = filters.get("funding", {})
-    news = filters.get("news", {})
-
     funding_text = funding.get("reason", "Funding/OI: нет данных")
-
-    news_text = (
-        f"Новости: риск {news.get('risk', 'UNKNOWN')}, "
-        f"фон {news.get('bias', 'NEUTRAL')}"
-    )
-
-    if news.get("headline"):
-        news_text += f"\nГлавная новость: {news.get('headline')[:160]}"
 
     grade_text = "A+ SIGNAL" if signal["grade"] == "A+" else "B SIGNAL"
 
     caution = ""
     if signal["grade"] == "B":
-        caution = "\n⚠️ B-сигнал: вход осторожнее, риск уменьшен в 2 раза."
+        caution = "\n⚠️ B-сигнал: вход осторожнее, риск уменьшен."
 
     return f"""
 🎯 <b>{mode} {grade_text}</b>
@@ -1377,8 +1345,8 @@ TP3: <code>{signal['tp3']}</code>
 {signal['reason']}
 
 <b>Фильтры:</b>
+BTC: {filters.get('btc_status', 'NEUTRAL')}
 {funding_text}
-{news_text}
 
 <b>Качество:</b> {signal['score']}/100
 <b>RR до TP1:</b> {signal['rr']}
@@ -1451,15 +1419,15 @@ def apply_result(signal: dict, result: str):
 
         if STATE["stats"]["pair_sl"][symbol] >= PAIR_MAX_SL:
             STATE["blocked_symbols"][symbol] = now_ts() + PAIR_BLOCK_SECONDS
-            notes.append(f"🚫 {display_symbol(symbol)} заблокирован на 24ч после SL.")
+            notes.append(f"🚫 {display_symbol(symbol)} заблокирован после SL.")
 
         if STATE["stats"]["side"][side]["consecutive_sl"] >= SIDE_MAX_CONSECUTIVE_SL:
             STATE["side_disabled_until"][side] = now_ts() + SIDE_DISABLE_SECONDS
-            notes.append(f"⛔ {side} отключён на 6 часов после серии SL.")
+            notes.append(f"⛔ {side} отключён после серии SL.")
 
         if STATE["stats"]["strategy"][strategy]["consecutive_sl"] >= STRATEGY_MAX_CONSECUTIVE_SL:
             STATE["strategy_disabled_until"][strategy] = now_ts() + STRATEGY_DISABLE_SECONDS
-            notes.append(f"⛔ Стратегия {strategy} отключена на 6 часов после серии SL.")
+            notes.append(f"⛔ Стратегия {strategy} отключена после серии SL.")
 
     elif result in ["TP1", "TP2", "TP3", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2"]:
         STATE["stats"]["side"][side]["consecutive_sl"] = 0
@@ -1747,7 +1715,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V4 Balanced PRO запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -1760,7 +1728,7 @@ async def startup_event():
         f"B risk: x{B_RISK_MULTIPLIER}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
-        "Бот будет искать A+ и B сигналы, отслеживать TP/SL и адаптироваться."
+        "Бот будет искать A+ и B сигналы, включая Momentum Scalper."
     )
 
     send_telegram_message(text)
@@ -1774,10 +1742,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V4 Balanced PRO</title>
+    <title>Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V4 Balanced PRO работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -1785,12 +1753,9 @@ GET /auto-signal?symbol=NEAR/USDT
 GET /track
 GET /stats
 GET /auto-status
-GET /news-status
 GET /test-telegram
 GET /reset-state
     </pre>
-    <p>Start Command:</p>
-    <pre>uvicorn bot:app --host 0.0.0.0 --port $PORT</pre>
 </body>
 </html>
 """
@@ -1800,7 +1765,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V4 Balanced PRO",
+        "service": "Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO",
         "test_mode": TEST_MODE,
         "a_plus_min_score": A_PLUS_MIN_SCORE,
         "b_min_score": B_MIN_SCORE,
@@ -1825,18 +1790,9 @@ def auto_status():
     }
 
 
-@app.get("/news-status")
-def news_status():
-    return {
-        "ok": True,
-        "news": STATE.get("news", {}),
-        "rss_urls": NEWS_RSS_URLS,
-    }
-
-
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4 Balanced PRO подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO подключён к Telegram.")
 
 
 @app.get("/auto-signal")
