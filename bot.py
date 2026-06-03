@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.4 Bear Retest")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -75,6 +75,7 @@ STRATEGIES = [
     "TREND_PULLBACK",
     "SWEEP_RECLAIM",
     "MOMENTUM_SCALPER",
+    "BEAR_CONTINUATION_RETEST",
 ]
 
 LIQUID_BASES = {
@@ -153,9 +154,14 @@ def default_state():
             "MOMENTUM_SCALPER": 0,
         },
 
-        # Новая правильная блокировка: только конкретная стратегия + конкретное направление.
-        # Используется для A+ после серии стопов, чтобы остановить всю связку.
+        # Legacy-поле оставлено только для совместимости со старым bot_state.json.
+        # В V4.3 оно НЕ используется для блокировки новых сигналов,
+        # чтобы старая B-блокировка не блокировала будущие A+.
         "strategy_side_disabled_until": strategy_side_default(),
+
+        # Жёсткая блокировка strategy+side используется ТОЛЬКО после серии SL на A+.
+        # B-сигналы никогда не пишут сюда.
+        "strategy_side_hard_disabled_until": strategy_side_default(),
 
         # Grade-specific блокировка: B-сигналы не блокируют будущий A+
         # по той же стратегии и направлению.
@@ -217,6 +223,12 @@ def ensure_state_structure(state: dict):
 
             if key not in state["strategy_side_disabled_until"]:
                 state["strategy_side_disabled_until"][key] = 0
+
+            if "strategy_side_hard_disabled_until" not in state:
+                state["strategy_side_hard_disabled_until"] = {}
+
+            if key not in state["strategy_side_hard_disabled_until"]:
+                state["strategy_side_hard_disabled_until"][key] = 0
 
             if key not in state["stats"]["strategy_side"]:
                 state["stats"]["strategy_side"][key] = {"positive": 0, "sl": 0, "consecutive_sl": 0}
@@ -430,7 +442,14 @@ def is_blocked(symbol: str) -> bool:
 def is_strategy_side_enabled(strategy: str, side: str) -> bool:
     ensure_stats_structure()
     key = f"{strategy}:{side}"
-    return now_ts() >= STATE["strategy_side_disabled_until"].get(key, 0)
+
+    # V4.3: намеренно НЕ используем legacy strategy_side_disabled_until.
+    # Если раньше B-сигнал заблокировал TREND_PULLBACK:SHORT,
+    # эта старая блокировка больше не будет мешать A+.
+    if "strategy_side_hard_disabled_until" not in STATE:
+        STATE["strategy_side_hard_disabled_until"] = {}
+
+    return now_ts() >= STATE["strategy_side_hard_disabled_until"].get(key, 0)
 
 
 def is_strategy_side_grade_enabled(strategy: str, side: str, grade: str) -> bool:
@@ -949,8 +968,9 @@ def build_signal(
 
     grade = grade_data["grade"]
 
-    # B-блокировка не блокирует будущие A+ сигналы.
-    # Сначала проверяется полная блокировка strategy+side, потом блокировка конкретного grade.
+    # V4.3:
+    # B-блокировка проверяется только по grade=B и НЕ блокирует A+.
+    # Жёсткая strategy+side блокировка действует только если именно A+ дал серию SL.
     if not is_strategy_side_enabled(strategy, direction):
         return None
 
@@ -1420,6 +1440,137 @@ def evaluate_momentum_scalper(symbol, direction, c15, c5, c1, c1h, c4h, btc_stat
     )
 
 
+def evaluate_bear_continuation_retest(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    """
+    BEAR_CONTINUATION_RETEST:
+    Только SHORT. Логика: падение -> откат к VWAP/EMA/уровню -> слабость покупателей -> красная свеча подтверждения.
+    Это не догоняет падение внизу, а ждёт ретест.
+    """
+    strategy = "BEAR_CONTINUATION_RETEST"
+
+    if direction != "SHORT":
+        return None
+
+    if btc_status not in ["BEARISH", "SOFT_BEARISH"]:
+        return None
+
+    closes5 = [c["close"] for c in c5]
+    closes15 = [c["close"] for c in c15]
+
+    if len(closes5) < 80 or len(closes15) < 80:
+        return None
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+    price = last5["close"]
+
+    a = atr(c5)
+    vw = vwap_like(c15)
+    rs5 = rsi(closes5)
+    rs15 = rsi(closes15)
+    vr5 = volume_ratio(c5, period=24)
+
+    if a is None or vw is None or rs5 is None or rs15 is None:
+        return None
+
+    ema21_5 = ema(closes5, 21)[-1]
+    ema50_15 = ema(closes15, 50)[-1]
+    trend1h = trend_state(c1h)
+    trend4h = trend_state(c4h)
+
+    if trend1h == "BULLISH":
+        return None
+
+    # Цена должна быть ниже старшего давления, иначе это не bearish continuation.
+    if price > ema50_15 * 1.004:
+        return None
+
+    # Было предыдущее снижение, затем откат. Не шортим без предшествующего импульса вниз.
+    old_price = c5[-12]["close"]
+    impulse_low = min(c["low"] for c in c5[-10:-3])
+    impulse_move = (impulse_low - old_price) / old_price * 100 if old_price > 0 else 0
+
+    if impulse_move > -0.35:
+        return None
+
+    # Ретест: цена/хай последней свечи вернулись к EMA21 5m или VWAP 15m.
+    near_ema = abs(last5["high"] - ema21_5) / ema21_5 * 100 <= 0.65
+    near_vwap = abs(last5["high"] - vw) / vw * 100 <= 0.9
+    retest_zone = near_ema or near_vwap
+
+    if not retest_zone:
+        return None
+
+    # Rejection: покупатели подняли цену к зоне, но свеча закрылась вниз.
+    rejection = (
+        last5["close"] < last5["open"]
+        and last5["close"] < prev5["close"]
+        and last5["close"] < ema21_5
+    )
+
+    if not rejection:
+        return None
+
+    # Откат должен быть слабее, чем импульс: не нужен мощный выкуп против шорта.
+    impulse_vol = sum(c["volume"] for c in c5[-12:-6]) / 6
+    pullback_vol = sum(c["volume"] for c in c5[-5:-1]) / 4
+    weak_pullback = pullback_vol <= impulse_vol * 1.15 if impulse_vol > 0 else True
+
+    if not weak_pullback:
+        return None
+
+    # RSI не должен быть экстремально перепродан, иначе высокий риск отскока.
+    if rs5 < 24 or rs15 < 28:
+        return None
+
+    # Не догоняем слишком поздно после огромного движения.
+    if late_entry_blocked(direction, c5, price, vw):
+        return None
+
+    score = 62
+
+    if btc_status == "BEARISH":
+        score += 8
+    elif btc_status == "SOFT_BEARISH":
+        score += 5
+
+    if trend1h in ["BEARISH", "SOFT_BEARISH"]:
+        score += 7
+
+    if trend4h in ["BEARISH", "SOFT_BEARISH"]:
+        score += 4
+
+    if weak_pullback:
+        score += 6
+
+    if vr5 >= B_MIN_VOLUME_RATIO:
+        score += 6
+
+    if vr5 >= A_PLUS_MIN_VOLUME_RATIO:
+        score += 4
+
+    if price < vw and price < ema21_5:
+        score += 4
+
+    # Стоп за зону ретеста/последний локальный хай.
+    recent_high = max(c["high"] for c in c5[-10:])
+    sl = max(recent_high + a * 0.12, last5["high"] + a * 0.18)
+
+    return build_signal(
+        symbol=symbol,
+        direction=direction,
+        strategy=strategy,
+        entry=price,
+        sl=sl,
+        score=score,
+        vol_ratio=vr5,
+        reason="Падение → откат к VWAP/EMA → слабый выкуп → rejection вниз. SHORT только после ретеста, не внизу движения.",
+        deposit=deposit,
+        risk_percent=risk_percent,
+        extra_filters=combine_extra_filters(symbol, direction, btc_status),
+    )
+
+
 def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_percent: float) -> Optional[dict]:
     symbol = normalize_symbol(symbol)
 
@@ -1448,6 +1599,7 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
             evaluate_pullback,
             evaluate_sweep,
             evaluate_momentum_scalper,
+            evaluate_bear_continuation_retest,
         ]:
             signal = func(symbol, d, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent)
 
@@ -1479,6 +1631,7 @@ def build_message(signal: dict) -> str:
         "TREND_PULLBACK": "📌 Откат по тренду",
         "SWEEP_RECLAIM": "🧲 Снятие ликвидности",
         "MOMENTUM_SCALPER": "⚡ Импульсный скальпинг",
+        "BEAR_CONTINUATION_RETEST": "🐻 Продолжение падения после отката",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -1617,7 +1770,7 @@ def apply_result(signal: dict, result: str):
                 STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["consecutive_sl"] = 0
                 notes.append(f"⛔ B {strategy} {side} отключён после серии SL. A+ по этой связке разрешён.")
             else:
-                STATE["strategy_side_disabled_until"][strategy_side_key] = now_ts() + STRATEGY_SIDE_DISABLE_SECONDS
+                STATE["strategy_side_hard_disabled_until"][strategy_side_key] = now_ts() + STRATEGY_SIDE_DISABLE_SECONDS
                 STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] = 0
                 STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["consecutive_sl"] = 0
                 notes.append(f"⛔ A+ {strategy} {side} дал серию SL — вся связка отключена временно.")
@@ -1723,6 +1876,7 @@ def build_result_message(signal: dict, result: str, price: float, notes: List[st
         "TREND_PULLBACK": "📌 Откат по тренду",
         "SWEEP_RECLAIM": "🧲 Снятие ликвидности",
         "MOMENTUM_SCALPER": "⚡ Импульсный скальпинг",
+        "BEAR_CONTINUATION_RETEST": "🐻 Продолжение падения после отката",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -1930,7 +2084,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V4.4 Bear Retest запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -1958,10 +2112,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO</title>
+    <title>Professional Adaptive Futures Bot AUTO V4.4 Bear Retest</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V4.4 Bear Retest работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -1981,7 +2135,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO",
+        "service": "Professional Adaptive Futures Bot AUTO V4.4 Bear Retest",
         "test_mode": TEST_MODE,
         "a_plus_min_score": A_PLUS_MIN_SCORE,
         "b_min_score": B_MIN_SCORE,
@@ -2008,7 +2162,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.1 Active Balanced PRO подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.4 Bear Retest подключён к Telegram.")
 
 
 @app.get("/auto-signal")
