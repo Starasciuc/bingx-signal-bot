@@ -108,6 +108,28 @@ def strategy_side_stats_default():
     return data
 
 
+def strategy_side_grade_default():
+    data = {}
+    for strategy in STRATEGIES:
+        for side in ["LONG", "SHORT"]:
+            for grade in ["A+", "B"]:
+                data[f"{strategy}:{side}:{grade}"] = 0
+    return data
+
+
+def strategy_side_grade_stats_default():
+    data = {}
+    for strategy in STRATEGIES:
+        for side in ["LONG", "SHORT"]:
+            for grade in ["A+", "B"]:
+                data[f"{strategy}:{side}:{grade}"] = {
+                    "positive": 0,
+                    "sl": 0,
+                    "consecutive_sl": 0,
+                }
+    return data
+
+
 def default_state():
     return {
         "active_signals": {},
@@ -132,7 +154,12 @@ def default_state():
         },
 
         # Новая правильная блокировка: только конкретная стратегия + конкретное направление.
+        # Используется для A+ после серии стопов, чтобы остановить всю связку.
         "strategy_side_disabled_until": strategy_side_default(),
+
+        # Grade-specific блокировка: B-сигналы не блокируют будущий A+
+        # по той же стратегии и направлению.
+        "strategy_side_grade_disabled_until": strategy_side_grade_default(),
 
         "stats": {
             "side": {
@@ -146,6 +173,7 @@ def default_state():
                 "MOMENTUM_SCALPER": {"positive": 0, "sl": 0, "consecutive_sl": 0},
             },
             "strategy_side": strategy_side_stats_default(),
+            "strategy_side_grade": strategy_side_grade_stats_default(),
             "grade": {
                 "A+": {"positive": 0, "sl": 0},
                 "B": {"positive": 0, "sl": 0},
@@ -192,6 +220,21 @@ def ensure_state_structure(state: dict):
 
             if key not in state["stats"]["strategy_side"]:
                 state["stats"]["strategy_side"][key] = {"positive": 0, "sl": 0, "consecutive_sl": 0}
+
+            if "strategy_side_grade_disabled_until" not in state:
+                state["strategy_side_grade_disabled_until"] = {}
+
+            if "strategy_side_grade" not in state["stats"]:
+                state["stats"]["strategy_side_grade"] = {}
+
+            for grade in ["A+", "B"]:
+                grade_key = f"{strategy}:{side}:{grade}"
+
+                if grade_key not in state["strategy_side_grade_disabled_until"]:
+                    state["strategy_side_grade_disabled_until"][grade_key] = 0
+
+                if grade_key not in state["stats"]["strategy_side_grade"]:
+                    state["stats"]["strategy_side_grade"][grade_key] = {"positive": 0, "sl": 0, "consecutive_sl": 0}
 
     for side in ["LONG", "SHORT"]:
         if side not in state["stats"]["side"]:
@@ -388,6 +431,12 @@ def is_strategy_side_enabled(strategy: str, side: str) -> bool:
     ensure_stats_structure()
     key = f"{strategy}:{side}"
     return now_ts() >= STATE["strategy_side_disabled_until"].get(key, 0)
+
+
+def is_strategy_side_grade_enabled(strategy: str, side: str, grade: str) -> bool:
+    ensure_stats_structure()
+    key = f"{strategy}:{side}:{grade}"
+    return now_ts() >= STATE["strategy_side_grade_disabled_until"].get(key, 0)
 
 
 def get_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
@@ -899,6 +948,15 @@ def build_signal(
         return None
 
     grade = grade_data["grade"]
+
+    # B-блокировка не блокирует будущие A+ сигналы.
+    # Сначала проверяется полная блокировка strategy+side, потом блокировка конкретного grade.
+    if not is_strategy_side_enabled(strategy, direction):
+        return None
+
+    if not is_strategy_side_grade_enabled(strategy, direction, grade):
+        return None
+
     risk_multiplier = grade_data["risk_multiplier"]
     adjusted_risk_percent = risk_percent * risk_multiplier
 
@@ -946,9 +1004,6 @@ def build_signal(
 
 def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
     strategy = "BREAKOUT_MOMENTUM"
-
-    if not is_strategy_side_enabled(strategy, direction):
-        return None
 
     closes15 = [c["close"] for c in c15]
     last = c15[-1]
@@ -1058,9 +1113,6 @@ def evaluate_breakout(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
     strategy = "TREND_PULLBACK"
 
-    if not is_strategy_side_enabled(strategy, direction):
-        return None
-
     closes15 = [c["close"] for c in c15]
     last = c15[-1]
     prev = c15[-2]
@@ -1150,9 +1202,6 @@ def evaluate_pullback(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, depo
 
 def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
     strategy = "SWEEP_RECLAIM"
-
-    if not is_strategy_side_enabled(strategy, direction):
-        return None
 
     closes15 = [c["close"] for c in c15]
     last = c15[-1]
@@ -1247,9 +1296,6 @@ def evaluate_sweep(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit
 
 def evaluate_momentum_scalper(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
     strategy = "MOMENTUM_SCALPER"
-
-    if not is_strategy_side_enabled(strategy, direction):
-        return None
 
     closes1 = [c["close"] for c in c1]
     closes5 = [c["close"] for c in c5]
@@ -1536,6 +1582,7 @@ def apply_result(signal: dict, result: str):
     symbol = normalize_symbol(signal["symbol"])
     grade = signal.get("grade", "A+")
     strategy_side_key = f"{strategy}:{side}"
+    strategy_side_grade_key = f"{strategy}:{side}:{grade}"
 
     notes = []
 
@@ -1551,6 +1598,9 @@ def apply_result(signal: dict, result: str):
         STATE["stats"]["strategy_side"][strategy_side_key]["sl"] += 1
         STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] += 1
 
+        STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["sl"] += 1
+        STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["consecutive_sl"] += 1
+
         STATE["stats"]["grade"][grade]["sl"] += 1
 
         STATE["stats"]["pair_sl"][symbol] = STATE["stats"]["pair_sl"].get(symbol, 0) + 1
@@ -1559,17 +1609,24 @@ def apply_result(signal: dict, result: str):
             STATE["blocked_symbols"][symbol] = now_ts() + PAIR_BLOCK_SECONDS
             notes.append(f"🚫 {display_symbol(symbol)} заблокирован после SL.")
 
-        # Важно: больше НЕ отключаем весь SHORT или весь LONG.
-        # Отключаем только слабую связку стратегия + направление.
-        if STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] >= STRATEGY_SIDE_MAX_CONSECUTIVE_SL:
-            STATE["strategy_side_disabled_until"][strategy_side_key] = now_ts() + STRATEGY_SIDE_DISABLE_SECONDS
-            STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] = 0
-            notes.append(f"⛔ {strategy} {side} отключён после серии SL.")
+        # Важно: B-сигналы блокируют только B-связку.
+        # A+ по той же стратегии/направлению сможет пройти даже если B временно отключён.
+        if STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["consecutive_sl"] >= STRATEGY_SIDE_MAX_CONSECUTIVE_SL:
+            if grade == "B":
+                STATE["strategy_side_grade_disabled_until"][strategy_side_grade_key] = now_ts() + STRATEGY_SIDE_DISABLE_SECONDS
+                STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["consecutive_sl"] = 0
+                notes.append(f"⛔ B {strategy} {side} отключён после серии SL. A+ по этой связке разрешён.")
+            else:
+                STATE["strategy_side_disabled_until"][strategy_side_key] = now_ts() + STRATEGY_SIDE_DISABLE_SECONDS
+                STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] = 0
+                STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["consecutive_sl"] = 0
+                notes.append(f"⛔ A+ {strategy} {side} дал серию SL — вся связка отключена временно.")
 
     elif result in ["TP1", "TP2", "TP3", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2"]:
         STATE["stats"]["side"][side]["consecutive_sl"] = 0
         STATE["stats"]["strategy"][strategy]["consecutive_sl"] = 0
         STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] = 0
+        STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["consecutive_sl"] = 0
 
         if not signal.get("counted_positive"):
             signal["counted_positive"] = True
@@ -1577,6 +1634,7 @@ def apply_result(signal: dict, result: str):
             STATE["stats"]["side"][side]["positive"] += 1
             STATE["stats"]["strategy"][strategy]["positive"] += 1
             STATE["stats"]["strategy_side"][strategy_side_key]["positive"] += 1
+            STATE["stats"]["strategy_side_grade"][strategy_side_grade_key]["positive"] += 1
             STATE["stats"]["grade"][grade]["positive"] += 1
 
             STATE["stats"]["pair_positive"][symbol] = STATE["stats"]["pair_positive"].get(symbol, 0) + 1
@@ -1885,7 +1943,8 @@ async def startup_event():
         f"B risk: x{B_RISK_MULTIPLIER}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
-        "Бот ищет LONG и SHORT, показывает стратегию, считает статистику и блокирует только strategy+side, а не весь SHORT/LONG."
+        "Бот ищет LONG и SHORT, показывает стратегию, считает статистику и блокирует только strategy+side, а не весь SHORT/LONG.\n"
+        "B-серия SL блокирует только B-связку, A+ не блокируется B-сигналами."
     )
 
     send_telegram_message(text)
