@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.4 Bear Retest")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.6 Stats-Aware Levels")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -22,10 +22,16 @@ TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
 # A+ строгий
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "84"))
-A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "1.25"))
-A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.75"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "86"))
+A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "1.30"))
+A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.85"))
 A_PLUS_RISK_MULTIPLIER = float(os.getenv("A_PLUS_RISK_MULTIPLIER", "1.0"))
+
+# V4.6: A+ становится статистически умнее.
+STATS_AWARE_A_PLUS_ENABLED = os.getenv("STATS_AWARE_A_PLUS_ENABLED", "true").lower() == "true"
+A_PLUS_MIN_STRATEGY_TRADES = int(os.getenv("A_PLUS_MIN_STRATEGY_TRADES", "10"))
+A_PLUS_MIN_STRATEGY_WR = float(os.getenv("A_PLUS_MIN_STRATEGY_WR", "55"))
+MOMENTUM_SCALPER_CAN_A_PLUS = os.getenv("MOMENTUM_SCALPER_CAN_A_PLUS", "false").lower() == "true"
 
 # B мягче, но риск ниже
 B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "74"))
@@ -67,6 +73,11 @@ ENABLE_LATE_ENTRY_FILTER = os.getenv("ENABLE_LATE_ENTRY_FILTER", "true").lower()
 MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "5.5"))
 MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "4.5"))
 
+# V4.6: параметры стратегий уровней.
+LEVEL_SWEEP_LOOKBACK_CANDLES = int(os.getenv("LEVEL_SWEEP_LOOKBACK_CANDLES", "14"))
+LEVEL_SWEEP_MAX_RECLAIM_DISTANCE_PERCENT = float(os.getenv("LEVEL_SWEEP_MAX_RECLAIM_DISTANCE_PERCENT", "7.0"))
+LEVEL_BREAK_RETEST_MAX_DISTANCE_PERCENT = float(os.getenv("LEVEL_BREAK_RETEST_MAX_DISTANCE_PERCENT", "3.2"))
+
 MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0010"))
 FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0020"))
 
@@ -76,6 +87,8 @@ STRATEGIES = [
     "SWEEP_RECLAIM",
     "MOMENTUM_SCALPER",
     "BEAR_CONTINUATION_RETEST",
+    "LEVEL_BREAK_RETEST_SHORT",
+    "LEVEL_SWEEP_BOUNCE_LONG",
 ]
 
 LIQUID_BASES = {
@@ -901,7 +914,43 @@ def combine_extra_filters(symbol: str, direction: str, btc_status: str) -> dict:
     }
 
 
-def classify_signal(score: int, rr: float, volume: float, filters: dict) -> Optional[dict]:
+
+def get_strategy_winrate(strategy: str) -> tuple:
+    """
+    Возвращает (trades, winrate) по стратегии из текущей статистики.
+    Если сделок мало, статистика считается недостаточной и не блокирует A+.
+    """
+    ensure_stats_structure()
+    s = STATE.get("stats", {}).get("strategy", {}).get(strategy, {})
+    positive = int(s.get("positive", 0))
+    sl = int(s.get("sl", 0))
+    trades = positive + sl
+    wr = calc_winrate(positive, sl)
+    return trades, wr
+
+
+def can_strategy_be_a_plus(strategy: str, direction: str) -> bool:
+    """
+    V4.6 Stats-Aware A+:
+    - Momentum Scalper по умолчанию не может быть A+.
+    - Если по стратегии уже есть достаточная статистика и WR ниже порога,
+      стратегия временно не получает A+, а только B.
+    - Новые стратегии с малой выборкой не душим заранее.
+    """
+    if strategy == "MOMENTUM_SCALPER" and not MOMENTUM_SCALPER_CAN_A_PLUS:
+        return False
+
+    if not STATS_AWARE_A_PLUS_ENABLED:
+        return True
+
+    trades, wr = get_strategy_winrate(strategy)
+
+    if trades >= A_PLUS_MIN_STRATEGY_TRADES and wr < A_PLUS_MIN_STRATEGY_WR:
+        return False
+
+    return True
+
+def classify_signal(score: int, rr: float, volume: float, filters: dict, strategy: str, direction: str) -> Optional[dict]:
     if filters.get("blocked"):
         return None
 
@@ -912,6 +961,7 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict) -> Opti
         and rr >= A_PLUS_MIN_RR
         and volume >= A_PLUS_MIN_VOLUME_RATIO
         and not funding.get("blocked")
+        and can_strategy_be_a_plus(strategy, direction)
     ):
         return {
             "grade": "A+",
@@ -961,7 +1011,7 @@ def build_signal(
     risk_price = abs(entry - sl) / entry * 100
     rr = reward / risk_price if risk_price > 0 else 0
 
-    grade_data = classify_signal(score, rr, vol_ratio, extra_filters)
+    grade_data = classify_signal(score, rr, vol_ratio, extra_filters, strategy, direction)
 
     if grade_data is None:
         return None
@@ -1571,6 +1621,345 @@ def evaluate_bear_continuation_retest(symbol, direction, c15, c5, c1, c1h, c4h, 
     )
 
 
+
+def find_swing_support_levels(candles: List[dict], lookback: int = 96) -> List[float]:
+    """
+    Ищет локальные уровни поддержки по swing-low на 15m.
+    Возвращает сглаженный список уровней от нижних к верхним.
+    """
+    if len(candles) < 40:
+        return []
+
+    window = candles[-lookback:] if len(candles) >= lookback else candles[:]
+    levels = []
+
+    for i in range(3, len(window) - 3):
+        low = window[i]["low"]
+        left = [window[i - 1]["low"], window[i - 2]["low"], window[i - 3]["low"]]
+        right = [window[i + 1]["low"], window[i + 2]["low"], window[i + 3]["low"]]
+
+        if low <= min(left) and low <= min(right):
+            levels.append(low)
+
+    if not levels:
+        return []
+
+    levels.sort()
+    merged = []
+
+    for level in levels:
+        if not merged:
+            merged.append(level)
+            continue
+
+        # Объединяем близкие уровни, чтобы не плодить шум.
+        if abs(level - merged[-1]) / merged[-1] * 100 <= 0.35:
+            merged[-1] = (merged[-1] + level) / 2
+        else:
+            merged.append(level)
+
+    return merged
+
+
+def nearest_level_above(price: float, levels: List[float], max_distance_percent: float = 3.0) -> Optional[float]:
+    candidates = [level for level in levels if level > price]
+    if not candidates:
+        return None
+
+    level = min(candidates, key=lambda x: abs(x - price))
+    if abs(level - price) / price * 100 > max_distance_percent:
+        return None
+
+    return level
+
+
+
+def nearest_level_below(price: float, levels: List[float], max_distance_percent: float = 7.0) -> Optional[float]:
+    """
+    Ищет ближайшую поддержку ниже текущей цены.
+    Нужна для sweep-bounce: цена могла уже отскочить от уровня на несколько процентов,
+    но вход всё ещё может быть логичным после reclaim.
+    """
+    candidates = [level for level in levels if level < price]
+    if not candidates:
+        return None
+
+    level = max(candidates)
+    if abs(price - level) / level * 100 > max_distance_percent:
+        return None
+
+    return level
+
+def nearest_level_near_price(price: float, levels: List[float], max_distance_percent: float = 1.2) -> Optional[float]:
+    if not levels:
+        return None
+
+    level = min(levels, key=lambda x: abs(x - price))
+    if abs(level - price) / price * 100 > max_distance_percent:
+        return None
+
+    return level
+
+
+def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    """
+    LEVEL_BREAK_RETEST_SHORT:
+    Пробой поддержки -> закрепление ниже -> ретест уровня снизу -> rejection -> SHORT.
+    Не шортит просто в момент пробоя, чтобы не ловить ложные выносы.
+    """
+    strategy = "LEVEL_BREAK_RETEST_SHORT"
+
+    if direction != "SHORT":
+        return None
+
+    if btc_status == "BULLISH":
+        return None
+
+    closes15 = [c["close"] for c in c15]
+    closes5 = [c["close"] for c in c5]
+
+    if len(closes15) < 100 or len(closes5) < 80:
+        return None
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+    price = last5["close"]
+
+    a5 = atr(c5)
+    vw = vwap_like(c15)
+    rs5 = rsi(closes5)
+    rs15 = rsi(closes15)
+    vr5 = volume_ratio(c5, period=24)
+
+    if a5 is None or vw is None or rs5 is None or rs15 is None:
+        return None
+
+    if late_entry_blocked(direction, c5, price, vw):
+        return None
+
+    ema21_5 = ema(closes5, 21)[-1]
+    ema50_15 = ema(closes15, 50)[-1]
+    trend1h = trend_state(c1h)
+    trend4h = trend_state(c4h)
+
+    if trend1h == "BULLISH":
+        return None
+
+    levels = find_swing_support_levels(c15, lookback=120)
+    level = nearest_level_above(price, levels, max_distance_percent=LEVEL_BREAK_RETEST_MAX_DISTANCE_PERCENT)
+
+    if level is None:
+        return None
+
+    # Должно быть подтверждение, что этот уровень недавно был пробит вниз.
+    recent_15 = c15[-10:]
+    had_close_above = any(c["close"] > level * 1.001 for c in recent_15[:-2])
+    now_below = c15[-1]["close"] < level * 0.998 or c15[-2]["close"] < level * 0.998
+
+    if not had_close_above or not now_below:
+        return None
+
+    # Ретест снизу: цена вернулась к уровню, но не смогла закрепиться выше.
+    touched_retest = last5["high"] >= level * 0.996
+    rejected_below = last5["close"] < level * 0.999 and last5["close"] < last5["open"] and last5["close"] < prev5["close"]
+
+    if not touched_retest or not rejected_below:
+        return None
+
+    # Дополнительное давление: цена под EMA/VWAP или под EMA50 15m.
+    if price > ema21_5 * 1.003:
+        return None
+
+    if price > ema50_15 * 1.006:
+        return None
+
+    # Не шортим, если уже слишком перепродано — высок риск отскока.
+    if rs5 < 24 or rs15 < 28:
+        return None
+
+    # Откат к пробитому уровню не должен быть на экстремально сильном выкупе.
+    recent_down_vol = sum(c["volume"] for c in c5[-12:-6]) / 6
+    retest_vol = sum(c["volume"] for c in c5[-5:-1]) / 4
+    if recent_down_vol > 0 and retest_vol > recent_down_vol * 1.35:
+        return None
+
+    score = 63
+
+    if btc_status == "BEARISH":
+        score += 8
+    elif btc_status == "SOFT_BEARISH":
+        score += 5
+
+    if trend1h in ["BEARISH", "SOFT_BEARISH"]:
+        score += 7
+
+    if trend4h in ["BEARISH", "SOFT_BEARISH"]:
+        score += 4
+
+    if vr5 >= B_MIN_VOLUME_RATIO:
+        score += 6
+
+    if vr5 >= A_PLUS_MIN_VOLUME_RATIO:
+        score += 4
+
+    if price < vw:
+        score += 3
+
+    if abs(last5["high"] - level) / level * 100 <= 0.45:
+        score += 3
+
+    recent_high = max(c["high"] for c in c5[-8:])
+    sl = max(level + a5 * 0.18, recent_high + a5 * 0.08)
+
+    return build_signal(
+        symbol=symbol,
+        direction=direction,
+        strategy=strategy,
+        entry=price,
+        sl=sl,
+        score=score,
+        vol_ratio=vr5,
+        reason="Пробой поддержки → закрепление ниже → ретест уровня снизу → rejection. SHORT к следующей зоне поддержки.",
+        deposit=deposit,
+        risk_percent=risk_percent,
+        extra_filters=combine_extra_filters(symbol, direction, btc_status),
+    )
+
+
+def evaluate_level_sweep_bounce_long(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    """
+    LEVEL_SWEEP_BOUNCE_LONG:
+    Цена приходит к поддержке -> снимает ликвидность ниже -> возвращается выше -> зелёное подтверждение -> LONG.
+    Не покупает поддержку вслепую, только после reclaim.
+    """
+    strategy = "LEVEL_SWEEP_BOUNCE_LONG"
+
+    if direction != "LONG":
+        return None
+
+    if btc_status == "BEARISH":
+        return None
+
+    closes15 = [c["close"] for c in c15]
+    closes5 = [c["close"] for c in c5]
+
+    if len(closes15) < 100 or len(closes5) < 80:
+        return None
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+    price = last5["close"]
+
+    a5 = atr(c5)
+    vw = vwap_like(c15)
+    rs5 = rsi(closes5)
+    rs15 = rsi(closes15)
+    vr5 = volume_ratio(c5, period=24)
+
+    if a5 is None or vw is None or rs5 is None or rs15 is None:
+        return None
+
+    if late_entry_blocked(direction, c5, price, vw):
+        return None
+
+    ema21_5 = ema(closes5, 21)[-1]
+    ema50_15 = ema(closes15, 50)[-1]
+    trend1h = trend_state(c1h)
+    trend4h = trend_state(c4h)
+
+    if trend1h == "BEARISH":
+        return None
+
+    levels = find_swing_support_levels(c15, lookback=140)
+
+    # V4.6: ищем не только уровень прямо возле текущей цены.
+    # Если был sweep 0.400 -> 0.380 и цена уже вернулась к 0.420,
+    # старая логика могла пропустить сделку. Теперь ближайшая поддержка ниже цены
+    # может быть до LEVEL_SWEEP_MAX_RECLAIM_DISTANCE_PERCENT от текущей цены.
+    level = nearest_level_below(
+        price,
+        levels,
+        max_distance_percent=LEVEL_SWEEP_MAX_RECLAIM_DISTANCE_PERCENT
+    )
+
+    if level is None:
+        level = nearest_level_near_price(price, levels, max_distance_percent=2.0)
+
+    if level is None:
+        return None
+
+    # Был sweep ниже поддержки и возврат выше уровня.
+    sweep_window = c5[-LEVEL_SWEEP_LOOKBACK_CANDLES:]
+    recent_lows = [c["low"] for c in sweep_window]
+    sweep_low = min(recent_lows)
+    swept = sweep_low < level * 0.997
+
+    # Reclaim разрешаем не только в последней свече: иногда возврат уже произошёл,
+    # а вход лучше появляется на следующем подтверждении.
+    reclaimed = any(c["close"] > level * 1.001 for c in c5[-4:])
+
+    if not swept or not reclaimed:
+        return None
+
+    # Подтверждение отскока: зелёная свеча и цена выше short EMA.
+    bounce_confirm = (
+        last5["close"] > last5["open"]
+        and last5["close"] > prev5["close"]
+        and last5["close"] >= ema21_5 * 0.995
+    )
+
+    if not bounce_confirm:
+        return None
+
+    # Не покупаем, если старшая структура сильно давит вниз.
+    if price < ema50_15 * 0.985 and btc_status != "BULLISH":
+        return None
+
+    # RSI не должен быть слишком перегрет после отскока.
+    if rs5 > 72 or rs15 > 68:
+        return None
+
+    score = 62
+
+    if btc_status == "BULLISH":
+        score += 8
+    elif btc_status == "SOFT_BULLISH":
+        score += 5
+
+    if trend1h in ["BULLISH", "SOFT_BULLISH"]:
+        score += 7
+
+    if trend4h in ["BULLISH", "SOFT_BULLISH"]:
+        score += 4
+
+    if vr5 >= B_MIN_VOLUME_RATIO:
+        score += 6
+
+    if vr5 >= A_PLUS_MIN_VOLUME_RATIO:
+        score += 4
+
+    if price > vw * 0.995:
+        score += 3
+
+    if abs(sweep_low - level) / level * 100 <= 0.8:
+        score += 3
+
+    sl = min(sweep_low - a5 * 0.12, min(c["low"] for c in c5[-10:]) - a5 * 0.05)
+
+    return build_signal(
+        symbol=symbol,
+        direction=direction,
+        strategy=strategy,
+        entry=price,
+        sl=sl,
+        score=score,
+        vol_ratio=vr5,
+        reason="Поддержка удержалась: sweep ниже уровня → возврат выше поддержки → зелёное подтверждение. LONG на отскок.",
+        deposit=deposit,
+        risk_percent=risk_percent,
+        extra_filters=combine_extra_filters(symbol, direction, btc_status),
+    )
+
 def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_percent: float) -> Optional[dict]:
     symbol = normalize_symbol(symbol)
 
@@ -1600,6 +1989,8 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
             evaluate_sweep,
             evaluate_momentum_scalper,
             evaluate_bear_continuation_retest,
+            evaluate_level_break_retest_short,
+            evaluate_level_sweep_bounce_long,
         ]:
             signal = func(symbol, d, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent)
 
@@ -1632,6 +2023,8 @@ def build_message(signal: dict) -> str:
         "SWEEP_RECLAIM": "🧲 Снятие ликвидности",
         "MOMENTUM_SCALPER": "⚡ Импульсный скальпинг",
         "BEAR_CONTINUATION_RETEST": "🐻 Продолжение падения после отката",
+        "LEVEL_BREAK_RETEST_SHORT": "📉 Пробой поддержки + ретест",
+        "LEVEL_SWEEP_BOUNCE_LONG": "🟢 Отскок от поддержки после sweep",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -1877,6 +2270,8 @@ def build_result_message(signal: dict, result: str, price: float, notes: List[st
         "SWEEP_RECLAIM": "🧲 Снятие ликвидности",
         "MOMENTUM_SCALPER": "⚡ Импульсный скальпинг",
         "BEAR_CONTINUATION_RETEST": "🐻 Продолжение падения после отката",
+        "LEVEL_BREAK_RETEST_SHORT": "📉 Пробой поддержки + ретест",
+        "LEVEL_SWEEP_BOUNCE_LONG": "🟢 Отскок от поддержки после sweep",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -2084,7 +2479,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V4.4 Bear Retest запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V4.6 Stats-Aware Levels запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -2095,6 +2490,9 @@ async def startup_event():
         f"A+ RR: {A_PLUS_MIN_RR}\n"
         f"B RR: {B_MIN_RR}\n"
         f"B risk: x{B_RISK_MULTIPLIER}\n"
+        f"Stats-Aware A+: {'ON' if STATS_AWARE_A_PLUS_ENABLED else 'OFF'}\n"
+        f"A+ strategy WR min: {A_PLUS_MIN_STRATEGY_WR}% after {A_PLUS_MIN_STRATEGY_TRADES} trades\n"
+        f"Momentum A+: {'ON' if MOMENTUM_SCALPER_CAN_A_PLUS else 'OFF'}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
         "Бот ищет LONG и SHORT, показывает стратегию, считает статистику и блокирует только strategy+side, а не весь SHORT/LONG.\n"
@@ -2112,10 +2510,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V4.4 Bear Retest</title>
+    <title>Professional Adaptive Futures Bot AUTO V4.6 Stats-Aware Levels</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V4.4 Bear Retest работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V4.6 Stats-Aware Levels работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -2135,7 +2533,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V4.4 Bear Retest",
+        "service": "Professional Adaptive Futures Bot AUTO V4.6 Stats-Aware Levels",
         "test_mode": TEST_MODE,
         "a_plus_min_score": A_PLUS_MIN_SCORE,
         "b_min_score": B_MIN_SCORE,
@@ -2162,7 +2560,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.4 Bear Retest подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.6 Stats-Aware Levels подключён к Telegram.")
 
 
 @app.get("/auto-signal")
