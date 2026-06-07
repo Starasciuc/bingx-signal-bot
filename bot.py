@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.8 Full Level Engine")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.9 Professional Level Reversal")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -34,10 +34,10 @@ A_PLUS_MIN_STRATEGY_WR = float(os.getenv("A_PLUS_MIN_STRATEGY_WR", "55"))
 MOMENTUM_SCALPER_CAN_A_PLUS = os.getenv("MOMENTUM_SCALPER_CAN_A_PLUS", "false").lower() == "true"
 
 # B мягче, но риск ниже
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "74"))
-B_MIN_VOLUME_RATIO = float(os.getenv("B_MIN_VOLUME_RATIO", "1.05"))
-B_MIN_RR = float(os.getenv("B_MIN_RR", "0.55"))
-B_RISK_MULTIPLIER = float(os.getenv("B_RISK_MULTIPLIER", "0.35"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "78"))
+B_MIN_VOLUME_RATIO = float(os.getenv("B_MIN_VOLUME_RATIO", "1.12"))
+B_MIN_RR = float(os.getenv("B_MIN_RR", "0.70"))
+B_RISK_MULTIPLIER = float(os.getenv("B_RISK_MULTIPLIER", "0.30"))
 
 TP1_POSITION_PERCENT = float(os.getenv("TP1_POSITION_PERCENT", "8"))
 TP2_POSITION_PERCENT = float(os.getenv("TP2_POSITION_PERCENT", "15"))
@@ -52,7 +52,7 @@ DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "180"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "2400"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "3600"))
 
 PAIR_BLOCK_SECONDS = int(os.getenv("PAIR_BLOCK_SECONDS", "43200"))
 STRATEGY_SIDE_DISABLE_SECONDS = int(os.getenv("STRATEGY_SIDE_DISABLE_SECONDS", "10800"))
@@ -80,6 +80,16 @@ LEVEL_SWEEP_MAX_RECLAIM_DISTANCE_PERCENT = float(os.getenv("LEVEL_SWEEP_MAX_RECL
 ALLOW_BEARISH_BTC_LEVEL_BOUNCE = os.getenv("ALLOW_BEARISH_BTC_LEVEL_BOUNCE", "true").lower() == "true"
 BEARISH_BTC_BOUNCE_RISK_MULTIPLIER = float(os.getenv("BEARISH_BTC_BOUNCE_RISK_MULTIPLIER", "0.25"))
 LEVEL_BREAK_RETEST_MAX_DISTANCE_PERCENT = float(os.getenv("LEVEL_BREAK_RETEST_MAX_DISTANCE_PERCENT", "3.2"))
+
+# V4.9 Professional Level Reversal:
+# не догоняем LONG после сильного роста; LONG только возле ретеста уровня.
+MAX_LEVEL_LONG_PRE_MOVE_PERCENT = float(os.getenv("MAX_LEVEL_LONG_PRE_MOVE_PERCENT", "4.0"))
+LEVEL_BREAK_RETEST_LONG_MAX_ABOVE_LEVEL_PERCENT = float(os.getenv("LEVEL_BREAK_RETEST_LONG_MAX_ABOVE_LEVEL_PERCENT", "1.2"))
+
+# SHORT от сопротивления после роста: нужен предшествующий импульс вверх, но вход не должен быть поздним.
+MIN_RESISTANCE_REJECT_PRIOR_UP_MOVE_PERCENT = float(os.getenv("MIN_RESISTANCE_REJECT_PRIOR_UP_MOVE_PERCENT", "2.0"))
+LEVEL_RESISTANCE_REJECT_MAX_AFTER_REJECT_DISTANCE_PERCENT = float(os.getenv("LEVEL_RESISTANCE_REJECT_MAX_AFTER_REJECT_DISTANCE_PERCENT", "3.0"))
+
 # V4.8: зеркальные стратегии уровней — пробой сопротивления в LONG и rejection от сопротивления в SHORT.
 LEVEL_RESISTANCE_REJECT_MAX_DISTANCE_PERCENT = float(os.getenv("LEVEL_RESISTANCE_REJECT_MAX_DISTANCE_PERCENT", "7.0"))
 
@@ -2127,6 +2137,13 @@ def evaluate_level_break_retest_long(symbol, direction, c15, c5, c1, c1h, c4h, b
     if a5 is None or vw is None or rs5 is None or rs15 is None:
         return None
 
+    # V4.9: не покупаем пробой, если монета уже сильно выросла до сигнала.
+    # Профессиональный вход здесь — не догонять рост, а ждать ретест уровня.
+    recent_15m_move = recent_move_percent(c15, lookback=8)
+    recent_5m_move = recent_move_percent(c5, lookback=12)
+    if recent_15m_move > MAX_LEVEL_LONG_PRE_MOVE_PERCENT or recent_5m_move > MAX_LEVEL_LONG_PRE_MOVE_PERCENT:
+        return None
+
     if late_entry_blocked(direction, c5, price, vw):
         return None
 
@@ -2142,6 +2159,12 @@ def evaluate_level_break_retest_long(symbol, direction, c15, c5, c1, c1h, c4h, b
     level = nearest_resistance_below(price, levels, max_distance_percent=LEVEL_BREAK_RETEST_MAX_DISTANCE_PERCENT)
 
     if level is None:
+        return None
+
+    # V4.9: если цена уже далеко выше пробитого сопротивления, это поздний LONG.
+    # Ждём вход возле ретеста, а не после пампа.
+    distance_above_level = (price - level) / level * 100 if level > 0 else 999
+    if distance_above_level > LEVEL_BREAK_RETEST_LONG_MAX_ABOVE_LEVEL_PERCENT:
         return None
 
     recent_15 = c15[-10:]
@@ -2200,6 +2223,10 @@ def evaluate_level_break_retest_long(symbol, direction, c15, c5, c1, c1h, c4h, b
     if abs(last5["low"] - level) / level * 100 <= 0.45:
         score += 3
 
+    # Чем ближе вход к ретесту, тем лучше качество. Далёкий вход не усиливаем.
+    if distance_above_level <= 0.65:
+        score += 3
+
     recent_low = min(c["low"] for c in c5[-8:])
     sl = min(level - a5 * 0.18, recent_low - a5 * 0.08)
 
@@ -2251,6 +2278,13 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
     if a5 is None or vw is None or rs5 is None or rs15 is None:
         return None
 
+    # V4.9: SHORT от сопротивления нужен именно после предшествующего роста.
+    # Если роста не было, это не качественный rejection-сетап.
+    prior_15m_move = recent_move_percent(c15, lookback=8)
+    prior_5m_move = recent_move_percent(c5, lookback=12)
+    if max(prior_15m_move, prior_5m_move) < MIN_RESISTANCE_REJECT_PRIOR_UP_MOVE_PERCENT:
+        return None
+
     if late_entry_blocked(direction, c5, price, vw):
         return None
 
@@ -2290,7 +2324,7 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
         return None
 
     rejection_distance = (level - price) / level * 100 if level > 0 else 0
-    if rejection_distance > 4.8:
+    if rejection_distance > LEVEL_RESISTANCE_REJECT_MAX_AFTER_REJECT_DISTANCE_PERCENT:
         return None
 
     if price > ema50_15 * 1.025 and btc_status != "BEARISH":
@@ -2324,6 +2358,9 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
 
     if abs(sweep_high - level) / level * 100 <= 0.9:
         score += 3
+
+    if max(prior_15m_move, prior_5m_move) >= 4.0:
+        score += 4
 
     sl = max(sweep_high + a5 * 0.12, max(c["high"] for c in c5[-10:]) + a5 * 0.05)
 
@@ -2868,7 +2905,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V4.8 Full Level Engine запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V4.9 Professional Level Reversal запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -2901,10 +2938,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V4.8 Full Level Engine</title>
+    <title>Professional Adaptive Futures Bot AUTO V4.9 Professional Level Reversal</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V4.8 Full Level Engine работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V4.9 Professional Level Reversal работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -2924,7 +2961,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V4.8 Full Level Engine",
+        "service": "Professional Adaptive Futures Bot AUTO V4.9 Professional Level Reversal",
         "test_mode": TEST_MODE,
         "a_plus_min_score": A_PLUS_MIN_SCORE,
         "b_min_score": B_MIN_SCORE,
@@ -2932,6 +2969,9 @@ def health():
         "b_min_volume_ratio": B_MIN_VOLUME_RATIO,
         "a_plus_min_rr": A_PLUS_MIN_RR,
         "b_min_rr": B_MIN_RR,
+        "max_level_long_pre_move_percent": MAX_LEVEL_LONG_PRE_MOVE_PERCENT,
+        "level_break_retest_long_max_above_level_percent": LEVEL_BREAK_RETEST_LONG_MAX_ABOVE_LEVEL_PERCENT,
+        "min_resistance_reject_prior_up_move_percent": MIN_RESISTANCE_REJECT_PRIOR_UP_MOVE_PERCENT,
         "auto_scan_enabled": AUTO_SCAN_ENABLED,
         "auto_track_enabled": AUTO_TRACK_ENABLED,
         "bearish_btc_level_bounce": ALLOW_BEARISH_BTC_LEVEL_BOUNCE,
@@ -2953,7 +2993,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.8 Full Level Engine подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.9 Professional Level Reversal подключён к Telegram.")
 
 
 @app.get("/auto-signal")
