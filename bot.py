@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V5.2 Balanced Risk-Aware Core Level Trader")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -115,6 +115,16 @@ LEVEL_STRENGTH_4H_BONUS = int(os.getenv("LEVEL_STRENGTH_4H_BONUS", "4"))
 # V4.9: периодический отчёт, если сигналов нет. Полезно для Background Worker.
 DEBUG_NO_SIGNAL_REPORT_ENABLED = os.getenv("DEBUG_NO_SIGNAL_REPORT_ENABLED", "true").lower() == "true"
 DEBUG_NO_SIGNAL_REPORT_SECONDS = int(os.getenv("DEBUG_NO_SIGNAL_REPORT_SECONDS", "10800"))
+
+# Optional pro momentum module: only cautious B signals after impulse -> pullback -> confirmation.
+IMPULSE_PULLBACK_ENABLED = os.getenv("IMPULSE_PULLBACK_ENABLED", "true").lower() == "true"
+IMPULSE_PULLBACK_RISK_MULTIPLIER = float(os.getenv("IMPULSE_PULLBACK_RISK_MULTIPLIER", "0.25"))
+IMPULSE_MIN_MOVE_5M_PERCENT = float(os.getenv("IMPULSE_MIN_MOVE_5M_PERCENT", "1.20"))
+IMPULSE_PULLBACK_MIN_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MIN_PERCENT", "0.25"))
+IMPULSE_PULLBACK_MAX_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MAX_PERCENT", "2.80"))
+IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT", "2.20"))
+IMPULSE_MIN_VOLUME_RATIO = float(os.getenv("IMPULSE_MIN_VOLUME_RATIO", "1.05"))
+IMPULSE_FORCE_B_ONLY = os.getenv("IMPULSE_FORCE_B_ONLY", "true").lower() == "true"
 
 MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0010"))
 FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0020"))
@@ -2681,6 +2691,7 @@ def build_message(signal: dict) -> str:
         "LEVEL_SWEEP_BOUNCE_LONG": "🟢 Отскок от поддержки после sweep",
         "LEVEL_BREAK_RETEST_LONG": "📈 Пробой сопротивления + ретест",
         "LEVEL_RESISTANCE_REJECT_SHORT": "🔴 Отбой от сопротивления после sweep",
+        "IMPULSE_PULLBACK_PRO": "⚡ Impulse Pullback Pro",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -2938,6 +2949,7 @@ def build_result_message(signal: dict, result: str, price: float, notes: List[st
         "LEVEL_SWEEP_BOUNCE_LONG": "🟢 Отскок от поддержки после sweep",
         "LEVEL_BREAK_RETEST_LONG": "📈 Пробой сопротивления + ретест",
         "LEVEL_RESISTANCE_REJECT_SHORT": "🔴 Отбой от сопротивления после sweep",
+        "IMPULSE_PULLBACK_PRO": "⚡ Impulse Pullback Pro",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -3194,7 +3206,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V5.2 Balanced Risk-Aware Core Level Trader запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -3230,10 +3242,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V5.2 Balanced Risk-Aware Core Level Trader</title>
+    <title>Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V5.2 Balanced Risk-Aware Core Level Trader работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -3253,7 +3265,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V5.2 Balanced Risk-Aware Core Level Trader",
+        "service": "Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro",
         "test_mode": TEST_MODE,
         "fee_rate": FEE_RATE,
         "slippage_rate": SLIPPAGE_RATE,
@@ -3290,7 +3302,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V5.2 Balanced Risk-Aware Core Level Trader подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro подключён к Telegram.")
 
 
 @app.get("/auto-signal")
