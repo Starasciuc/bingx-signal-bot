@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V4.9 Active Level Engine")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V5.0 Anti-Fakeout Levels")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -92,6 +92,17 @@ LEVEL_SIGNAL_SCORE_BONUS = int(os.getenv("LEVEL_SIGNAL_SCORE_BONUS", "3"))
 
 # V4.9: защита от покупки слишком позднего пробоя после сильного роста.
 MAX_LEVEL_LONG_15M_MOVE_PERCENT = float(os.getenv("MAX_LEVEL_LONG_15M_MOVE_PERCENT", "6.5"))
+
+# V5.0: анти-фейкаут защита для пробоев/ретестов уровней.
+# Цель — не давать A+ на пробой, если цена быстро возвращается за уровень.
+ANTI_FAKEOUT_LEVELS_ENABLED = os.getenv("ANTI_FAKEOUT_LEVELS_ENABLED", "true").lower() == "true"
+LEVEL_RETEST_MAX_PIERCE_PERCENT = float(os.getenv("LEVEL_RETEST_MAX_PIERCE_PERCENT", "0.35"))
+LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT = float(os.getenv("LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT", "0.10"))
+LEVEL_MICRO_CONFIRM_CANDLES = int(os.getenv("LEVEL_MICRO_CONFIRM_CANDLES", "3"))
+LEVEL_REJECTION_CLOSE_POSITION = float(os.getenv("LEVEL_REJECTION_CLOSE_POSITION", "0.45"))
+LEVEL_BREAK_A_PLUS_NEEDS_MICRO_CONFIRM = os.getenv("LEVEL_BREAK_A_PLUS_NEEDS_MICRO_CONFIRM", "true").lower() == "true"
+LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM = os.getenv("LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM", "true").lower() == "true"
+LEVEL_BREAK_SHORT_BONUS_AFTER_CONFIRM = int(os.getenv("LEVEL_BREAK_SHORT_BONUS_AFTER_CONFIRM", "4"))
 
 # V4.9: периодический отчёт, если сигналов нет. Полезно для Background Worker.
 DEBUG_NO_SIGNAL_REPORT_ENABLED = os.getenv("DEBUG_NO_SIGNAL_REPORT_ENABLED", "true").lower() == "true"
@@ -1832,11 +1843,63 @@ def nearest_level_near_price(price: float, levels: List[float], max_distance_per
     return level
 
 
+def candle_close_position(candle: dict) -> float:
+    """
+    Возвращает позицию закрытия внутри свечи:
+    0 = закрылась у low, 1 = закрылась у high.
+    Для SHORT rejection лучше, когда значение ближе к 0.
+    Для LONG confirmation лучше, когда значение ближе к 1.
+    """
+    high = candle.get("high", 0)
+    low = candle.get("low", 0)
+    close = candle.get("close", 0)
+    rng = high - low
+    if rng <= 0:
+        return 0.5
+    return (close - low) / rng
+
+
+def micro_confirm_below_level(c1: List[dict], level: float) -> bool:
+    if len(c1) < LEVEL_MICRO_CONFIRM_CANDLES + 10:
+        return False
+
+    closes = [c["close"] for c in c1]
+    ema9 = ema(closes, 9)[-1]
+    recent = c1[-LEVEL_MICRO_CONFIRM_CANDLES:]
+    buffer = 1 - LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT / 100
+
+    closes_below = all(c["close"] < level * buffer for c in recent)
+    below_ema = recent[-1]["close"] < ema9
+    lower_pressure = recent[-1]["close"] < recent[0]["open"]
+
+    return closes_below and below_ema and lower_pressure
+
+
+def micro_confirm_above_level(c1: List[dict], level: float) -> bool:
+    if len(c1) < LEVEL_MICRO_CONFIRM_CANDLES + 10:
+        return False
+
+    closes = [c["close"] for c in c1]
+    ema9 = ema(closes, 9)[-1]
+    recent = c1[-LEVEL_MICRO_CONFIRM_CANDLES:]
+    buffer = 1 + LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT / 100
+
+    closes_above = all(c["close"] > level * buffer for c in recent)
+    above_ema = recent[-1]["close"] > ema9
+    buy_pressure = recent[-1]["close"] > recent[0]["open"]
+
+    return closes_above and above_ema and buy_pressure
+
+
 def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
     """
-    LEVEL_BREAK_RETEST_SHORT:
-    Пробой поддержки -> закрепление ниже -> ретест уровня снизу -> rejection -> SHORT.
-    Не шортит просто в момент пробоя, чтобы не ловить ложные выносы.
+    V5.0 LEVEL_BREAK_RETEST_SHORT:
+    Пробой поддержки -> закрепление ниже -> ретест снизу -> rejection -> микро-подтверждение вниз -> SHORT.
+
+    Главное изменение V5.0:
+    - не даём A+ только по факту пробоя и объёма;
+    - если цена быстро возвращается выше уровня, сигнал отменяется;
+    - если подтверждение слабое, сигнал максимум B, а не A+.
     """
     strategy = "LEVEL_BREAK_RETEST_SHORT"
 
@@ -1849,7 +1912,7 @@ def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, 
     closes15 = [c["close"] for c in c15]
     closes5 = [c["close"] for c in c5]
 
-    if len(closes15) < 100 or len(closes5) < 80:
+    if len(closes15) < 100 or len(closes5) < 80 or len(c1) < 30:
         return None
 
     last5 = c5[-1]
@@ -1882,7 +1945,6 @@ def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, 
     if level is None:
         return None
 
-    # Должно быть подтверждение, что этот уровень недавно был пробит вниз.
     recent_15 = c15[-10:]
     had_close_above = any(c["close"] > level * 1.001 for c in recent_15[:-2])
     now_below = c15[-1]["close"] < level * 0.998 or c15[-2]["close"] < level * 0.998
@@ -1890,18 +1952,42 @@ def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, 
     if not had_close_above or not now_below:
         return None
 
-    # Ретест снизу: цена вернулась к уровню, но не смогла закрепиться выше.
+    # Ретест снизу: цена вернулась к уровню, но не должна слишком глубоко прокалывать его вверх.
     touched_retest = last5["high"] >= level * 0.996
-    rejected_below = last5["close"] < level * 0.999 and last5["close"] < last5["open"] and last5["close"] < prev5["close"]
+    max_allowed_pierce = level * (1 + LEVEL_RETEST_MAX_PIERCE_PERCENT / 100)
+    too_deep_back_above = last5["high"] > max_allowed_pierce
 
-    if not touched_retest or not rejected_below:
+    close_buffer = 1 - LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT / 100
+    rejected_below = (
+        last5["close"] < level * close_buffer
+        and last5["close"] < last5["open"]
+        and last5["close"] < prev5["close"]
+        and candle_close_position(last5) <= LEVEL_REJECTION_CLOSE_POSITION
+    )
+
+    if not touched_retest or too_deep_back_above or not rejected_below:
         return None
+
+    # Анти-фейкаут: несколько последних 5m закрытий должны оставаться ниже уровня.
+    recent5 = c5[-3:]
+    closes_below_count = sum(1 for c in recent5 if c["close"] < level * close_buffer)
+    two_5m_closes_below = closes_below_count >= 2
+
+    if ANTI_FAKEOUT_LEVELS_ENABLED and not two_5m_closes_below:
+        return None
+
+    # Анти-фейкаут: последние 1m свечи не должны возвращаться выше уровня.
+    micro_below = micro_confirm_below_level(c1, level)
+
+    if ANTI_FAKEOUT_LEVELS_ENABLED and LEVEL_BREAK_A_PLUS_NEEDS_MICRO_CONFIRM and not micro_below:
+        # Не отменяем полностью, но не даём A+ — только осторожный B.
+        pass
 
     # Дополнительное давление: цена под EMA/VWAP или под EMA50 15m.
-    if price > ema21_5 * 1.003:
+    if price > ema21_5 * 1.002:
         return None
 
-    if price > ema50_15 * 1.006:
+    if price > ema50_15 * 1.004:
         return None
 
     # Не шортим, если уже слишком перепродано — высок риск отскока.
@@ -1911,7 +1997,7 @@ def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, 
     # Откат к пробитому уровню не должен быть на экстремально сильном выкупе.
     recent_down_vol = sum(c["volume"] for c in c5[-12:-6]) / 6
     retest_vol = sum(c["volume"] for c in c5[-5:-1]) / 4
-    if recent_down_vol > 0 and retest_vol > recent_down_vol * 1.35:
+    if recent_down_vol > 0 and retest_vol > recent_down_vol * 1.25:
         return None
 
     score = 63
@@ -1939,8 +2025,18 @@ def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, 
     if abs(last5["high"] - level) / level * 100 <= 0.45:
         score += 3
 
+    if two_5m_closes_below and micro_below:
+        score += LEVEL_BREAK_SHORT_BONUS_AFTER_CONFIRM
+
     recent_high = max(c["high"] for c in c5[-8:])
     sl = max(level + a5 * 0.18, recent_high + a5 * 0.08)
+
+    filters = combine_extra_filters(symbol, direction, btc_status)
+
+    # Если подтверждение не идеальное, не даём A+ — только B.
+    if LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM and not (two_5m_closes_below and micro_below):
+        filters["force_grade"] = "B"
+        filters["anti_fakeout_note"] = "A+ запрещён: нет полного 5m+1m подтверждения ниже пробитой поддержки."
 
     return build_signal(
         symbol=symbol,
@@ -1950,10 +2046,10 @@ def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, 
         sl=sl,
         score=score,
         vol_ratio=vr5,
-        reason="Пробой поддержки → закрепление ниже → ретест уровня снизу → rejection. SHORT к следующей зоне поддержки.",
+        reason="Пробой поддержки → закрепление ниже → ретест снизу → rejection + анти-фейкаут подтверждение. SHORT к следующей зоне поддержки.",
         deposit=deposit,
         risk_percent=risk_percent,
-        extra_filters=combine_extra_filters(symbol, direction, btc_status),
+        extra_filters=filters,
     )
 
 
@@ -2203,6 +2299,20 @@ def evaluate_level_break_retest_long(symbol, direction, c15, c5, c1, c1h, c4h, b
     if not touched_retest or not held_above or not confirmed_up:
         return None
 
+    # V5.0 anti-fakeout: после пробоя сопротивления последние 5m/1m должны удерживаться выше уровня.
+    close_buffer = 1 + LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT / 100
+    recent5 = c5[-3:]
+    two_5m_closes_above = sum(1 for c in recent5 if c["close"] > level * close_buffer) >= 2
+    micro_above = micro_confirm_above_level(c1, level)
+
+    if ANTI_FAKEOUT_LEVELS_ENABLED and not two_5m_closes_above:
+        return None
+
+    # Ретест не должен слишком глубоко проваливаться обратно под уровень.
+    min_allowed_pierce = level * (1 - LEVEL_RETEST_MAX_PIERCE_PERCENT / 100)
+    if last5["low"] < min_allowed_pierce:
+        return None
+
     if price < ema21_5 * 0.997:
         return None
 
@@ -2247,6 +2357,13 @@ def evaluate_level_break_retest_long(symbol, direction, c15, c5, c1, c1h, c4h, b
     recent_low = min(c["low"] for c in c5[-8:])
     sl = min(level - a5 * 0.18, recent_low - a5 * 0.08)
 
+    filters = combine_extra_filters(symbol, direction, btc_status)
+
+    # Если подтверждение пробоя вверх слабое, не даём A+ — только B.
+    if LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM and not (two_5m_closes_above and micro_above):
+        filters["force_grade"] = "B"
+        filters["anti_fakeout_note"] = "A+ запрещён: нет полного 5m+1m подтверждения выше пробитого сопротивления."
+
     return build_signal(
         symbol=symbol,
         direction=direction,
@@ -2255,10 +2372,10 @@ def evaluate_level_break_retest_long(symbol, direction, c15, c5, c1, c1h, c4h, b
         sl=sl,
         score=score,
         vol_ratio=vr5,
-        reason="Пробой сопротивления → закрепление выше → ретест уровня сверху → удержание. LONG на продолжение роста.",
+        reason="Пробой сопротивления → закрепление выше → ретест сверху → удержание уровня + анти-фейкаут подтверждение. LONG на продолжение роста.",
         deposit=deposit,
         risk_percent=risk_percent,
-        extra_filters=combine_extra_filters(symbol, direction, btc_status),
+        extra_filters=filters,
     )
 
 
@@ -2477,6 +2594,10 @@ def build_message(signal: dict) -> str:
     funding = filters.get("funding", {})
     funding_text = funding.get("reason", "Funding/OI: нет данных")
     countertrend_note = filters.get("countertrend_note", "")
+    anti_fakeout_note = filters.get("anti_fakeout_note", "")
+
+    if anti_fakeout_note:
+        funding_text += f"\nAnti-fakeout: {anti_fakeout_note}"
 
     grade_text = "A+ SIGNAL" if signal["grade"] == "A+" else "B SIGNAL"
 
@@ -2936,7 +3057,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V4.9 Active Level Engine запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V5.0 Anti-Fakeout Levels запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -2972,10 +3093,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V4.9 Active Level Engine</title>
+    <title>Professional Adaptive Futures Bot AUTO V5.0 Anti-Fakeout Levels</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V4.9 Active Level Engine работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V5.0 Anti-Fakeout Levels работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -2995,7 +3116,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V4.9 Active Level Engine",
+        "service": "Professional Adaptive Futures Bot AUTO V5.0 Anti-Fakeout Levels",
         "test_mode": TEST_MODE,
         "a_plus_min_score": A_PLUS_MIN_SCORE,
         "b_min_score": B_MIN_SCORE,
@@ -3029,7 +3150,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V4.9 Active Level Engine подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V5.0 Anti-Fakeout Levels подключён к Telegram.")
 
 
 @app.get("/auto-signal")
