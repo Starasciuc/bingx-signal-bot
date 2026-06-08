@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -104,6 +104,15 @@ LEVEL_BREAK_A_PLUS_NEEDS_MICRO_CONFIRM = os.getenv("LEVEL_BREAK_A_PLUS_NEEDS_MIC
 LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM = os.getenv("LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM", "true").lower() == "true"
 LEVEL_BREAK_SHORT_BONUS_AFTER_CONFIRM = int(os.getenv("LEVEL_BREAK_SHORT_BONUS_AFTER_CONFIRM", "4"))
 
+# V5.4: шорты от сопротивления делаем профессиональнее.
+# По статистике B-шорты от сопротивления были слабым местом, поэтому по умолчанию B там выключен.
+# A+ разрешён только при 1H-подтверждении и дополнительном 5m/1m подтверждении.
+RESISTANCE_REJECT_B_ENABLED = os.getenv("RESISTANCE_REJECT_B_ENABLED", "false").lower() == "true"
+RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM = os.getenv("RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM", "true").lower() == "true"
+RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL = int(os.getenv("RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL", "2"))
+RESISTANCE_REJECT_NEEDS_MICRO_CONFIRM = os.getenv("RESISTANCE_REJECT_NEEDS_MICRO_CONFIRM", "true").lower() == "true"
+RESISTANCE_REJECT_MAX_REBOUND_TO_SWEEP_PERCENT = float(os.getenv("RESISTANCE_REJECT_MAX_REBOUND_TO_SWEEP_PERCENT", "0.65"))
+
 # V5.2 Balanced Risk-Aware Core Level Trader: сила уровня по старшим таймфреймам.
 # A+ по уровню разрешается только если 15m уровень подтверждён 1H.
 LEVEL_A_PLUS_REQUIRES_1H_CONFIRM = os.getenv("LEVEL_A_PLUS_REQUIRES_1H_CONFIRM", "true").lower() == "true"
@@ -116,16 +125,6 @@ LEVEL_STRENGTH_4H_BONUS = int(os.getenv("LEVEL_STRENGTH_4H_BONUS", "4"))
 DEBUG_NO_SIGNAL_REPORT_ENABLED = os.getenv("DEBUG_NO_SIGNAL_REPORT_ENABLED", "true").lower() == "true"
 DEBUG_NO_SIGNAL_REPORT_SECONDS = int(os.getenv("DEBUG_NO_SIGNAL_REPORT_SECONDS", "10800"))
 
-# Optional pro momentum module: only cautious B signals after impulse -> pullback -> confirmation.
-IMPULSE_PULLBACK_ENABLED = os.getenv("IMPULSE_PULLBACK_ENABLED", "true").lower() == "true"
-IMPULSE_PULLBACK_RISK_MULTIPLIER = float(os.getenv("IMPULSE_PULLBACK_RISK_MULTIPLIER", "0.25"))
-IMPULSE_MIN_MOVE_5M_PERCENT = float(os.getenv("IMPULSE_MIN_MOVE_5M_PERCENT", "1.20"))
-IMPULSE_PULLBACK_MIN_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MIN_PERCENT", "0.25"))
-IMPULSE_PULLBACK_MAX_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MAX_PERCENT", "2.80"))
-IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT", "2.20"))
-IMPULSE_MIN_VOLUME_RATIO = float(os.getenv("IMPULSE_MIN_VOLUME_RATIO", "1.05"))
-IMPULSE_FORCE_B_ONLY = os.getenv("IMPULSE_FORCE_B_ONLY", "true").lower() == "true"
-
 MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0010"))
 FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0020"))
 
@@ -136,6 +135,17 @@ SIGNAL_MAX_LIFETIME_SECONDS = int(os.getenv("SIGNAL_MAX_LIFETIME_SECONDS", "2160
 SENT_SIGNALS_KEEP_SECONDS = int(os.getenv("SENT_SIGNALS_KEEP_SECONDS", "1209600"))
 SAVE_SIGNAL_ONLY_IF_TELEGRAM_OK = os.getenv("SAVE_SIGNAL_ONLY_IF_TELEGRAM_OK", "true").lower() == "true"
 
+# V5.3: осторожная B-only стратегия импульс -> откат -> подтверждение.
+# ВАЖНО: настройки A+/B/Level B не менялись. Это только дополнительный модуль.
+IMPULSE_PULLBACK_ENABLED = os.getenv("IMPULSE_PULLBACK_ENABLED", "true").lower() == "true"
+IMPULSE_PULLBACK_RISK_MULTIPLIER = float(os.getenv("IMPULSE_PULLBACK_RISK_MULTIPLIER", "0.25"))
+IMPULSE_MIN_MOVE_5M_PERCENT = float(os.getenv("IMPULSE_MIN_MOVE_5M_PERCENT", "1.20"))
+IMPULSE_PULLBACK_MIN_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MIN_PERCENT", "0.25"))
+IMPULSE_PULLBACK_MAX_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MAX_PERCENT", "2.80"))
+IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT", "2.20"))
+IMPULSE_MIN_VOLUME_RATIO = float(os.getenv("IMPULSE_MIN_VOLUME_RATIO", "1.05"))
+IMPULSE_FORCE_B_ONLY = os.getenv("IMPULSE_FORCE_B_ONLY", "true").lower() == "true"
+
 # V5.1: убираем «кашу» и оставляем 4 основные структуры уровня.
 # Старые вспомогательные функции в файле остаются, но больше не вызываются.
 STRATEGIES = [
@@ -143,6 +153,7 @@ STRATEGIES = [
     "LEVEL_RESISTANCE_REJECT_SHORT", # сопротивление удержалось -> SHORT
     "LEVEL_BREAK_RETEST_SHORT",      # поддержка пробита -> SHORT
     "LEVEL_BREAK_RETEST_LONG",       # сопротивление пробито -> LONG
+    "IMPULSE_PULLBACK_PRO",          # импульс -> откат к EMA/VWAP -> подтверждение, только B
 ]
 
 LIQUID_BASES = {
@@ -1043,8 +1054,15 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
 
     funding = filters.get("funding", {})
 
+    # V5.4: B-шорты от сопротивления были слабым местом по статистике.
+    # По умолчанию оставляем только A+ для LEVEL_RESISTANCE_REJECT_SHORT.
+    if strategy == "LEVEL_RESISTANCE_REJECT_SHORT" and not RESISTANCE_REJECT_B_ENABLED:
+        filters["no_b_allowed"] = True
+
     # V4.8: контртрендовый LONG-отскок при bearish BTC может быть только B, не A+.
     if filters.get("force_grade") == "B":
+        if filters.get("no_b_allowed"):
+            return None
         if (
             score >= B_MIN_SCORE
             and rr >= B_MIN_RR
@@ -1088,7 +1106,8 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         b_volume = LEVEL_B_MIN_VOLUME_RATIO
 
     if (
-        score >= b_score
+        not filters.get("no_b_allowed")
+        and score >= b_score
         and rr >= b_rr
         and volume >= b_volume
         and not funding.get("blocked")
@@ -2563,6 +2582,21 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
     if not rejection_confirm:
         return None
 
+    # V5.4: не входим по первой красной реакции от сопротивления.
+    # Ждём, чтобы рынок реально подтвердил отказ от уровня, иначе часто бывает второй вынос вверх.
+    close_buffer = 1 - LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT / 100
+    closes_below_level = sum(1 for c in c5[-4:] if c["close"] < level * close_buffer)
+    micro_below = micro_confirm_below_level(c1, level)
+    rebound_to_sweep = (sweep_high - price) / sweep_high * 100 if sweep_high > 0 else 0
+
+    if RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM:
+        if closes_below_level < RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL:
+            return None
+        if RESISTANCE_REJECT_NEEDS_MICRO_CONFIRM and not micro_below:
+            return None
+        if rebound_to_sweep < RESISTANCE_REJECT_MAX_REBOUND_TO_SWEEP_PERCENT:
+            return None
+
     rejection_distance = (level - price) / level * 100 if level > 0 else 0
     if rejection_distance > 6.0:
         return None
@@ -2603,6 +2637,9 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
     if abs(sweep_high - level) / level * 100 <= 1.2:
         score += 3
 
+    if closes_below_level >= RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL and micro_below:
+        score += 5
+
     sl = max(sweep_high + a5 * 0.12, max(c["high"] for c in c5[-10:]) + a5 * 0.05)
 
     mtf = level_mtf_strength(level, c1h, c4h, kind="resistance")
@@ -2611,6 +2648,11 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters.update(mtf)
     filters["anti_fakeout_note"] = (filters.get("anti_fakeout_note", "") + " " + mtf.get("level_strength_note", "")).strip()
+    if strategy == "LEVEL_RESISTANCE_REJECT_SHORT":
+        filters["anti_fakeout_note"] = (
+            filters.get("anti_fakeout_note", "")
+            + f" Resistance reject confirm: {closes_below_level}x5m below level, micro {'OK' if micro_below else 'NO'}, B {'ON' if RESISTANCE_REJECT_B_ENABLED else 'OFF'}."
+        ).strip()
 
     return build_signal(
         symbol=symbol,
@@ -2621,6 +2663,176 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
         score=score,
         vol_ratio=vr5,
         reason="Сопротивление удержалось: sweep выше уровня → возврат ниже → красное подтверждение. SHORT от сопротивления.",
+        deposit=deposit,
+        risk_percent=risk_percent,
+        extra_filters=filters,
+    )
+
+
+def evaluate_impulse_pullback_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    """
+    IMPULSE_PULLBACK_PRO:
+    Осторожная стратегия только B: импульс -> откат к EMA/VWAP -> подтверждение.
+    Цель — ловить быстрые сделки после нормального отката, а не покупать верх/шортить низ.
+    """
+    strategy = "IMPULSE_PULLBACK_PRO"
+
+    if not IMPULSE_PULLBACK_ENABLED:
+        return None
+
+    if direction not in ["LONG", "SHORT"]:
+        return None
+
+    closes5 = [c["close"] for c in c5]
+    closes15 = [c["close"] for c in c15]
+
+    if len(closes5) < 80 or len(closes15) < 120 or len(c1) < 40:
+        return None
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+    price = last5["close"]
+
+    a5 = atr(c5)
+    vw = vwap_like(c15)
+    rs5 = rsi(closes5)
+    rs15 = rsi(closes15)
+    vr5 = volume_ratio(c5, period=24)
+
+    if a5 is None or vw is None or rs5 is None or rs15 is None:
+        return None
+
+    if vr5 < IMPULSE_MIN_VOLUME_RATIO:
+        return None
+
+    # Не берём импульс, если цена слишком далеко от VWAP: это часто поздний вход.
+    if distance_from_vwap_percent(price, vw) > IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT:
+        return None
+
+    ema9_1 = ema([c["close"] for c in c1], 9)[-1]
+    ema21_5 = ema(closes5, 21)[-1]
+    ema50_15 = ema(closes15, 50)[-1]
+    trend1h = trend_state(c1h)
+    trend4h = trend_state(c4h)
+
+    # Смотрим импульс до отката: старое значение 12 свечей назад и экстремум до последних 3 свечей.
+    old_price = c5[-15]["close"]
+    recent_before_confirm = c5[-12:-3]
+    if not recent_before_confirm or old_price <= 0:
+        return None
+
+    score = 58
+
+    if direction == "LONG":
+        if btc_status == "BEARISH" or trend1h == "BEARISH":
+            return None
+
+        impulse_high = max(c["high"] for c in recent_before_confirm)
+        impulse_move = (impulse_high - old_price) / old_price * 100
+        if impulse_move < IMPULSE_MIN_MOVE_5M_PERCENT:
+            return None
+
+        # Откат должен быть реальным, но не сломанным.
+        pullback_low = min(c["low"] for c in c5[-6:-1])
+        pullback_percent = (impulse_high - pullback_low) / impulse_high * 100 if impulse_high > 0 else 0
+        if pullback_percent < IMPULSE_PULLBACK_MIN_PERCENT or pullback_percent > IMPULSE_PULLBACK_MAX_PERCENT:
+            return None
+
+        # Цена должна удерживать EMA/VWAP-зону и подтверждаться зелёной свечой.
+        if price < ema21_5 * 0.995:
+            return None
+        if price < vw * 0.990 and btc_status != "BULLISH":
+            return None
+        if price < ema50_15 * 0.985 and trend1h != "BULLISH":
+            return None
+
+        confirm = (
+            last5["close"] > last5["open"]
+            and last5["close"] > prev5["close"]
+            and c1[-1]["close"] > ema9_1
+        )
+        if not confirm:
+            return None
+
+        if rs5 > 74 or rs15 > 72:
+            return None
+
+        impulse_vol = sum(c["volume"] for c in c5[-12:-6]) / 6
+        pullback_vol = sum(c["volume"] for c in c5[-6:-1]) / 5
+        if impulse_vol > 0 and pullback_vol > impulse_vol * 1.25:
+            return None
+
+        score += 7 if btc_status == "BULLISH" else 4 if btc_status == "SOFT_BULLISH" else 0
+        score += 6 if trend1h in ["BULLISH", "SOFT_BULLISH"] else 0
+        score += 3 if trend4h in ["BULLISH", "SOFT_BULLISH"] else 0
+        score += 5 if vr5 >= max(B_MIN_VOLUME_RATIO, IMPULSE_MIN_VOLUME_RATIO) else 0
+        score += 3 if price > vw else 0
+        score += 3 if pullback_percent <= 1.8 else 0
+
+        sl = min(pullback_low - a5 * 0.14, min(c["low"] for c in c5[-8:]) - a5 * 0.05)
+        reason = "Импульс вверх → контролируемый откат к EMA/VWAP → зелёное подтверждение. Только осторожный B LONG."
+
+    else:
+        if btc_status == "BULLISH" or trend1h == "BULLISH":
+            return None
+
+        impulse_low = min(c["low"] for c in recent_before_confirm)
+        impulse_move = (old_price - impulse_low) / old_price * 100
+        if impulse_move < IMPULSE_MIN_MOVE_5M_PERCENT:
+            return None
+
+        pullback_high = max(c["high"] for c in c5[-6:-1])
+        pullback_percent = (pullback_high - impulse_low) / impulse_low * 100 if impulse_low > 0 else 0
+        if pullback_percent < IMPULSE_PULLBACK_MIN_PERCENT or pullback_percent > IMPULSE_PULLBACK_MAX_PERCENT:
+            return None
+
+        if price > ema21_5 * 1.005:
+            return None
+        if price > vw * 1.010 and btc_status != "BEARISH":
+            return None
+        if price > ema50_15 * 1.015 and trend1h != "BEARISH":
+            return None
+
+        confirm = (
+            last5["close"] < last5["open"]
+            and last5["close"] < prev5["close"]
+            and c1[-1]["close"] < ema9_1
+        )
+        if not confirm:
+            return None
+
+        if rs5 < 26 or rs15 < 28:
+            return None
+
+        impulse_vol = sum(c["volume"] for c in c5[-12:-6]) / 6
+        pullback_vol = sum(c["volume"] for c in c5[-6:-1]) / 5
+        if impulse_vol > 0 and pullback_vol > impulse_vol * 1.25:
+            return None
+
+        score += 7 if btc_status == "BEARISH" else 4 if btc_status == "SOFT_BEARISH" else 0
+        score += 6 if trend1h in ["BEARISH", "SOFT_BEARISH"] else 0
+        score += 3 if trend4h in ["BEARISH", "SOFT_BEARISH"] else 0
+        score += 5 if vr5 >= max(B_MIN_VOLUME_RATIO, IMPULSE_MIN_VOLUME_RATIO) else 0
+        score += 3 if price < vw else 0
+        score += 3 if pullback_percent <= 1.8 else 0
+
+        sl = max(pullback_high + a5 * 0.14, max(c["high"] for c in c5[-8:]) + a5 * 0.05)
+        reason = "Импульс вниз → контролируемый откат к EMA/VWAP → красное подтверждение. Только осторожный B SHORT."
+
+    filters = combine_extra_filters(symbol, direction, btc_status)
+    filters["force_grade"] = "B"
+    filters["risk_multiplier_override"] = IMPULSE_PULLBACK_RISK_MULTIPLIER
+    filters["anti_fakeout_note"] = "Impulse Pullback Pro: стратегия только B, вход после отката, не на конце импульса."
+
+    return build_signal(
+        symbol=symbol,
+        direction=direction,
+        strategy=strategy,
+        entry=price,
+        sl=sl,
+        score=score,
+        vol_ratio=vr5,
+        reason=reason,
         deposit=deposit,
         risk_percent=risk_percent,
         extra_filters=filters,
@@ -2655,6 +2867,7 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
             evaluate_level_resistance_reject_short,
             evaluate_level_break_retest_short,
             evaluate_level_break_retest_long,
+            evaluate_impulse_pullback_pro,
         ]:
             signal = func(symbol, d, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent)
 
@@ -3206,7 +3419,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -3225,6 +3438,8 @@ async def startup_event():
         f"Active Level B: {'ON' if LEVEL_ACTIVE_B_ENABLED else 'OFF'}\n"
         f"Level B score/RR/volume: {LEVEL_B_MIN_SCORE}+ / {LEVEL_B_MIN_RR} / x{LEVEL_B_MIN_VOLUME_RATIO}\n"
         f"Debug no-signal report: {'ON' if DEBUG_NO_SIGNAL_REPORT_ENABLED else 'OFF'}\n"
+        f"Impulse Pullback Pro: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
+        f"Resistance Reject B: {'ON' if RESISTANCE_REJECT_B_ENABLED else 'OFF'}; second confirm: {'ON' if RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM else 'OFF'}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
         "Бот ищет LONG и SHORT, показывает стратегию, считает статистику и блокирует только strategy+side, а не весь SHORT/LONG.\n"
@@ -3242,10 +3457,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro</title>
+    <title>Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -3265,7 +3480,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro",
+        "service": "Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro",
         "test_mode": TEST_MODE,
         "fee_rate": FEE_RATE,
         "slippage_rate": SLIPPAGE_RATE,
@@ -3302,7 +3517,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro подключён к Telegram.")
 
 
 @app.get("/auto-signal")
