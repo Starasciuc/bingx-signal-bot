@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-app = FastAPI(title="Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro")
+app = FastAPI(title="Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -103,15 +103,6 @@ LEVEL_REJECTION_CLOSE_POSITION = float(os.getenv("LEVEL_REJECTION_CLOSE_POSITION
 LEVEL_BREAK_A_PLUS_NEEDS_MICRO_CONFIRM = os.getenv("LEVEL_BREAK_A_PLUS_NEEDS_MICRO_CONFIRM", "true").lower() == "true"
 LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM = os.getenv("LEVEL_BREAK_RETEST_FORCE_B_ON_WEAK_CONFIRM", "true").lower() == "true"
 LEVEL_BREAK_SHORT_BONUS_AFTER_CONFIRM = int(os.getenv("LEVEL_BREAK_SHORT_BONUS_AFTER_CONFIRM", "4"))
-
-# V5.4: шорты от сопротивления делаем профессиональнее.
-# По статистике B-шорты от сопротивления были слабым местом, поэтому по умолчанию B там выключен.
-# A+ разрешён только при 1H-подтверждении и дополнительном 5m/1m подтверждении.
-RESISTANCE_REJECT_B_ENABLED = os.getenv("RESISTANCE_REJECT_B_ENABLED", "false").lower() == "true"
-RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM = os.getenv("RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM", "true").lower() == "true"
-RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL = int(os.getenv("RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL", "2"))
-RESISTANCE_REJECT_NEEDS_MICRO_CONFIRM = os.getenv("RESISTANCE_REJECT_NEEDS_MICRO_CONFIRM", "true").lower() == "true"
-RESISTANCE_REJECT_MAX_REBOUND_TO_SWEEP_PERCENT = float(os.getenv("RESISTANCE_REJECT_MAX_REBOUND_TO_SWEEP_PERCENT", "0.65"))
 
 # V5.2 Balanced Risk-Aware Core Level Trader: сила уровня по старшим таймфреймам.
 # A+ по уровню разрешается только если 15m уровень подтверждён 1H.
@@ -1054,15 +1045,8 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
 
     funding = filters.get("funding", {})
 
-    # V5.4: B-шорты от сопротивления были слабым местом по статистике.
-    # По умолчанию оставляем только A+ для LEVEL_RESISTANCE_REJECT_SHORT.
-    if strategy == "LEVEL_RESISTANCE_REJECT_SHORT" and not RESISTANCE_REJECT_B_ENABLED:
-        filters["no_b_allowed"] = True
-
     # V4.8: контртрендовый LONG-отскок при bearish BTC может быть только B, не A+.
     if filters.get("force_grade") == "B":
-        if filters.get("no_b_allowed"):
-            return None
         if (
             score >= B_MIN_SCORE
             and rr >= B_MIN_RR
@@ -1106,8 +1090,7 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         b_volume = LEVEL_B_MIN_VOLUME_RATIO
 
     if (
-        not filters.get("no_b_allowed")
-        and score >= b_score
+        score >= b_score
         and rr >= b_rr
         and volume >= b_volume
         and not funding.get("blocked")
@@ -2582,21 +2565,6 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
     if not rejection_confirm:
         return None
 
-    # V5.4: не входим по первой красной реакции от сопротивления.
-    # Ждём, чтобы рынок реально подтвердил отказ от уровня, иначе часто бывает второй вынос вверх.
-    close_buffer = 1 - LEVEL_CONFIRM_CLOSE_BUFFER_PERCENT / 100
-    closes_below_level = sum(1 for c in c5[-4:] if c["close"] < level * close_buffer)
-    micro_below = micro_confirm_below_level(c1, level)
-    rebound_to_sweep = (sweep_high - price) / sweep_high * 100 if sweep_high > 0 else 0
-
-    if RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM:
-        if closes_below_level < RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL:
-            return None
-        if RESISTANCE_REJECT_NEEDS_MICRO_CONFIRM and not micro_below:
-            return None
-        if rebound_to_sweep < RESISTANCE_REJECT_MAX_REBOUND_TO_SWEEP_PERCENT:
-            return None
-
     rejection_distance = (level - price) / level * 100 if level > 0 else 0
     if rejection_distance > 6.0:
         return None
@@ -2637,9 +2605,6 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
     if abs(sweep_high - level) / level * 100 <= 1.2:
         score += 3
 
-    if closes_below_level >= RESISTANCE_REJECT_MIN_5M_CLOSES_BELOW_LEVEL and micro_below:
-        score += 5
-
     sl = max(sweep_high + a5 * 0.12, max(c["high"] for c in c5[-10:]) + a5 * 0.05)
 
     mtf = level_mtf_strength(level, c1h, c4h, kind="resistance")
@@ -2648,11 +2613,6 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters.update(mtf)
     filters["anti_fakeout_note"] = (filters.get("anti_fakeout_note", "") + " " + mtf.get("level_strength_note", "")).strip()
-    if strategy == "LEVEL_RESISTANCE_REJECT_SHORT":
-        filters["anti_fakeout_note"] = (
-            filters.get("anti_fakeout_note", "")
-            + f" Resistance reject confirm: {closes_below_level}x5m below level, micro {'OK' if micro_below else 'NO'}, B {'ON' if RESISTANCE_REJECT_B_ENABLED else 'OFF'}."
-        ).strip()
 
     return build_signal(
         symbol=symbol,
@@ -3419,7 +3379,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -3439,7 +3399,6 @@ async def startup_event():
         f"Level B score/RR/volume: {LEVEL_B_MIN_SCORE}+ / {LEVEL_B_MIN_RR} / x{LEVEL_B_MIN_VOLUME_RATIO}\n"
         f"Debug no-signal report: {'ON' if DEBUG_NO_SIGNAL_REPORT_ENABLED else 'OFF'}\n"
         f"Impulse Pullback Pro: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
-        f"Resistance Reject B: {'ON' if RESISTANCE_REJECT_B_ENABLED else 'OFF'}; second confirm: {'ON' if RESISTANCE_REJECT_NEEDS_SECOND_CONFIRM else 'OFF'}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
         "Бот ищет LONG и SHORT, показывает стратегию, считает статистику и блокирует только strategy+side, а не весь SHORT/LONG.\n"
@@ -3457,10 +3416,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro</title>
+    <title>Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -3480,7 +3439,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro",
+        "service": "Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro",
         "test_mode": TEST_MODE,
         "fee_rate": FEE_RATE,
         "slippage_rate": SLIPPAGE_RATE,
@@ -3517,7 +3476,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V5.4 Professional Level + Impulse Pullback Pro подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V5.3 Core Level + Impulse Pullback Pro подключён к Telegram.")
 
 
 @app.get("/auto-signal")
