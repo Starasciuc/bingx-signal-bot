@@ -10,7 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V5.5 HTF Confirm Balanced"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V5.9 CLEAN FINAL Anti-Chase A+ / B+ HTF"
+DEPLOY_MARKER = "V5.9_CLEAN_FINAL_2026_06_09_1908"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -45,26 +46,36 @@ SAVE_SIGNAL_ONLY_IF_TELEGRAM_OK = os.getenv("SAVE_SIGNAL_ONLY_IF_TELEGRAM_OK", "
 DEBUG_NO_SIGNAL_REPORT_ENABLED = os.getenv("DEBUG_NO_SIGNAL_REPORT_ENABLED", "true").lower() == "true"
 DEBUG_NO_SIGNAL_REPORT_SECONDS = int(os.getenv("DEBUG_NO_SIGNAL_REPORT_SECONDS", "7200"))
 
-# V5.5 HTF Confirm Balanced: больше сигналов, но A+ остаётся качественным.
+# V5.9 Render Fresh Deploy Anti-Chase: A+ уверенный, B+ среднеуверенный.
+# Важно: старые Render Environment Variables могут перебивать код.
+# По умолчанию стратегические пороги НЕ берём из env, чтобы старые 82/68/66 не возвращались.
+ALLOW_ENV_STRATEGY_OVERRIDES = os.getenv("ALLOW_ENV_STRATEGY_OVERRIDES", "false").lower() == "true"
+
+def strategy_int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default))) if ALLOW_ENV_STRATEGY_OVERRIDES else default
+
+def strategy_float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default))) if ALLOW_ENV_STRATEGY_OVERRIDES else default
+
 BALANCED_PRO_MODE = os.getenv("BALANCED_PRO_MODE", "true").lower() == "true"
 USE_CLOSED_CANDLES_ONLY = os.getenv("USE_CLOSED_CANDLES_ONLY", "true").lower() == "true"
 
-# A+ не слишком редкий, но требует качества.
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "82"))
-A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "1.12"))
-A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.80"))
-A_PLUS_RISK_MULTIPLIER = float(os.getenv("A_PLUS_RISK_MULTIPLIER", "1.0"))
+# A+ = уверенный сигнал: реже, но качественнее.
+A_PLUS_MIN_SCORE = strategy_int("A_PLUS_MIN_SCORE", 86)
+A_PLUS_MIN_VOLUME_RATIO = strategy_float("A_PLUS_MIN_VOLUME_RATIO", 1.20)
+A_PLUS_MIN_RR = strategy_float("A_PLUS_MIN_RR", 1.00)
+A_PLUS_RISK_MULTIPLIER = strategy_float("A_PLUS_RISK_MULTIPLIER", 1.0)
 
-# B живее, чтобы бот реально давал заявки/сигналы. Риск ниже.
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "68"))
-B_MIN_VOLUME_RATIO = float(os.getenv("B_MIN_VOLUME_RATIO", "0.85"))
-B_MIN_RR = float(os.getenv("B_MIN_RR", "0.45"))
-B_RISK_MULTIPLIER = float(os.getenv("B_RISK_MULTIPLIER", "0.25"))
+# B+ = среднеуверенный рабочий сигнал: чаще A+, но с меньшим риском.
+B_MIN_SCORE = strategy_int("B_MIN_SCORE", 73)
+B_MIN_VOLUME_RATIO = strategy_float("B_MIN_VOLUME_RATIO", 0.95)
+B_MIN_RR = strategy_float("B_MIN_RR", 0.58)
+B_RISK_MULTIPLIER = strategy_float("B_RISK_MULTIPLIER", 0.22)
 
-# Level B ещё чуть живее, потому что рынок не всегда даёт идеальный ретест.
-LEVEL_B_MIN_SCORE = int(os.getenv("LEVEL_B_MIN_SCORE", "66"))
-LEVEL_B_MIN_VOLUME_RATIO = float(os.getenv("LEVEL_B_MIN_VOLUME_RATIO", "0.82"))
-LEVEL_B_MIN_RR = float(os.getenv("LEVEL_B_MIN_RR", "0.40"))
+# Level B+ чуть мягче обычного B+, потому что уровни не всегда дают идеальный объём.
+LEVEL_B_MIN_SCORE = strategy_int("LEVEL_B_MIN_SCORE", 71)
+LEVEL_B_MIN_VOLUME_RATIO = strategy_float("LEVEL_B_MIN_VOLUME_RATIO", 0.92)
+LEVEL_B_MIN_RR = strategy_float("LEVEL_B_MIN_RR", 0.52)
 LEVEL_SIGNAL_SCORE_BONUS = int(os.getenv("LEVEL_SIGNAL_SCORE_BONUS", "3"))
 
 # Stats-aware A+ — не душим слишком рано, но плохие связки режем.
@@ -88,6 +99,15 @@ MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "7.5"))
 MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "5.8"))
 MAX_LEVEL_LONG_15M_MOVE_PERCENT = float(os.getenv("MAX_LEVEL_LONG_15M_MOVE_PERCENT", "8.0"))
 
+# Anti-chase: не догоняем монеты, которые уже прошли 5-10% без отката.
+ENABLE_ANTI_CHASE_FILTER = os.getenv("ENABLE_ANTI_CHASE_FILTER", "true").lower() == "true"
+CHASE_LOOKBACK_CANDLES_5M = int(os.getenv("CHASE_LOOKBACK_CANDLES_5M", "18"))
+MAX_CHASE_MOVE_5M_PERCENT = float(os.getenv("MAX_CHASE_MOVE_5M_PERCENT", "4.8"))
+EXTREME_CHASE_MOVE_5M_PERCENT = float(os.getenv("EXTREME_CHASE_MOVE_5M_PERCENT", "8.5"))
+MIN_PULLBACK_AFTER_CHASE_PERCENT = float(os.getenv("MIN_PULLBACK_AFTER_CHASE_PERCENT", "0.55"))
+MIN_PULLBACK_AFTER_EXTREME_PERCENT = float(os.getenv("MIN_PULLBACK_AFTER_EXTREME_PERCENT", "1.20"))
+MAX_CHASE_DISTANCE_FROM_EMA21_PERCENT = float(os.getenv("MAX_CHASE_DISTANCE_FROM_EMA21_PERCENT", "2.8"))
+
 # Space filter: professional, but soft. If no next level found, signal is allowed.
 ENABLE_SPACE_TO_TARGET_FILTER = os.getenv("ENABLE_SPACE_TO_TARGET_FILTER", "true").lower() == "true"
 MIN_SPACE_TO_TARGET_PERCENT_A_PLUS = float(os.getenv("MIN_SPACE_TO_TARGET_PERCENT_A_PLUS", "0.45"))
@@ -103,7 +123,7 @@ FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0025"))
 ALLOW_COUNTER_BTC_B_SIGNALS = os.getenv("ALLOW_COUNTER_BTC_B_SIGNALS", "true").lower() == "true"
 COUNTER_BTC_RISK_MULTIPLIER = float(os.getenv("COUNTER_BTC_RISK_MULTIPLIER", "0.18"))
 
-# V5.5 HTF Confirm Balanced: 1H/4H подтверждение для A+ и B.
+# V5.9 Render Fresh Deploy Anti-Chase A+ / B+ HTF: 1H/4H подтверждение для A+ и B.
 # A+ требует подтверждение и 1H, и 4H.
 # B не душим: достаточно 1H или 4H, но если оба старших ТФ против — сигнал режется.
 HTF_CONFIRMATION_ENABLED = os.getenv("HTF_CONFIRMATION_ENABLED", "true").lower() == "true"
@@ -344,7 +364,7 @@ def build_stats_text() -> str:
     pf = calc_profit_factor_from_closed()
 
     return f"""
-📊 <b>Статистика V5.5 HTF Confirm Balanced:</b>
+📊 <b>Статистика V5.9 Render Fresh Deploy Anti-Chase A+ / B+ HTF:</b>
 
 📈 LONG: {long_stats['positive']} позитив / {long_stats['sl']} SL / WR {long_wr}%
 📉 SHORT: {short_stats['positive']} позитив / {short_stats['sl']} SL / WR {short_wr}%
@@ -623,6 +643,47 @@ def late_entry_blocked(direction: str, candles: List[dict], price: float, vwap_v
         return True
     if vwap_distance > MAX_DISTANCE_FROM_VWAP_PERCENT:
         return True
+    return False
+
+
+def anti_chase_blocked(direction: str, c5: List[dict]) -> bool:
+    """
+    Блокирует поздний вход после сильного движения без нормального отката.
+    LONG: если цена уже сильно выросла за 5m-lookback и не откатилась к EMA21/не дала pullback.
+    SHORT: если цена уже сильно упала и не было нормального отката вверх.
+    """
+    if not ENABLE_ANTI_CHASE_FILTER:
+        return False
+    if len(c5) < max(CHASE_LOOKBACK_CANDLES_5M + 5, 40):
+        return False
+
+    closes = [c["close"] for c in c5]
+    ema21 = ema(closes, 21)[-1]
+    price = closes[-1]
+    old = c5[-CHASE_LOOKBACK_CANDLES_5M]["close"]
+    if old <= 0 or ema21 <= 0:
+        return False
+
+    move = (price - old) / old * 100
+    distance_ema = abs(price - ema21) / ema21 * 100
+
+    recent = c5[-8:]
+    if direction == "LONG":
+        high = max(c["high"] for c in c5[-CHASE_LOOKBACK_CANDLES_5M:])
+        pullback = (high - min(c["low"] for c in recent)) / high * 100 if high > 0 else 0
+        if move >= EXTREME_CHASE_MOVE_5M_PERCENT:
+            return pullback < MIN_PULLBACK_AFTER_EXTREME_PERCENT or distance_ema > MAX_CHASE_DISTANCE_FROM_EMA21_PERCENT
+        if move >= MAX_CHASE_MOVE_5M_PERCENT:
+            return pullback < MIN_PULLBACK_AFTER_CHASE_PERCENT and distance_ema > MAX_CHASE_DISTANCE_FROM_EMA21_PERCENT
+
+    if direction == "SHORT":
+        low = min(c["low"] for c in c5[-CHASE_LOOKBACK_CANDLES_5M:])
+        pullback = (max(c["high"] for c in recent) - low) / low * 100 if low > 0 else 0
+        if move <= -EXTREME_CHASE_MOVE_5M_PERCENT:
+            return pullback < MIN_PULLBACK_AFTER_EXTREME_PERCENT or distance_ema > MAX_CHASE_DISTANCE_FROM_EMA21_PERCENT
+        if move <= -MAX_CHASE_MOVE_5M_PERCENT:
+            return pullback < MIN_PULLBACK_AFTER_CHASE_PERCENT and distance_ema > MAX_CHASE_DISTANCE_FROM_EMA21_PERCENT
+
     return False
 
 
@@ -1681,6 +1742,8 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
     ]
 
     for d in directions:
+        if anti_chase_blocked(d, c5):
+            continue
         for func in funcs:
             try:
                 signal = func(symbol, d, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent)
@@ -2029,7 +2092,7 @@ def scan_best_signal(deposit: float, risk_percent: float) -> dict:
             "checked": checked,
             "found_candidates": found,
             "btc_status": btc_status,
-            "message": "Сильных сигналов сейчас нет. V5.5 режим живее, но учитывает 1H/4H, но фильтры не дали нормальный вход."
+            "message": "Сильных сигналов сейчас нет. V5.9 режим: A+ уверенный, B+ среднеуверенный, anti-chase фильтр не дал нормальный вход."
         }
 
     return {
@@ -2140,7 +2203,7 @@ async def auto_worker():
                         last_report = STATE["auto"].get("last_no_signal_report_time", 0)
                         if DEBUG_NO_SIGNAL_REPORT_ENABLED and current - last_report >= DEBUG_NO_SIGNAL_REPORT_SECONDS:
                             report = (
-                                "🧠 <b>Диагностика V5.5 HTF Confirm Balanced</b>\n\n"
+                                "🧠 <b>Диагностика V5.9 Render Fresh Deploy Anti-Chase A+ / B+ HTF</b>\n\n"
                                 f"BTC regime: {result.get('btc_status', 'NEUTRAL')}\n"
                                 f"Проверено пар: {result.get('checked', 0)}\n"
                                 f"Кандидатов найдено: {result.get('found_candidates', 0)}\n"
@@ -2175,19 +2238,21 @@ def unauthorized_response():
 async def startup_event():
     text = (
         f"✅ {APP_NAME} запущен.\n\n"
+        f"Deploy marker: {DEPLOY_MARKER}\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'} / {AUTO_SCAN_SECONDS} сек.\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'} / {AUTO_TRACK_SECONDS} сек.\n"
         f"Closed candles only: {'ON' if USE_CLOSED_CANDLES_ONLY else 'OFF'}\n"
         f"A+ score/RR/volume: {A_PLUS_MIN_SCORE}+ / {A_PLUS_MIN_RR} / x{A_PLUS_MIN_VOLUME_RATIO}\n"
-        f"B score/RR/volume: {B_MIN_SCORE}+ / {B_MIN_RR} / x{B_MIN_VOLUME_RATIO}\n"
-        f"Level B score/RR/volume: {LEVEL_B_MIN_SCORE}+ / {LEVEL_B_MIN_RR} / x{LEVEL_B_MIN_VOLUME_RATIO}\n"
+        f"B+ score/RR/volume: {B_MIN_SCORE}+ / {B_MIN_RR} / x{B_MIN_VOLUME_RATIO}\n"
+        f"Level B+ score/RR/volume: {LEVEL_B_MIN_SCORE}+ / {LEVEL_B_MIN_RR} / x{LEVEL_B_MIN_VOLUME_RATIO}\n"
         f"B risk: x{B_RISK_MULTIPLIER}\n"
         f"Impulse Pullback: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
         f"Space filter: {'ON' if ENABLE_SPACE_TO_TARGET_FILTER else 'OFF'}\n"
+        f"Anti-chase: {'ON' if ENABLE_ANTI_CHASE_FILTER else 'OFF'} / max {MAX_CHASE_MOVE_5M_PERCENT}% / extreme {EXTREME_CHASE_MOVE_5M_PERCENT}%\n"
         f"HTF 1H/4H confirm: {'ON' if HTF_CONFIRMATION_ENABLED else 'OFF'} | A+ both TF: {'ON' if A_PLUS_REQUIRES_1H_4H_CONFIRM else 'OFF'} | B any TF: {'ON' if B_REQUIRES_AT_LEAST_ONE_HTF_CONFIRM else 'OFF'}\n"
         f"API key protection: {'ON' if bool(API_KEY) else 'OFF'}\n\n"
-        "V5.5 цель: больше заявок, но без входов по незакрытой свече и с более честным RR по TP2."
+        "V5.9 цель: A+ уверенный, B+ среднеуверенный, без догоняющих входов после 5-10% движения."
     )
     send_telegram_message(text)
     asyncio.create_task(auto_worker())
@@ -2222,6 +2287,7 @@ def health():
     return {
         "status": "ok",
         "service": APP_NAME,
+        "deploy_marker": DEPLOY_MARKER,
         "test_mode": TEST_MODE,
         "leverage": LEVERAGE,
         "balanced_pro_mode": BALANCED_PRO_MODE,
@@ -2245,6 +2311,23 @@ def health():
         "a_plus_requires_1h_4h_confirm": A_PLUS_REQUIRES_1H_4H_CONFIRM,
         "b_requires_at_least_one_htf_confirm": B_REQUIRES_AT_LEAST_ONE_HTF_CONFIRM,
         "api_key_enabled": bool(API_KEY),
+        "allow_env_strategy_overrides": ALLOW_ENV_STRATEGY_OVERRIDES,
+        "anti_chase_enabled": ENABLE_ANTI_CHASE_FILTER,
+        "max_chase_move_5m_percent": MAX_CHASE_MOVE_5M_PERCENT,
+        "extreme_chase_move_5m_percent": EXTREME_CHASE_MOVE_5M_PERCENT,
+    }
+
+
+@app.get("/version")
+def version():
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "deploy_marker": DEPLOY_MARKER,
+        "a_plus_min_score": A_PLUS_MIN_SCORE,
+        "b_plus_min_score": B_MIN_SCORE,
+        "level_b_plus_min_score": LEVEL_B_MIN_SCORE,
+        "anti_chase_enabled": ENABLE_ANTI_CHASE_FILTER,
     }
 
 
