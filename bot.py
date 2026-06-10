@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.7.2 EXTREME MOVER PRO FIXED STARTUP"
-DEPLOY_MARKER = "V7_7_2_EXTREME_MOVER_PRO_FIXED_STARTUP_2026_06_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE"
+DEPLOY_MARKER = "V7_7_3_EXTREME_MOVER_STARTUP_VISIBLE_2026_06_10"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -4031,7 +4031,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V7.7.2 EXTREME MOVER PRO FIXED STARTUP запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -4052,6 +4052,11 @@ async def startup_event():
         f"Debug no-signal report: {'ON' if DEBUG_NO_SIGNAL_REPORT_ENABLED else 'OFF'}\n"
         f"Impulse Pullback Pro: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
         f"BTC Dominance Engine: {'ON' if BTC_DOMINANCE_ENABLED else 'OFF'} | fast 1m/5m/15m: {BTC_FAST_1M_PERCENT}% / {BTC_FAST_5M_PERCENT}% / {BTC_FAST_15M_PERCENT}%\n"
+        f"Extreme Mover Pro: {'ON' if EXTREME_MOVER_ENABLED else 'OFF'} / strategy EXTREME_MOVER_PULLBACK_PRO\n"
+        f"Extreme movers: HMSTR, GUA, DOGS, CATI, MEME, NOT, PEPE, BONK, WIF...\n"
+        f"Extreme move filter: 24h {EXTREME_MOVER_MIN_24H_MOVE_PERCENT}%+ / 6h {EXTREME_MOVER_MIN_6H_MOVE_PERCENT}%+ / hard {EXTREME_MOVER_HARD_24H_MOVE_PERCENT}%+\n"
+        f"Extreme pullback: {EXTREME_PULLBACK_MIN_PERCENT}%–{EXTREME_PULLBACK_MAX_PERCENT}% / volume x{EXTREME_MIN_VOLUME_RATIO}\n"
+        f"Extreme risk: A+ x{EXTREME_A_PLUS_RISK_MULTIPLIER} / B {'ON' if EXTREME_ALLOW_B else 'OFF'} x{EXTREME_B_RISK_MULTIPLIER}\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
         "Бот ищет LONG и SHORT, показывает стратегию, считает статистику и блокирует только strategy+side, а не весь SHORT/LONG.\n"
@@ -4069,10 +4074,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V7.7.2 EXTREME MOVER PRO FIXED STARTUP</title>
+    <title>Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V7.7.2 EXTREME MOVER PRO FIXED STARTUP работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -4092,7 +4097,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V7.7.2 EXTREME MOVER PRO FIXED STARTUP",
+        "service": "Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE",
         "test_mode": TEST_MODE,
         "fee_rate": FEE_RATE,
         "slippage_rate": SLIPPAGE_RATE,
@@ -4129,7 +4134,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V7.7.2 EXTREME MOVER PRO FIXED STARTUP подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE подключён к Telegram.")
 
 
 @app.get("/auto-signal")
