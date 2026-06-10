@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE"
-DEPLOY_MARKER = "V7_7_3_EXTREME_MOVER_STARTUP_VISIBLE_2026_06_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.8 DYNAMIC EXTREME MOVER SCANNER"
+DEPLOY_MARKER = "V7_8_DYNAMIC_EXTREME_MOVER_SCANNER_2026_06_10"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -209,6 +209,15 @@ EXTREME_B_RISK_MULTIPLIER = float(os.getenv("EXTREME_B_RISK_MULTIPLIER", "0.08")
 EXTREME_A_PLUS_RISK_MULTIPLIER = float(os.getenv("EXTREME_A_PLUS_RISK_MULTIPLIER", "0.15"))
 EXTREME_REQUIRE_BTC_ALIGNMENT = os.getenv("EXTREME_REQUIRE_BTC_ALIGNMENT", "true").lower() == "true"
 EXTREME_BLOCK_DURING_BTC_STORM_AGAINST = os.getenv("EXTREME_BLOCK_DURING_BTC_STORM_AGAINST", "true").lower() == "true"
+
+# V7.8 Dynamic Extreme Mover Scanner:
+# бот больше не зависит только от ручного списка HMSTR/GUA/WIF.
+# Он пытается подтянуть дневных лидеров/аутсайдеров по всем BingX USDT futures
+# и добавить их в скан как EXTREME_MOVER candidates.
+DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED = os.getenv("DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED", "true").lower() == "true"
+DYNAMIC_EXTREME_TOP_N = int(os.getenv("DYNAMIC_EXTREME_TOP_N", "35"))
+DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT = float(os.getenv("DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT", "18.0"))
+DYNAMIC_EXTREME_INCLUDE_UNKNOWN_BASES = os.getenv("DYNAMIC_EXTREME_INCLUDE_UNKNOWN_BASES", "true").lower() == "true"
 
 
 # V5.1: убираем «кашу» и оставляем 4 основные структуры уровня.
@@ -643,6 +652,106 @@ def get_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
         return None
 
 
+def extract_24h_change_percent_from_ticker(item: dict) -> Optional[float]:
+    """
+    BingX может отдавать 24h изменение в разных полях и форматах:
+    49.35, "49.35%", 0.4935 или 0.4935-like ratio.
+    Возвращаем именно процентные пункты: 49.35 = +49.35%.
+    """
+    keys = [
+        "priceChangePercent", "priceChangeRate", "changePercent", "changeRate",
+        "chg", "chgRate", "rate", "priceChangeRatio", "change",
+    ]
+    for key in keys:
+        if key not in item:
+            continue
+        raw = item.get(key)
+        try:
+            if isinstance(raw, str):
+                value = float(raw.replace("%", "").strip())
+            else:
+                value = float(raw)
+            # Если биржа отдала ratio 0.49, считаем как 49%.
+            if abs(value) <= 2.0:
+                value *= 100
+            return value
+        except Exception:
+            continue
+    return None
+
+
+def get_all_contract_symbols() -> List[str]:
+    url = f"{BINGX_BASE_URL}/openApi/swap/v2/quote/contracts"
+    data = get_json(url)
+    if not data:
+        return []
+
+    result = []
+    bad = ["USD", "EUR", "GBP", "JPY", "AAPL", "TSLA", "NVDA", "META", "GOOG"]
+    for item in data.get("data", []):
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+        symbol = normalize_symbol(symbol)
+        base = base_from_symbol(symbol)
+        if not symbol.endswith("-USDT"):
+            continue
+        if any(x in base for x in bad):
+            continue
+        result.append(symbol)
+    return list(dict.fromkeys(result))
+
+
+def get_dynamic_extreme_mover_symbols() -> List[str]:
+    """
+    Ищет реальные дневные пампы/дампы среди всех USDT perpetuals.
+    Нужен для монет типа MAGMA/VELVET/FOLKS/STG/BEAT/FIGHT/BLEND,
+    которые могут не быть в ручном LIQUID_BASES, но сегодня дают +20..50%.
+    """
+    if not DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED:
+        return []
+
+    candidates = []
+
+    # Быстрый путь: пробуем получить весь 24h ticker одним запросом.
+    data = get_json(f"{BINGX_BASE_URL}/openApi/swap/v2/quote/ticker")
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    if isinstance(rows, dict):
+        rows = [rows]
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol") or item.get("s")
+        if not symbol:
+            continue
+        symbol = normalize_symbol(symbol)
+        if not symbol.endswith("-USDT"):
+            continue
+        change = extract_24h_change_percent_from_ticker(item)
+        if change is None:
+            continue
+        if abs(change) >= DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT:
+            candidates.append((symbol, abs(change), change))
+
+    # Fallback: если ticker не дал список, берём все контракты и быстро считаем по 15m свечам.
+    if not candidates:
+        for symbol in get_all_contract_symbols()[:260]:
+            try:
+                c15 = remove_unclosed_candle(get_klines(symbol, "15m", 110), "15m")
+                if not c15:
+                    continue
+                change = percent_change_from(c15, 96)
+                if abs(change) >= DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT:
+                    candidates.append((symbol, abs(change), change))
+            except Exception:
+                continue
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    symbols = [x[0] for x in candidates[:DYNAMIC_EXTREME_TOP_N]]
+    return list(dict.fromkeys(symbols))
+
+
 def get_symbols() -> List[str]:
     url = f"{BINGX_BASE_URL}/openApi/swap/v2/quote/contracts"
     data = get_json(url)
@@ -650,14 +759,18 @@ def get_symbols() -> List[str]:
     if not data:
         return []
 
-    result = []
+    regular = []
 
     for item in data.get("data", []):
         symbol = item.get("symbol")
         if symbol and is_good_symbol(symbol):
-            result.append(normalize_symbol(symbol))
+            regular.append(normalize_symbol(symbol))
 
-    random.shuffle(result)
+    dynamic_extremes = get_dynamic_extreme_mover_symbols()
+
+    # Важно: extreme movers идут первыми, чтобы MAX_SYMBOLS не отрезал MAGMA/VELVET/HMSTR и т.п.
+    random.shuffle(regular)
+    result = list(dict.fromkeys(dynamic_extremes + regular))
     return result[:MAX_SYMBOLS]
 
 
@@ -4053,7 +4166,8 @@ async def startup_event():
         f"Impulse Pullback Pro: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
         f"BTC Dominance Engine: {'ON' if BTC_DOMINANCE_ENABLED else 'OFF'} | fast 1m/5m/15m: {BTC_FAST_1M_PERCENT}% / {BTC_FAST_5M_PERCENT}% / {BTC_FAST_15M_PERCENT}%\n"
         f"Extreme Mover Pro: {'ON' if EXTREME_MOVER_ENABLED else 'OFF'} / strategy EXTREME_MOVER_PULLBACK_PRO\n"
-        f"Extreme movers: HMSTR, GUA, DOGS, CATI, MEME, NOT, PEPE, BONK, WIF...\n"
+        f"Dynamic Extreme Scanner: {'ON' if DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED else 'OFF'} / top {DYNAMIC_EXTREME_TOP_N} / min 24h ±{DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT}%\n"
+        f"Extreme movers: HMSTR, GUA, DOGS, CATI, MEME, NOT, PEPE, BONK, WIF + dynamic movers MAGMA/VELVET/FOLKS/STG...\n"
         f"Extreme move filter: 24h {EXTREME_MOVER_MIN_24H_MOVE_PERCENT}%+ / 6h {EXTREME_MOVER_MIN_6H_MOVE_PERCENT}%+ / hard {EXTREME_MOVER_HARD_24H_MOVE_PERCENT}%+\n"
         f"Extreme pullback: {EXTREME_PULLBACK_MIN_PERCENT}%–{EXTREME_PULLBACK_MAX_PERCENT}% / volume x{EXTREME_MIN_VOLUME_RATIO}\n"
         f"Extreme risk: A+ x{EXTREME_A_PLUS_RISK_MULTIPLIER} / B {'ON' if EXTREME_ALLOW_B else 'OFF'} x{EXTREME_B_RISK_MULTIPLIER}\n"
