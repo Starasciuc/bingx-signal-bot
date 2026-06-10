@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.7 EXTREME MOVER PRO"
-DEPLOY_MARKER = "V7_7_EXTREME_MOVER_PRO_2026_06_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.7.1 EXTREME MOVER PRO FORCE DEPLOY"
+DEPLOY_MARKER = "V7_7_1_EXTREME_MOVER_PRO_FORCE_DEPLOY_2026_06_10"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
