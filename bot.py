@@ -1,5 +1,3 @@
-
-
 import os
 import time
 import json
@@ -11,8 +9,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.0 MARKET REGIME PRO"
-DEPLOY_MARKER = "V7_0_MARKET_REGIME_PRO_2026_06_09"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.1 ADAPTIVE TRUST ENGINE"
+DEPLOY_MARKER = "V7_1_ADAPTIVE_TRUST_ENGINE_2026_06_10"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -75,6 +73,24 @@ SHORT_B_MIN_SCORE = strategy_int("SHORT_B_MIN_SCORE", 83)
 SHORT_B_MIN_RR = strategy_float("SHORT_B_MIN_RR", 0.82)
 SHORT_B_MIN_VOLUME_RATIO = strategy_float("SHORT_B_MIN_VOLUME_RATIO", 1.08)
 SHORT_A_PLUS_REQUIRES_BTC_NOT_BULLISH = os.getenv("SHORT_A_PLUS_REQUIRES_BTC_NOT_BULLISH", "true").lower() == "true"
+
+# V7.1 Adaptive Trust Engine: бот больше не доверяет стратегии только из-за красивого score.
+# Он смотрит фактическую статистику strategy + side + grade и сам понижает/блокирует слабые связки.
+ADAPTIVE_TRUST_ENABLED = os.getenv("ADAPTIVE_TRUST_ENABLED", "true").lower() == "true"
+TRUST_MIN_TRADES_FOR_GRADE = int(os.getenv("TRUST_MIN_TRADES_FOR_GRADE", "6"))
+TRUST_MIN_TRADES_FOR_SIDE = int(os.getenv("TRUST_MIN_TRADES_FOR_SIDE", "8"))
+TRUST_A_PLUS_MIN_SIDE_WR = float(os.getenv("TRUST_A_PLUS_MIN_SIDE_WR", "52"))
+TRUST_B_MIN_GRADE_WR = float(os.getenv("TRUST_B_MIN_GRADE_WR", "48"))
+TRUST_SIDE_BLOCK_WR = float(os.getenv("TRUST_SIDE_BLOCK_WR", "42"))
+TRUST_STRATEGY_OFF_WR = float(os.getenv("TRUST_STRATEGY_OFF_WR", "40"))
+TRUST_LOW_WR_DISABLE_SECONDS = int(os.getenv("TRUST_LOW_WR_DISABLE_SECONDS", "10800"))
+TRUST_B_GLOBAL_WR_MIN = float(os.getenv("TRUST_B_GLOBAL_WR_MIN", "48"))
+TRUST_B_SCORE_ADD_IF_WEAK = int(os.getenv("TRUST_B_SCORE_ADD_IF_WEAK", "4"))
+TRUST_B_RR_ADD_IF_WEAK = float(os.getenv("TRUST_B_RR_ADD_IF_WEAK", "0.08"))
+TRUST_B_VOL_ADD_IF_WEAK = float(os.getenv("TRUST_B_VOL_ADD_IF_WEAK", "0.04"))
+TRUST_BAD_LONG_B_OFF = os.getenv("TRUST_BAD_LONG_B_OFF", "true").lower() == "true"
+TRUST_BREAK_RETEST_SHORT_A_PLUS_MIN_WR = float(os.getenv("TRUST_BREAK_RETEST_SHORT_A_PLUS_MIN_WR", "52"))
+TRUST_BREAK_RETEST_LONG_MIN_WR = float(os.getenv("TRUST_BREAK_RETEST_LONG_MIN_WR", "45"))
 
 # Market regime first.
 MARKET_REGIME_ENABLED = os.getenv("MARKET_REGIME_ENABLED", "true").lower() == "true"
@@ -284,6 +300,126 @@ def calc_profit_factor_from_closed() -> float:
     if losses <= 0:
         return round(wins, 2) if wins > 0 else 0.0
     return round(wins / losses, 2)
+
+
+
+def _stat_wr(bucket: dict) -> Tuple[int, int, int, float]:
+    positive = int(bucket.get("positive", 0))
+    sl = int(bucket.get("sl", 0))
+    total = positive + sl
+    return positive, sl, total, calc_winrate(positive, sl)
+
+
+def get_strategy_trust(strategy: str, direction: str, grade: str) -> dict:
+    """
+    V7.1 trust layer.
+    Trust не заменяет сетап, а решает, можно ли стратегии доверять A+/B прямо сейчас.
+    Использует уже накопленную статистику из bot_state.json.
+    """
+    ensure_stats_structure()
+    if not ADAPTIVE_TRUST_ENABLED:
+        return {"status": "OFF", "blocked": False, "a_plus_allowed": True, "b_allowed": True, "score_adjustment": 0, "risk_multiplier": 1.0, "note": "Trust Engine OFF"}
+
+    stats = STATE.get("stats", {})
+    side_bucket = stats.get("side", {}).get(direction, {})
+    grade_bucket = stats.get("grade", {}).get(grade, {})
+    strategy_bucket = stats.get("strategy", {}).get(strategy, {})
+    ss_key = f"{strategy}:{direction}"
+    ssg_key = f"{strategy}:{direction}:{grade}"
+    ss_bucket = stats.get("strategy_side", {}).get(ss_key, {})
+    ssg_bucket = stats.get("strategy_side_grade", {}).get(ssg_key, {})
+
+    _, _, side_total, side_wr = _stat_wr(side_bucket)
+    _, _, global_grade_total, global_grade_wr = _stat_wr(grade_bucket)
+    _, _, strategy_total, strategy_wr = _stat_wr(strategy_bucket)
+    _, _, ss_total, ss_wr = _stat_wr(ss_bucket)
+    _, _, ssg_total, ssg_wr = _stat_wr(ssg_bucket)
+
+    blocked = False
+    a_plus_allowed = True
+    b_allowed = True
+    score_adjustment = 0
+    risk_multiplier = 1.0
+    status = "NEW"
+    reasons = []
+
+    # 1) Связка strategy+side очень плохая — вообще не даём новый сигнал по ней.
+    if ss_total >= TRUST_MIN_TRADES_FOR_SIDE and ss_wr < TRUST_SIDE_BLOCK_WR:
+        blocked = True
+        status = "BLOCKED"
+        reasons.append(f"strategy+side WR {ss_wr}% after {ss_total} trades < {TRUST_SIDE_BLOCK_WR}%")
+
+    # 2) Вся стратегия провалилась — временно не доверяем ей.
+    if strategy_total >= TRUST_MIN_TRADES_FOR_SIDE and strategy_wr < TRUST_STRATEGY_OFF_WR:
+        blocked = True
+        status = "BLOCKED"
+        reasons.append(f"strategy WR {strategy_wr}% after {strategy_total} trades < {TRUST_STRATEGY_OFF_WR}%")
+
+    # 3) A+ запрещаем, если конкретная сторона стратегии не доказала качество.
+    if grade == "A+" and ss_total >= TRUST_MIN_TRADES_FOR_SIDE and ss_wr < TRUST_A_PLUS_MIN_SIDE_WR:
+        a_plus_allowed = False
+        status = "A+_DENIED"
+        reasons.append(f"A+ denied: {strategy} {direction} WR {ss_wr}% < {TRUST_A_PLUS_MIN_SIDE_WR}%")
+
+    # 4) B запрещаем, если именно B-связка слабая.
+    if grade == "B" and ssg_total >= TRUST_MIN_TRADES_FOR_GRADE and ssg_wr < TRUST_B_MIN_GRADE_WR:
+        b_allowed = False
+        status = "B_DENIED"
+        reasons.append(f"B denied: {ssg_key} WR {ssg_wr}% < {TRUST_B_MIN_GRADE_WR}%")
+
+    # 5) Если общий B слабый, повышаем требования для всех B, но не отключаем полностью.
+    if grade == "B" and global_grade_total >= 20 and global_grade_wr < TRUST_B_GLOBAL_WR_MIN:
+        score_adjustment -= TRUST_B_SCORE_ADD_IF_WEAK
+        risk_multiplier = min(risk_multiplier, 0.75)
+        status = "B_STRICT"
+        reasons.append(f"Global B WR {global_grade_wr}% < {TRUST_B_GLOBAL_WR_MIN}% → B stricter")
+
+    # 6) Если общий LONG провален — B LONG временно не берём, пока статистика не улучшится.
+    if TRUST_BAD_LONG_B_OFF and direction == "LONG" and grade == "B" and side_total >= 5 and side_wr < 45:
+        b_allowed = False
+        status = "B_DENIED"
+        reasons.append(f"B LONG denied: LONG WR {side_wr}% after {side_total} trades")
+
+    # 7) Особые правила по текущей фактической статистике пользователя.
+    if strategy == "BREAK_RETEST_SHORT" and direction == "SHORT" and grade == "A+" and ss_total >= 10 and ss_wr < TRUST_BREAK_RETEST_SHORT_A_PLUS_MIN_WR:
+        a_plus_allowed = False
+        status = "A+_DENIED"
+        reasons.append(f"BREAK_RETEST_SHORT A+ denied: WR {ss_wr}% < {TRUST_BREAK_RETEST_SHORT_A_PLUS_MIN_WR}%")
+
+    if strategy == "BREAK_RETEST_LONG" and direction == "LONG" and ss_total >= 4 and ss_wr < TRUST_BREAK_RETEST_LONG_MIN_WR:
+        blocked = True
+        status = "BLOCKED"
+        reasons.append(f"BREAK_RETEST_LONG blocked: WR {ss_wr}% < {TRUST_BREAK_RETEST_LONG_MIN_WR}%")
+
+    # 8) Хорошим связкам даём приоритет.
+    if ss_total >= 10 and ss_wr >= 58:
+        status = "HIGH"
+        score_adjustment += 3
+        reasons.append(f"Trust HIGH: {strategy} {direction} WR {ss_wr}% after {ss_total} trades")
+    elif ss_total >= 6 and ss_wr >= 52:
+        status = "MEDIUM"
+        score_adjustment += 1
+        reasons.append(f"Trust MEDIUM: {strategy} {direction} WR {ss_wr}% after {ss_total} trades")
+    elif ss_total >= 6:
+        status = status if status not in ["NEW"] else "LOW"
+        reasons.append(f"Trust LOW: {strategy} {direction} WR {ss_wr}% after {ss_total} trades")
+    else:
+        reasons.append(f"Trust NEW: {strategy} {direction}, sample {ss_total} trades")
+
+    return {
+        "status": status,
+        "blocked": blocked,
+        "a_plus_allowed": a_plus_allowed,
+        "b_allowed": b_allowed,
+        "score_adjustment": score_adjustment,
+        "risk_multiplier": risk_multiplier,
+        "strategy_side_trades": ss_total,
+        "strategy_side_wr": ss_wr,
+        "strategy_side_grade_trades": ssg_total,
+        "strategy_side_grade_wr": ssg_wr,
+        "global_grade_wr": global_grade_wr,
+        "note": "Trust: " + " | ".join(reasons[:4]),
+    }
 
 
 def build_stats_text() -> str:
@@ -865,30 +1001,56 @@ def classify_signal(score: int, rr: float, vol: float, filters: dict, strategy: 
         else:
             b_score, b_rr, b_vol = max(b_score, SHORT_B_MIN_SCORE), max(b_rr, SHORT_B_MIN_RR), max(b_vol, SHORT_B_MIN_VOLUME_RATIO)
 
-    if filters.get("force_grade") == "B":
-        if score >= b_score and rr >= b_rr and vol >= b_vol and htf_any:
-            return {"grade": "B", "risk_multiplier": filters.get("risk_multiplier_override", B_RISK_MULTIPLIER)}
-        return None
+    # Если общий B уже показал слабость, не отключаем его полностью, а делаем сильно строже.
+    if ADAPTIVE_TRUST_ENABLED:
+        b_global = STATE.get("stats", {}).get("grade", {}).get("B", {"positive": 0, "sl": 0})
+        _, _, b_total, b_wr = _stat_wr(b_global)
+        if b_total >= 20 and b_wr < TRUST_B_GLOBAL_WR_MIN:
+            b_score += TRUST_B_SCORE_ADD_IF_WEAK
+            b_rr += TRUST_B_RR_ADD_IF_WEAK
+            b_vol += TRUST_B_VOL_ADD_IF_WEAK
 
-    # A+ теперь только market-regime aligned + full HTF. Score не перебивает контекст.
+    # A+ теперь только market-regime aligned + full HTF + trust. Score не перебивает контекст.
     a_plus_allowed = htf_full and not filters.get("btc_against")
     if direction == "SHORT" and SHORT_A_PLUS_REQUIRES_BTC_NOT_BULLISH and btc_status == "BULLISH":
         a_plus_allowed = False
     if regime == "RANGE" and direction == "SHORT":
-        # В range short A+ нужен только от верхней границы и full HTF; иначе B максимум.
         a_plus_allowed = a_plus_allowed and filters.get("range_edge_quality", False)
 
     if score >= A_PLUS_MIN_SCORE and rr >= A_PLUS_MIN_RR and vol >= A_PLUS_MIN_VOLUME_RATIO and a_plus_allowed:
-        return {"grade": "A+", "risk_multiplier": A_PLUS_RISK_MULTIPLIER}
+        trust = get_strategy_trust(strategy, direction, "A+")
+        filters["trust"] = trust
+        filters["trust_note"] = trust.get("note")
+        if not trust.get("blocked") and trust.get("a_plus_allowed", True):
+            risk_mult = A_PLUS_RISK_MULTIPLIER * float(trust.get("risk_multiplier", 1.0))
+            return {"grade": "A+", "risk_multiplier": risk_mult, "trust": trust}
 
-    # B: нужен хотя бы один HTF + режим не против. Контртренд только в range и с меньшим риском.
+    # Если какой-то фильтр требует только B — уважаем это, но B тоже проходит через trust.
+    if filters.get("force_grade") == "B":
+        if score >= b_score and rr >= b_rr and vol >= b_vol and htf_any:
+            trust = get_strategy_trust(strategy, direction, "B")
+            filters["trust"] = trust
+            filters["trust_note"] = trust.get("note")
+            if not trust.get("blocked") and trust.get("b_allowed", True):
+                risk_mult = filters.get("risk_multiplier_override", B_RISK_MULTIPLIER) * float(trust.get("risk_multiplier", 1.0))
+                return {"grade": "B", "risk_multiplier": risk_mult, "trust": trust}
+        return None
+
+    # B: нужен хотя бы один HTF + режим не против + trust. Контртренд только в range и с меньшим риском.
     if score >= b_score and rr >= b_rr and vol >= b_vol and htf_any:
         risk_mult = filters.get("risk_multiplier_override", B_RISK_MULTIPLIER)
         if filters.get("btc_against") or (regime not in ["RANGE"] and direction not in filters.get("regime_allowed", [])):
             if not ALLOW_COUNTERTREND_B_IN_RANGE_ONLY or regime != "RANGE":
                 return None
             risk_mult = min(risk_mult, 0.14)
-        return {"grade": "B", "risk_multiplier": risk_mult}
+
+        trust = get_strategy_trust(strategy, direction, "B")
+        filters["trust"] = trust
+        filters["trust_note"] = trust.get("note")
+        if trust.get("blocked") or not trust.get("b_allowed", True):
+            return None
+        risk_mult = risk_mult * float(trust.get("risk_multiplier", 1.0))
+        return {"grade": "B", "risk_multiplier": risk_mult, "trust": trust}
 
     return None
 
@@ -920,6 +1082,9 @@ def build_signal(symbol: str, direction: str, strategy: str, entry: float, sl: f
     if not grade_data:
         return None
     grade = grade_data["grade"]
+    if grade_data.get("trust"):
+        filters["trust"] = grade_data.get("trust")
+        filters["trust_note"] = grade_data.get("trust", {}).get("note")
     if not is_strategy_enabled(strategy, direction, grade):
         return None
 
@@ -940,6 +1105,8 @@ def build_signal(symbol: str, direction: str, strategy: str, entry: float, sl: f
         "strategy": strategy,
         "grade": grade,
         "risk_multiplier": grade_data["risk_multiplier"],
+        "trust_status": filters.get("trust", {}).get("status", "NEW"),
+        "trust_note": filters.get("trust_note"),
         "status": "ACTIVE",
         "score": min(max(score, 0), 98),
         "entry": round(entry, 8),
@@ -1330,7 +1497,7 @@ def build_message(signal: dict) -> str:
     f = signal.get("filters", {})
     funding_text = f.get("funding", {}).get("reason", "Funding/OI: нет данных")
     notes = []
-    for key in ["regime_note", "htf_note", "level_strength_note", "setup_note", "space_note"]:
+    for key in ["regime_note", "htf_note", "level_strength_note", "setup_note", "space_note", "trust_note"]:
         if f.get(key):
             notes.append(f.get(key))
     if f.get("hard_block_reasons"):
@@ -1362,6 +1529,7 @@ BTC: {f.get('btc_status', 'NEUTRAL')}
 {chr(10).join(notes)}
 
 <b>Качество:</b> {signal['score']}/100
+<b>Trust:</b> {signal.get('trust_status', 'NEW')}
 <b>RR:</b> {signal['rr']} ({signal.get('rr_basis', 'TP2 net')})
 <b>TP1 gross/net:</b> {signal.get('raw_reward_to_tp1_percent', 0)}% / {signal.get('net_reward_to_tp1_percent', 0)}%
 <b>TP2 gross/net:</b> {signal.get('raw_reward_to_tp2_percent', 0)}% / {signal.get('net_reward_to_tp2_percent', 0)}%
@@ -1390,7 +1558,10 @@ def scan_best_signal(deposit: float, risk_percent: float) -> dict:
         if not sig:
             continue
         found += 1
-        if best is None or (1 if sig["grade"] == "A+" else 0, sig["score"], sig["rr"], sig["volume_ratio"]) > (1 if best["grade"] == "A+" else 0, best["score"], best["rr"], best["volume_ratio"]):
+        trust_rank = {"HIGH": 3, "MEDIUM": 2, "NEW": 1, "LOW": 0, "B_STRICT": 0, "A+_DENIED": -1, "B_DENIED": -1, "BLOCKED": -2}
+        sig_key = (trust_rank.get(sig.get("trust_status", "NEW"), 1), 1 if sig["grade"] == "A+" else 0, sig["score"], sig["rr"], sig["volume_ratio"])
+        best_key = (trust_rank.get(best.get("trust_status", "NEW"), 1), 1 if best["grade"] == "A+" else 0, best["score"], best["rr"], best["volume_ratio"]) if best else None
+        if best is None or sig_key > best_key:
             best = sig
     if not best:
         return {"ok": False, "checked": checked, "found_candidates": found, "btc_status": btc_status, "message": "Сильных сигналов сейчас нет. V7 сначала фильтрует режим рынка, потом ищет сетап."}
@@ -1612,6 +1783,7 @@ async def startup_event():
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'} / {AUTO_TRACK_SECONDS} сек.\n"
         f"Closed candles only: {'ON' if USE_CLOSED_CANDLES_ONLY else 'OFF'}\n"
         f"Market Regime Engine: {'ON' if MARKET_REGIME_ENABLED else 'OFF'} | CHOP no-trade: {'ON' if NO_TRADE_IN_CHOP else 'OFF'}\n"
+        f"Adaptive Trust Engine: {'ON' if ADAPTIVE_TRUST_ENABLED else 'OFF'} | A+ side WR min {TRUST_A_PLUS_MIN_SIDE_WR}% | B grade WR min {TRUST_B_MIN_GRADE_WR}%\n"
         f"A+ score/RR/volume: {A_PLUS_MIN_SCORE}+ / {A_PLUS_MIN_RR} / x{A_PLUS_MIN_VOLUME_RATIO}\n"
         f"B score/RR/volume: {B_MIN_SCORE}+ / {B_MIN_RR} / x{B_MIN_VOLUME_RATIO}\n"
         f"Level B score/RR/volume: {LEVEL_B_MIN_SCORE}+ / {LEVEL_B_MIN_RR} / x{LEVEL_B_MIN_VOLUME_RATIO}\n"
@@ -1619,7 +1791,7 @@ async def startup_event():
         f"Impulse Pullback: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
         f"Anti-chase: {'ON' if ENABLE_ANTI_CHASE_FILTER else 'OFF'}\n"
         f"ALLOW_ENV_STRATEGY_OVERRIDES: {'ON' if ALLOW_ENV_STRATEGY_OVERRIDES else 'OFF'}\n\n"
-        "V7 логика: сначала режим рынка → разрешённое направление → структура/liquidity → подтверждение → RR. Score больше не перебивает плохой контекст."
+        "V7.1 логика: market regime + strategy trust. Score больше не перебивает плохой контекст и плохую статистику связки."
     )
     send_telegram_message(text)
     asyncio.create_task(auto_worker())
@@ -1646,12 +1818,12 @@ GET /test-telegram</pre>
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": APP_NAME, "deploy_marker": DEPLOY_MARKER, "test_mode": TEST_MODE, "active_signals": len(STATE.get("active_signals", {})), "market_regime_enabled": MARKET_REGIME_ENABLED, "a_plus_min_score": A_PLUS_MIN_SCORE, "b_min_score": B_MIN_SCORE, "short_b_enabled": SHORT_B_ENABLED, "api_key_enabled": bool(API_KEY)}
+    return {"status": "ok", "service": APP_NAME, "deploy_marker": DEPLOY_MARKER, "test_mode": TEST_MODE, "active_signals": len(STATE.get("active_signals", {})), "market_regime_enabled": MARKET_REGIME_ENABLED, "adaptive_trust_enabled": ADAPTIVE_TRUST_ENABLED, "a_plus_min_score": A_PLUS_MIN_SCORE, "b_min_score": B_MIN_SCORE, "short_b_enabled": SHORT_B_ENABLED, "api_key_enabled": bool(API_KEY)}
 
 
 @app.get("/version")
 def version():
-    return {"ok": True, "service": APP_NAME, "deploy_marker": DEPLOY_MARKER, "telegram_token_set": bool(TELEGRAM_BOT_TOKEN), "telegram_chat_id_set": bool(TELEGRAM_CHAT_ID), "start_command_recommended": "python bot.py"}
+    return {"ok": True, "service": APP_NAME, "deploy_marker": DEPLOY_MARKER, "telegram_token_set": bool(TELEGRAM_BOT_TOKEN), "telegram_chat_id_set": bool(TELEGRAM_CHAT_ID), "adaptive_trust_enabled": ADAPTIVE_TRUST_ENABLED, "start_command_recommended": "python bot.py"}
 
 
 @app.get("/auto-status")
