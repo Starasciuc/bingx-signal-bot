@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.8 DYNAMIC EXTREME MOVER SCANNER"
-DEPLOY_MARKER = "V7_8_DYNAMIC_EXTREME_MOVER_SCANNER_2026_06_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.8.1 DYNAMIC EXTREME MOVER SCANNER FIXED STARTUP"
+DEPLOY_MARKER = "V7_8_1_DYNAMIC_EXTREME_MOVER_SCANNER_FIXED_STARTUP_2026_06_10"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -1338,7 +1338,7 @@ def btc_master_context() -> dict:
 
 def attach_btc_master_filter(filters: dict, direction: str, c5: List[dict], c15: List[dict]) -> dict:
     """
-    V7.6 BTC Dominance Guard:
+    BTC Dominance Guard:
     - BTC fast/storm UP => alt SHORT is blocked.
     - BTC fast/storm DOWN => alt LONG is blocked.
     - Counter-BTC B signals are blocked.
@@ -4144,7 +4144,8 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE запущен.\n\n"
+        f"✅ {APP_NAME} запущен.\n"
+        f"Deploy marker: {DEPLOY_MARKER}\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -4184,14 +4185,14 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """
+    return f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE</title>
+    <title>{APP_NAME}</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE работает</h1>
+    <h1>✅ {APP_NAME} работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -4211,7 +4212,8 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE",
+        "service": APP_NAME,
+        "deploy_marker": DEPLOY_MARKER,
         "test_mode": TEST_MODE,
         "fee_rate": FEE_RATE,
         "slippage_rate": SLIPPAGE_RATE,
@@ -4248,7 +4250,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V7.7.3 EXTREME MOVER STARTUP VISIBLE подключён к Telegram.")
+    return send_telegram_message(f"✅ {APP_NAME} подключён к Telegram.\nDeploy marker: {DEPLOY_MARKER}")
 
 
 @app.get("/auto-signal")
