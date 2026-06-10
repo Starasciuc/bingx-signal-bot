@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.4 PULLBACK CONTINUATION PRO"
-DEPLOY_MARKER = "V7_4_PULLBACK_CONTINUATION_PRO_2026_06_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.6 BTC DOMINANCE DECISION ENGINE"
+DEPLOY_MARKER = "V7_6_BTC_DOMINANCE_DECISION_ENGINE_2026_06_10"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -94,6 +94,41 @@ EXTENSION_REQUIRE_PULLBACK_CONTINUATION = os.getenv("EXTENSION_REQUIRE_PULLBACK_
 EXTENSION_B_RISK_MULTIPLIER = float(os.getenv("EXTENSION_B_RISK_MULTIPLIER", "0.16"))
 EXTENSION_A_PLUS_RISK_MULTIPLIER = float(os.getenv("EXTENSION_A_PLUS_RISK_MULTIPLIER", "0.70"))
 HARD_EXTENSION_ALLOW_B = os.getenv("HARD_EXTENSION_ALLOW_B", "false").lower() == "true"
+
+
+# V7.5 BTC Master Trend Filter.
+# Главная цель: не открывать альткоин против сильного движения BTC.
+# B-сигналы против BTC-импульса запрещаются. A+ против BTC разрешается только если альт реально отвязан
+# и показывает самостоятельную силу/слабость относительно BTC.
+ENABLE_BTC_MASTER_FILTER = os.getenv("ENABLE_BTC_MASTER_FILTER", "true").lower() == "true"
+BTC_MASTER_LOOKBACK_1M = int(os.getenv("BTC_MASTER_LOOKBACK_1M", "10"))
+BTC_MASTER_LOOKBACK_5M = int(os.getenv("BTC_MASTER_LOOKBACK_5M", "6"))
+BTC_MASTER_LOOKBACK_15M = int(os.getenv("BTC_MASTER_LOOKBACK_15M", "4"))
+BTC_STORM_1M_PERCENT = float(os.getenv("BTC_STORM_1M_PERCENT", "0.32"))
+BTC_STORM_5M_PERCENT = float(os.getenv("BTC_STORM_5M_PERCENT", "0.62"))
+BTC_TREND_15M_PERCENT = float(os.getenv("BTC_TREND_15M_PERCENT", "0.75"))
+BTC_MASTER_BLOCK_B_AGAINST = os.getenv("BTC_MASTER_BLOCK_B_AGAINST", "true").lower() == "true"
+BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED = os.getenv("BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED", "true").lower() == "true"
+BTC_MASTER_STORM_B_SCORE_ADD = int(os.getenv("BTC_MASTER_STORM_B_SCORE_ADD", "5"))
+BTC_MASTER_STORM_B_RISK_MULTIPLIER = float(os.getenv("BTC_MASTER_STORM_B_RISK_MULTIPLIER", "0.16"))
+BTC_MASTER_A_PLUS_AGAINST_SCORE_MIN = int(os.getenv("BTC_MASTER_A_PLUS_AGAINST_SCORE_MIN", "95"))
+BTC_MASTER_A_PLUS_AGAINST_RR_MIN = float(os.getenv("BTC_MASTER_A_PLUS_AGAINST_RR_MIN", "1.20"))
+ALT_DECOUPLE_EDGE_PERCENT = float(os.getenv("ALT_DECOUPLE_EDGE_PERCENT", "1.45"))
+
+# V7.6 BTC Dominance Decision Engine.
+# BTC is the boss: if BTC has a fast impulse, altcoin counter-trades are blocked.
+# Exceptions are allowed only when the altcoin proves real relative strength/weakness.
+BTC_DOMINANCE_ENABLED = os.getenv("BTC_DOMINANCE_ENABLED", "true").lower() == "true"
+BTC_FAST_1M_PERCENT = float(os.getenv("BTC_FAST_1M_PERCENT", "0.20"))
+BTC_FAST_5M_PERCENT = float(os.getenv("BTC_FAST_5M_PERCENT", "0.38"))
+BTC_FAST_15M_PERCENT = float(os.getenv("BTC_FAST_15M_PERCENT", "0.55"))
+BTC_DOMINANCE_BLOCK_COUNTER_B = os.getenv("BTC_DOMINANCE_BLOCK_COUNTER_B", "true").lower() == "true"
+BTC_DOMINANCE_BLOCK_COUNTER_A_PLUS = os.getenv("BTC_DOMINANCE_BLOCK_COUNTER_A_PLUS", "true").lower() == "true"
+BTC_DOMINANCE_EXCEPTION_SCORE_MIN = int(os.getenv("BTC_DOMINANCE_EXCEPTION_SCORE_MIN", "96"))
+BTC_DOMINANCE_EXCEPTION_RR_MIN = float(os.getenv("BTC_DOMINANCE_EXCEPTION_RR_MIN", "1.25"))
+BTC_DOMINANCE_EXCEPTION_VOLUME_MIN = float(os.getenv("BTC_DOMINANCE_EXCEPTION_VOLUME_MIN", "1.55"))
+BTC_DOMINANCE_ALT_5M_EDGE_PERCENT = float(os.getenv("BTC_DOMINANCE_ALT_5M_EDGE_PERCENT", "0.35"))
+BTC_DOMINANCE_NO_B_IN_STORM = os.getenv("BTC_DOMINANCE_NO_B_IN_STORM", "true").lower() == "true"
 
 # V4.6: параметры стратегий уровней.
 LEVEL_SWEEP_LOOKBACK_CANDLES = int(os.getenv("LEVEL_SWEEP_LOOKBACK_CANDLES", "14"))
@@ -1030,6 +1065,189 @@ def detect_btc_status() -> str:
     return trend_state(btc)
 
 
+def move_percent_from_lookback(candles: Optional[List[dict]], lookback: int) -> float:
+    if not candles or len(candles) < lookback + 2:
+        return 0.0
+    old = candles[-lookback]["close"]
+    new = candles[-1]["close"]
+    return (new - old) / old * 100 if old > 0 else 0.0
+
+
+def safe_ema_last(candles: Optional[List[dict]], period: int) -> Optional[float]:
+    if not candles or len(candles) < period + 2:
+        return None
+    return ema([c["close"] for c in candles], period)[-1]
+
+
+def safe_vwap_last(candles: Optional[List[dict]], period: int = 48) -> Optional[float]:
+    if not candles or len(candles) < period:
+        return None
+    return vwap_like(candles, period)
+
+
+def btc_master_context() -> dict:
+    """
+    V7.6 BTC Dominance Decision Engine.
+    BTC is the boss for altcoin futures.
+
+    The old filter looked at BTC as one of many filters. This engine makes BTC the first gate:
+    - fast BTC UP blocks alt SHORTs;
+    - fast BTC DOWN blocks alt LONGs;
+    - B counter-BTC signals are blocked;
+    - A+ counter-BTC is allowed only if the altcoin proves real decoupling.
+    """
+    if not ENABLE_BTC_MASTER_FILTER or not BTC_DOMINANCE_ENABLED:
+        return {"btc_master_enabled": False, "btc_master_state": "OFF"}
+
+    b1 = remove_unclosed_candle(get_klines("BTC-USDT", "1m", max(90, BTC_MASTER_LOOKBACK_1M + 30)), "1m")
+    b5 = remove_unclosed_candle(get_klines("BTC-USDT", "5m", max(90, BTC_MASTER_LOOKBACK_5M + 30)), "5m")
+    b15 = remove_unclosed_candle(get_klines("BTC-USDT", "15m", max(90, BTC_MASTER_LOOKBACK_15M + 30)), "15m")
+    b1h = remove_unclosed_candle(get_klines("BTC-USDT", "1h", 260), "1h")
+    b4h = remove_unclosed_candle(get_klines("BTC-USDT", "4h", 260), "4h")
+
+    if not b1 or not b5 or not b15:
+        return {"btc_master_enabled": True, "btc_master_state": "UNKNOWN", "btc_master_note": "BTC Dominance: данные BTC недоступны."}
+
+    m1 = move_percent_from_lookback(b1, BTC_MASTER_LOOKBACK_1M)
+    m5 = move_percent_from_lookback(b5, BTC_MASTER_LOOKBACK_5M)
+    m15 = move_percent_from_lookback(b15, BTC_MASTER_LOOKBACK_15M)
+    trend1h = trend_state(b1h) if b1h else "NEUTRAL"
+    trend4h = trend_state(b4h) if b4h else "NEUTRAL"
+
+    price_1m = b1[-1]["close"]
+    price_5m = b5[-1]["close"]
+    price_15m = b15[-1]["close"]
+    ema9_1m = safe_ema_last(b1, 9) or price_1m
+    ema21_5m = safe_ema_last(b5, 21) or price_5m
+    ema21_15m = safe_ema_last(b15, 21) or price_15m
+    vwap15 = safe_vwap_last(b15, 48) or price_15m
+    vr5 = volume_ratio(b5, 24) if b5 else 0.0
+
+    btc_above_fast = price_1m >= ema9_1m and price_5m >= ema21_5m and price_15m >= min(ema21_15m, vwap15)
+    btc_below_fast = price_1m <= ema9_1m and price_5m <= ema21_5m and price_15m <= max(ema21_15m, vwap15)
+
+    fast_up = (m1 >= BTC_FAST_1M_PERCENT and price_1m >= ema9_1m) or (m5 >= BTC_FAST_5M_PERCENT and price_5m >= ema21_5m) or (m15 >= BTC_FAST_15M_PERCENT and btc_above_fast)
+    fast_down = (m1 <= -BTC_FAST_1M_PERCENT and price_1m <= ema9_1m) or (m5 <= -BTC_FAST_5M_PERCENT and price_5m <= ema21_5m) or (m15 <= -BTC_FAST_15M_PERCENT and btc_below_fast)
+
+    storm_up = (m1 >= BTC_STORM_1M_PERCENT or m5 >= BTC_STORM_5M_PERCENT) and btc_above_fast
+    storm_down = (m1 <= -BTC_STORM_1M_PERCENT or m5 <= -BTC_STORM_5M_PERCENT) and btc_below_fast
+
+    sustained_up = (m5 > 0 and m15 >= BTC_TREND_15M_PERCENT and btc_above_fast) or (trend1h in ["BULLISH", "SOFT_BULLISH"] and m5 >= 0.10 and price_5m >= ema21_5m)
+    sustained_down = (m5 < 0 and m15 <= -BTC_TREND_15M_PERCENT and btc_below_fast) or (trend1h in ["BEARISH", "SOFT_BEARISH"] and m5 <= -0.10 and price_5m <= ema21_5m)
+
+    if storm_up:
+        state = "BTC_STORM_UP"
+        master_direction = "UP"
+        hard_direction = True
+    elif storm_down:
+        state = "BTC_STORM_DOWN"
+        master_direction = "DOWN"
+        hard_direction = True
+    elif fast_up:
+        state = "BTC_FAST_UP"
+        master_direction = "UP"
+        hard_direction = True
+    elif fast_down:
+        state = "BTC_FAST_DOWN"
+        master_direction = "DOWN"
+        hard_direction = True
+    elif sustained_up and not sustained_down:
+        state = "BTC_SUSTAINED_UP"
+        master_direction = "UP"
+        hard_direction = False
+    elif sustained_down and not sustained_up:
+        state = "BTC_SUSTAINED_DOWN"
+        master_direction = "DOWN"
+        hard_direction = False
+    elif trend1h in ["BULLISH", "SOFT_BULLISH"] and trend4h not in ["BEARISH"]:
+        state = "BTC_BIAS_UP"
+        master_direction = "UP"
+        hard_direction = False
+    elif trend1h in ["BEARISH", "SOFT_BEARISH"] and trend4h not in ["BULLISH"]:
+        state = "BTC_BIAS_DOWN"
+        master_direction = "DOWN"
+        hard_direction = False
+    else:
+        state = "BTC_NEUTRAL"
+        master_direction = "NEUTRAL"
+        hard_direction = False
+
+    return {
+        "btc_master_enabled": True,
+        "btc_master_state": state,
+        "btc_master_direction": master_direction,
+        "btc_master_hard_direction": hard_direction,
+        "btc_master_move_1m": round(m1, 3),
+        "btc_master_move_5m": round(m5, 3),
+        "btc_master_move_15m": round(m15, 3),
+        "btc_master_1h_trend": trend1h,
+        "btc_master_4h_trend": trend4h,
+        "btc_master_storm": storm_up or storm_down,
+        "btc_master_fast": fast_up or fast_down,
+        "btc_master_trend_up": master_direction == "UP",
+        "btc_master_trend_down": master_direction == "DOWN",
+        "btc_master_volume_ratio_5m": round(vr5, 2),
+        "btc_master_note": f"BTC Dominance: {state}; dir {master_direction}; 1m {m1:.2f}%, 5m {m5:.2f}%, 15m {m15:.2f}%, 1H {trend1h}, 4H {trend4h}, vol x{vr5:.2f}.",
+    }
+
+
+def attach_btc_master_filter(filters: dict, direction: str, c5: List[dict], c15: List[dict]) -> dict:
+    """
+    V7.6 BTC Dominance Guard:
+    - BTC fast/storm UP => alt SHORT is blocked.
+    - BTC fast/storm DOWN => alt LONG is blocked.
+    - Counter-BTC B signals are blocked.
+    - Counter-BTC A+ requires real relative strength/weakness, not just local candles.
+    """
+    ctx = btc_master_context()
+    filters.update(ctx)
+    if not ctx.get("btc_master_enabled"):
+        return filters
+
+    direction = normalize_direction(direction) or direction
+    master_direction = ctx.get("btc_master_direction", "NEUTRAL")
+    hard_direction = bool(ctx.get("btc_master_hard_direction", False))
+    btc_m15 = float(ctx.get("btc_master_move_15m", 0.0))
+    btc_m5 = float(ctx.get("btc_master_move_5m", 0.0))
+    alt_m15 = move_percent_from_lookback(c15, min(BTC_MASTER_LOOKBACK_15M, max(2, len(c15) - 2)))
+    alt_m5 = move_percent_from_lookback(c5, min(BTC_MASTER_LOOKBACK_5M, max(2, len(c5) - 2)))
+
+    aligned = (direction == "LONG" and master_direction == "UP") or (direction == "SHORT" and master_direction == "DOWN")
+    opposite = (direction == "LONG" and master_direction == "DOWN") or (direction == "SHORT" and master_direction == "UP")
+    hard_opposite = opposite and hard_direction
+
+    # Real decoupling must be visible on both 15m and 5m.
+    if direction == "SHORT":
+        decoupled = (alt_m15 <= btc_m15 - ALT_DECOUPLE_EDGE_PERCENT) and (alt_m5 <= btc_m5 - BTC_DOMINANCE_ALT_5M_EDGE_PERCENT)
+    else:
+        decoupled = (alt_m15 >= btc_m15 + ALT_DECOUPLE_EDGE_PERCENT) and (alt_m5 >= btc_m5 + BTC_DOMINANCE_ALT_5M_EDGE_PERCENT)
+
+    filters["btc_master_aligned"] = aligned
+    filters["btc_master_opposite"] = opposite
+    filters["btc_master_hard_opposite"] = hard_opposite
+    filters["btc_master_decoupled"] = decoupled
+    filters["alt_move_15m_percent"] = round(alt_m15, 3)
+    filters["alt_move_5m_percent"] = round(alt_m5, 3)
+
+    note = ctx.get("btc_master_note", "")
+    if hard_opposite:
+        if decoupled:
+            note += f" Жёстко против BTC, но альт реально отвязан: alt 5m {alt_m5:.2f}% / 15m {alt_m15:.2f}% vs BTC 5m {btc_m5:.2f}% / 15m {btc_m15:.2f}%. Только редкий A+ exception."
+        else:
+            note += f" ЖЁСТКИЙ БЛОК: BTC против {direction}; alt 5m {alt_m5:.2f}% / 15m {alt_m15:.2f}% не доказал decouple."
+    elif opposite:
+        if decoupled:
+            note += f" BTC bias против {direction}, но есть относительная сила/слабость альта. B запрещён, A+ только при супер-условиях."
+        else:
+            note += f" BTC bias против {direction}: B запрещён, A+ почти всегда запрещён."
+    elif aligned:
+        note += f" BTC подтверждает {direction}; alt 5m {alt_m5:.2f}% / 15m {alt_m15:.2f}%."
+    else:
+        note += f" BTC нейтральный/смешанный; alt 5m {alt_m5:.2f}% / 15m {alt_m15:.2f}%."
+
+    filters["btc_master_note"] = note
+    return filters
+
 def momentum_confirm(c1: List[dict], c5: List[dict], direction: str) -> bool:
     if len(c1) < 20 or len(c5) < 20:
         return False
@@ -1180,6 +1398,12 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
     extension_hard = filters.get("extension_hard", False)
     extension_continuation_ok = filters.get("extension_continuation_ok", False)
 
+    btc_master_opposite = filters.get("btc_master_opposite", False)
+    btc_master_aligned = filters.get("btc_master_aligned", False)
+    btc_master_decoupled = filters.get("btc_master_decoupled", False)
+    btc_master_storm = filters.get("btc_master_storm", False)
+    btc_master_hard_opposite = filters.get("btc_master_hard_opposite", False)
+
     # V7.4: после движения 3%+ запрещаем chase, но разрешаем continuation после отката.
     # B после hard-extension по умолчанию запрещён, потому что откат может легко выбить короткий SL.
     if extension_blocked and filters.get("force_grade") == "B":
@@ -1196,6 +1420,12 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
             and not funding.get("blocked")
             and (not filters.get("btc_against") or filters.get("allow_btc_countertrend_bounce"))
         ):
+            if (BTC_MASTER_BLOCK_B_AGAINST and btc_master_opposite) or (BTC_DOMINANCE_BLOCK_COUNTER_B and btc_master_hard_opposite):
+                return None
+            if (BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED or BTC_DOMINANCE_NO_B_IN_STORM) and btc_master_storm and not btc_master_aligned:
+                return None
+            if btc_master_storm and btc_master_aligned and score < B_MIN_SCORE + BTC_MASTER_STORM_B_SCORE_ADD:
+                return None
             if extension_extended:
                 if not extension_continuation_ok:
                     return None
@@ -1204,6 +1434,8 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
                 b_risk = min(filters.get("risk_multiplier_override", B_RISK_MULTIPLIER), EXTENSION_B_RISK_MULTIPLIER)
             else:
                 b_risk = filters.get("risk_multiplier_override", B_RISK_MULTIPLIER)
+            if btc_master_storm:
+                b_risk = min(b_risk, BTC_MASTER_STORM_B_RISK_MULTIPLIER)
             return {
                 "grade": "B",
                 "risk_multiplier": b_risk,
@@ -1222,6 +1454,15 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         and can_strategy_be_a_plus(strategy, direction)
         and level_a_plus_allowed
     ):
+        if btc_master_opposite:
+            btc_exception_ok = (
+                btc_master_decoupled
+                and score >= max(BTC_MASTER_A_PLUS_AGAINST_SCORE_MIN, BTC_DOMINANCE_EXCEPTION_SCORE_MIN)
+                and rr >= max(BTC_MASTER_A_PLUS_AGAINST_RR_MIN, BTC_DOMINANCE_EXCEPTION_RR_MIN)
+                and volume >= max(SUPER_SETUP_VOLUME_MIN, BTC_DOMINANCE_EXCEPTION_VOLUME_MIN)
+            )
+            if BTC_DOMINANCE_BLOCK_COUNTER_A_PLUS and not btc_exception_ok:
+                return None
         if extension_extended:
             super_setup_ok = (
                 score >= SUPER_SETUP_SCORE_MIN
@@ -1240,6 +1481,8 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
             a_risk = A_PLUS_RISK_MULTIPLIER * EXTENSION_A_PLUS_RISK_MULTIPLIER
         else:
             a_risk = A_PLUS_RISK_MULTIPLIER
+        if btc_master_storm:
+            a_risk = min(a_risk, 0.65)
         return {
             "grade": "A+",
             "risk_multiplier": a_risk,
@@ -1265,7 +1508,15 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         and not extension_blocked
         and (not filters.get("btc_against") or filters.get("allow_btc_countertrend_bounce"))
     ):
+        if (BTC_MASTER_BLOCK_B_AGAINST and btc_master_opposite) or (BTC_DOMINANCE_BLOCK_COUNTER_B and btc_master_hard_opposite):
+            return None
+        if (BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED or BTC_DOMINANCE_NO_B_IN_STORM) and btc_master_storm and not btc_master_aligned:
+            return None
+        if btc_master_storm and btc_master_aligned and score < b_score + BTC_MASTER_STORM_B_SCORE_ADD:
+            return None
         b_risk = filters.get("risk_multiplier_override", B_RISK_MULTIPLIER)
+        if btc_master_storm:
+            b_risk = min(b_risk, BTC_MASTER_STORM_B_RISK_MULTIPLIER)
         if extension_extended:
             if not extension_continuation_ok:
                 return None
@@ -2312,6 +2563,7 @@ def evaluate_level_break_retest_short(symbol, direction, c15, c5, c1, c1h, c4h, 
 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters = attach_extension_filter(filters, direction, c5, c15, price, score)
+    filters = attach_btc_master_filter(filters, direction, c5, c15)
     filters.update(mtf)
     filters["anti_fakeout_note"] = (filters.get("anti_fakeout_note", "") + " " + mtf.get("level_strength_note", "")).strip()
 
@@ -2489,6 +2741,7 @@ def evaluate_level_sweep_bounce_long(symbol, direction, c15, c5, c1, c1h, c4h, b
 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters = attach_extension_filter(filters, direction, c5, c15, price, score)
+    filters = attach_btc_master_filter(filters, direction, c5, c15)
     filters.update(mtf)
     filters["anti_fakeout_note"] = (filters.get("anti_fakeout_note", "") + " " + mtf.get("level_strength_note", "")).strip()
 
@@ -2650,6 +2903,7 @@ def evaluate_level_break_retest_long(symbol, direction, c15, c5, c1, c1h, c4h, b
 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters = attach_extension_filter(filters, direction, c5, c15, price, score)
+    filters = attach_btc_master_filter(filters, direction, c5, c15)
     filters.update(mtf)
     filters["anti_fakeout_note"] = (filters.get("anti_fakeout_note", "") + " " + mtf.get("level_strength_note", "")).strip()
 
@@ -2791,6 +3045,7 @@ def evaluate_level_resistance_reject_short(symbol, direction, c15, c5, c1, c1h, 
 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters = attach_extension_filter(filters, direction, c5, c15, price, score)
+    filters = attach_btc_master_filter(filters, direction, c5, c15)
     filters.update(mtf)
     filters["anti_fakeout_note"] = (filters.get("anti_fakeout_note", "") + " " + mtf.get("level_strength_note", "")).strip()
 
@@ -2961,6 +3216,7 @@ def evaluate_impulse_pullback_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_
 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters = attach_extension_filter(filters, direction, c5, c15, price, score)
+    filters = attach_btc_master_filter(filters, direction, c5, c15)
     filters["force_grade"] = "B"
     filters["risk_multiplier_override"] = IMPULSE_PULLBACK_RISK_MULTIPLIER
     filters["anti_fakeout_note"] = "Impulse Pullback Pro: стратегия только B, вход после отката, не на конце импульса."
@@ -3066,9 +3322,12 @@ def build_message(signal: dict) -> str:
     funding_text = funding.get("reason", "Funding/OI: нет данных")
     countertrend_note = filters.get("countertrend_note", "")
     anti_fakeout_note = filters.get("anti_fakeout_note", "")
+    btc_master_note = filters.get("btc_master_note", "")
 
     if anti_fakeout_note:
         funding_text += f"\nAnti-fakeout: {anti_fakeout_note}"
+    if btc_master_note:
+        funding_text += f"\nBTC Master: {btc_master_note}"
 
     grade_text = "A+ SIGNAL" if signal["grade"] == "A+" else "B SIGNAL"
 
@@ -3560,7 +3819,7 @@ async def auto_worker():
 @app.on_event("startup")
 async def startup_event():
     text = (
-        "✅ Professional Adaptive Futures Bot AUTO V7.4 PULLBACK CONTINUATION PRO запущен.\n\n"
+        "✅ Professional Adaptive Futures Bot AUTO V7.6 BTC DOMINANCE DECISION ENGINE запущен.\n\n"
         f"Режим: {'TEST' if TEST_MODE else 'TRADE'}\n"
         f"Auto Scan: {'ON' if AUTO_SCAN_ENABLED else 'OFF'}\n"
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'}\n"
@@ -3580,6 +3839,7 @@ async def startup_event():
         f"Level B score/RR/volume: {LEVEL_B_MIN_SCORE}+ / {LEVEL_B_MIN_RR} / x{LEVEL_B_MIN_VOLUME_RATIO}\n"
         f"Debug no-signal report: {'ON' if DEBUG_NO_SIGNAL_REPORT_ENABLED else 'OFF'}\n"
         f"Impulse Pullback Pro: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
+        f"BTC Dominance Engine: {'ON' if BTC_DOMINANCE_ENABLED else 'OFF'} | fast 1m/5m/15m: {BTC_FAST_1M_PERCENT}% / {BTC_FAST_5M_PERCENT}% / {BTC_FAST_15M_PERCENT}%\n"
         f"Scan interval: {AUTO_SCAN_SECONDS} сек.\n"
         f"Track interval: {AUTO_TRACK_SECONDS} сек.\n\n"
         "Бот ищет LONG и SHORT, показывает стратегию, считает статистику и блокирует только strategy+side, а не весь SHORT/LONG.\n"
@@ -3597,10 +3857,10 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V7.4 PULLBACK CONTINUATION PRO</title>
+    <title>Professional Adaptive Futures Bot AUTO V7.6 BTC DOMINANCE DECISION ENGINE</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
-    <h1>✅ Professional Adaptive Futures Bot AUTO V7.4 PULLBACK CONTINUATION PRO работает</h1>
+    <h1>✅ Professional Adaptive Futures Bot AUTO V7.6 BTC DOMINANCE DECISION ENGINE работает</h1>
     <pre>
 GET /health
 GET /scan?send_to_telegram=false
@@ -3620,7 +3880,7 @@ GET /reset-state
 def health():
     return {
         "status": "ok",
-        "service": "Professional Adaptive Futures Bot AUTO V7.4 PULLBACK CONTINUATION PRO",
+        "service": "Professional Adaptive Futures Bot AUTO V7.6 BTC DOMINANCE DECISION ENGINE",
         "test_mode": TEST_MODE,
         "fee_rate": FEE_RATE,
         "slippage_rate": SLIPPAGE_RATE,
@@ -3657,7 +3917,7 @@ def auto_status():
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V7.4 PULLBACK CONTINUATION PRO подключён к Telegram.")
+    return send_telegram_message("✅ Professional Adaptive Futures Bot AUTO V7.6 BTC DOMINANCE DECISION ENGINE подключён к Telegram.")
 
 
 @app.get("/auto-signal")
