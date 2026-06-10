@@ -9,8 +9,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.1 ADAPTIVE TRUST ENGINE"
-DEPLOY_MARKER = "V7_1_ADAPTIVE_TRUST_ENGINE_2026_06_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.2 PROFESSIONAL TRADE MANAGEMENT"
+DEPLOY_MARKER = "V7_2_PRO_TRADE_MANAGEMENT_2026_06_10"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -137,6 +137,30 @@ IMPULSE_PULLBACK_MIN_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MIN_PERCENT", "
 IMPULSE_PULLBACK_MAX_PERCENT = float(os.getenv("IMPULSE_PULLBACK_MAX_PERCENT", "3.20"))
 IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT", "3.00"))
 IMPULSE_MIN_VOLUME_RATIO = float(os.getenv("IMPULSE_MIN_VOLUME_RATIO", "0.95"))
+
+# V7.2 Professional Trade Management: не только вход, но и ведение сделки.
+# Цель: не выбивать A+ короткой шпилькой, особенно когда BTC штормит.
+PRO_TRADE_MANAGEMENT_ENABLED = os.getenv("PRO_TRADE_MANAGEMENT_ENABLED", "true").lower() == "true"
+BTC_STORM_FILTER_ENABLED = os.getenv("BTC_STORM_FILTER_ENABLED", "true").lower() == "true"
+BTC_STORM_LOOKBACK_1M = int(os.getenv("BTC_STORM_LOOKBACK_1M", "10"))
+BTC_STORM_MOVE_1M_PERCENT = float(os.getenv("BTC_STORM_MOVE_1M_PERCENT", "0.45"))
+BTC_STORM_LOOKBACK_5M = int(os.getenv("BTC_STORM_LOOKBACK_5M", "4"))
+BTC_STORM_MOVE_5M_PERCENT = float(os.getenv("BTC_STORM_MOVE_5M_PERCENT", "0.75"))
+BLOCK_B_DURING_BTC_STORM = os.getenv("BLOCK_B_DURING_BTC_STORM", "true").lower() == "true"
+BTC_STORM_A_PLUS_RISK_MULTIPLIER = float(os.getenv("BTC_STORM_A_PLUS_RISK_MULTIPLIER", "0.35"))
+
+# A+ = structural trade: даём цене немного воздуха, если стоп слишком короткий.
+A_PLUS_STRUCTURAL_SL_ENABLED = os.getenv("A_PLUS_STRUCTURAL_SL_ENABLED", "true").lower() == "true"
+A_PLUS_MIN_STOP_PRICE_MOVE_PERCENT = float(os.getenv("A_PLUS_MIN_STOP_PRICE_MOVE_PERCENT", "0.34"))
+A_PLUS_EXTRA_ATR_BUFFER = float(os.getenv("A_PLUS_EXTRA_ATR_BUFFER", "0.18"))
+
+# Soft Stop: первые минуты A+ не закрывается по одной шпильке, нужен close за SL.
+A_PLUS_SOFT_STOP_ENABLED = os.getenv("A_PLUS_SOFT_STOP_ENABLED", "true").lower() == "true"
+A_PLUS_SOFT_STOP_SECONDS = int(os.getenv("A_PLUS_SOFT_STOP_SECONDS", "300"))
+
+# После TP1 не ставим защиту ровно в entry, даём маленький buffer от шума.
+POST_TP1_BUFFER_ENABLED = os.getenv("POST_TP1_BUFFER_ENABLED", "true").lower() == "true"
+POST_TP1_BE_BUFFER_PERCENT = float(os.getenv("POST_TP1_BE_BUFFER_PERCENT", "0.08"))
 
 STRATEGIES = [
     "SWEEP_RECLAIM_LONG",
@@ -744,6 +768,39 @@ def detect_btc_status() -> str:
     return trend_state(btc) if btc else "NEUTRAL"
 
 
+BTC_STORM_CACHE = {"ts": 0.0, "data": {"storm": False, "note": "BTC storm: cache empty", "move_1m": 0.0, "move_5m": 0.0}}
+
+
+def detect_btc_storm() -> dict:
+    """Возвращает режим BTC_STORM, чтобы не открывать слабые сделки во время резких BTC-движений."""
+    if not BTC_STORM_FILTER_ENABLED:
+        return {"storm": False, "note": "BTC storm filter OFF", "move_1m": 0.0, "move_5m": 0.0}
+    current = now_ts()
+    if current - BTC_STORM_CACHE.get("ts", 0) < 60:
+        return BTC_STORM_CACHE.get("data", {})
+
+    c1 = remove_unclosed_candle(get_klines("BTC-USDT", "1m", max(60, BTC_STORM_LOOKBACK_1M + 5)), "1m")
+    c5 = remove_unclosed_candle(get_klines("BTC-USDT", "5m", max(60, BTC_STORM_LOOKBACK_5M + 5)), "5m")
+
+    move_1m = 0.0
+    move_5m = 0.0
+    if c1 and len(c1) > BTC_STORM_LOOKBACK_1M and c1[-BTC_STORM_LOOKBACK_1M]["close"] > 0:
+        move_1m = (c1[-1]["close"] - c1[-BTC_STORM_LOOKBACK_1M]["close"]) / c1[-BTC_STORM_LOOKBACK_1M]["close"] * 100
+    if c5 and len(c5) > BTC_STORM_LOOKBACK_5M and c5[-BTC_STORM_LOOKBACK_5M]["close"] > 0:
+        move_5m = (c5[-1]["close"] - c5[-BTC_STORM_LOOKBACK_5M]["close"]) / c5[-BTC_STORM_LOOKBACK_5M]["close"] * 100
+
+    storm = abs(move_1m) >= BTC_STORM_MOVE_1M_PERCENT or abs(move_5m) >= BTC_STORM_MOVE_5M_PERCENT
+    data = {
+        "storm": storm,
+        "move_1m": round(move_1m, 3),
+        "move_5m": round(move_5m, 3),
+        "note": f"BTC_STORM={'ON' if storm else 'OFF'} | 1m move {round(move_1m, 3)}% / 5m move {round(move_5m, 3)}%",
+    }
+    BTC_STORM_CACHE["ts"] = current
+    BTC_STORM_CACHE["data"] = data
+    return data
+
+
 def is_confirming(trend: str, direction: str) -> bool:
     return trend in (["BULLISH", "SOFT_BULLISH"] if direction == "LONG" else ["BEARISH", "SOFT_BEARISH"])
 
@@ -850,6 +907,7 @@ def analyze_funding_oi(symbol: str, direction: str) -> dict:
 
 def base_filters(symbol: str, direction: str, btc_status: str, d: dict, regime: dict) -> dict:
     funding = analyze_funding_oi(symbol, direction)
+    btc_storm = detect_btc_storm()
     trend1h = d.get("trend1h", "NEUTRAL")
     trend4h = d.get("trend4h", "NEUTRAL")
     htf_1h = is_confirming(trend1h, direction)
@@ -886,6 +944,12 @@ def base_filters(symbol: str, direction: str, btc_status: str, d: dict, regime: 
         "funding": funding,
         "btc_status": btc_status,
         "btc_against": btc_against,
+        "btc_storm": btc_storm.get("storm", False),
+        "btc_storm_note": btc_storm.get("note", ""),
+        "btc_storm_move_1m": btc_storm.get("move_1m", 0.0),
+        "btc_storm_move_5m": btc_storm.get("move_5m", 0.0),
+        "atr5": d.get("a5"),
+        "atr15": d.get("a15"),
         "trend1h": trend1h,
         "trend4h": trend4h,
         "htf_1h_confirmed": htf_1h,
@@ -1055,13 +1119,39 @@ def classify_signal(score: int, rr: float, vol: float, filters: dict, strategy: 
     return None
 
 
+def apply_professional_sl_buffer(entry: float, sl: float, direction: str, score: int, filters: dict) -> float:
+    """Для потенциальных A+ делаем стоп структурнее: не впритык к локальной шпильке."""
+    if not PRO_TRADE_MANAGEMENT_ENABLED or not A_PLUS_STRUCTURAL_SL_ENABLED:
+        return sl
+    if score < A_PLUS_MIN_SCORE:
+        return sl
+    atr5 = filters.get("atr5") or 0
+    if entry <= 0 or sl <= 0:
+        return sl
+    min_stop = entry * A_PLUS_MIN_STOP_PRICE_MOVE_PERCENT / 100
+    current_stop = abs(entry - sl)
+    extra = atr5 * A_PLUS_EXTRA_ATR_BUFFER if atr5 else 0
+    required = max(min_stop, current_stop + extra)
+    if required <= current_stop:
+        return sl
+    new_sl = entry - required if direction == "LONG" else entry + required
+    filters["sl_management_note"] = (
+        f"A+ structural SL: стоп расширен под шум/ATR; было {round(sl, 8)}, стало {round(new_sl, 8)}. "
+        "Это может уменьшить размер позиции, но снижает риск выбивания шпилькой."
+    )
+    return new_sl
+
+
 def build_signal(symbol: str, direction: str, strategy: str, entry: float, sl: float, score: int, vol_ratio: float, reason: str, deposit: float, risk_percent: float, filters: dict) -> Optional[dict]:
-    risk_pos = calc_risk_position(entry, sl)
-    if risk_pos > MAX_RISK_POSITION_PERCENT:
-        return None
     score += filters.get("score_adjustment", 0)
     if is_level_strategy(strategy):
         score += 2
+
+    # V7.2: сначала делаем потенциальный A+ стоп структурнее, потом считаем RR/risk.
+    sl = apply_professional_sl_buffer(entry, sl, direction, score, filters)
+    risk_pos = calc_risk_position(entry, sl)
+    if risk_pos > MAX_RISK_POSITION_PERCENT:
+        return None
 
     space = filters.get("space_to_target_percent")
     if ENABLE_SPACE_TO_TARGET_FILTER and space is not None:
@@ -1111,6 +1201,9 @@ def build_signal(symbol: str, direction: str, strategy: str, entry: float, sl: f
         "score": min(max(score, 0), 98),
         "entry": round(entry, 8),
         "sl": round(sl, 8),
+        "post_tp1_sl": round((entry - entry * POST_TP1_BE_BUFFER_PERCENT / 100) if direction == "LONG" else (entry + entry * POST_TP1_BE_BUFFER_PERCENT / 100), 8),
+        "soft_stop_seconds": A_PLUS_SOFT_STOP_SECONDS if grade == "A+" and A_PLUS_SOFT_STOP_ENABLED else 0,
+        "trade_management_note": "A+ soft-stop + TP1 buffer active" if grade == "A+" and A_PLUS_SOFT_STOP_ENABLED else "standard stop management",
         "tp1": round(tp1, 8),
         "tp2": round(tp2, 8),
         "tp3": round(tp3, 8),
@@ -1497,7 +1590,7 @@ def build_message(signal: dict) -> str:
     f = signal.get("filters", {})
     funding_text = f.get("funding", {}).get("reason", "Funding/OI: нет данных")
     notes = []
-    for key in ["regime_note", "htf_note", "level_strength_note", "setup_note", "space_note", "trust_note"]:
+    for key in ["regime_note", "htf_note", "level_strength_note", "setup_note", "space_note", "trust_note", "btc_storm_note", "btc_storm_trade_note", "sl_management_note"]:
         if f.get(key):
             notes.append(f.get(key))
     if f.get("hard_block_reasons"):
@@ -1540,8 +1633,9 @@ BTC: {f.get('btc_status', 'NEUTRAL')}
 {risk_text}
 {caution}
 
+<b>Trade management:</b> {signal.get('trade_management_note', 'standard')}
 <b>После TP1:</b>
-Закрыть примерно {TP1_CLOSE_PERCENT:.0f}% позиции и перенести SL в безубыток.
+Закрыть примерно {TP1_CLOSE_PERCENT:.0f}% позиции. Защитный SL после TP1: <code>{signal.get('post_tp1_sl', signal['entry'])}</code> — не ровно entry, а с buffer от шума.
 
 ⚠️ Не финансовый совет.
 """.strip()
@@ -1578,15 +1672,26 @@ def check_signal_hit(signal: dict, candles: List[dict]):
     new = [c for c in candles if c["time"] > last_checked]
     if not new:
         return None, candles[-1]["close"]
+
+    soft_stop_seconds = int(signal.get("soft_stop_seconds", 0) or 0)
+    created_at = float(signal.get("created_at", 0) or 0)
+    post_tp1_sl = float(signal.get("post_tp1_sl", signal.get("entry", 0)) or signal.get("entry", 0))
+
     for c in new:
-        high, low = c["high"], c["low"]
+        high, low, close = c["high"], c["low"], c.get("close", 0)
         signal["last_checked_time"] = c["time"]
+        candle_age = c["time"] / 1000 - created_at if created_at else 999999
+        soft_stop_active = soft_stop_seconds > 0 and candle_age <= soft_stop_seconds and not signal.get("tp1_hit")
+
         if side == "LONG":
-            if signal.get("tp2_hit") and low <= signal["entry"]:
-                return "PROFIT_AFTER_TP2", signal["entry"]
-            if signal.get("tp1_hit") and low <= signal["entry"]:
-                return "PROFIT_AFTER_TP1", signal["entry"]
+            if signal.get("tp2_hit") and low <= post_tp1_sl:
+                return "PROFIT_AFTER_TP2", post_tp1_sl
+            if signal.get("tp1_hit") and low <= post_tp1_sl:
+                return "PROFIT_AFTER_TP1", post_tp1_sl
             if not signal.get("tp1_hit") and low <= signal["sl"]:
+                if soft_stop_active and close > signal["sl"]:
+                    # A+ soft-stop: шпилька под SL без закрытия — пока не считаем SL.
+                    continue
                 return "SL", signal["sl"]
             if not signal.get("tp1_hit") and high >= signal["tp1"]:
                 signal["tp1_hit"] = True; return "TP1", signal["tp1"]
@@ -1595,11 +1700,14 @@ def check_signal_hit(signal: dict, candles: List[dict]):
             if signal.get("tp2_hit") and not signal.get("tp3_hit") and high >= signal["tp3"]:
                 signal["tp3_hit"] = True; return "TP3", signal["tp3"]
         else:
-            if signal.get("tp2_hit") and high >= signal["entry"]:
-                return "PROFIT_AFTER_TP2", signal["entry"]
-            if signal.get("tp1_hit") and high >= signal["entry"]:
-                return "PROFIT_AFTER_TP1", signal["entry"]
+            if signal.get("tp2_hit") and high >= post_tp1_sl:
+                return "PROFIT_AFTER_TP2", post_tp1_sl
+            if signal.get("tp1_hit") and high >= post_tp1_sl:
+                return "PROFIT_AFTER_TP1", post_tp1_sl
             if not signal.get("tp1_hit") and high >= signal["sl"]:
+                if soft_stop_active and close < signal["sl"]:
+                    # A+ soft-stop: шпилька выше SL без закрытия — пока не считаем SL.
+                    continue
                 return "SL", signal["sl"]
             if not signal.get("tp1_hit") and low <= signal["tp1"]:
                 signal["tp1_hit"] = True; return "TP1", signal["tp1"]
@@ -1784,6 +1892,7 @@ async def startup_event():
         f"Closed candles only: {'ON' if USE_CLOSED_CANDLES_ONLY else 'OFF'}\n"
         f"Market Regime Engine: {'ON' if MARKET_REGIME_ENABLED else 'OFF'} | CHOP no-trade: {'ON' if NO_TRADE_IN_CHOP else 'OFF'}\n"
         f"Adaptive Trust Engine: {'ON' if ADAPTIVE_TRUST_ENABLED else 'OFF'} | A+ side WR min {TRUST_A_PLUS_MIN_SIDE_WR}% | B grade WR min {TRUST_B_MIN_GRADE_WR}%\n"
+        f"Pro Trade Management: {'ON' if PRO_TRADE_MANAGEMENT_ENABLED else 'OFF'} | BTC Storm: {'ON' if BTC_STORM_FILTER_ENABLED else 'OFF'} | A+ soft stop {A_PLUS_SOFT_STOP_SECONDS}s | TP1 buffer {POST_TP1_BE_BUFFER_PERCENT}%\n"
         f"A+ score/RR/volume: {A_PLUS_MIN_SCORE}+ / {A_PLUS_MIN_RR} / x{A_PLUS_MIN_VOLUME_RATIO}\n"
         f"B score/RR/volume: {B_MIN_SCORE}+ / {B_MIN_RR} / x{B_MIN_VOLUME_RATIO}\n"
         f"Level B score/RR/volume: {LEVEL_B_MIN_SCORE}+ / {LEVEL_B_MIN_RR} / x{LEVEL_B_MIN_VOLUME_RATIO}\n"
@@ -1791,7 +1900,7 @@ async def startup_event():
         f"Impulse Pullback: {'ON' if IMPULSE_PULLBACK_ENABLED else 'OFF'} / risk x{IMPULSE_PULLBACK_RISK_MULTIPLIER}\n"
         f"Anti-chase: {'ON' if ENABLE_ANTI_CHASE_FILTER else 'OFF'}\n"
         f"ALLOW_ENV_STRATEGY_OVERRIDES: {'ON' if ALLOW_ENV_STRATEGY_OVERRIDES else 'OFF'}\n\n"
-        "V7.1 логика: market regime + strategy trust. Score больше не перебивает плохой контекст и плохую статистику связки."
+        "V7.2 логика: market regime + strategy trust + professional trade management. A+ получает структурный SL, soft-stop первые минуты и TP1 buffer; B блокируется во время BTC storm."
     )
     send_telegram_message(text)
     asyncio.create_task(auto_worker())
@@ -1818,7 +1927,7 @@ GET /test-telegram</pre>
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": APP_NAME, "deploy_marker": DEPLOY_MARKER, "test_mode": TEST_MODE, "active_signals": len(STATE.get("active_signals", {})), "market_regime_enabled": MARKET_REGIME_ENABLED, "adaptive_trust_enabled": ADAPTIVE_TRUST_ENABLED, "a_plus_min_score": A_PLUS_MIN_SCORE, "b_min_score": B_MIN_SCORE, "short_b_enabled": SHORT_B_ENABLED, "api_key_enabled": bool(API_KEY)}
+    return {"status": "ok", "service": APP_NAME, "deploy_marker": DEPLOY_MARKER, "test_mode": TEST_MODE, "active_signals": len(STATE.get("active_signals", {})), "market_regime_enabled": MARKET_REGIME_ENABLED, "adaptive_trust_enabled": ADAPTIVE_TRUST_ENABLED, "pro_trade_management_enabled": PRO_TRADE_MANAGEMENT_ENABLED, "btc_storm_filter_enabled": BTC_STORM_FILTER_ENABLED, "a_plus_min_score": A_PLUS_MIN_SCORE, "b_min_score": B_MIN_SCORE, "short_b_enabled": SHORT_B_ENABLED, "api_key_enabled": bool(API_KEY)}
 
 
 @app.get("/version")
