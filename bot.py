@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.8.1 DYNAMIC EXTREME MOVER SCANNER FIXED STARTUP"
-DEPLOY_MARKER = "V7_8_1_DYNAMIC_EXTREME_MOVER_SCANNER_FIXED_STARTUP_2026_06_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.9 BALANCED ACTIVE PRO"
+DEPLOY_MARKER = "V7_9_BALANCED_ACTIVE_PRO_2026_06_11"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -51,10 +51,10 @@ MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
 DEFAULT_DEPOSIT = float(os.getenv("DEFAULT_DEPOSIT", "1000"))
 DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "180"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "260"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "2400"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1200"))
 
 PAIR_BLOCK_SECONDS = int(os.getenv("PAIR_BLOCK_SECONDS", "43200"))
 STRATEGY_SIDE_DISABLE_SECONDS = int(os.getenv("STRATEGY_SIDE_DISABLE_SECONDS", "10800"))
@@ -65,15 +65,15 @@ STRATEGY_SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_SIDE_MAX_CONSECUTIVE_
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "300"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "180"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "60"))
 
 ENABLE_FUNDING_FILTER = os.getenv("ENABLE_FUNDING_FILTER", "true").lower() == "true"
 ENABLE_OI_FILTER = os.getenv("ENABLE_OI_FILTER", "true").lower() == "true"
 ENABLE_LATE_ENTRY_FILTER = os.getenv("ENABLE_LATE_ENTRY_FILTER", "true").lower() == "true"
 
-MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "5.5"))
-MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "4.5"))
+MAX_RECENT_MOVE_PERCENT = float(os.getenv("MAX_RECENT_MOVE_PERCENT", "6.5"))
+MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("MAX_DISTANCE_FROM_VWAP_PERCENT", "5.2"))
 
 # V7.3 Anti-Extension Guard: не входим после движения 3%+ по направлению сделки.
 # LONG после пампа и SHORT после дампа чаще дают поздний вход и SL на откате.
@@ -82,18 +82,18 @@ ANTI_EXTENSION_LOOKBACK_5M = int(os.getenv("ANTI_EXTENSION_LOOKBACK_5M", "12"))
 ANTI_EXTENSION_LOOKBACK_15M = int(os.getenv("ANTI_EXTENSION_LOOKBACK_15M", "8"))
 MAX_ENTRY_EXTENSION_PERCENT = float(os.getenv("MAX_ENTRY_EXTENSION_PERCENT", "3.0"))
 HARD_ENTRY_EXTENSION_PERCENT = float(os.getenv("HARD_ENTRY_EXTENSION_PERCENT", "5.0"))
-EXTENSION_MIN_PULLBACK_PERCENT = float(os.getenv("EXTENSION_MIN_PULLBACK_PERCENT", "0.65"))
-HARD_EXTENSION_MIN_PULLBACK_PERCENT = float(os.getenv("HARD_EXTENSION_MIN_PULLBACK_PERCENT", "1.20"))
-SUPER_SETUP_SCORE_MIN = int(os.getenv("SUPER_SETUP_SCORE_MIN", "94"))
-SUPER_SETUP_VOLUME_MIN = float(os.getenv("SUPER_SETUP_VOLUME_MIN", "1.45"))
-SUPER_SETUP_RR_MIN = float(os.getenv("SUPER_SETUP_RR_MIN", "1.15"))
+EXTENSION_MIN_PULLBACK_PERCENT = float(os.getenv("EXTENSION_MIN_PULLBACK_PERCENT", "0.45"))
+HARD_EXTENSION_MIN_PULLBACK_PERCENT = float(os.getenv("HARD_EXTENSION_MIN_PULLBACK_PERCENT", "0.95"))
+SUPER_SETUP_SCORE_MIN = int(os.getenv("SUPER_SETUP_SCORE_MIN", "92"))
+SUPER_SETUP_VOLUME_MIN = float(os.getenv("SUPER_SETUP_VOLUME_MIN", "1.28"))
+SUPER_SETUP_RR_MIN = float(os.getenv("SUPER_SETUP_RR_MIN", "1.05"))
 
 # V7.4: после движения 3%+ не запрещаем всё подряд.
 # Запрещаем chase-входы, но разрешаем continuation после нормального отката.
 EXTENSION_REQUIRE_PULLBACK_CONTINUATION = os.getenv("EXTENSION_REQUIRE_PULLBACK_CONTINUATION", "true").lower() == "true"
-EXTENSION_B_RISK_MULTIPLIER = float(os.getenv("EXTENSION_B_RISK_MULTIPLIER", "0.16"))
+EXTENSION_B_RISK_MULTIPLIER = float(os.getenv("EXTENSION_B_RISK_MULTIPLIER", "0.10"))
 EXTENSION_A_PLUS_RISK_MULTIPLIER = float(os.getenv("EXTENSION_A_PLUS_RISK_MULTIPLIER", "0.70"))
-HARD_EXTENSION_ALLOW_B = os.getenv("HARD_EXTENSION_ALLOW_B", "false").lower() == "true"
+HARD_EXTENSION_ALLOW_B = os.getenv("HARD_EXTENSION_ALLOW_B", "true").lower() == "true"
 
 
 # V7.5 BTC Master Trend Filter.
@@ -107,10 +107,10 @@ BTC_MASTER_LOOKBACK_15M = int(os.getenv("BTC_MASTER_LOOKBACK_15M", "4"))
 BTC_STORM_1M_PERCENT = float(os.getenv("BTC_STORM_1M_PERCENT", "0.32"))
 BTC_STORM_5M_PERCENT = float(os.getenv("BTC_STORM_5M_PERCENT", "0.62"))
 BTC_TREND_15M_PERCENT = float(os.getenv("BTC_TREND_15M_PERCENT", "0.75"))
-BTC_MASTER_BLOCK_B_AGAINST = os.getenv("BTC_MASTER_BLOCK_B_AGAINST", "true").lower() == "true"
+BTC_MASTER_BLOCK_B_AGAINST = os.getenv("BTC_MASTER_BLOCK_B_AGAINST", "false").lower() == "true"
 BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED = os.getenv("BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED", "true").lower() == "true"
-BTC_MASTER_STORM_B_SCORE_ADD = int(os.getenv("BTC_MASTER_STORM_B_SCORE_ADD", "5"))
-BTC_MASTER_STORM_B_RISK_MULTIPLIER = float(os.getenv("BTC_MASTER_STORM_B_RISK_MULTIPLIER", "0.16"))
+BTC_MASTER_STORM_B_SCORE_ADD = int(os.getenv("BTC_MASTER_STORM_B_SCORE_ADD", "3"))
+BTC_MASTER_STORM_B_RISK_MULTIPLIER = float(os.getenv("BTC_MASTER_STORM_B_RISK_MULTIPLIER", "0.10"))
 BTC_MASTER_A_PLUS_AGAINST_SCORE_MIN = int(os.getenv("BTC_MASTER_A_PLUS_AGAINST_SCORE_MIN", "95"))
 BTC_MASTER_A_PLUS_AGAINST_RR_MIN = float(os.getenv("BTC_MASTER_A_PLUS_AGAINST_RR_MIN", "1.20"))
 ALT_DECOUPLE_EDGE_PERCENT = float(os.getenv("ALT_DECOUPLE_EDGE_PERCENT", "1.45"))
@@ -122,11 +122,11 @@ BTC_DOMINANCE_ENABLED = os.getenv("BTC_DOMINANCE_ENABLED", "true").lower() == "t
 BTC_FAST_1M_PERCENT = float(os.getenv("BTC_FAST_1M_PERCENT", "0.20"))
 BTC_FAST_5M_PERCENT = float(os.getenv("BTC_FAST_5M_PERCENT", "0.38"))
 BTC_FAST_15M_PERCENT = float(os.getenv("BTC_FAST_15M_PERCENT", "0.55"))
-BTC_DOMINANCE_BLOCK_COUNTER_B = os.getenv("BTC_DOMINANCE_BLOCK_COUNTER_B", "true").lower() == "true"
+BTC_DOMINANCE_BLOCK_COUNTER_B = os.getenv("BTC_DOMINANCE_BLOCK_COUNTER_B", "false").lower() == "true"
 BTC_DOMINANCE_BLOCK_COUNTER_A_PLUS = os.getenv("BTC_DOMINANCE_BLOCK_COUNTER_A_PLUS", "true").lower() == "true"
-BTC_DOMINANCE_EXCEPTION_SCORE_MIN = int(os.getenv("BTC_DOMINANCE_EXCEPTION_SCORE_MIN", "96"))
-BTC_DOMINANCE_EXCEPTION_RR_MIN = float(os.getenv("BTC_DOMINANCE_EXCEPTION_RR_MIN", "1.25"))
-BTC_DOMINANCE_EXCEPTION_VOLUME_MIN = float(os.getenv("BTC_DOMINANCE_EXCEPTION_VOLUME_MIN", "1.55"))
+BTC_DOMINANCE_EXCEPTION_SCORE_MIN = int(os.getenv("BTC_DOMINANCE_EXCEPTION_SCORE_MIN", "94"))
+BTC_DOMINANCE_EXCEPTION_RR_MIN = float(os.getenv("BTC_DOMINANCE_EXCEPTION_RR_MIN", "1.12"))
+BTC_DOMINANCE_EXCEPTION_VOLUME_MIN = float(os.getenv("BTC_DOMINANCE_EXCEPTION_VOLUME_MIN", "1.35"))
 BTC_DOMINANCE_ALT_5M_EDGE_PERCENT = float(os.getenv("BTC_DOMINANCE_ALT_5M_EDGE_PERCENT", "0.35"))
 BTC_DOMINANCE_NO_B_IN_STORM = os.getenv("BTC_DOMINANCE_NO_B_IN_STORM", "true").lower() == "true"
 
@@ -197,15 +197,15 @@ IMPULSE_FORCE_B_ONLY = os.getenv("IMPULSE_FORCE_B_ONLY", "true").lower() == "tru
 # V7.7 Extreme Mover Pro: отдельный режим для HMSTR/GUA/мемов/новых листингов.
 # Идея: не догонять +20-50% или -20-50%, а ждать pullback/reclaim/continuation.
 EXTREME_MOVER_ENABLED = os.getenv("EXTREME_MOVER_ENABLED", "true").lower() == "true"
-EXTREME_MOVER_MIN_24H_MOVE_PERCENT = float(os.getenv("EXTREME_MOVER_MIN_24H_MOVE_PERCENT", "10.0"))
+EXTREME_MOVER_MIN_24H_MOVE_PERCENT = float(os.getenv("EXTREME_MOVER_MIN_24H_MOVE_PERCENT", "8.0"))
 EXTREME_MOVER_HARD_24H_MOVE_PERCENT = float(os.getenv("EXTREME_MOVER_HARD_24H_MOVE_PERCENT", "25.0"))
-EXTREME_MOVER_MIN_6H_MOVE_PERCENT = float(os.getenv("EXTREME_MOVER_MIN_6H_MOVE_PERCENT", "6.0"))
-EXTREME_PULLBACK_MIN_PERCENT = float(os.getenv("EXTREME_PULLBACK_MIN_PERCENT", "1.0"))
+EXTREME_MOVER_MIN_6H_MOVE_PERCENT = float(os.getenv("EXTREME_MOVER_MIN_6H_MOVE_PERCENT", "4.0"))
+EXTREME_PULLBACK_MIN_PERCENT = float(os.getenv("EXTREME_PULLBACK_MIN_PERCENT", "0.55"))
 EXTREME_PULLBACK_MAX_PERCENT = float(os.getenv("EXTREME_PULLBACK_MAX_PERCENT", "9.0"))
-EXTREME_RECLAIM_MAX_DISTANCE_VWAP_PERCENT = float(os.getenv("EXTREME_RECLAIM_MAX_DISTANCE_VWAP_PERCENT", "4.0"))
-EXTREME_MIN_VOLUME_RATIO = float(os.getenv("EXTREME_MIN_VOLUME_RATIO", "1.10"))
-EXTREME_ALLOW_B = os.getenv("EXTREME_ALLOW_B", "false").lower() == "true"
-EXTREME_B_RISK_MULTIPLIER = float(os.getenv("EXTREME_B_RISK_MULTIPLIER", "0.08"))
+EXTREME_RECLAIM_MAX_DISTANCE_VWAP_PERCENT = float(os.getenv("EXTREME_RECLAIM_MAX_DISTANCE_VWAP_PERCENT", "4.8"))
+EXTREME_MIN_VOLUME_RATIO = float(os.getenv("EXTREME_MIN_VOLUME_RATIO", "0.95"))
+EXTREME_ALLOW_B = os.getenv("EXTREME_ALLOW_B", "true").lower() == "true"
+EXTREME_B_RISK_MULTIPLIER = float(os.getenv("EXTREME_B_RISK_MULTIPLIER", "0.05"))
 EXTREME_A_PLUS_RISK_MULTIPLIER = float(os.getenv("EXTREME_A_PLUS_RISK_MULTIPLIER", "0.15"))
 EXTREME_REQUIRE_BTC_ALIGNMENT = os.getenv("EXTREME_REQUIRE_BTC_ALIGNMENT", "true").lower() == "true"
 EXTREME_BLOCK_DURING_BTC_STORM_AGAINST = os.getenv("EXTREME_BLOCK_DURING_BTC_STORM_AGAINST", "true").lower() == "true"
@@ -215,9 +215,19 @@ EXTREME_BLOCK_DURING_BTC_STORM_AGAINST = os.getenv("EXTREME_BLOCK_DURING_BTC_STO
 # Он пытается подтянуть дневных лидеров/аутсайдеров по всем BingX USDT futures
 # и добавить их в скан как EXTREME_MOVER candidates.
 DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED = os.getenv("DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED", "true").lower() == "true"
-DYNAMIC_EXTREME_TOP_N = int(os.getenv("DYNAMIC_EXTREME_TOP_N", "35"))
-DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT = float(os.getenv("DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT", "18.0"))
+DYNAMIC_EXTREME_TOP_N = int(os.getenv("DYNAMIC_EXTREME_TOP_N", "60"))
+DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT = float(os.getenv("DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT", "12.0"))
 DYNAMIC_EXTREME_INCLUDE_UNKNOWN_BASES = os.getenv("DYNAMIC_EXTREME_INCLUDE_UNKNOWN_BASES", "true").lower() == "true"
+
+# V7.9 Balanced Active Pro: больше сделок без возврата к мусорным входам.
+# B разрешается чаще, но с микрориском при BTC storm/extension/extreme.
+BALANCED_ACTIVE_PRO_ENABLED = os.getenv("BALANCED_ACTIVE_PRO_ENABLED", "true").lower() == "true"
+ACTIVE_EXTREME_B_MIN_SCORE = int(os.getenv("ACTIVE_EXTREME_B_MIN_SCORE", "82"))
+ACTIVE_EXTREME_B_MIN_RR = float(os.getenv("ACTIVE_EXTREME_B_MIN_RR", "0.72"))
+ACTIVE_EXTREME_B_MIN_VOLUME = float(os.getenv("ACTIVE_EXTREME_B_MIN_VOLUME", "1.02"))
+ACTIVE_BTC_SOFT_COUNTER_RISK = float(os.getenv("ACTIVE_BTC_SOFT_COUNTER_RISK", "0.06"))
+ACTIVE_NORMAL_B_MIN_RR = float(os.getenv("ACTIVE_NORMAL_B_MIN_RR", "0.72"))
+ACTIVE_NORMAL_B_MIN_VOLUME = float(os.getenv("ACTIVE_NORMAL_B_MIN_VOLUME", "1.02"))
 
 
 # V5.1: убираем «кашу» и оставляем 4 основные структуры уровня.
@@ -1550,8 +1560,8 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
     btc_master_hard_opposite = filters.get("btc_master_hard_opposite", False)
     extreme_mover = filters.get("extreme_mover", False)
 
-    # V7.7 Extreme Mover: по сверхволатильным монетам B по умолчанию запрещён,
-    # A+ проходит только с уменьшенным риском и BTC/continuation подтверждением.
+    # V7.9: по extreme-монетам B разрешён только как micro-risk continuation,
+    # а не как обычный догоняющий вход.
     if extreme_mover and filters.get("force_grade") == "B" and not EXTREME_ALLOW_B:
         return None
 
@@ -1564,18 +1574,22 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
 
     # V4.8: контртрендовый LONG-отскок при bearish BTC может быть только B, не A+.
     if filters.get("force_grade") == "B":
+        force_b_score = ACTIVE_EXTREME_B_MIN_SCORE if extreme_mover else B_MIN_SCORE
+        force_b_rr = ACTIVE_EXTREME_B_MIN_RR if extreme_mover else max(B_MIN_RR, ACTIVE_NORMAL_B_MIN_RR)
+        force_b_vol = ACTIVE_EXTREME_B_MIN_VOLUME if extreme_mover else max(B_MIN_VOLUME_RATIO, ACTIVE_NORMAL_B_MIN_VOLUME)
         if (
-            score >= B_MIN_SCORE
-            and rr >= B_MIN_RR
-            and volume >= B_MIN_VOLUME_RATIO
+            score >= force_b_score
+            and rr >= force_b_rr
+            and volume >= force_b_vol
             and not funding.get("blocked")
             and (not filters.get("btc_against") or filters.get("allow_btc_countertrend_bounce"))
         ):
-            if (BTC_MASTER_BLOCK_B_AGAINST and btc_master_opposite) or (BTC_DOMINANCE_BLOCK_COUNTER_B and btc_master_hard_opposite):
+            # Hard BTC-opposite/storm still blocks. Soft opposite is allowed only with tiny risk.
+            if btc_master_hard_opposite:
                 return None
             if (BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED or BTC_DOMINANCE_NO_B_IN_STORM) and btc_master_storm and not btc_master_aligned:
                 return None
-            if btc_master_storm and btc_master_aligned and score < B_MIN_SCORE + BTC_MASTER_STORM_B_SCORE_ADD:
+            if btc_master_storm and btc_master_aligned and score < force_b_score + BTC_MASTER_STORM_B_SCORE_ADD:
                 return None
             if extension_extended:
                 if not extension_continuation_ok:
@@ -1587,6 +1601,8 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
                 b_risk = filters.get("risk_multiplier_override", B_RISK_MULTIPLIER)
             if btc_master_storm:
                 b_risk = min(b_risk, BTC_MASTER_STORM_B_RISK_MULTIPLIER)
+            if btc_master_opposite and not btc_master_hard_opposite:
+                b_risk = min(b_risk, ACTIVE_BTC_SOFT_COUNTER_RISK)
             if extreme_mover:
                 b_risk = min(b_risk, EXTREME_B_RISK_MULTIPLIER)
             return {
@@ -1644,8 +1660,8 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         }
 
     b_score = B_MIN_SCORE
-    b_rr = B_MIN_RR
-    b_volume = B_MIN_VOLUME_RATIO
+    b_rr = max(B_MIN_RR, ACTIVE_NORMAL_B_MIN_RR)
+    b_volume = max(B_MIN_VOLUME_RATIO, ACTIVE_NORMAL_B_MIN_VOLUME)
 
     # V4.9: уровневые B-сигналы разрешаем чуть живее,
     # потому что реальный рынок не всегда даёт идеальный учебниковый ретест.
@@ -1663,7 +1679,7 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         and not extension_blocked
         and (not filters.get("btc_against") or filters.get("allow_btc_countertrend_bounce"))
     ):
-        if (BTC_MASTER_BLOCK_B_AGAINST and btc_master_opposite) or (BTC_DOMINANCE_BLOCK_COUNTER_B and btc_master_hard_opposite):
+        if btc_master_hard_opposite:
             return None
         if (BTC_MASTER_BLOCK_B_DURING_STORM_IF_NOT_ALIGNED or BTC_DOMINANCE_NO_B_IN_STORM) and btc_master_storm and not btc_master_aligned:
             return None
@@ -1672,8 +1688,12 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         b_risk = filters.get("risk_multiplier_override", B_RISK_MULTIPLIER)
         if btc_master_storm:
             b_risk = min(b_risk, BTC_MASTER_STORM_B_RISK_MULTIPLIER)
+        if btc_master_opposite and not btc_master_hard_opposite:
+            b_risk = min(b_risk, ACTIVE_BTC_SOFT_COUNTER_RISK)
         if extreme_mover:
             if not EXTREME_ALLOW_B:
+                return None
+            if score < ACTIVE_EXTREME_B_MIN_SCORE or rr < ACTIVE_EXTREME_B_MIN_RR or volume < ACTIVE_EXTREME_B_MIN_VOLUME:
                 return None
             b_risk = min(b_risk, EXTREME_B_RISK_MULTIPLIER)
         if extension_extended:
@@ -4168,6 +4188,8 @@ async def startup_event():
         f"BTC Dominance Engine: {'ON' if BTC_DOMINANCE_ENABLED else 'OFF'} | fast 1m/5m/15m: {BTC_FAST_1M_PERCENT}% / {BTC_FAST_5M_PERCENT}% / {BTC_FAST_15M_PERCENT}%\n"
         f"Extreme Mover Pro: {'ON' if EXTREME_MOVER_ENABLED else 'OFF'} / strategy EXTREME_MOVER_PULLBACK_PRO\n"
         f"Dynamic Extreme Scanner: {'ON' if DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED else 'OFF'} / top {DYNAMIC_EXTREME_TOP_N} / min 24h ±{DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT}%\n"
+        f"Balanced Active Pro: {'ON' if BALANCED_ACTIVE_PRO_ENABLED else 'OFF'} / scan {AUTO_SCAN_SECONDS}s / cooldown {SIGNAL_COOLDOWN_SECONDS}s / max symbols {MAX_SYMBOLS}\n"
+        f"Extreme micro-B: {'ON' if EXTREME_ALLOW_B else 'OFF'} / score {ACTIVE_EXTREME_B_MIN_SCORE}+ / RR {ACTIVE_EXTREME_B_MIN_RR} / vol x{ACTIVE_EXTREME_B_MIN_VOLUME} / risk x{EXTREME_B_RISK_MULTIPLIER}\n"
         f"Extreme movers: HMSTR, GUA, DOGS, CATI, MEME, NOT, PEPE, BONK, WIF + dynamic movers MAGMA/VELVET/FOLKS/STG...\n"
         f"Extreme move filter: 24h {EXTREME_MOVER_MIN_24H_MOVE_PERCENT}%+ / 6h {EXTREME_MOVER_MIN_6H_MOVE_PERCENT}%+ / hard {EXTREME_MOVER_HARD_24H_MOVE_PERCENT}%+\n"
         f"Extreme pullback: {EXTREME_PULLBACK_MIN_PERCENT}%–{EXTREME_PULLBACK_MAX_PERCENT}% / volume x{EXTREME_MIN_VOLUME_RATIO}\n"
