@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V7.9 BALANCED ACTIVE PRO"
-DEPLOY_MARKER = "V7_9_BALANCED_ACTIVE_PRO_2026_06_11"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V7.9.1 BALANCED ACTIVE PRO SCAN WATCHDOG"
+DEPLOY_MARKER = "V7_9_1_BALANCED_ACTIVE_PRO_SCAN_WATCHDOG_2026_06_11"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -51,10 +51,10 @@ MAX_RISK_POSITION_PERCENT = float(os.getenv("MAX_RISK_POSITION_PERCENT", "10"))
 DEFAULT_DEPOSIT = float(os.getenv("DEFAULT_DEPOSIT", "1000"))
 DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "260"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "300"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1200"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "900"))
 
 PAIR_BLOCK_SECONDS = int(os.getenv("PAIR_BLOCK_SECONDS", "43200"))
 STRATEGY_SIDE_DISABLE_SECONDS = int(os.getenv("STRATEGY_SIDE_DISABLE_SECONDS", "10800"))
@@ -65,7 +65,7 @@ STRATEGY_SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_SIDE_MAX_CONSECUTIVE_
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "180"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "120"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "60"))
 
 ENABLE_FUNDING_FILTER = os.getenv("ENABLE_FUNDING_FILTER", "true").lower() == "true"
@@ -171,7 +171,7 @@ LEVEL_STRENGTH_4H_BONUS = int(os.getenv("LEVEL_STRENGTH_4H_BONUS", "4"))
 
 # V4.9: периодический отчёт, если сигналов нет. Полезно для Background Worker.
 DEBUG_NO_SIGNAL_REPORT_ENABLED = os.getenv("DEBUG_NO_SIGNAL_REPORT_ENABLED", "true").lower() == "true"
-DEBUG_NO_SIGNAL_REPORT_SECONDS = int(os.getenv("DEBUG_NO_SIGNAL_REPORT_SECONDS", "10800"))
+DEBUG_NO_SIGNAL_REPORT_SECONDS = int(os.getenv("DEBUG_NO_SIGNAL_REPORT_SECONDS", "900"))
 
 MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0010"))
 FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0020"))
@@ -4189,6 +4189,7 @@ async def startup_event():
         f"Extreme Mover Pro: {'ON' if EXTREME_MOVER_ENABLED else 'OFF'} / strategy EXTREME_MOVER_PULLBACK_PRO\n"
         f"Dynamic Extreme Scanner: {'ON' if DYNAMIC_EXTREME_MOVER_SCANNER_ENABLED else 'OFF'} / top {DYNAMIC_EXTREME_TOP_N} / min 24h ±{DYNAMIC_EXTREME_MIN_24H_ABS_MOVE_PERCENT}%\n"
         f"Balanced Active Pro: {'ON' if BALANCED_ACTIVE_PRO_ENABLED else 'OFF'} / scan {AUTO_SCAN_SECONDS}s / cooldown {SIGNAL_COOLDOWN_SECONDS}s / max symbols {MAX_SYMBOLS}\n"
+        f"Scan Watchdog: ON / no-signal report every {DEBUG_NO_SIGNAL_REPORT_SECONDS}s / manual /scan enabled\n"
         f"Extreme micro-B: {'ON' if EXTREME_ALLOW_B else 'OFF'} / score {ACTIVE_EXTREME_B_MIN_SCORE}+ / RR {ACTIVE_EXTREME_B_MIN_RR} / vol x{ACTIVE_EXTREME_B_MIN_VOLUME} / risk x{EXTREME_B_RISK_MULTIPLIER}\n"
         f"Extreme movers: HMSTR, GUA, DOGS, CATI, MEME, NOT, PEPE, BONK, WIF + dynamic movers MAGMA/VELVET/FOLKS/STG...\n"
         f"Extreme move filter: 24h {EXTREME_MOVER_MIN_24H_MOVE_PERCENT}%+ / 6h {EXTREME_MOVER_MIN_6H_MOVE_PERCENT}%+ / hard {EXTREME_MOVER_HARD_24H_MOVE_PERCENT}%+\n"
