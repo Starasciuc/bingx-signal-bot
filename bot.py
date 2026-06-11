@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V8.1 FULL STATS RESTORED"
-DEPLOY_MARKER = "V8_1_FULL_STATS_RESTORED_2026_06_11"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V8.2 ACTIVE EXTREME SCANNER PRO"
+DEPLOY_MARKER = "V8_2_ACTIVE_EXTREME_SCANNER_PRO_2026_06_11"
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -54,7 +54,7 @@ DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "180"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "2400"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "900"))
 
 PAIR_BLOCK_SECONDS = int(os.getenv("PAIR_BLOCK_SECONDS", "43200"))
 STRATEGY_SIDE_DISABLE_SECONDS = int(os.getenv("STRATEGY_SIDE_DISABLE_SECONDS", "10800"))
@@ -65,7 +65,7 @@ STRATEGY_SIDE_MAX_CONSECUTIVE_SL = int(os.getenv("STRATEGY_SIDE_MAX_CONSECUTIVE_
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "300"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "120"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "60"))
 
 ENABLE_FUNDING_FILTER = os.getenv("ENABLE_FUNDING_FILTER", "true").lower() == "true"
@@ -116,7 +116,7 @@ LEVEL_STRENGTH_4H_BONUS = int(os.getenv("LEVEL_STRENGTH_4H_BONUS", "4"))
 
 # V4.9: периодический отчёт, если сигналов нет. Полезно для Background Worker.
 DEBUG_NO_SIGNAL_REPORT_ENABLED = os.getenv("DEBUG_NO_SIGNAL_REPORT_ENABLED", "true").lower() == "true"
-DEBUG_NO_SIGNAL_REPORT_SECONDS = int(os.getenv("DEBUG_NO_SIGNAL_REPORT_SECONDS", "10800"))
+DEBUG_NO_SIGNAL_REPORT_SECONDS = int(os.getenv("DEBUG_NO_SIGNAL_REPORT_SECONDS", "900"))
 
 MAX_ABS_FUNDING_RATE = float(os.getenv("MAX_ABS_FUNDING_RATE", "0.0010"))
 FUNDING_EXTREME_RATE = float(os.getenv("FUNDING_EXTREME_RATE", "0.0020"))
@@ -139,6 +139,32 @@ IMPULSE_MAX_DISTANCE_FROM_VWAP_PERCENT = float(os.getenv("IMPULSE_MAX_DISTANCE_F
 IMPULSE_MIN_VOLUME_RATIO = float(os.getenv("IMPULSE_MIN_VOLUME_RATIO", "1.05"))
 IMPULSE_FORCE_B_ONLY = os.getenv("IMPULSE_FORCE_B_ONLY", "true").lower() == "true"
 
+# V8.2: активный динамический сканер экстремальных движений.
+# Важно: он добавляет в скан не только заранее выбранные LIQUID_BASES,
+# но и дневные топ-монеты вроде VELVET/BEAT/COLLECT/SPACE, если они есть на BingX Futures.
+DYNAMIC_EXTREME_SCANNER_ENABLED = os.getenv("DYNAMIC_EXTREME_SCANNER_ENABLED", "true").lower() == "true"
+DYNAMIC_EXTREME_TOP_N = int(os.getenv("DYNAMIC_EXTREME_TOP_N", "80"))
+DYNAMIC_EXTREME_MIN_24H_MOVE_PERCENT = float(os.getenv("DYNAMIC_EXTREME_MIN_24H_MOVE_PERCENT", "12"))
+EXTREME_MOVER_ENABLED = os.getenv("EXTREME_MOVER_ENABLED", "true").lower() == "true"
+EXTREME_MOVER_MIN_24H_MOVE_PERCENT = float(os.getenv("EXTREME_MOVER_MIN_24H_MOVE_PERCENT", "12"))
+EXTREME_MOVER_MIN_6H_MOVE_PERCENT = float(os.getenv("EXTREME_MOVER_MIN_6H_MOVE_PERCENT", "4"))
+EXTREME_PULLBACK_MIN_PERCENT = float(os.getenv("EXTREME_PULLBACK_MIN_PERCENT", "1.0"))
+EXTREME_PULLBACK_MAX_PERCENT = float(os.getenv("EXTREME_PULLBACK_MAX_PERCENT", "10.0"))
+EXTREME_MIN_VOLUME_RATIO = float(os.getenv("EXTREME_MIN_VOLUME_RATIO", "1.02"))
+EXTREME_A_PLUS_RISK_MULTIPLIER = float(os.getenv("EXTREME_A_PLUS_RISK_MULTIPLIER", "0.15"))
+EXTREME_B_RISK_MULTIPLIER = float(os.getenv("EXTREME_B_RISK_MULTIPLIER", "0.05"))
+EXTREME_ALLOW_B = os.getenv("EXTREME_ALLOW_B", "true").lower() == "true"
+EXTREME_B_MIN_SCORE = int(os.getenv("EXTREME_B_MIN_SCORE", "80"))
+EXTREME_B_MIN_RR = float(os.getenv("EXTREME_B_MIN_RR", "0.65"))
+EXTREME_B_MIN_VOLUME_RATIO = float(os.getenv("EXTREME_B_MIN_VOLUME_RATIO", "1.00"))
+
+EXTREME_BASES = {
+    "HMSTR", "GUA", "DOGS", "CATI", "MEME", "NOT", "1000SATS",
+    "PEPE", "1000PEPE", "BONK", "WIF", "PNUT", "ACT", "GOAT",
+    "MOODENG", "NEIRO", "TURBO", "BOME", "MAGMA", "VELVET",
+    "BEAT", "COLLECT", "SPACE", "GOBLIN", "FOLKS", "STG", "FIGHT", "BLEND"
+}
+
 # V5.1: убираем «кашу» и оставляем 4 основные структуры уровня.
 # Старые вспомогательные функции в файле остаются, но больше не вызываются.
 STRATEGIES = [
@@ -147,6 +173,7 @@ STRATEGIES = [
     "LEVEL_BREAK_RETEST_SHORT",      # поддержка пробита -> SHORT
     "LEVEL_BREAK_RETEST_LONG",       # сопротивление пробито -> LONG
     "IMPULSE_PULLBACK_PRO",          # импульс -> откат к EMA/VWAP -> подтверждение, только B
+    "EXTREME_MOVER_PULLBACK_PRO",     # дневной топ-мовер -> откат -> продолжение, micro-risk
 ]
 
 LIQUID_BASES = {
@@ -470,7 +497,7 @@ def is_good_symbol(symbol: str) -> bool:
     symbol = normalize_symbol(symbol)
     base = base_from_symbol(symbol)
 
-    if base not in LIQUID_BASES:
+    if base not in LIQUID_BASES and base not in EXTREME_BASES:
         return False
 
     bad = ["USD", "EUR", "GBP", "JPY", "AAPL", "TSLA", "NVDA", "META", "GOOG"]
@@ -556,22 +583,105 @@ def get_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
         return None
 
 
+
+def extract_symbol_and_change(item: dict) -> tuple:
+    """Robust parser for BingX ticker-like payloads."""
+    symbol = item.get("symbol") or item.get("s") or item.get("contract") or item.get("currency")
+    change = None
+    for key in ["priceChangePercent", "priceChangeRate", "changeRate", "changePercent", "change", "riseFallRate"]:
+        if key in item:
+            try:
+                change = float(item[key])
+                # Some APIs return 0.124 for 12.4%, some return 12.4.
+                if abs(change) <= 2:
+                    change *= 100
+                break
+            except Exception:
+                pass
+    return symbol, change
+
+
+def get_dynamic_extreme_symbols() -> List[str]:
+    if not DYNAMIC_EXTREME_SCANNER_ENABLED:
+        return []
+
+    candidates = []
+    # Try ticker endpoints first. If unavailable, fallback to manual EXTREME_BASES from contracts.
+    endpoints = [
+        "/openApi/swap/v2/quote/ticker",
+        "/openApi/swap/v1/ticker/24hr",
+    ]
+    for endpoint in endpoints:
+        data = get_json(f"{BINGX_BASE_URL}{endpoint}")
+        raw = None
+        if isinstance(data, dict):
+            raw = data.get("data")
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            symbol, change = extract_symbol_and_change(item)
+            if not symbol:
+                continue
+            symbol = normalize_symbol(symbol)
+            base = base_from_symbol(symbol)
+            if base in {"BTC", "ETH"}:
+                continue
+            if change is not None and abs(change) >= DYNAMIC_EXTREME_MIN_24H_MOVE_PERCENT:
+                candidates.append((abs(change), symbol))
+        if candidates:
+            candidates.sort(reverse=True)
+            return [s for _, s in candidates[:DYNAMIC_EXTREME_TOP_N]]
+
+    # Fallback: if ticker change data is not available, at least include known risky bases if BingX lists them.
+    data = get_json(f"{BINGX_BASE_URL}/openApi/swap/v2/quote/contracts")
+    result = []
+    if data:
+        for item in data.get("data", []):
+            symbol = item.get("symbol")
+            if not symbol:
+                continue
+            symbol = normalize_symbol(symbol)
+            if base_from_symbol(symbol) in EXTREME_BASES:
+                result.append(symbol)
+    random.shuffle(result)
+    return result[:DYNAMIC_EXTREME_TOP_N]
+
 def get_symbols() -> List[str]:
     url = f"{BINGX_BASE_URL}/openApi/swap/v2/quote/contracts"
     data = get_json(url)
 
-    if not data:
-        return []
-
+    dynamic = get_dynamic_extreme_symbols()
     result = []
 
-    for item in data.get("data", []):
-        symbol = item.get("symbol")
-        if symbol and is_good_symbol(symbol):
-            result.append(normalize_symbol(symbol))
+    if data:
+        all_contracts = []
+        for item in data.get("data", []):
+            symbol = item.get("symbol")
+            if not symbol:
+                continue
+            symbol = normalize_symbol(symbol)
+            all_contracts.append(symbol)
+            if is_good_symbol(symbol):
+                result.append(symbol)
 
-    random.shuffle(result)
-    return result[:MAX_SYMBOLS]
+        # V8.2 fallback: add a small portion of other listed futures so brand-new daily movers
+        # are not ignored only because they are absent from the old LIQUID_BASES list.
+        extra = [s for s in all_contracts if s not in result and base_from_symbol(s) not in {"BTC", "ETH"}]
+        random.shuffle(extra)
+        result.extend(extra[:max(20, MAX_SYMBOLS // 5)])
+
+    # Put dynamic extreme movers first.
+    merged = []
+    for s in dynamic + result:
+        if s not in merged:
+            merged.append(s)
+
+    random.shuffle(merged[len(dynamic):])
+    return merged[:MAX_SYMBOLS]
 
 
 def get_klines(symbol: str, interval: str, limit: int = 260) -> Optional[List[dict]]:
@@ -1046,6 +1156,14 @@ def classify_signal(score: int, rr: float, volume: float, filters: dict, strateg
         return None
 
     funding = filters.get("funding", {})
+
+    # V8.2: Extreme Mover B is allowed only with micro-risk and stricter local thresholds.
+    if strategy == "EXTREME_MOVER_PULLBACK_PRO":
+        if score >= A_PLUS_MIN_SCORE and rr >= A_PLUS_MIN_RR and volume >= A_PLUS_MIN_VOLUME_RATIO and not funding.get("blocked"):
+            return {"grade": "A+", "risk_multiplier": EXTREME_A_PLUS_RISK_MULTIPLIER}
+        if EXTREME_ALLOW_B and score >= EXTREME_B_MIN_SCORE and rr >= EXTREME_B_MIN_RR and volume >= EXTREME_B_MIN_VOLUME_RATIO and not funding.get("blocked"):
+            return {"grade": "B", "risk_multiplier": EXTREME_B_RISK_MULTIPLIER}
+        return None
 
     # V4.8: контртрендовый LONG-отскок при bearish BTC может быть только B, не A+.
     if filters.get("force_grade") == "B":
@@ -2800,6 +2918,112 @@ def evaluate_impulse_pullback_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_
         extra_filters=filters,
     )
 
+
+def evaluate_extreme_mover_pullback_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    """
+    V8.2 Extreme Mover Pullback Pro:
+    Finds high-volatility daily movers (+/-12% 24h or +/-4% 6h) and waits for pullback continuation.
+    It does NOT buy tops or short bottoms. Risk is reduced by classify_signal.
+    """
+    strategy = "EXTREME_MOVER_PULLBACK_PRO"
+    if not EXTREME_MOVER_ENABLED or direction not in ["LONG", "SHORT"]:
+        return None
+    if len(c15) < 80 or len(c5) < 60 or len(c1) < 30 or len(c1h) < 30:
+        return None
+
+    closes5 = [c["close"] for c in c5]
+    closes15 = [c["close"] for c in c15]
+    price = c5[-1]["close"]
+    a5 = atr(c5)
+    vw = vwap_like(c15)
+    rs5 = rsi(closes5)
+    rs15 = rsi(closes15)
+    vr5 = volume_ratio(c5, period=24)
+    ema21_5 = ema(closes5, 21)[-1] if len(closes5) >= 22 else None
+    ema9_1 = ema([c["close"] for c in c1], 9)[-1] if len(c1) >= 10 else None
+    if not all([a5, vw, rs5, rs15, ema21_5, ema9_1]) or price <= 0:
+        return None
+
+    base_24 = c1h[-24]["close"] if len(c1h) >= 24 else c1h[0]["close"]
+    base_6 = c15[-24]["close"] if len(c15) >= 24 else c15[0]["close"]
+    move_24 = (price - base_24) / base_24 * 100 if base_24 > 0 else 0
+    move_6 = (price - base_6) / base_6 * 100 if base_6 > 0 else 0
+
+    is_up_mover = move_24 >= EXTREME_MOVER_MIN_24H_MOVE_PERCENT or move_6 >= EXTREME_MOVER_MIN_6H_MOVE_PERCENT
+    is_down_mover = move_24 <= -EXTREME_MOVER_MIN_24H_MOVE_PERCENT or move_6 <= -EXTREME_MOVER_MIN_6H_MOVE_PERCENT
+    if direction == "LONG" and not is_up_mover:
+        return None
+    if direction == "SHORT" and not is_down_mover:
+        return None
+
+    # BTC gate: don't fight a clear BTC move on extreme alts.
+    if direction == "LONG" and btc_status == "BEARISH":
+        return None
+    if direction == "SHORT" and btc_status == "BULLISH":
+        return None
+
+    recent = c5[-18:]
+    last, prev = c5[-1], c5[-2]
+    score = 66
+
+    if direction == "LONG":
+        high = max(c["high"] for c in recent[:-1])
+        pullback_low = min(c["low"] for c in c5[-8:-1])
+        pullback = (high - pullback_low) / high * 100 if high > 0 else 0
+        held_zone = price >= ema21_5 * 0.990 or price >= vw * 0.990
+        confirm = last["close"] > last["open"] and last["close"] >= prev["close"] * 0.998 and c1[-1]["close"] >= ema9_1 * 0.998
+        if not (EXTREME_PULLBACK_MIN_PERCENT <= pullback <= EXTREME_PULLBACK_MAX_PERCENT and held_zone and confirm):
+            return None
+        if rs5 > 82 or rs15 > 80:
+            return None
+        sl = min(pullback_low - a5 * 0.20, min(c["low"] for c in c5[-10:]) - a5 * 0.08)
+        reason = f"Extreme mover LONG: 24h {round(move_24,1)}% / 6h {round(move_6,1)}%, откат {round(pullback,2)}%, удержание EMA/VWAP и подтверждение продолжения."
+        if btc_status in ["BULLISH", "SOFT_BULLISH"]:
+            score += 8
+        if price > vw:
+            score += 4
+        if price > ema21_5:
+            score += 4
+        if vr5 >= 1.10:
+            score += 6
+        if move_24 >= 25 or move_6 >= 10:
+            score += 4
+    else:
+        low = min(c["low"] for c in recent[:-1])
+        pullback_high = max(c["high"] for c in c5[-8:-1])
+        pullback = (pullback_high - low) / low * 100 if low > 0 else 0
+        held_zone = price <= ema21_5 * 1.010 or price <= vw * 1.010
+        confirm = last["close"] < last["open"] and last["close"] <= prev["close"] * 1.002 and c1[-1]["close"] <= ema9_1 * 1.002
+        if not (EXTREME_PULLBACK_MIN_PERCENT <= pullback <= EXTREME_PULLBACK_MAX_PERCENT and held_zone and confirm):
+            return None
+        if rs5 < 18 or rs15 < 20:
+            return None
+        sl = max(pullback_high + a5 * 0.20, max(c["high"] for c in c5[-10:]) + a5 * 0.08)
+        reason = f"Extreme mover SHORT: 24h {round(move_24,1)}% / 6h {round(move_6,1)}%, откат {round(pullback,2)}%, lower-high/VWAP rejection и подтверждение продолжения."
+        if btc_status in ["BEARISH", "SOFT_BEARISH"]:
+            score += 8
+        if price < vw:
+            score += 4
+        if price < ema21_5:
+            score += 4
+        if vr5 >= 1.10:
+            score += 6
+        if move_24 <= -25 or move_6 <= -10:
+            score += 4
+
+    if vr5 < EXTREME_MIN_VOLUME_RATIO:
+        return None
+
+    filters = combine_extra_filters(symbol, direction, btc_status)
+    if filters.get("btc_against"):
+        return None
+    filters["force_grade"] = "B" if score < A_PLUS_MIN_SCORE else None
+    if filters["force_grade"] == "B":
+        filters["risk_multiplier_override"] = EXTREME_B_RISK_MULTIPLIER
+    filters["extreme_mover_note"] = "Extreme Mover Pro: dynamic top mover, вход только после отката, риск снижен."
+
+    return build_signal(symbol, direction, strategy, price, sl, score, vr5, reason, deposit, risk_percent, filters)
+
 def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_percent: float) -> Optional[dict]:
     symbol = normalize_symbol(symbol)
 
@@ -2830,6 +3054,7 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
             evaluate_level_break_retest_short,
             evaluate_level_break_retest_long,
             evaluate_impulse_pullback_pro,
+            evaluate_extreme_mover_pullback_pro,
         ]:
             signal = func(symbol, d, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent)
 
@@ -2867,6 +3092,7 @@ def build_message(signal: dict) -> str:
         "LEVEL_BREAK_RETEST_LONG": "📈 Пробой сопротивления + ретест",
         "LEVEL_RESISTANCE_REJECT_SHORT": "🔴 Отбой от сопротивления после sweep",
         "IMPULSE_PULLBACK_PRO": "⚡ Impulse Pullback Pro",
+        "EXTREME_MOVER_PULLBACK_PRO": "🚀 Extreme Mover Pullback Pro",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
@@ -3125,6 +3351,7 @@ def build_result_message(signal: dict, result: str, price: float, notes: List[st
         "LEVEL_BREAK_RETEST_LONG": "📈 Пробой сопротивления + ретест",
         "LEVEL_RESISTANCE_REJECT_SHORT": "🔴 Отбой от сопротивления после sweep",
         "IMPULSE_PULLBACK_PRO": "⚡ Impulse Pullback Pro",
+        "EXTREME_MOVER_PULLBACK_PRO": "🚀 Extreme Mover Pullback Pro",
     }
 
     strategy_text = strategy_names.get(signal["strategy"], signal["strategy"])
