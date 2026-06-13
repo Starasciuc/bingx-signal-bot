@@ -10,8 +10,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V10.5 PRO TREND OPPORTUNITY TRADER"
-DEPLOY_MARKER = "V10_5_PRO_TREND_OPPORTUNITY_TRADER_2026_06_13"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V10.7 SMART MARKET CYCLE TRADER"
+DEPLOY_MARKER = "V10_7_SMART_MARKET_CYCLE_TRADER_2026_06_13"
 
 app = FastAPI(title=APP_NAME)
 
@@ -25,9 +25,9 @@ TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
 # A+ строгий
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "86"))
-A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "0.95"))
-A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.75"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
+A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "1.05"))
+A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.95"))
 A_PLUS_RISK_MULTIPLIER = float(os.getenv("A_PLUS_RISK_MULTIPLIER", "1.0"))
 
 # V4.6: A+ становится статистически умнее.
@@ -148,8 +148,56 @@ ALLOW_B_SIGNALS_EXPLICIT = os.getenv("ALLOW_B_SIGNALS_EXPLICIT", "false").lower(
 B_SIGNALS_ENABLED = (os.getenv("B_SIGNALS_ENABLED", "false").lower() == "true") and ALLOW_B_SIGNALS_EXPLICIT
 B_ONLY_WITH_HIGH_POTENTIAL = os.getenv("B_ONLY_WITH_HIGH_POTENTIAL", "true").lower() == "true"
 EXTREME_DYNAMIC_ENABLED = os.getenv("EXTREME_DYNAMIC_ENABLED", "true").lower() == "true"
-EXTREME_DYNAMIC_TOP_N = int(os.getenv("EXTREME_DYNAMIC_TOP_N", "250"))
-EXTREME_DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("EXTREME_DYNAMIC_MIN_CHANGE_PERCENT", "3.5"))
+EXTREME_DYNAMIC_TOP_N = int(os.getenv("EXTREME_DYNAMIC_TOP_N", "140"))
+EXTREME_DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("EXTREME_DYNAMIC_MIN_CHANGE_PERCENT", "4.5"))
+
+
+# V10.6: quality universe guard.
+# Причина: динамический scanner на V10.5 стал подтягивать слишком много низколиквидных shitcoin,
+# где одно движение может дать -10/-20% за пару свечей. Теперь рискованные монеты НЕ торгуются
+# обычными trend/pullback стратегиями. Они допускаются только через EXTREME_CONTEXT_PRO и только
+# после сильного подтверждения exhaustion/reclaim. По умолчанию LONG по рискованным монетам выключен.
+QUALITY_ONLY_MODE = os.getenv("QUALITY_ONLY_MODE", "true").lower() == "true"
+ALLOW_RISKY_EXTREME_TRADES = os.getenv("ALLOW_RISKY_EXTREME_TRADES", "false").lower() == "true"
+ALLOW_RISKY_EXTREME_LONGS = os.getenv("ALLOW_RISKY_EXTREME_LONGS", "false").lower() == "true"
+MIN_DYNAMIC_QUOTE_VOLUME_USDT = float(os.getenv("MIN_DYNAMIC_QUOTE_VOLUME_USDT", "2000000"))
+RISKY_EXTREME_MIN_CHANGE_PERCENT = float(os.getenv("RISKY_EXTREME_MIN_CHANGE_PERCENT", "18.0"))
+RISKY_EXTREME_MIN_VOLUME_RATIO = float(os.getenv("RISKY_EXTREME_MIN_VOLUME_RATIO", "1.35"))
+RISKY_EXTREME_RISK_MULTIPLIER = float(os.getenv("RISKY_EXTREME_RISK_MULTIPLIER", "0.04"))
+RISKY_EXTREME_MAX_RISK_POSITION_PERCENT = float(os.getenv("RISKY_EXTREME_MAX_RISK_POSITION_PERCENT", "18"))
+
+# V10.7: Smart Market Cycle Guard.
+# Цель: сканировать широкий рынок, но отсеивать монеты, где один откат может дать -10/-20% за пару свечей.
+# Такие активы не подходят под задачу стабильных 10% ROI при x10.
+ULTRA_VOLATILITY_GUARD_ENABLED = os.getenv("ULTRA_VOLATILITY_GUARD_ENABLED", "true").lower() == "true"
+ALLOW_ULTRA_RISKY_SYMBOLS = os.getenv("ALLOW_ULTRA_RISKY_SYMBOLS", "false").lower() == "true"
+MAX_5M_CANDLE_RANGE_NORMAL = float(os.getenv("MAX_5M_CANDLE_RANGE_NORMAL", "4.8"))
+MAX_15M_BLOCK_RANGE_NORMAL = float(os.getenv("MAX_15M_BLOCK_RANGE_NORMAL", "9.5"))
+MAX_ATR5_PERCENT_NORMAL = float(os.getenv("MAX_ATR5_PERCENT_NORMAL", "1.85"))
+MAX_ATR15_PERCENT_NORMAL = float(os.getenv("MAX_ATR15_PERCENT_NORMAL", "3.20"))
+MIN_QUOTE_VOLUME_NORMAL_USDT = float(os.getenv("MIN_QUOTE_VOLUME_NORMAL_USDT", "1200000"))
+
+# V10.7: цели по типам сделок. TP1 всегда >= 10% ROI при x10, но структура может иметь TP2/TP3 дальше.
+FAST_CONTEXT_TP1_ROI = float(os.getenv("FAST_CONTEXT_TP1_ROI", "10"))
+FAST_CONTEXT_TP2_ROI = float(os.getenv("FAST_CONTEXT_TP2_ROI", "18"))
+FAST_CONTEXT_TP3_ROI = float(os.getenv("FAST_CONTEXT_TP3_ROI", "28"))
+RANGE_CONTEXT_TP1_ROI = float(os.getenv("RANGE_CONTEXT_TP1_ROI", "10"))
+RANGE_CONTEXT_TP2_ROI = float(os.getenv("RANGE_CONTEXT_TP2_ROI", "22"))
+RANGE_CONTEXT_TP3_ROI = float(os.getenv("RANGE_CONTEXT_TP3_ROI", "38"))
+
+QUALITY_BASES = {
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "LTC", "BCH",
+    "DOT", "TRX", "NEAR", "APT", "SUI", "SEI", "INJ", "AAVE", "UNI", "ATOM", "FIL",
+    "ETC", "OP", "ARB", "TON", "ICP", "RNDR", "FET", "IMX", "AR", "MKR", "LDO",
+    "CRV", "ENA", "JUP", "PYTH", "STRK", "DYDX", "RUNE", "TIA", "STX", "COMP", "TAO"
+}
+
+RISKY_BASES = {
+    "VELVET", "BEAT", "COLLECT", "SPACE", "GOBLIN", "MAGMA", "FOLKS", "FIGHT",
+    "HMSTR", "GUA", "DOGS", "CATI", "MEME", "NOT", "1000SATS", "1000PEPE",
+    "PEPE", "BONK", "WIF", "PNUT", "ACT", "GOAT", "MOODENG", "NEIRO",
+    "TURBO", "BOME", "HYPE", "OPN", "WLFI", "PUMP", "AERO", "MANTA", "ARKM", "SIREN", "MAVIA"
+}
 EXTREME_BASES = {
     "VELVET", "BEAT", "COLLECT", "SPACE", "GOBLIN", "MAGMA", "FOLKS", "FIGHT",
     "HMSTR", "GUA", "DOGS", "CATI", "MEME", "NOT", "1000SATS", "1000PEPE",
@@ -223,6 +271,7 @@ STRATEGIES = [
     "RANGE_STRUCTURE_PRO",         # диапазон: нижняя/верхняя граница -> возврат к середине
     "STRUCTURE_SWING_PRO",          # TAO-style: sweep -> reclaim -> дальняя цель по диапазону
     "TREND_CONTEXT_PRO",           # V10.5: трендовый pullback/breakout по BTC+1H/4H с TP1 >= 10% ROI
+    "MARKET_CYCLE_CONTEXT_PRO",    # V10.7: быстрый/средний трендовый цикл без ultra-risk
     "EXTREME_CONTEXT_PRO",         # сильные movers: continuation/reversal после подтверждения
 ]
 
@@ -531,6 +580,25 @@ def base_from_symbol(symbol: str) -> str:
     return normalize_symbol(symbol).replace("-USDT", "")
 
 
+def is_risky_base(base: str) -> bool:
+    return base.upper() in RISKY_BASES
+
+
+def is_quality_base(base: str) -> bool:
+    return base.upper() in QUALITY_BASES
+
+
+def _extract_quote_volume_usdt(item: dict) -> Optional[float]:
+    # BingX/other ticker fields can differ. Prefer quote volume when available.
+    for key in ["quoteVolume", "quoteVol", "turnover", "volumeUSDT", "amount", "q"]:
+        if key in item:
+            try:
+                return float(item.get(key) or 0)
+            except Exception:
+                pass
+    return None
+
+
 def normalize_direction(direction: Optional[str]) -> Optional[str]:
     if direction is None:
         return None
@@ -689,7 +757,17 @@ def get_dynamic_extreme_symbols(limit: int = None) -> List[str]:
             change = _extract_change_percent(item)
             if change is None:
                 continue
-            if abs(change) >= EXTREME_DYNAMIC_MIN_CHANGE_PERCENT:
+            base = base_from_symbol(symbol)
+            quote_vol = _extract_quote_volume_usdt(item)
+            # V10.6: рискованные low-cap movers допускаются в dynamic list только если движение действительно большое
+            # и есть хотя бы минимальный оборот. Иначе они забивают сканер и дают ложные входы.
+            if is_risky_base(base) and not ALLOW_RISKY_EXTREME_TRADES:
+                continue
+            min_change = RISKY_EXTREME_MIN_CHANGE_PERCENT if is_risky_base(base) else EXTREME_DYNAMIC_MIN_CHANGE_PERCENT
+            min_vol = MIN_DYNAMIC_QUOTE_VOLUME_USDT if is_risky_base(base) else MIN_QUOTE_VOLUME_NORMAL_USDT
+            if quote_vol is not None and quote_vol > 0 and quote_vol < min_vol:
+                continue
+            if abs(change) >= min_change:
                 movers.append((abs(change), symbol))
         if movers:
             break
@@ -723,7 +801,9 @@ def get_symbols() -> List[str]:
             continue
         base = base_from_symbol(symbol)
         all_symbols.append(symbol)
-        if base in LIQUID_BASES or base in EXTREME_BASES or symbol in dynamic_extremes:
+        # V10.6: обычный рынок = quality universe. Рискованные монеты идут только если они реально попали
+        # в dynamic extreme scanner, и дальше всё равно будут проверяться только extreme-логикой.
+        if is_quality_base(base) or base in LIQUID_BASES or (symbol in dynamic_extremes and (not is_risky_base(base) or ALLOW_RISKY_EXTREME_TRADES)):
             priority_symbols.append(symbol)
 
     random.shuffle(all_symbols)
@@ -1233,6 +1313,240 @@ def recent_failed_push(c5: List[dict], direction: str) -> bool:
         return move > 0.9 and (has_exhaustion_rejection(last, "LONG") or last["close"] < prev["close"])
     return move < -0.9 and (has_exhaustion_rejection(last, "SHORT") or last["close"] > prev["close"])
 
+
+def _candle_range_percent(c: dict) -> float:
+    close = c.get("close", 0) or 0
+    if close <= 0:
+        return 0.0
+    return (c.get("high", 0) - c.get("low", 0)) / close * 100
+
+
+def market_too_violent(symbol: str, c5: List[dict], c15: List[dict]) -> Optional[str]:
+    """
+    V10.7: отсеивает именно те монеты, о которых ты говорил:
+    один отскок/свеча может дать -10/-20% почти моментально. Это не рынок для нормального
+    контекстного входа с целью 10% ROI при x10, это казино-волатильность.
+    """
+    if not ULTRA_VOLATILITY_GUARD_ENABLED or ALLOW_ULTRA_RISKY_SYMBOLS:
+        return None
+    if len(c5) < 30 or len(c15) < 20:
+        return None
+    base = base_from_symbol(symbol)
+    price = c5[-1]["close"]
+    if price <= 0:
+        return "bad_price"
+    a5 = atr(c5)
+    a15 = atr(c15)
+    atr5p = (a5 / price * 100) if a5 else 0.0
+    atr15p = (a15 / price * 100) if a15 else 0.0
+    max5 = max(_candle_range_percent(c) for c in c5[-8:])
+    block15_high = max(c["high"] for c in c15[-4:])
+    block15_low = min(c["low"] for c in c15[-4:])
+    block15 = (block15_high - block15_low) / price * 100 if price > 0 else 0
+
+    # Для заранее известных risky/shitcoin — почти всегда запрещаем, если явно не включили.
+    if is_risky_base(base):
+        return f"risky_base:{base}"
+    if max5 >= MAX_5M_CANDLE_RANGE_NORMAL:
+        return f"5m_candle_range_{round(max5,2)}%"
+    if block15 >= MAX_15M_BLOCK_RANGE_NORMAL:
+        return f"15m_block_range_{round(block15,2)}%"
+    if atr5p >= MAX_ATR5_PERCENT_NORMAL:
+        return f"atr5_{round(atr5p,2)}%"
+    if atr15p >= MAX_ATR15_PERCENT_NORMAL:
+        return f"atr15_{round(atr15p,2)}%"
+    return None
+
+
+def _tp_by_roi(entry: float, direction: str, roi: float) -> float:
+    return make_tp(entry, direction, roi)
+
+
+def _market_cycle_text(direction: str, price: float, support: float, resistance: float, pos: float) -> str:
+    zone = "нижней" if pos <= 0.33 else "верхней" if pos >= 0.67 else "средней"
+    if direction == "LONG":
+        return (
+            f"Рынок в цикле диапазона: цена у {zone} зоны {round(support,8)}–{round(resistance,8)}. "
+            "Идея LONG не в том, что цена уже летит вверх, а в том, что продавец не смог закрепиться ниже, "
+            "покупатель вернул цену в структуру. Такой сделке нужно время: сначала возврат к середине, потом к верхней зоне."
+        )
+    return (
+        f"Рынок в цикле диапазона: цена у {zone} зоны {round(support,8)}–{round(resistance,8)}. "
+        "Идея SHORT не в том, что цена уже падает, а в том, что покупатель не смог закрепиться выше, "
+        "продавец удержал сопротивление. Такой сделке нужно время: сначала возврат к середине, потом к нижней зоне."
+    )
+
+
+def evaluate_market_cycle_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent):
+    """
+    V10.7 MARKET_CYCLE_CONTEXT_PRO:
+    Универсальный модуль для нормальных монет, не shitcoin.
+    Ловит два сценария:
+    1) FAST-CYCLE: трендовый откат/продолжение на 15–90 минут.
+    2) RANGE-CYCLE: движение от границы диапазона на 1–6 часов.
+    Главное: TP1 >= 10% ROI при x10, BTC/1H/4H не против, ultra-risk блокируется.
+    """
+    strategy = "MARKET_CYCLE_CONTEXT_PRO"
+    if direction not in ["LONG", "SHORT"]:
+        return None
+    if len(c15) < 120 or len(c5) < 100 or len(c1h) < 120 or len(c4h) < 80:
+        return None
+    base = base_from_symbol(symbol)
+    if is_risky_base(base):
+        return None
+    violent = market_too_violent(symbol, c5, c15)
+    if violent:
+        return None
+
+    price = c5[-1]["close"]
+    closes5 = [c["close"] for c in c5]
+    closes15 = [c["close"] for c in c15]
+    a5 = atr(c5)
+    a15 = atr(c15)
+    vw15 = vwap_like(c15)
+    rs5 = rsi(closes5)
+    rs15 = rsi(closes15)
+    vr5 = volume_ratio(c5, period=24)
+    if not a5 or not a15 or not vw15 or rs5 is None or rs15 is None:
+        return None
+
+    trend1h = trend_state(c1h)
+    trend4h = trend_state(c4h)
+    ema21_5 = _ema_value(c5, 21)
+    ema50_15 = _ema_value(c15, 50)
+    if ema21_5 is None or ema50_15 is None:
+        return None
+
+    recent1h = c1h[-48:]
+    range_high = max(c["high"] for c in recent1h)
+    range_low = min(c["low"] for c in recent1h)
+    if range_low <= 0 or range_high <= range_low:
+        return None
+    range_width = (range_high - range_low) / range_low * 100
+    pos = (price - range_low) / (range_high - range_low)
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+    last15 = c15[-1]
+    prev15 = c15[-2]
+    score = 86
+    if vr5 >= 0.80:
+        score += 2
+    if vr5 >= 1.00:
+        score += 4
+    if vr5 >= 1.18:
+        score += 4
+
+    filters = combine_extra_filters(symbol, direction, btc_status)
+    filters["max_risk_position_percent"] = TREND_CONTEXT_MAX_RISK_POSITION_PERCENT
+    filters["risk_multiplier_override"] = TREND_CONTEXT_RISK_MULTIPLIER
+    filters["rr_target"] = "TP2"
+
+    # BTC filter: не торгуем обычные монеты против явного BTC.
+    if direction == "LONG" and btc_status == "BEARISH":
+        return None
+    if direction == "SHORT" and btc_status == "BULLISH":
+        return None
+
+    # Scenario A: RANGE cycle, как BTC 62–65: верх/низ диапазона, ожидание несколько часов.
+    in_valid_range = 1.8 <= range_width <= 14.0
+    if in_valid_range and ((direction == "LONG" and pos <= 0.30) or (direction == "SHORT" and pos >= 0.70)):
+        if direction == "LONG":
+            if not confirmed_5m_followthrough(c5, "LONG"):
+                return None
+            if rs5 > 68 or rs15 > 66:
+                return None
+            if last15["close"] < prev15["close"] * 0.992:
+                return None
+            sl = min(range_low - a15 * 0.35, min(c["low"] for c in c5[-36:]) - a5 * 0.45)
+            mid = range_low + (range_high - range_low) * 0.52
+            tp1 = max(_tp_by_roi(price, direction, RANGE_CONTEXT_TP1_ROI), mid)
+            tp2 = range_low + (range_high - range_low) * 0.76
+            tp3 = range_high * 0.995
+            if tp2 <= tp1:
+                tp2 = _tp_by_roi(price, direction, RANGE_CONTEXT_TP2_ROI)
+            if tp3 <= tp2:
+                tp3 = _tp_by_roi(price, direction, RANGE_CONTEXT_TP3_ROI)
+            reason = _market_cycle_text(direction, price, range_low, range_high, pos)
+        else:
+            if not confirmed_5m_followthrough(c5, "SHORT"):
+                return None
+            if rs5 < 32 or rs15 < 34:
+                return None
+            if last15["close"] > prev15["close"] * 1.008:
+                return None
+            sl = max(range_high + a15 * 0.35, max(c["high"] for c in c5[-36:]) + a5 * 0.45)
+            mid = range_low + (range_high - range_low) * 0.48
+            tp1 = min(_tp_by_roi(price, direction, RANGE_CONTEXT_TP1_ROI), mid)
+            tp2 = range_low + (range_high - range_low) * 0.24
+            tp3 = range_low * 1.005
+            if tp2 >= tp1:
+                tp2 = _tp_by_roi(price, direction, RANGE_CONTEXT_TP2_ROI)
+            if tp3 >= tp2:
+                tp3 = _tp_by_roi(price, direction, RANGE_CONTEXT_TP3_ROI)
+            reason = _market_cycle_text(direction, price, range_low, range_high, pos)
+
+        filters["trade_class_override"] = "STRUCTURE"
+        filters["trade_style"] = "🏗 MARKET CYCLE RANGE / диапазон, нужно дать время"
+        filters["expected_hold"] = "1–6 часов"
+        filters["custom_tp1"] = tp1
+        filters["custom_tp2"] = tp2
+        filters["custom_tp3"] = tp3
+        filters["anti_fakeout_note"] = "V10.7: вход от границы диапазона, не от случайной свечи. Ultra-risk и shitcoin отсекаются."
+        if btc_status in ["BULLISH", "SOFT_BULLISH"] and direction == "LONG":
+            score += 5
+        if btc_status in ["BEARISH", "SOFT_BEARISH"] and direction == "SHORT":
+            score += 5
+        return build_signal(symbol, direction, strategy, price, sl, score, max(vr5, 0.95), reason, deposit, risk_percent, filters)
+
+    # Scenario B: FAST/TREND cycle, 15–120 минут. Не покупает вертикальную свечу; ждёт откат к EMA/VWAP.
+    move15 = recent_move_percent(c15, lookback=6)
+    move5 = recent_move_percent(c5, lookback=6)
+    if direction == "LONG":
+        htf_ok = trend1h in ["BULLISH", "SOFT_BULLISH"] or trend4h in ["BULLISH", "SOFT_BULLISH"]
+        if not htf_ok or btc_status not in ["BULLISH", "SOFT_BULLISH", "NEUTRAL"]:
+            return None
+        if move15 < 0.25 or move15 > 2.8 or move5 > 1.55:
+            return None
+        pullback_zone = (ema21_5 * 0.987 <= price <= ema21_5 * 1.014) or (vw15 * 0.985 <= price <= vw15 * 1.012)
+        if not pullback_zone or not confirmed_5m_followthrough(c5, "LONG"):
+            return None
+        if rs5 > 72 or rs15 > 70 or recent_failed_push(c5, "LONG"):
+            return None
+        sl = min(min(c["low"] for c in c5[-30:]) - a5 * 0.55, ema50_15 - a15 * 0.35)
+        reason = (
+            "V10.7 FAST/TREND LONG: нормальная монета, BTC/HTF не против. Цена не покупается на вершине: "
+            "был откат к EMA/VWAP, затем 5m подтвердил возврат покупателя. Ожидание 20–120 минут."
+        )
+    else:
+        htf_ok = trend1h in ["BEARISH", "SOFT_BEARISH"] or trend4h in ["BEARISH", "SOFT_BEARISH"]
+        if not htf_ok or btc_status not in ["BEARISH", "SOFT_BEARISH", "NEUTRAL"]:
+            return None
+        if move15 > -0.25 or move15 < -2.8 or move5 < -1.55:
+            return None
+        pullback_zone = (ema21_5 * 0.986 <= price <= ema21_5 * 1.013) or (vw15 * 0.988 <= price <= vw15 * 1.015)
+        if not pullback_zone or not confirmed_5m_followthrough(c5, "SHORT"):
+            return None
+        if rs5 < 28 or rs15 < 30 or recent_failed_push(c5, "SHORT"):
+            return None
+        sl = max(max(c["high"] for c in c5[-30:]) + a5 * 0.55, ema50_15 + a15 * 0.35)
+        reason = (
+            "V10.7 FAST/TREND SHORT: нормальная монета, BTC/HTF не против. Цена не шортится на дне: "
+            "был откат к EMA/VWAP, затем 5m подтвердил возврат продавца. Ожидание 20–120 минут."
+        )
+
+    filters["trade_class_override"] = "FAST"
+    filters["trade_style"] = "⚡ FAST/TREND CYCLE / трендовый откат 20–120 минут"
+    filters["expected_hold"] = "20 минут – 2 часа"
+    filters["rr_target"] = "TP1"
+    filters["max_risk_position_percent"] = FAST_MAX_RISK_POSITION_PERCENT
+    filters["risk_multiplier_override"] = FAST_RISK_MULTIPLIER
+    filters["custom_tp1"] = _tp_by_roi(price, direction, FAST_CONTEXT_TP1_ROI)
+    filters["custom_tp2"] = _tp_by_roi(price, direction, FAST_CONTEXT_TP2_ROI)
+    filters["custom_tp3"] = _tp_by_roi(price, direction, FAST_CONTEXT_TP3_ROI)
+    filters["anti_fakeout_note"] = "V10.7: быстрый вход разрешён только после отката к EMA/VWAP; ultra-risk и вертикальные свечи заблокированы."
+    return build_signal(symbol, direction, strategy, price, sl, score, max(vr5, 0.95), reason, deposit, risk_percent, filters)
+
 def get_strategy_winrate(strategy: str) -> tuple:
     """
     Возвращает (trades, winrate) по стратегии из текущей статистики.
@@ -1408,6 +1722,12 @@ def build_signal(
     risk_percent: float,
     extra_filters: dict
 ) -> Optional[dict]:
+    base = base_from_symbol(symbol)
+    # V10.6: risky/shitcoin не может пройти обычным trend/pullback/impulse сигналом.
+    # Только EXTREME_CONTEXT_PRO, иначе бот снова будет покупать монеты, которые за 2 свечи могут дать -20%.
+    if is_risky_base(base) and strategy != "EXTREME_CONTEXT_PRO":
+        return None
+
     risk_pos = calc_risk_position(entry, sl)
 
     trade_class = extra_filters.get("trade_class_override") or ("FAST" if strategy in ["IMPULSE_PULLBACK_PRO", "EXTREME_CONTEXT_PRO"] else "STRUCTURE")
@@ -3369,9 +3689,9 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
             return None
         if recent_failed_push(c5, "LONG"):
             return None
-        if price < vw * 0.992:
-            return None
-        if rs5 < 28 or rs15 < 30 or rs5 > 62:
+        # V10.7: у нижней границы диапазона цена часто ниже VWAP. Это нормально;
+        # главное — возврат покупателя на 5m/15m и отсутствие ultra-risk.
+        if rs5 < 28 or rs15 < 30 or rs5 > 66:
             return None
         if trend4h in ["BULLISH", "SOFT_BULLISH"]:
             score += 4
@@ -3380,9 +3700,14 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
         # V10.1: дальний технический SL за реальной границей диапазона, не под ближайшей шпилькой.
         sl = min(range_low - a5 * 1.20, min(c["low"] for c in c5[-30:]) - a5 * 0.45)
         reason = (
-            f"V10 STRUCTURE RANGE: цена у нижней части диапазона 1H ({round(range_low,8)}–{round(range_high,8)}), "
-            "есть возврат/зелёное подтверждение. Это не быстрая сделка: цель — движение к середине диапазона."
+            f"V10.7 STRUCTURE RANGE LONG: цена у нижней части диапазона 1H ({round(range_low,8)}–{round(range_high,8)}). "
+            "Продавец не смог закрепиться ниже, появился возврат покупателя. Это не быстрая сделка: "
+            "ждём движение к середине диапазона, затем к верхней зоне, если BTC не сломает контекст."
         )
+        mid = range_low + (range_high - range_low) * 0.52
+        filters_tp1 = max(_tp_by_roi(price, direction, RANGE_CONTEXT_TP1_ROI), mid)
+        filters_tp2 = range_low + (range_high - range_low) * 0.76
+        filters_tp3 = range_high * 0.995
     else:
         if pos < 0.76:
             return None
@@ -3392,9 +3717,9 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
             return None
         if recent_failed_push(c5, "SHORT"):
             return None
-        if price > vw * 1.008:
-            return None
-        if rs5 > 72 or rs15 > 70 or rs5 < 38:
+        # V10.7: у верхней границы диапазона цена часто выше VWAP. Это нормально;
+        # главное — rejection и возврат продавца.
+        if rs5 > 72 or rs15 > 70 or rs5 < 34:
             return None
         if trend4h in ["BEARISH", "SOFT_BEARISH"]:
             score += 4
@@ -3403,9 +3728,14 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
         # V10.1: дальний технический SL за реальной границей диапазона, не над ближайшей шпилькой.
         sl = max(range_high + a5 * 1.20, max(c["high"] for c in c5[-30:]) + a5 * 0.45)
         reason = (
-            f"V10 STRUCTURE RANGE: цена у верхней части диапазона 1H ({round(range_low,8)}–{round(range_high,8)}), "
-            "есть rejection/красное подтверждение. Это не быстрая сделка: цель — движение к середине диапазона."
+            f"V10.7 STRUCTURE RANGE SHORT: цена у верхней части диапазона 1H ({round(range_low,8)}–{round(range_high,8)}). "
+            "Покупатель не смог закрепиться выше, появился возврат продавца. Это не быстрая сделка: "
+            "ждём движение к середине диапазона, затем к нижней зоне, если BTC не сломает контекст."
         )
+        mid = range_low + (range_high - range_low) * 0.48
+        filters_tp1 = min(_tp_by_roi(price, direction, RANGE_CONTEXT_TP1_ROI), mid)
+        filters_tp2 = range_low + (range_high - range_low) * 0.24
+        filters_tp3 = range_low * 1.005
 
     filters = combine_extra_filters(symbol, direction, btc_status)
     filters["trade_class_override"] = "STRUCTURE"
@@ -3414,7 +3744,13 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
     filters["rr_target"] = "TP2"
     filters["max_risk_position_percent"] = STRUCTURE_MAX_RISK_POSITION_PERCENT
     filters["risk_multiplier_override"] = STRUCTURE_RISK_MULTIPLIER
-    filters["anti_fakeout_note"] = "V10.4: range-сделка только после 5m+15m подтверждения. SL за границей диапазона, позиция меньше, сделке нужно время."
+    if 'filters_tp1' in locals():
+        filters["custom_tp1"] = filters_tp1
+    if 'filters_tp2' in locals() and ((direction == "LONG" and filters_tp2 > filters.get("custom_tp1", 0)) or (direction == "SHORT" and filters_tp2 < filters.get("custom_tp1", 10**18))):
+        filters["custom_tp2"] = filters_tp2
+    if 'filters_tp3' in locals() and ((direction == "LONG" and filters_tp3 > filters.get("custom_tp2", filters.get("custom_tp1", 0))) or (direction == "SHORT" and filters_tp3 < filters.get("custom_tp2", filters.get("custom_tp1", 10**18)))):
+        filters["custom_tp3"] = filters_tp3
+    filters["anti_fakeout_note"] = "V10.7: range-сделка только после 5m+15m подтверждения. SL за границей диапазона, позиция меньше, сделке нужно время. Ultra-risk и shitcoin отсекаются."
 
     return build_signal(symbol, direction, strategy, price, sl, score, vr5, reason, deposit, risk_percent, filters)
 
@@ -3431,6 +3767,9 @@ def evaluate_extreme_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
         return None
 
     base = base_from_symbol(symbol)
+    risky = is_risky_base(base)
+    if risky and not ALLOW_RISKY_EXTREME_TRADES:
+        return None
     price = c5[-1]["close"]
     old24 = c1h[-25]["close"] if len(c1h) >= 25 else c1h[0]["close"]
     if old24 <= 0:
@@ -3450,6 +3789,12 @@ def evaluate_extreme_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
     a5 = atr(c5)
     if vw is None or rs5 is None or rs15 is None or a5 is None:
         return None
+    if risky:
+        # Для risky-монет не берём движение ±6%; это шум. Нужен реальный перегрев/импульс.
+        if abs(change24) < RISKY_EXTREME_MIN_CHANGE_PERCENT:
+            return None
+        if vr5 < RISKY_EXTREME_MIN_VOLUME_RATIO:
+            return None
 
     last5, prev5 = c5[-1], c5[-2]
     recent_high = max(c["high"] for c in c5[-36:])
@@ -3467,6 +3812,8 @@ def evaluate_extreme_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
         score += 4
 
     if direction == "LONG":
+        if risky and not ALLOW_RISKY_EXTREME_LONGS:
+            return None
         if btc_status == "BEARISH":
             return None
         continuation = change24 > 6 and 2.0 <= pullback_from_high <= 18.0 and price > ema21_5 and last5["close"] > last5["open"] and last5["close"] > prev5["close"]
@@ -3516,8 +3863,8 @@ def evaluate_extreme_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
     filters["trade_style"] = filters_style
     filters["expected_hold"] = "10–90 минут"
     filters["rr_target"] = "TP1"
-    filters["max_risk_position_percent"] = EXTREME_MAX_RISK_POSITION_PERCENT
-    filters["risk_multiplier_override"] = EXTREME_RISK_MULTIPLIER
+    filters["max_risk_position_percent"] = RISKY_EXTREME_MAX_RISK_POSITION_PERCENT if risky else EXTREME_MAX_RISK_POSITION_PERCENT
+    filters["risk_multiplier_override"] = RISKY_EXTREME_RISK_MULTIPLIER if risky else EXTREME_RISK_MULTIPLIER
     filters["anti_fakeout_note"] = "V10.4: extreme вход только после подтверждённого отката/сломa и без exhaustion-фитиля. Риск уменьшен, SL шире обычного fast."
     return build_signal(symbol, direction, strategy, price, sl, score, vr5, reason, deposit, risk_percent, filters)
 
@@ -3699,6 +4046,11 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
     if not c15 or not c5 or not c1 or not c1h or not c4h:
         return None
 
+    # V10.7: если монета слишком дерганая, не даём по ней сигнал вообще.
+    # Это защищает от сценария "зашёл — и за две свечи -20%".
+    if market_too_violent(symbol, c5, c15):
+        return None
+
     btc_status = detect_btc_status()
 
     normalized_direction = normalize_direction(direction)
@@ -3710,14 +4062,21 @@ def analyze_symbol(symbol: str, direction: Optional[str], deposit: float, risk_p
         # V10.1: по умолчанию торгуем только context-aware стратегии.
         # Старые level-сигналы можно включить вручную через PRO_LEGACY_LEVELS_ENABLED=true,
         # но после твоей статистики они выключены, чтобы не повторять серию SL.
-        funcs = [
-            evaluate_trend_context_pro,
-            evaluate_structure_swing_pro,
-            evaluate_range_structure_pro,
-            evaluate_pullback,  # V10.4: BTC/1H aligned trend pullback added back; not B, only HIGH/A+ context.
-            evaluate_extreme_context_pro,
-            evaluate_impulse_pullback_pro,
-        ]
+        base = base_from_symbol(symbol)
+        if is_risky_base(base):
+            # V10.6: shitcoin/risky movers только через extreme guard. Никаких обычных LONG по тренду.
+            funcs = [evaluate_extreme_context_pro]
+        else:
+            funcs = [
+                evaluate_market_cycle_context_pro,
+                evaluate_trend_context_pro,
+                evaluate_structure_swing_pro,
+                evaluate_range_structure_pro,
+                evaluate_pullback,  # BTC/1H aligned trend pullback; not B, only HIGH/A+ context.
+                evaluate_impulse_pullback_pro,
+            ]
+            # EXTREME_CONTEXT_PRO разрешаем и для quality-монет, если там реально сильное движение.
+            funcs.append(evaluate_extreme_context_pro)
         if PRO_LEGACY_LEVELS_ENABLED:
             funcs.extend([
                 evaluate_level_break_retest_short,
@@ -4291,15 +4650,16 @@ async def startup_event():
         f"Auto Track: {'ON' if AUTO_TRACK_ENABLED else 'OFF'} / {AUTO_TRACK_SECONDS} сек.\n"
         f"No-signal spam: {'ON' if DEBUG_NO_SIGNAL_REPORT_ENABLED else 'OFF'}\n\n"
         f"A+ pro: score {A_PLUS_MIN_SCORE}+ / RR {A_PLUS_MIN_RR}+ / vol x{A_PLUS_MIN_VOLUME_RATIO}\n"
-        f"B signals: {'ON' if B_SIGNALS_ENABLED else 'OFF'} / V10.5 default OFF, только HIGH/A+ сигналы\n"
+        f"B signals: {'ON' if B_SIGNALS_ENABLED else 'OFF'} / V10.7 default OFF, только HIGH/A+ сигналы\n"
         f"Legacy level strategies: {'ON' if PRO_LEGACY_LEVELS_ENABLED else 'OFF'} / старые weak sweep/reject выключены\n"
         f"SL model: STRUCTURE max {STRUCTURE_MAX_RISK_POSITION_PERCENT}% position-risk at x{LEVERAGE}, позиция уменьшается под дальний SL\n"
         f"Target model: TP1 {TP1_POSITION_PERCENT}% ROI / TP2 {TP2_POSITION_PERCENT}% ROI / TP3 {TP3_POSITION_PERCENT}% ROI at x{LEVERAGE}\n"
         f"Minimum TP1 filter: {MIN_TARGET_ROI_PERCENT}% ROI by TP1\n"
         f"Dynamic extreme scanner: {'ON' if EXTREME_DYNAMIC_ENABLED else 'OFF'} / top {EXTREME_DYNAMIC_TOP_N} / ±{EXTREME_DYNAMIC_MIN_CHANGE_PERCENT}%\n"
+        f"V10.7 Smart Cycle Guard: ON / ultra-risk blocked / risky coins {'ON' if ALLOW_RISKY_EXTREME_TRADES else 'OFF'} by default\n"
         f"Max symbols: {MAX_SYMBOLS}\n\n"
-        "V10.5 логика: активный трендовый контекст без B-мусора — BTC/1H/4H, затем TREND/FAST/STRUCTURE/SWING/EXTREME. Добавлен TREND_CONTEXT_PRO, чтобы бот не молчал, но TP1 всё равно минимум 10% ROI при x10.\n"
-        "STRUCTURE получает более дальний технический SL, но меньший размер позиции. Цель — не выбиваться на первом откате.\n"
+        "V10.7 логика: широкий рынок, но ultra-risk и дерганые shitcoin отсекаются. Бот делит сделки на FAST/TREND 20–120 минут и MARKET CYCLE RANGE 1–6 часов. TP1 минимум 10% ROI при x10.\n"
+        "STRUCTURE/RANGE получает технический SL за структурой, меньший размер позиции и объяснение: где диапазон, где поддержка/сопротивление, чего ждём дальше.\n"
         "TP/SL уведомления, статистика и блокировка strategy+side+grade сохранены."
     )
 
@@ -4313,7 +4673,7 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Professional Adaptive Futures Bot AUTO V10.5 PRO TREND OPPORTUNITY TRADER</title>
+    <title>Professional Adaptive Futures Bot AUTO V10.6 QUALITY TREND EXTREME GUARD</title>
 </head>
 <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:40px;">
     <h1>✅ Professional Adaptive Futures Bot AUTO V10.4 PRO ACTIVE CONTEXT TRADER работает</h1>
