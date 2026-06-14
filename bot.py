@@ -18,8 +18,8 @@ from fastapi.responses import HTMLResponse
 # quality universe -> BTC regime -> HTF context -> strategy -> entry near invalidation -> TP1 >= 10% ROI at x10
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V11.0 PROFESSIONAL FUTURES TRADER"
-DEPLOY_MARKER = "V11_0_PROFESSIONAL_FUTURES_TRADER_2026_06_14"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V11.1 PROFESSIONAL FUTURES TRADER STARTUP ACTIVE"
+DEPLOY_MARKER = "V11_1_PROFESSIONAL_FUTURES_TRADER_STARTUP_ACTIVE_2026_06_14"
 
 app = FastAPI(title=APP_NAME)
 
@@ -1140,23 +1140,41 @@ def test_telegram():
 # ----------------------------- startup -----------------------------
 
 STARTUP_TEXT = (
-    f"✅ {APP_NAME} запущен.\n"
+    f"✅ {APP_NAME} активирован и работает.\n"
     f"Deploy marker: {DEPLOY_MARKER}\n\n"
+    f"Статус: AUTO SCAN {'ON' if AUTO_SCAN_ENABLED else 'OFF'} / tracking TP-SL ON.\n"
+    f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS}.\n\n"
     f"Архитектура: quality universe → BTC → 4H/1H context → 15m confirm → 5m entry.\n"
     f"Стратегии: TREND_PULLBACK / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
     f"A+ и B: ON, но B = medium-quality с меньшим риском, не мусор.\n"
     f"TP1 filter: минимум {MIN_TP1_ROI_PERCENT:.0f}% ROI при x{LEVERAGE:.0f}.\n"
     f"Ultra-risk: обычные стратегии заблокированы, только EXTREME_CONTEXT с малым риском.\n"
-    f"No-signal spam: OFF. TP/SL и статистика: ON."
+    f"No-signal spam: OFF. TP/SL и статистика: ON.\n\n"
+    f"Если ты видишь это сообщение — Render запустил именно этот файл bot.py."
 )
+
+def notify_startup_once() -> None:
+    """Send activation message on both Background Worker and Web Service startups.
+    It does not send frequent scan reports; only one message per process start.
+    """
+    load_state()
+    STATE["startup_notified_at"] = now_ts()
+    STATE["startup_app"] = APP_NAME
+    STATE["startup_deploy_marker"] = DEPLOY_MARKER
+    save_state()
+    ok = send_telegram(STARTUP_TEXT)
+    if not ok:
+        STATE["last_error"] = STATE.get("last_error", "startup telegram failed") or "startup telegram failed"
+        save_state()
 
 @app.on_event("startup")
 async def fastapi_startup():
-    load_state()
+    # For uvicorn/Web Service mode. Background Worker uses main().
+    notify_startup_once()
 
 async def main():
-    load_state()
-    send_telegram(STARTUP_TEXT)
+    # For Render Background Worker: Start Command = python bot.py
+    notify_startup_once()
     await asyncio.gather(auto_loop(), track_loop())
 
 if __name__ == "__main__":
