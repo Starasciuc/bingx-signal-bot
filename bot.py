@@ -4,6 +4,7 @@ import json
 import math
 import asyncio
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -18,8 +19,8 @@ from fastapi.responses import HTMLResponse
 # quality universe -> BTC regime -> HTF context -> strategy -> entry near invalidation -> TP1 >= 10% ROI at x10
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V11.1 PROFESSIONAL FUTURES TRADER STARTUP ACTIVE"
-DEPLOY_MARKER = "V11_1_PROFESSIONAL_FUTURES_TRADER_STARTUP_ACTIVE_2026_06_14"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V11.3 SMART FAST SCANNER"
+DEPLOY_MARKER = "V11_3_SMART_FAST_SCANNER_2026_06_14"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,12 +35,16 @@ MIN_TP1_ROI_PERCENT = float(os.getenv("MIN_TP1_ROI_PERCENT", "10"))
 MIN_TP1_PRICE_MOVE_PERCENT = MIN_TP1_ROI_PERCENT / max(LEVERAGE, 1.0)
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "90"))
-TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "35"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "450"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
+TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "25"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "650"))
+SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "8"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1200"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
+ANALYTICS_TOP_MOVERS = int(os.getenv("ANALYTICS_TOP_MOVERS", "18"))
+ANALYTICS_TOP_SETUPS = int(os.getenv("ANALYTICS_TOP_SETUPS", "8"))
+SEND_ANALYTICS_ON_STARTUP = os.getenv("SEND_ANALYTICS_ON_STARTUP", "false").lower() == "true"
 
 # Grades. B is not garbage. B = medium quality with reduced risk.
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
@@ -51,8 +56,8 @@ EXTREME_RISK_MULTIPLIER = float(os.getenv("EXTREME_RISK_MULTIPLIER", "0.12"))
 
 MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "8000000"))
 MIN_ACTIVE_QUOTE_VOLUME_USDT = float(os.getenv("MIN_ACTIVE_QUOTE_VOLUME_USDT", "15000000"))
-DYNAMIC_TOP_N = int(os.getenv("DYNAMIC_TOP_N", "180"))
-DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("DYNAMIC_MIN_CHANGE_PERCENT", "4.0"))
+DYNAMIC_TOP_N = int(os.getenv("DYNAMIC_TOP_N", "260"))
+DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("DYNAMIC_MIN_CHANGE_PERCENT", "2.5"))
 EXTREME_MIN_CHANGE_PERCENT = float(os.getenv("EXTREME_MIN_CHANGE_PERCENT", "18.0"))
 ULTRA_RISK_5M_MOVE_BLOCK = float(os.getenv("ULTRA_RISK_5M_MOVE_BLOCK", "8.0"))
 ULTRA_RISK_15M_MOVE_BLOCK = float(os.getenv("ULTRA_RISK_15M_MOVE_BLOCK", "12.0"))
@@ -449,18 +454,23 @@ def get_symbols() -> List[str]:
             s = normalize_symbol(item.get("symbol", ""))
             if is_good_symbol(s):
                 all_symbols.append(s)
+
     dynamic = get_dynamic_symbols()
-    priority = []
-    for s in all_symbols:
-        if base_from_symbol(s) in QUALITY_BASES:
-            priority.append(s)
-    random.shuffle(all_symbols)
+    quality = [s for s in all_symbols if base_from_symbol(s) in QUALITY_BASES]
+    active = [s for s in all_symbols if base_from_symbol(s) not in QUALITY_BASES]
+    random.shuffle(active)
+
+    # Smart balanced priority:
+    # 1) quality coins first, because these give cleaner futures signals;
+    # 2) dynamic movers next, but ultra-risk is still blocked from normal strategies later;
+    # 3) broad active universe last so the bot does not miss new opportunities.
     result = []
-    for s in dynamic + priority + all_symbols:
-        if s not in result:
-            result.append(s)
-        if len(result) >= MAX_SYMBOLS:
-            break
+    for bucket in [quality, dynamic, active]:
+        for s in bucket:
+            if s not in result:
+                result.append(s)
+            if len(result) >= MAX_SYMBOLS:
+                return result
     return result
 
 
@@ -898,6 +908,95 @@ def analyze_symbol(symbol: str, btc: MarketRegime) -> Optional[CandidateSignal]:
         STATE["last_error"] = f"analyze_symbol {symbol}: {e}"
         return None
 
+
+# ----------------------------- market analytics -----------------------------
+
+def classify_btc_plan(btc: MarketRegime) -> str:
+    if btc.trend in ["TREND_UP", "IMPULSE_UP"]:
+        return "План: приоритет LONG по сильным монетам после отката к EMA/VWAP. SHORT только если альт явно слабее BTC."
+    if btc.trend in ["TREND_DOWN", "IMPULSE_DOWN"]:
+        return "План: приоритет SHORT после слабых отскоков. LONG по альтам лучше пропускать, пока BTC не покажет reclaim."
+    if btc.trend == "RANGE":
+        return "План: рынок диапазонный. Лучшие сделки — от нижней/верхней границы диапазона, не посередине."
+    if btc.trend == "CHOP":
+        return "План: BTC в шуме. Торговать меньше, брать только A+ у сильных уровней."
+    return "План: нет уверенного режима BTC, риск ниже."
+
+
+def top_market_movers(limit: int = ANALYTICS_TOP_MOVERS) -> List[Tuple[str, float, float, str]]:
+    rows: List[Tuple[str, float, float, str]] = []
+    for item in get_tickers():
+        symbol = normalize_symbol(item.get("symbol") or item.get("s") or "")
+        if not is_good_symbol(symbol):
+            continue
+        ch = extract_change_percent(item)
+        qv = extract_quote_volume_usdt(item)
+        if ch is None or qv <= 0:
+            continue
+        base = base_from_symbol(symbol)
+        risk = "ULTRA_RISK" if base in ULTRA_RISK_BASES else ("QUALITY" if base in QUALITY_BASES else "ACTIVE")
+        rows.append((symbol, float(ch), float(qv), risk))
+    rows.sort(key=lambda x: abs(x[1]), reverse=True)
+    return rows[:limit]
+
+
+def build_market_analytics_text(send_to_telegram: bool = False) -> str:
+    """Build a compact professional market analysis without opening trades.
+    This is on-demand analytics, not no-signal spam.
+    """
+    btc = get_btc_regime()
+    movers = top_market_movers(ANALYTICS_TOP_MOVERS)
+    symbols = get_symbols()
+    found: List[CandidateSignal] = []
+    checked = 0
+    for symbol in symbols:
+        if checked >= min(MAX_SYMBOLS, 180):
+            break
+        checked += 1
+        if has_active_or_recent(symbol):
+            continue
+        sig = analyze_symbol(symbol, btc)
+        if sig:
+            found.append(sig)
+    found.sort(key=lambda s: (s.grade == "A+", s.score, s.rr, s.roi_tp1), reverse=True)
+
+    lines = []
+    lines.append(f"📊 <b>Рыночная аналитика {APP_NAME}</b>")
+    lines.append(f"Deploy: <code>{DEPLOY_MARKER}</code>\n")
+    lines.append(f"<b>BTC режим:</b> {btc.trend} / confidence {btc.confidence}")
+    lines.append(f"{btc.reason}")
+    lines.append(classify_btc_plan(btc))
+
+    lines.append("\n<b>Лидеры движения сейчас:</b>")
+    if movers:
+        for symbol, ch, qv, risk in movers[:ANALYTICS_TOP_MOVERS]:
+            mark = "⚠️" if risk == "ULTRA_RISK" else ("✅" if risk == "QUALITY" else "•")
+            lines.append(f"{mark} {display_symbol(symbol)}: {ch:+.1f}% / vol≈{qv/1_000_000:.1f}M / {risk}")
+    else:
+        lines.append("Нет данных по movers от BingX.")
+
+    lines.append("\n<b>Лучшие найденные сетапы без открытия вручную:</b>")
+    if found:
+        for s in found[:ANALYTICS_TOP_SETUPS]:
+            lines.append(
+                f"{s.grade} {s.side} {display_symbol(s.symbol)} | {s.strategy}/{s.trade_type} | "
+                f"TP1≈{s.roi_tp1:.1f}% ROI x{LEVERAGE:.0f} | score {s.score} | RR {s.rr:.2f}"
+            )
+    else:
+        lines.append(f"За проверку {checked} пар готовых A+/B сетапов не найдено. Это не ошибка: бот ждёт цену у уровня/отката/ретеста.")
+
+    lines.append("\n<b>Как читать:</b>")
+    lines.append("A+ — сильное совпадение BTC + HTF + уровень + вход + потенциал 10% ROI.")
+    lines.append("B — рабочий средний сетап с меньшим риском, не мусорный вход.")
+    lines.append("ULTRA_RISK не торгуется обычными стратегиями.")
+    text = "\n".join(lines)
+    if send_to_telegram:
+        send_telegram(text)
+    STATE["last_analytics_at"] = now_ts()
+    STATE["last_analytics_preview"] = text[:1500]
+    save_state()
+    return text
+
 # ----------------------------- messaging -----------------------------
 
 def signal_to_dict(s: CandidateSignal) -> Dict[str, Any]:
@@ -1039,30 +1138,56 @@ def scan_once(manual: bool = False) -> Dict[str, Any]:
     started = now_ts()
     btc = get_btc_regime()
     symbols = get_symbols()
-    checked = 0
     candidates: List[CandidateSignal] = []
     skipped_recent = 0
+
+    open_slots = max(0, MAX_ACTIVE_SIGNALS - len([x for x in STATE.setdefault("active_signals", []) if not x.get("closed")]))
+    if open_slots <= 0:
+        summary = {
+            "checked": 0, "symbols": len(symbols), "candidates": 0, "sent": 0,
+            "btc": asdict(btc), "skipped_recent": 0, "duration_sec": now_ts() - started,
+            "time": started, "note": "max active signals reached"
+        }
+        STATE["last_scan_at"] = started
+        STATE["last_scan_summary"] = summary
+        save_state()
+        return summary
+
+    eligible: List[str] = []
     for symbol in symbols:
-        if len([x for x in STATE.setdefault("active_signals", []) if not x.get("closed")]) >= MAX_ACTIVE_SIGNALS:
-            break
         if has_active_or_recent(symbol):
             skipped_recent += 1
             continue
-        checked += 1
-        sig = analyze_symbol(symbol, btc)
-        if sig:
-            candidates.append(sig)
-        # prevent very long scans on worker
-        if checked >= MAX_SYMBOLS:
+        eligible.append(symbol)
+        if len(eligible) >= MAX_SYMBOLS:
             break
+
+    checked = len(eligible)
+    workers = max(1, min(SCAN_WORKERS, 12, checked or 1))
+
+    # Faster scan: parallel kline analysis with a small worker pool.
+    # This keeps no-signal spam OFF, but lets the bot cover more of the market each minute.
+    if checked > 0:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(analyze_symbol, symbol, btc): symbol for symbol in eligible}
+            for future in as_completed(future_map):
+                try:
+                    sig = future.result()
+                except Exception as e:
+                    STATE["last_error"] = f"scan worker {future_map.get(future)}: {e}"
+                    sig = None
+                if sig:
+                    candidates.append(sig)
+
     candidates.sort(key=lambda s: (s.grade == "A+", s.score, s.rr, s.roi_tp1), reverse=True)
     sent = 0
-    for sig in candidates[:3]:
+    for sig in candidates[:min(3, open_slots)]:
         if has_active_or_recent(sig.symbol):
             continue
         add_active_signal(sig)
         send_telegram(build_signal_message(sig))
         sent += 1
+
     summary = {
         "checked": checked,
         "symbols": len(symbols),
@@ -1070,6 +1195,7 @@ def scan_once(manual: bool = False) -> Dict[str, Any]:
         "sent": sent,
         "btc": asdict(btc),
         "skipped_recent": skipped_recent,
+        "workers": workers,
         "duration_sec": now_ts() - started,
         "time": started,
     }
@@ -1132,6 +1258,16 @@ def scan_endpoint():
 def stats_endpoint():
     return HTMLResponse("<pre>" + build_stats_text(short=False).replace("<", "&lt;").replace(">", "&gt;") + "</pre>")
 
+@app.get("/analysis")
+def analysis_endpoint():
+    text = build_market_analytics_text(send_to_telegram=False)
+    return HTMLResponse("<pre>" + text.replace("<", "&lt;").replace(">", "&gt;") + "</pre>")
+
+@app.get("/send-analysis")
+def send_analysis_endpoint():
+    text = build_market_analytics_text(send_to_telegram=True)
+    return {"sent": True, "app": APP_NAME, "deploy_marker": DEPLOY_MARKER, "preview": text[:1000]}
+
 @app.get("/test-telegram")
 def test_telegram():
     ok = send_telegram(f"✅ {APP_NAME}\nDeploy marker: {DEPLOY_MARKER}\nTelegram test OK")
@@ -1143,13 +1279,15 @@ STARTUP_TEXT = (
     f"✅ {APP_NAME} активирован и работает.\n"
     f"Deploy marker: {DEPLOY_MARKER}\n\n"
     f"Статус: AUTO SCAN {'ON' if AUTO_SCAN_ENABLED else 'OFF'} / tracking TP-SL ON.\n"
-    f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS}.\n\n"
+    f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS} / Workers: {SCAN_WORKERS}.\n\n"
     f"Архитектура: quality universe → BTC → 4H/1H context → 15m confirm → 5m entry.\n"
+    f"Smart Fast Scanner: ON — параллельный анализ, quality-first, dynamic movers, broad market.\n"
     f"Стратегии: TREND_PULLBACK / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
     f"A+ и B: ON, но B = medium-quality с меньшим риском, не мусор.\n"
     f"TP1 filter: минимум {MIN_TP1_ROI_PERCENT:.0f}% ROI при x{LEVERAGE:.0f}.\n"
     f"Ultra-risk: обычные стратегии заблокированы, только EXTREME_CONTEXT с малым риском.\n"
-    f"No-signal spam: OFF. TP/SL и статистика: ON.\n\n"
+    f"No-signal spam: OFF. TP/SL и статистика: ON.\n"
+    f"Аналитика: /analysis показывает обзор, /send-analysis отправляет обзор в Telegram.\n\n"
     f"Если ты видишь это сообщение — Render запустил именно этот файл bot.py."
 )
 
@@ -1163,6 +1301,12 @@ def notify_startup_once() -> None:
     STATE["startup_deploy_marker"] = DEPLOY_MARKER
     save_state()
     ok = send_telegram(STARTUP_TEXT)
+    if ok and SEND_ANALYTICS_ON_STARTUP:
+        try:
+            build_market_analytics_text(send_to_telegram=True)
+        except Exception as e:
+            STATE["last_error"] = f"startup analytics: {e}"
+            save_state()
     if not ok:
         STATE["last_error"] = STATE.get("last_error", "startup telegram failed") or "startup telegram failed"
         save_state()
