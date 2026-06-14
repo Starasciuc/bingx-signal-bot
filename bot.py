@@ -11,14 +11,14 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import HTMLResponse
 
 
-APP_NAME = "Professional Futures Bot V11 Market Regime Trader"
-DEPLOY_MARKER = "V11_MARKET_REGIME_ENGINE_2026_06_14"
+APP_NAME = "Professional Futures Bot V11.2 Active Defensive Market Regime Trader"
+DEPLOY_MARKER = "V11_2_ACTIVE_DEFENSIVE_ENGINE_2026_06_14"
 
 app = FastAPI(title=APP_NAME)
 
-# =========================
+# ============================================================
 # ENV / SETTINGS
-# =========================
+# ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -35,15 +35,19 @@ LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 DEFAULT_DEPOSIT = float(os.getenv("DEFAULT_DEPOSIT", "1000"))
 DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "0.5"))
 
+# V11.2 Active Defensive:
+# Бот торгует, но ограничивает частоту и не стреляет сериями в плохом рынке.
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "180"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
+MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "2"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "90"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "180"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "45"))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "900"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "3600"))
 SIGNAL_MAX_LIFETIME_SECONDS = int(os.getenv("SIGNAL_MAX_LIFETIME_SECONDS", "21600"))
 SENT_SIGNALS_KEEP_SECONDS = int(os.getenv("SENT_SIGNALS_KEEP_SECONDS", "1209600"))
 
@@ -56,31 +60,45 @@ FEE_RATE = float(os.getenv("FEE_RATE", "0.0005"))
 SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0003"))
 
 # Signal quality
+# V11.2: не A+ Only, но сильно лучше, чем Balanced.
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
-A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "0.95"))
-A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "0.90"))
+A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "1.00"))
+A_PLUS_MIN_VOLUME_RATIO = float(os.getenv("A_PLUS_MIN_VOLUME_RATIO", "1.00"))
 
 WEAK_MIN_SCORE = int(os.getenv("WEAK_MIN_SCORE", "82"))
-WEAK_MIN_RR = float(os.getenv("WEAK_MIN_RR", "0.75"))
-WEAK_MIN_VOLUME_RATIO = float(os.getenv("WEAK_MIN_VOLUME_RATIO", "0.75"))
+WEAK_MIN_RR = float(os.getenv("WEAK_MIN_RR", "0.80"))
+WEAK_MIN_VOLUME_RATIO = float(os.getenv("WEAK_MIN_VOLUME_RATIO", "0.85"))
 ALLOW_WEAK_SIGNALS = os.getenv("ALLOW_WEAK_SIGNALS", "false").lower() == "true"
+
+# Minimum volume confirmation by setup type.
+FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "1.15"))
+TREND_MIN_VOLUME_RATIO = float(os.getenv("TREND_MIN_VOLUME_RATIO", "0.95"))
+RANGE_MIN_VOLUME_RATIO = float(os.getenv("RANGE_MIN_VOLUME_RATIO", "0.90"))
+
+# Global protection.
+MAX_GLOBAL_CONSECUTIVE_SL = int(os.getenv("MAX_GLOBAL_CONSECUTIVE_SL", "2"))
+GLOBAL_PAUSE_AFTER_SL_SECONDS = int(os.getenv("GLOBAL_PAUSE_AFTER_SL_SECONDS", "7200"))
+MAX_DAILY_SL = int(os.getenv("MAX_DAILY_SL", "4"))
+DAILY_PAUSE_AFTER_MAX_SL_SECONDS = int(os.getenv("DAILY_PAUSE_AFTER_MAX_SL_SECONDS", "21600"))
 
 MIN_TARGET_ROI_PERCENT = float(os.getenv("MIN_TARGET_ROI_PERCENT", "10"))
 
 # Risk multipliers
-STRONG_RISK_MULTIPLIER = float(os.getenv("STRONG_RISK_MULTIPLIER", "0.35"))
-WEAK_RISK_MULTIPLIER = float(os.getenv("WEAK_RISK_MULTIPLIER", "0.10"))
-FAST_RISK_MULTIPLIER = float(os.getenv("FAST_RISK_MULTIPLIER", "0.12"))
-STRUCTURE_RISK_MULTIPLIER = float(os.getenv("STRUCTURE_RISK_MULTIPLIER", "0.18"))
-EXTREME_RISK_MULTIPLIER = float(os.getenv("EXTREME_RISK_MULTIPLIER", "0.06"))
+# V11.2: риск снижен, потому что цель — выжить в серии ошибок.
+STRONG_RISK_MULTIPLIER = float(os.getenv("STRONG_RISK_MULTIPLIER", "0.25"))
+WEAK_RISK_MULTIPLIER = float(os.getenv("WEAK_RISK_MULTIPLIER", "0.06"))
 
-# Max risk by position ROI to SL at leverage
+FAST_RISK_MULTIPLIER = float(os.getenv("FAST_RISK_MULTIPLIER", "0.07"))
+STRUCTURE_RISK_MULTIPLIER = float(os.getenv("STRUCTURE_RISK_MULTIPLIER", "0.10"))
+EXTREME_RISK_MULTIPLIER = float(os.getenv("EXTREME_RISK_MULTIPLIER", "0.03"))
+
+# Max risk by position ROI to SL at leverage.
 FAST_MAX_RISK_POSITION_PERCENT = float(os.getenv("FAST_MAX_RISK_POSITION_PERCENT", "14"))
 STRUCTURE_MAX_RISK_POSITION_PERCENT = float(os.getenv("STRUCTURE_MAX_RISK_POSITION_PERCENT", "42"))
 SWING_MAX_RISK_POSITION_PERCENT = float(os.getenv("SWING_MAX_RISK_POSITION_PERCENT", "85"))
 EXTREME_MAX_RISK_POSITION_PERCENT = float(os.getenv("EXTREME_MAX_RISK_POSITION_PERCENT", "20"))
 
-# TP ROI targets
+# TP ROI targets.
 FAST_TP1_ROI = float(os.getenv("FAST_TP1_ROI", "10"))
 FAST_TP2_ROI = float(os.getenv("FAST_TP2_ROI", "18"))
 FAST_TP3_ROI = float(os.getenv("FAST_TP3_ROI", "28"))
@@ -141,7 +159,7 @@ QUALITY_BASES = {
     "DOT", "TRX", "NEAR", "APT", "SUI", "SEI", "INJ", "AAVE", "UNI", "ATOM", "FIL",
     "ETC", "OP", "ARB", "TON", "ICP", "RNDR", "FET", "IMX", "AR", "MKR", "LDO",
     "CRV", "ENA", "JUP", "PYTH", "STRK", "DYDX", "RUNE", "TIA", "STX", "COMP", "TAO",
-    "WLD", "JTO", "GALA", "APE", "SNX"
+    "WLD", "JTO", "GALA", "APE", "SNX", "JASMY", "ORDI"
 }
 
 RISKY_BASES = {
@@ -153,30 +171,29 @@ RISKY_BASES = {
 }
 
 EXTREME_BASES = RISKY_BASES | {
-    "TAO", "SEI", "INJ", "SUI", "APT", "WLD", "ENA", "JUP", "PYTH"
+    "TAO", "SEI", "INJ", "SUI", "APT", "WLD", "ENA", "JUP", "PYTH", "ORDI"
 }
 
 STRATEGIES = [
     "FAST_REACTION_PRO",
     "TREND_CONTINUATION_PRO",
     "RANGE_STRUCTURE_PRO",
-    "STRUCTURE_SWING_PRO",
     "EXTREME_CONTEXT_PRO",
 ]
 
 
-# =========================
+# ============================================================
 # SECURITY
-# =========================
+# ============================================================
 
 def require_api_key(key: str):
     if API_KEY and key != API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
-# =========================
+# ============================================================
 # STATE
-# =========================
+# ============================================================
 
 def now_ts() -> float:
     return time.time()
@@ -225,6 +242,11 @@ def default_state():
             "last_track_result": None,
             "last_no_signal_report_time": 0,
             "last_error": None,
+            "global_consecutive_sl": 0,
+            "global_pause_until": 0,
+            "daily_sl_date": "",
+            "daily_sl": 0,
+            "signals_sent_times": [],
         }
     }
 
@@ -276,6 +298,13 @@ def ensure_state_structure(state: dict) -> dict:
 
     if "pair_positive" not in state["stats"]:
         state["stats"]["pair_positive"] = {}
+
+    if "auto" not in state:
+        state["auto"] = base["auto"]
+
+    for key, value in base["auto"].items():
+        if key not in state["auto"]:
+            state["auto"][key] = value
 
     return state
 
@@ -332,9 +361,9 @@ def cleanup_state():
     save_state(STATE)
 
 
-# =========================
+# ============================================================
 # BASIC HELPERS
-# =========================
+# ============================================================
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.upper().replace("/", "-").strip()
@@ -461,9 +490,9 @@ def is_strategy_side_enabled(strategy: str, side: str) -> bool:
     return now_ts() >= STATE["strategy_side_hard_disabled_until"].get(key, 0)
 
 
-# =========================
+# ============================================================
 # HTTP / MARKET DATA
-# =========================
+# ============================================================
 
 def get_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
     try:
@@ -607,7 +636,6 @@ def get_symbols() -> List[str]:
     random.shuffle(all_symbols)
 
     result = []
-
     source_symbols = dynamic_extremes + priority_symbols
 
     if not QUALITY_ONLY_MODE:
@@ -733,9 +761,9 @@ def get_open_interest(symbol: str) -> Optional[float]:
     return None
 
 
-# =========================
+# ============================================================
 # INDICATORS
-# =========================
+# ============================================================
 
 def ema(values: List[float], period: int) -> List[float]:
     if not values:
@@ -940,14 +968,14 @@ def confirmed_5m_followthrough(c5: List[dict], direction: str) -> bool:
     if direction == "LONG":
         return (
             last["close"] > last["open"]
-            and last["close"] > prev["close"]
-            and prev["close"] >= before["close"] * 0.997
+            and last["close"] > prev["close"] * 0.998
+            and prev["close"] >= before["close"] * 0.995
         )
 
     return (
         last["close"] < last["open"]
-        and last["close"] < prev["close"]
-        and prev["close"] <= before["close"] * 1.003
+        and last["close"] < prev["close"] * 1.002
+        and prev["close"] <= before["close"] * 1.005
     )
 
 
@@ -959,9 +987,9 @@ def confirmed_15m_direction(c15: List[dict], direction: str) -> bool:
     prev = c15[-2]
 
     if direction == "LONG":
-        return last["close"] >= prev["close"] * 0.997 or last["close"] > last["open"]
+        return last["close"] >= prev["close"] * 0.996 or last["close"] > last["open"]
 
-    return last["close"] <= prev["close"] * 1.003 or last["close"] < last["open"]
+    return last["close"] <= prev["close"] * 1.004 or last["close"] < last["open"]
 
 
 def recent_failed_push(c5: List[dict], direction: str) -> bool:
@@ -980,14 +1008,14 @@ def recent_failed_push(c5: List[dict], direction: str) -> bool:
     prev = c5[-2]
 
     if direction == "LONG":
-        return move > 0.9 and (has_exhaustion_rejection(last, "LONG") or last["close"] < prev["close"])
+        return move > 1.25 and (has_exhaustion_rejection(last, "LONG") or last["close"] < prev["close"] * 0.996)
 
-    return move < -0.9 and (has_exhaustion_rejection(last, "SHORT") or last["close"] > prev["close"])
+    return move < -1.25 and (has_exhaustion_rejection(last, "SHORT") or last["close"] > prev["close"] * 1.004)
 
 
-# =========================
+# ============================================================
 # FILTERS
-# =========================
+# ============================================================
 
 def market_too_violent(symbol: str, c5: List[dict], c15: List[dict]) -> Optional[str]:
     if not ULTRA_VOLATILITY_GUARD_ENABLED or ALLOW_ULTRA_RISKY_SYMBOLS:
@@ -1101,11 +1129,121 @@ def combine_filters(symbol: str, direction: str, btc_status: str) -> dict:
     }
 
 
-# =========================
-# MARKET REGIME ENGINE
-# =========================
+
+# ============================================================
+# GLOBAL TRADE PROTECTION
+# ============================================================
+
+def current_day_key() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def refresh_daily_sl_counter():
+    day = current_day_key()
+    if STATE["auto"].get("daily_sl_date") != day:
+        STATE["auto"]["daily_sl_date"] = day
+        STATE["auto"]["daily_sl"] = 0
+        save_state(STATE)
+
+
+def clean_signal_rate_window():
+    cutoff = now_ts() - 3600
+    times = STATE["auto"].get("signals_sent_times", [])
+    STATE["auto"]["signals_sent_times"] = [t for t in times if t >= cutoff]
+    save_state(STATE)
+
+
+def can_open_new_signal() -> tuple:
+    """
+    Возвращает (True, reason), если можно открыть новый сигнал.
+    Это защита от серийных входов в плохом рынке.
+    """
+    refresh_daily_sl_counter()
+    clean_signal_rate_window()
+    current_time = now_ts()
+
+    if current_time < STATE["auto"].get("global_pause_until", 0):
+        left = int(STATE["auto"]["global_pause_until"] - current_time)
+        return False, f"global_pause_active_{left}s"
+
+    if len(STATE.get("active_signals", {})) >= MAX_ACTIVE_SIGNALS:
+        return False, f"max_active_signals_{MAX_ACTIVE_SIGNALS}"
+
+    if len(STATE["auto"].get("signals_sent_times", [])) >= MAX_SIGNALS_PER_HOUR:
+        return False, f"max_signals_per_hour_{MAX_SIGNALS_PER_HOUR}"
+
+    if STATE["auto"].get("daily_sl", 0) >= MAX_DAILY_SL:
+        STATE["auto"]["global_pause_until"] = current_time + DAILY_PAUSE_AFTER_MAX_SL_SECONDS
+        save_state(STATE)
+        return False, f"daily_sl_limit_{MAX_DAILY_SL}"
+
+    return True, "ok"
+
+
+def register_signal_sent():
+    clean_signal_rate_window()
+    STATE["auto"].setdefault("signals_sent_times", []).append(now_ts())
+    save_state(STATE)
+
+
+def register_global_sl():
+    refresh_daily_sl_counter()
+    STATE["auto"]["global_consecutive_sl"] = int(STATE["auto"].get("global_consecutive_sl", 0)) + 1
+    STATE["auto"]["daily_sl"] = int(STATE["auto"].get("daily_sl", 0)) + 1
+    notes = []
+
+    if STATE["auto"]["global_consecutive_sl"] >= MAX_GLOBAL_CONSECUTIVE_SL:
+        STATE["auto"]["global_pause_until"] = now_ts() + GLOBAL_PAUSE_AFTER_SL_SECONDS
+        notes.append(
+            f"🛑 Глобальная пауза после {STATE['auto']['global_consecutive_sl']} SL подряд: "
+            f"{GLOBAL_PAUSE_AFTER_SL_SECONDS // 60} минут."
+        )
+
+    if STATE["auto"]["daily_sl"] >= MAX_DAILY_SL:
+        STATE["auto"]["global_pause_until"] = max(
+            STATE["auto"].get("global_pause_until", 0),
+            now_ts() + DAILY_PAUSE_AFTER_MAX_SL_SECONDS,
+        )
+        notes.append(
+            f"🛑 Дневной лимит SL достигнут ({STATE['auto']['daily_sl']}/{MAX_DAILY_SL}). "
+            f"Пауза на {DAILY_PAUSE_AFTER_MAX_SL_SECONDS // 3600} ч."
+        )
+
+    save_state(STATE)
+    return notes
+
+
+def register_global_positive():
+    STATE["auto"]["global_consecutive_sl"] = 0
+    save_state(STATE)
+
+
+def defensive_score_bonus_required() -> int:
+    """
+    После 1 SL подряд бот не выключается, но становится строже.
+    """
+    consecutive_sl = int(STATE["auto"].get("global_consecutive_sl", 0))
+    if consecutive_sl <= 0:
+        return 0
+    if consecutive_sl == 1:
+        return 3
+    return 6
+
+
+# ============================================================
+# MARKET REGIME ENGINE V11.2
+# ============================================================
 
 def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
+    """
+    V11.2 Balanced Market Regime Engine.
+
+    Задача:
+    - видеть быстрые реакции рынка;
+    - видеть трендовые откаты;
+    - видеть диапазонные сделки, которым нужно время;
+    - не лезть в хаотичные shitcoin без разрешения.
+    """
     base = base_from_symbol(symbol)
 
     if len(c5) < 80 or len(c15) < 100 or len(c1h) < 80 or len(c4h) < 50:
@@ -1150,7 +1288,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
 
     violent = market_too_violent(symbol, c5, c15)
 
-    # Risky-монеты не идут в обычные стратегии. Только EXTREME.
+    # Risky-монеты только через EXTREME.
     if is_risky_base(base):
         if not ALLOW_RISKY_EXTREME_TRADES:
             return {
@@ -1179,6 +1317,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             "avoid_reason": None,
         }
 
+    # Normal-монеты с ultra-risk блокируются.
     if violent:
         return {
             "regime": "AVOID",
@@ -1192,30 +1331,51 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             "avoid_reason": violent,
         }
 
-    # FAST MOMENTUM
-    fast_up = move5_6 >= 0.75 or move15_6 >= 1.10 or move5_12 >= 1.30
-    fast_down = move5_6 <= -0.75 or move15_6 <= -1.10 or move5_12 <= -1.30
+    # FAST MOMENTUM — V11.2 чуть мягче.
+    fast_up = move5_6 >= 0.85 or move15_6 >= 1.20 or move5_12 >= 1.55
+    fast_down = move5_6 <= -0.85 or move15_6 <= -1.20 or move5_12 <= -1.55
 
     if fast_up or fast_down:
         direction_bias = "LONG" if fast_up else "SHORT"
 
+        # Против явного BTC всё ещё не лезем.
         if direction_bias == "LONG" and btc_status == "BEARISH":
-            return {"regime": "AVOID", "direction_bias": "LONG", "avoid_reason": "btc_against_fast_long"}
+            return {
+                "regime": "AVOID",
+                "direction_bias": "LONG",
+                "avoid_reason": "btc_against_fast_long",
+            }
 
         if direction_bias == "SHORT" and btc_status == "BULLISH":
-            return {"regime": "AVOID", "direction_bias": "SHORT", "avoid_reason": "btc_against_fast_short"}
+            return {
+                "regime": "AVOID",
+                "direction_bias": "SHORT",
+                "avoid_reason": "btc_against_fast_short",
+            }
 
-        quality = 82
+        quality = 80
 
+        if vr5 >= 0.85:
+            quality += 3
         if vr5 >= 1.00:
-            quality += 4
+            quality += 3
         if vr5 >= 1.25:
             quality += 4
-        if distance_vwap <= 2.2:
+        if distance_vwap <= 2.6:
             quality += 4
-        if direction_bias == "LONG" and 42 <= rs5 <= 74:
+        if distance_vwap <= 1.8:
+            quality += 2
+
+        if direction_bias == "LONG" and 38 <= rs5 <= 76:
             quality += 3
-        if direction_bias == "SHORT" and 26 <= rs5 <= 58:
+
+        if direction_bias == "SHORT" and 24 <= rs5 <= 62:
+            quality += 3
+
+        if direction_bias == "LONG" and trend1h in ["BULLISH", "SOFT_BULLISH"]:
+            quality += 3
+
+        if direction_bias == "SHORT" and trend1h in ["BEARISH", "SOFT_BEARISH"]:
             quality += 3
 
         return {
@@ -1224,7 +1384,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             "speed": "FAST",
             "quality": min(quality, 96),
             "expected_hold": "10–90 минут",
-            "allowed_trade_classes": ["FAST", "EXTREME"],
+            "allowed_trade_classes": ["FAST", "EXTREME", "TREND"],
             "range_low": range_low,
             "range_high": range_high,
             "range_width": round(range_width, 2),
@@ -1235,14 +1395,16 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             "avoid_reason": None,
         }
 
-    # TREND CONTINUATION
+    # TREND CONTINUATION — V11.2 немного мягче.
     bullish_context = (
         btc_status in ["BULLISH", "SOFT_BULLISH", "NEUTRAL"]
         and (
             trend1h in ["BULLISH", "SOFT_BULLISH"]
             or trend4h in ["BULLISH", "SOFT_BULLISH"]
+            or price > vw15 * 1.003
         )
-        and price >= vw15 * 0.985
+        and price >= vw15 * 0.975
+        and rs15 <= 74
     )
 
     bearish_context = (
@@ -1250,12 +1412,14 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
         and (
             trend1h in ["BEARISH", "SOFT_BEARISH"]
             or trend4h in ["BEARISH", "SOFT_BEARISH"]
+            or price < vw15 * 0.997
         )
-        and price <= vw15 * 1.015
+        and price <= vw15 * 1.025
+        and rs15 >= 26
     )
 
     if bullish_context:
-        quality = 84
+        quality = 82
 
         if trend1h in ["BULLISH", "SOFT_BULLISH"]:
             quality += 4
@@ -1263,8 +1427,12 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             quality += 4
         if btc_status in ["BULLISH", "SOFT_BULLISH"]:
             quality += 4
-        if vr5 >= 0.95:
+        if vr5 >= 0.85:
+            quality += 2
+        if vr5 >= 1.00:
             quality += 3
+        if range_pos < 0.75:
+            quality += 2
 
         return {
             "regime": "TREND_CONTINUATION",
@@ -1272,7 +1440,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             "speed": "MEDIUM",
             "quality": min(quality, 96),
             "expected_hold": "30 минут – 4 часа",
-            "allowed_trade_classes": ["TREND", "STRUCTURE"],
+            "allowed_trade_classes": ["TREND", "STRUCTURE", "FAST"],
             "range_low": range_low,
             "range_high": range_high,
             "range_width": round(range_width, 2),
@@ -1283,7 +1451,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
         }
 
     if bearish_context:
-        quality = 84
+        quality = 82
 
         if trend1h in ["BEARISH", "SOFT_BEARISH"]:
             quality += 4
@@ -1291,8 +1459,12 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             quality += 4
         if btc_status in ["BEARISH", "SOFT_BEARISH"]:
             quality += 4
-        if vr5 >= 0.95:
+        if vr5 >= 0.85:
+            quality += 2
+        if vr5 >= 1.00:
             quality += 3
+        if range_pos > 0.25:
+            quality += 2
 
         return {
             "regime": "TREND_CONTINUATION",
@@ -1300,7 +1472,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             "speed": "MEDIUM",
             "quality": min(quality, 96),
             "expected_hold": "30 минут – 4 часа",
-            "allowed_trade_classes": ["TREND", "STRUCTURE"],
+            "allowed_trade_classes": ["TREND", "STRUCTURE", "FAST"],
             "range_low": range_low,
             "range_high": range_high,
             "range_width": round(range_width, 2),
@@ -1310,13 +1482,16 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
             "avoid_reason": None,
         }
 
-    # RANGE STRUCTURE
-    if 1.8 <= range_width <= 16:
-        if range_pos <= 0.30 and btc_status != "BEARISH":
-            quality = 84
-            if rs5 >= 30:
+    # RANGE STRUCTURE — границы чуть шире.
+    if 1.6 <= range_width <= 18:
+        if range_pos <= 0.36 and btc_status != "BEARISH":
+            quality = 83
+
+            if rs5 >= 28:
                 quality += 3
-            if vr5 >= 0.85:
+            if vr5 >= 0.75:
+                quality += 2
+            if vr5 >= 0.95:
                 quality += 3
 
             return {
@@ -1325,7 +1500,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
                 "speed": "SLOW",
                 "quality": min(quality, 94),
                 "expected_hold": "1–8 часов",
-                "allowed_trade_classes": ["RANGE", "STRUCTURE", "SWING"],
+                "allowed_trade_classes": ["RANGE", "STRUCTURE", "TREND"],
                 "range_low": range_low,
                 "range_high": range_high,
                 "range_width": round(range_width, 2),
@@ -1334,11 +1509,14 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
                 "avoid_reason": None,
             }
 
-        if range_pos >= 0.70 and btc_status != "BULLISH":
-            quality = 84
-            if rs5 <= 70:
+        if range_pos >= 0.64 and btc_status != "BULLISH":
+            quality = 83
+
+            if rs5 <= 72:
                 quality += 3
-            if vr5 >= 0.85:
+            if vr5 >= 0.75:
+                quality += 2
+            if vr5 >= 0.95:
                 quality += 3
 
             return {
@@ -1347,7 +1525,7 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
                 "speed": "SLOW",
                 "quality": min(quality, 94),
                 "expected_hold": "1–8 часов",
-                "allowed_trade_classes": ["RANGE", "STRUCTURE", "SWING"],
+                "allowed_trade_classes": ["RANGE", "STRUCTURE", "TREND"],
                 "range_low": range_low,
                 "range_high": range_high,
                 "range_width": round(range_width, 2),
@@ -1369,9 +1547,9 @@ def classify_market_profile(symbol, c1, c5, c15, c1h, c4h, btc_status) -> dict:
     }
 
 
-# =========================
+# ============================================================
 # RISK / SIGNAL BUILDING
-# =========================
+# ============================================================
 
 def make_tp_by_roi(entry: float, direction: str, roi_percent: float) -> float:
     price_move = roi_percent / LEVERAGE / 100
@@ -1424,7 +1602,7 @@ def calculate_position(entry: float, sl: float, deposit: float, risk_percent: fl
 
 def model_probability_from_score(score: int, rr: float, volume_ratio_value: float, profile_quality: int) -> int:
     """
-    Это НЕ реальная гарантия вероятности.
+    Это НЕ гарантия вероятности.
     Это модельная оценка качества сетапа для Telegram.
     """
     probability = 45
@@ -1437,6 +1615,11 @@ def model_probability_from_score(score: int, rr: float, volume_ratio_value: floa
 
 
 def classify_signal(score: int, rr: float, volume_ratio_value: float, filters: dict, strategy: str, direction: str) -> Optional[dict]:
+    """
+    V11.2 Balanced:
+    STRONG стал чуть доступнее.
+    WEAK всё ещё выключен по умолчанию через ALLOW_WEAK_SIGNALS=false.
+    """
     if filters.get("blocked"):
         return None
 
@@ -1446,8 +1629,10 @@ def classify_signal(score: int, rr: float, volume_ratio_value: float, filters: d
     if is_statistically_bad_strategy_side(strategy, direction):
         return None
 
+    required_score = A_PLUS_MIN_SCORE + defensive_score_bonus_required()
+
     if (
-        score >= A_PLUS_MIN_SCORE
+        score >= required_score
         and rr >= A_PLUS_MIN_RR
         and volume_ratio_value >= A_PLUS_MIN_VOLUME_RATIO
     ):
@@ -1460,7 +1645,7 @@ def classify_signal(score: int, rr: float, volume_ratio_value: float, filters: d
         return None
 
     if (
-        score >= WEAK_MIN_SCORE
+        score >= WEAK_MIN_SCORE + defensive_score_bonus_required()
         and rr >= WEAK_MIN_RR
         and volume_ratio_value >= WEAK_MIN_VOLUME_RATIO
     ):
@@ -1632,14 +1817,17 @@ def build_signal(
     }
 
 
-# =========================
+# ============================================================
 # STRATEGIES
-# =========================
+# ============================================================
 
 def evaluate_fast_reaction_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent, profile):
     strategy = "FAST_REACTION_PRO"
 
-    if profile.get("regime") != "FAST_MOMENTUM":
+    # V11.2:
+    # FAST может появиться не только в чистом FAST_MOMENTUM,
+    # но и внутри трендового режима, если цена дала быстрый откат/реакцию.
+    if profile.get("regime") not in ["FAST_MOMENTUM", "TREND_CONTINUATION"]:
         return None
 
     if direction != profile.get("direction_bias"):
@@ -1661,23 +1849,29 @@ def evaluate_fast_reaction_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_sta
     if a5 is None or vw15 is None or rs5 is None or rs15 is None or ema21_5 is None or ema50_15 is None:
         return None
 
+    if vr5 < FAST_MIN_VOLUME_RATIO:
+        return None
+
     if recent_failed_push(c5, direction):
         return None
 
+    # V11.2: зона отката чуть шире.
     pullback_zone_long = (
-        ema21_5 * 0.987 <= price <= ema21_5 * 1.018
-        or vw15 * 0.985 <= price <= vw15 * 1.016
+        ema21_5 * 0.986 <= price <= ema21_5 * 1.020
+        or vw15 * 0.984 <= price <= vw15 * 1.018
     )
 
     pullback_zone_short = (
-        ema21_5 * 0.982 <= price <= ema21_5 * 1.010
-        or vw15 * 0.984 <= price <= vw15 * 1.014
+        ema21_5 * 0.980 <= price <= ema21_5 * 1.014
+        or vw15 * 0.982 <= price <= vw15 * 1.016
     )
 
     score = 84
 
+    if vr5 >= 0.85:
+        score += 2
     if vr5 >= 1.00:
-        score += 4
+        score += 3
     if vr5 >= 1.25:
         score += 4
     if confirmed_5m_followthrough(c5, direction):
@@ -1692,18 +1886,18 @@ def evaluate_fast_reaction_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_sta
             return None
         if not confirmed_5m_followthrough(c5, "LONG"):
             return None
-        if rs5 > 74 or rs15 > 72:
+        if rs5 > 76 or rs15 > 74:
             return None
-        if price < ema50_15 * 0.975:
+        if price < ema50_15 * 0.970:
             return None
 
         sl = min(
             min(c["low"] for c in c5[-24:]) - a5 * 0.45,
-            price * 0.992
+            price * 0.992,
         )
 
         reason = (
-            "FAST LONG: монета уже дала быстрый импульс, но вход не на вершине. "
+            "FAST LONG: монета дала быстрый импульс, но вход не на вершине. "
             "Цена вернулась к EMA/VWAP, затем 5m снова показал покупателя. "
             "Это быстрая сделка, её не нужно держать как structure."
         )
@@ -1715,18 +1909,18 @@ def evaluate_fast_reaction_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_sta
             return None
         if not confirmed_5m_followthrough(c5, "SHORT"):
             return None
-        if rs5 < 26 or rs15 < 28:
+        if rs5 < 24 or rs15 < 26:
             return None
-        if price > ema50_15 * 1.025:
+        if price > ema50_15 * 1.030:
             return None
 
         sl = max(
             max(c["high"] for c in c5[-24:]) + a5 * 0.45,
-            price * 1.008
+            price * 1.008,
         )
 
         reason = (
-            "FAST SHORT: монета уже дала быстрый импульс вниз, но вход не в самом низу. "
+            "FAST SHORT: монета дала быстрый импульс вниз, но вход не в самом низу. "
             "Был откат к EMA/VWAP, затем 5m снова показал продавца. "
             "Это быстрая сделка, её не нужно держать как structure."
         )
@@ -1761,7 +1955,10 @@ def evaluate_fast_reaction_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_sta
 def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent, profile):
     strategy = "TREND_CONTINUATION_PRO"
 
-    if profile.get("regime") != "TREND_CONTINUATION":
+    # V11.2:
+    # Трендовая сделка может появиться и после fast-движения,
+    # если fast уже перешёл в нормальный откат по тренду.
+    if profile.get("regime") not in ["TREND_CONTINUATION", "FAST_MOMENTUM", "RANGE_STRUCTURE"]:
         return None
 
     if direction != profile.get("direction_bias"):
@@ -1789,6 +1986,9 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
     if ema21_5 is None or ema50_15 is None or ema100_15 is None:
         return None
 
+    if vr5 < TREND_MIN_VOLUME_RATIO:
+        return None
+
     trend1h = trend_state(c1h)
     trend4h = trend_state(c4h)
 
@@ -1797,7 +1997,9 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
 
     score = 84
 
-    if vr5 >= 0.90:
+    if vr5 >= 0.80:
+        score += 2
+    if vr5 >= 0.95:
         score += 3
     if vr5 >= 1.10:
         score += 4
@@ -1810,14 +2012,18 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
         if btc_status == "BEARISH":
             return None
 
-        htf_ok = trend1h in ["BULLISH", "SOFT_BULLISH"] or trend4h in ["BULLISH", "SOFT_BULLISH"]
+        htf_ok = (
+            trend1h in ["BULLISH", "SOFT_BULLISH"]
+            or trend4h in ["BULLISH", "SOFT_BULLISH"]
+            or price > vw15 * 1.002
+        )
 
         if not htf_ok:
             return None
 
         pullback_zone = (
-            ema21_5 * 0.988 <= price <= ema21_5 * 1.018
-            or vw15 * 0.985 <= price <= vw15 * 1.018
+            ema21_5 * 0.986 <= price <= ema21_5 * 1.022
+            or vw15 * 0.984 <= price <= vw15 * 1.020
         )
 
         if not pullback_zone:
@@ -1826,10 +2032,10 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
         if not confirmed_5m_followthrough(c5, "LONG"):
             return None
 
-        if rs5 > 74 or rs15 > 72:
+        if rs5 > 76 or rs15 > 74:
             return None
 
-        if price < ema50_15 * 0.985 or price < ema100_15 * 0.975:
+        if price < ema50_15 * 0.980 or price < ema100_15 * 0.970:
             return None
 
         if btc_status in ["BULLISH", "SOFT_BULLISH"]:
@@ -1854,14 +2060,18 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
         if btc_status == "BULLISH":
             return None
 
-        htf_ok = trend1h in ["BEARISH", "SOFT_BEARISH"] or trend4h in ["BEARISH", "SOFT_BEARISH"]
+        htf_ok = (
+            trend1h in ["BEARISH", "SOFT_BEARISH"]
+            or trend4h in ["BEARISH", "SOFT_BEARISH"]
+            or price < vw15 * 0.998
+        )
 
         if not htf_ok:
             return None
 
         pullback_zone = (
-            ema21_5 * 0.982 <= price <= ema21_5 * 1.012
-            or vw15 * 0.982 <= price <= vw15 * 1.014
+            ema21_5 * 0.978 <= price <= ema21_5 * 1.016
+            or vw15 * 0.980 <= price <= vw15 * 1.018
         )
 
         if not pullback_zone:
@@ -1870,10 +2080,10 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
         if not confirmed_5m_followthrough(c5, "SHORT"):
             return None
 
-        if rs5 < 26 or rs15 < 28:
+        if rs5 < 24 or rs15 < 26:
             return None
 
-        if price > ema50_15 * 1.015 or price > ema100_15 * 1.025:
+        if price > ema50_15 * 1.020 or price > ema100_15 * 1.030:
             return None
 
         if btc_status in ["BEARISH", "SOFT_BEARISH"]:
@@ -1903,7 +2113,7 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
         entry=price,
         sl=sl,
         score=score,
-        vol_ratio=max(vr5, 0.85),
+        vol_ratio=max(vr5, 0.80),
         reason=reason,
         deposit=deposit,
         risk_percent=risk_percent,
@@ -1924,7 +2134,7 @@ def evaluate_trend_continuation_pro(symbol, direction, c15, c5, c1, c1h, c4h, bt
 def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_status, deposit, risk_percent, profile):
     strategy = "RANGE_STRUCTURE_PRO"
 
-    if profile.get("regime") != "RANGE_STRUCTURE":
+    if profile.get("regime") not in ["RANGE_STRUCTURE", "TREND_CONTINUATION"]:
         return None
 
     if direction != profile.get("direction_bias"):
@@ -1933,9 +2143,17 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
     price = c5[-1]["close"]
     range_low = float(profile.get("range_low", 0))
     range_high = float(profile.get("range_high", 0))
+    range_pos = float(profile.get("range_pos", 0.5))
 
     if range_low <= 0 or range_high <= range_low:
         return None
+
+    # Если профиль TREND, range-сделку разрешаем только если цена реально близко к границе.
+    if profile.get("regime") == "TREND_CONTINUATION":
+        if direction == "LONG" and range_pos > 0.40:
+            return None
+        if direction == "SHORT" and range_pos < 0.60:
+            return None
 
     closes5 = [c["close"] for c in c5]
     closes15 = [c["close"] for c in c15]
@@ -1949,12 +2167,17 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
     if a5 is None or a15 is None or rs5 is None or rs15 is None:
         return None
 
+    if vr5 < RANGE_MIN_VOLUME_RATIO:
+        return None
+
     if recent_failed_push(c5, direction):
         return None
 
     score = 86
 
-    if vr5 >= 0.85:
+    if vr5 >= 0.75:
+        score += 2
+    if vr5 >= 0.95:
         score += 3
     if vr5 >= 1.05:
         score += 3
@@ -1970,7 +2193,7 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
             return None
         if not confirmed_15m_direction(c15, "LONG"):
             return None
-        if rs5 > 68 or rs15 > 66:
+        if rs5 > 70 or rs15 > 68:
             return None
 
         sl = min(
@@ -1998,7 +2221,7 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
             return None
         if not confirmed_15m_direction(c15, "SHORT"):
             return None
-        if rs5 < 32 or rs15 < 34:
+        if rs5 < 30 or rs15 < 32:
             return None
 
         sl = max(
@@ -2028,7 +2251,7 @@ def evaluate_range_structure_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
         entry=price,
         sl=sl,
         score=score,
-        vol_ratio=max(vr5, 0.80),
+        vol_ratio=max(vr5, 0.75),
         reason=reason,
         deposit=deposit,
         risk_percent=risk_percent,
@@ -2129,7 +2352,7 @@ def evaluate_extreme_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
         if not (continuation or reversal):
             return None
 
-        if rs5 > 76 or rs15 > 74:
+        if rs5 > 78 or rs15 > 76:
             return None
 
         if recent_failed_push(c5, "LONG"):
@@ -2173,7 +2396,7 @@ def evaluate_extreme_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
         if not (continuation or reversal):
             return None
 
-        if rs5 < 24 or rs15 < 26:
+        if rs5 < 22 or rs15 < 24:
             return None
 
         if recent_failed_push(c5, "SHORT"):
@@ -2223,9 +2446,16 @@ def evaluate_extreme_context_pro(symbol, direction, c15, c5, c1, c1h, c4h, btc_s
 
 
 def choose_strategy_functions_by_profile(profile: dict, symbol: str):
+    """
+    V11.2 Balanced:
+    Режим рынка выбирает основной набор стратегий.
+    Но бот не должен быть слишком мёртвым, поэтому в некоторых режимах
+    разрешаем 2-3 похожих сценария, если они сами пройдут подтверждения.
+    """
     regime = profile.get("regime")
     base = base_from_symbol(symbol)
 
+    # Risky/shitcoin только через EXTREME.
     if is_risky_base(base):
         return [evaluate_extreme_context_pro]
 
@@ -2236,25 +2466,28 @@ def choose_strategy_functions_by_profile(profile: dict, symbol: str):
         return [
             evaluate_fast_reaction_pro,
             evaluate_extreme_context_pro,
+            evaluate_trend_continuation_pro,
         ]
 
     if regime == "TREND_CONTINUATION":
         return [
             evaluate_trend_continuation_pro,
             evaluate_fast_reaction_pro,
+            evaluate_range_structure_pro,
         ]
 
     if regime == "RANGE_STRUCTURE":
         return [
             evaluate_range_structure_pro,
+            evaluate_trend_continuation_pro,
         ]
 
     return []
 
 
-# =========================
+# ============================================================
 # ANALYSIS / SCAN
-# =========================
+# ============================================================
 
 def analyze_symbol(
     symbol: str,
@@ -2332,6 +2565,17 @@ def analyze_symbol(
 
 def scan_best_signal(deposit: float, risk_percent: float) -> dict:
     cleanup_state()
+
+    allowed, reason = can_open_new_signal()
+    if not allowed:
+        return {
+            "ok": False,
+            "checked": 0,
+            "btc_status": "UNKNOWN",
+            "message": f"Новый сигнал запрещён защитой: {reason}",
+            "protection_reason": reason,
+        }
+
     symbols = get_symbols()
 
     best = None
@@ -2395,16 +2639,15 @@ def scan_best_signal(deposit: float, risk_percent: float) -> dict:
     }
 
 
-# =========================
+# ============================================================
 # TELEGRAM MESSAGES
-# =========================
+# ============================================================
 
 def strategy_title(strategy: str) -> str:
     names = {
         "FAST_REACTION_PRO": "⚡ Fast Reaction Pro",
         "TREND_CONTINUATION_PRO": "📈 Trend Continuation Pro",
         "RANGE_STRUCTURE_PRO": "🏗 Range Structure Pro",
-        "STRUCTURE_SWING_PRO": "🏗 Structure Swing Pro",
         "EXTREME_CONTEXT_PRO": "🔥 Extreme Context Pro",
     }
     return names.get(strategy, strategy)
@@ -2529,7 +2772,7 @@ def build_stats_text() -> str:
         )
 
     return f"""
-📊 <b>Статистика V11:</b>
+📊 <b>Статистика V11.2:</b>
 
 📈 LONG: {long_stats['positive']} позитив / {long_stats['sl']} SL / WR {long_wr}%
 📉 SHORT: {short_stats['positive']} позитив / {short_stats['sl']} SL / WR {short_wr}%
@@ -2568,13 +2811,14 @@ def send_telegram_message(text: str) -> dict:
         }
 
 
-# =========================
+# ============================================================
 # SIGNAL SAVE / TRACKING
-# =========================
+# ============================================================
 
 def save_signal(signal: dict):
     STATE["active_signals"][signal["id"]] = signal
     STATE["sent_signals"][signal["id"]] = now_ts()
+    register_signal_sent()
     set_cooldown(signal["symbol"])
     save_state(STATE)
 
@@ -2615,10 +2859,14 @@ def apply_result(signal: dict, result: str):
             STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] = 0
             notes.append(f"⛔ {strategy_side_key} отключён после серии SL.")
 
+        notes.extend(register_global_sl())
+
     elif result in ["TP1", "TP2", "TP3", "PROFIT_AFTER_TP1", "PROFIT_AFTER_TP2"]:
         STATE["stats"]["side"][side]["consecutive_sl"] = 0
         STATE["stats"]["strategy"][strategy]["consecutive_sl"] = 0
         STATE["stats"]["strategy_side"][strategy_side_key]["consecutive_sl"] = 0
+
+        register_global_positive()
 
         if not signal.get("counted_positive"):
             signal["counted_positive"] = True
@@ -2858,9 +3106,9 @@ def track_active_signals(send_to_telegram: bool = True) -> dict:
     }
 
 
-# =========================
+# ============================================================
 # AUTO WORKER
-# =========================
+# ============================================================
 
 async def auto_worker():
     await asyncio.sleep(10)
@@ -2904,7 +3152,7 @@ async def auto_worker():
 
                         if DEBUG_NO_SIGNAL_REPORT_ENABLED and current_time - last_report >= DEBUG_NO_SIGNAL_REPORT_SECONDS:
                             report = (
-                                "🧠 <b>Диагностика V11</b>\n\n"
+                                "🧠 <b>Диагностика V11.2</b>\n\n"
                                 f"Проверено пар: {result.get('checked', 0)}\n"
                                 f"BTC статус: {result.get('btc_status', 'NEUTRAL')}\n"
                                 "Сильных сигналов сейчас нет.\n\n"
@@ -2931,9 +3179,9 @@ async def auto_worker():
             await asyncio.sleep(30)
 
 
-# =========================
+# ============================================================
 # ROUTES
-# =========================
+# ============================================================
 
 @app.on_event("startup")
 async def startup_event():
@@ -2946,10 +3194,13 @@ async def startup_event():
         f"Weak signals: {'ON' if ALLOW_WEAK_SIGNALS else 'OFF'}\n"
         f"Quality only: {'ON' if QUALITY_ONLY_MODE else 'OFF'}\n"
         f"Risky extreme: {'ON' if ALLOW_RISKY_EXTREME_TRADES else 'OFF'}\n"
-        f"Max symbols: {MAX_SYMBOLS}\n\n"
-        "V11 логика: бот сначала определяет режим рынка "
+        f"Max symbols: {MAX_SYMBOLS}\n"
+        f"Max active signals: {MAX_ACTIVE_SIGNALS}\n"
+        f"Max signals/hour: {MAX_SIGNALS_PER_HOUR}\n"
+        f"Pause after SL series: {GLOBAL_PAUSE_AFTER_SL_SECONDS // 60} min\n\n"
+        "V11.2 Active Defensive логика: бот сначала определяет режим рынка "
         "FAST / TREND / RANGE / EXTREME, потом выбирает стратегию. "
-        "В Telegram будет стратегия, сила сигнала, модельная вероятность, вход, SL, TP и время отработки."
+        "Версия Balanced стала менее мёртвой, но слабые сигналы по умолчанию выключены."
     )
 
     send_telegram_message(text)
@@ -2997,6 +3248,11 @@ def health():
         "max_symbols": MAX_SYMBOLS,
         "weak_signals": ALLOW_WEAK_SIGNALS,
         "quality_only_mode": QUALITY_ONLY_MODE,
+        "max_active_signals": MAX_ACTIVE_SIGNALS,
+        "max_signals_per_hour": MAX_SIGNALS_PER_HOUR,
+        "global_consecutive_sl": STATE.get("auto", {}).get("global_consecutive_sl", 0),
+        "global_pause_until": STATE.get("auto", {}).get("global_pause_until", 0),
+        "daily_sl": STATE.get("auto", {}).get("daily_sl", 0),
     }
 
 
@@ -3006,12 +3262,17 @@ def version():
         "ok": True,
         "service": APP_NAME,
         "deploy_marker": DEPLOY_MARKER,
-        "logic": "V11 Market Regime Engine",
+        "logic": "V11.2 Balanced Market Regime Engine",
         "regimes": ["FAST_MOMENTUM", "TREND_CONTINUATION", "RANGE_STRUCTURE", "EXTREME_ONLY"],
         "strong_min_score": A_PLUS_MIN_SCORE,
         "weak_min_score": WEAK_MIN_SCORE,
         "min_target_roi_tp1": MIN_TARGET_ROI_PERCENT,
         "leverage": LEVERAGE,
+        "max_active_signals": MAX_ACTIVE_SIGNALS,
+        "max_signals_per_hour": MAX_SIGNALS_PER_HOUR,
+        "max_global_consecutive_sl": MAX_GLOBAL_CONSECUTIVE_SL,
+        "global_pause_after_sl_seconds": GLOBAL_PAUSE_AFTER_SL_SECONDS,
+        "max_daily_sl": MAX_DAILY_SL,
     }
 
 
@@ -3042,6 +3303,15 @@ def auto_signal(
 ):
     if send_to_telegram:
         require_api_key(key)
+        allowed, protection_reason = can_open_new_signal()
+        if not allowed:
+            return {
+                "ok": False,
+                "symbol": display_symbol(symbol),
+                "direction": direction,
+                "message": f"Новый сигнал запрещён защитой: {protection_reason}",
+                "protection_reason": protection_reason,
+            }
 
     btc_status = detect_btc_status()
 
@@ -3126,6 +3396,12 @@ def stats():
         "stats": STATE["stats"],
         "stats_text": build_stats_text(),
         "active_signals": len(STATE["active_signals"]),
+        "protection": {
+            "global_consecutive_sl": STATE.get("auto", {}).get("global_consecutive_sl", 0),
+            "global_pause_until": STATE.get("auto", {}).get("global_pause_until", 0),
+            "daily_sl": STATE.get("auto", {}).get("daily_sl", 0),
+            "signals_last_hour": len(STATE.get("auto", {}).get("signals_sent_times", [])),
+        },
         "blocked_symbols": {
             display_symbol(k): int(v - now_ts())
             for k, v in STATE["blocked_symbols"].items()
