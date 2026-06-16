@@ -19,15 +19,15 @@ from fastapi.responses import HTMLResponse
 # quality universe -> BTC regime -> HTF context -> strategy -> entry near invalidation -> TP1 >= 10% ROI at x10
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V11.5.1 ACTIVE OPPORTUNITY SCORE FIX"
-DEPLOY_MARKER = "V11_5_1_ACTIVE_OPPORTUNITY_SCORE_FIX_2026_06_15"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V11.6 LIVE OPPORTUNITY BALANCED"
+DEPLOY_MARKER = "V11_6_LIVE_OPPORTUNITY_BALANCED_2026_06_16"
 
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_5_1.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_6.json")
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
@@ -35,12 +35,12 @@ MIN_TP1_ROI_PERCENT = float(os.getenv("MIN_TP1_ROI_PERCENT", "10"))
 MIN_TP1_PRICE_MOVE_PERCENT = MIN_TP1_ROI_PERCENT / max(LEVERAGE, 1.0)
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "35"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "30"))
 TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "20"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "1000"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "1200"))
 SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "10"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5"))
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "900"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "600"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
 ANALYTICS_TOP_MOVERS = int(os.getenv("ANALYTICS_TOP_MOVERS", "18"))
 ANALYTICS_TOP_SETUPS = int(os.getenv("ANALYTICS_TOP_SETUPS", "8"))
@@ -57,7 +57,7 @@ EXTREME_RISK_MULTIPLIER = float(os.getenv("EXTREME_RISK_MULTIPLIER", "0.12"))
 MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "1200000"))
 MIN_ACTIVE_QUOTE_VOLUME_USDT = float(os.getenv("MIN_ACTIVE_QUOTE_VOLUME_USDT", "2500000"))
 DYNAMIC_TOP_N = int(os.getenv("DYNAMIC_TOP_N", "500"))
-DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("DYNAMIC_MIN_CHANGE_PERCENT", "0.7"))
+DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("DYNAMIC_MIN_CHANGE_PERCENT", "0.4"))
 EXTREME_MIN_CHANGE_PERCENT = float(os.getenv("EXTREME_MIN_CHANGE_PERCENT", "12.0"))
 ULTRA_RISK_5M_MOVE_BLOCK = float(os.getenv("ULTRA_RISK_5M_MOVE_BLOCK", "6.0"))
 ULTRA_RISK_15M_MOVE_BLOCK = float(os.getenv("ULTRA_RISK_15M_MOVE_BLOCK", "9.0"))
@@ -83,6 +83,13 @@ ULTRA_RISK_BASES = {
 }
 
 BLOCKED_BASES = {"USDC", "BUSD", "FDUSD", "TUSD", "DAI"}
+
+FALLBACK_BASES = [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ", "SEI",
+    "ARB", "OP", "APT", "TON", "DOT", "ADA", "DOGE", "LTC", "BCH", "UNI", "ETC", "ATOM", "FIL",
+    "TRX", "ICP", "MKR", "RUNE", "FET", "TIA", "JUP", "PYTH", "LDO", "CRV", "COMP", "GALA",
+    "WLD", "ENA", "ONDO", "ORDI", "STX", "PENDLE", "JTO"
+]
 
 STATE: Dict[str, Any] = {
     "active_signals": [],
@@ -462,6 +469,12 @@ def get_symbols() -> List[str]:
             if is_good_symbol(s):
                 all_symbols.append(s)
 
+    # If BingX contracts/tickers endpoint returns empty on a deploy, do not let the bot silently scan zero symbols.
+    # Use a conservative fallback universe of liquid USDT futures names. Non-listed symbols will simply fail kline fetch and be skipped.
+    if not all_symbols:
+        all_symbols = [normalize_symbol(x + "USDT") for x in FALLBACK_BASES]
+        STATE["last_error"] = "contracts endpoint returned 0 symbols; fallback universe enabled"
+
     dynamic = get_dynamic_symbols()
     quality = [s for s in all_symbols if base_from_symbol(s) in QUALITY_BASES]
     active = [s for s in all_symbols if base_from_symbol(s) not in QUALITY_BASES]
@@ -655,10 +668,10 @@ def build_signal(symbol: str, side: str, strategy: str, trade_type: str, entry: 
         return None
     rr = reward / max(risk, entry * 0.0001)
     # Need realistic RR. Swing can have slightly lower tp1 RR, because tp2 is structural.
-    min_rr = 0.55 if trade_type in ["RANGE EDGE", "STRUCTURE SWING", "ACTIVE TREND", "PULLBACK RECLAIM"] else 0.68
+    min_rr = 0.42 if trade_type in ["RANGE EDGE", "STRUCTURE SWING", "ACTIVE TREND", "PULLBACK RECLAIM", "QUALITY RECLAIM"] else 0.58
     if rr < min_rr:
         return None
-    grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= 0.72 else "B"
+    grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= 0.62 else "B"
     if grade == "B" and (not ALLOW_B_SIGNALS or score < B_MIN_SCORE):
         return None
     allowed, why = adaptive_allows(strategy, side, grade)
@@ -951,6 +964,74 @@ def strategy_pullback_reclaim(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h)
                 out.append(sig)
     return out
 
+
+def strategy_quality_reclaim(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h) -> List[CandidateSignal]:
+    """V11.6 balanced live opportunity.
+    This is the anti-silence module: liquid/quality coins only, no ultra-risk, entry after reclaim/reject near EMA/VWAP.
+    It keeps TP1 >= 10% ROI at x10, but does not demand a perfect 1H/4H trend.
+    """
+    out: List[CandidateSignal] = []
+    base = base_from_symbol(symbol)
+    if is_ultra_risk(symbol, c5, c15):
+        return out
+    # Focus on cleaner names. Broad active names can still be traded by other strategies.
+    if base not in QUALITY_BASES:
+        # allow only if it is not too wild and has clean 15m structure
+        if max(candle_move_percent(x) for x in c5[-8:]) > 3.2:
+            return out
+    t1, s1, _ = trend_from_candles(c1h)
+    t4, s4, _ = trend_from_candles(c4h)
+    cl5, cl15 = closes(c5), closes(c15)
+    entry = cl5[-1]
+    e20_5, e50_5 = ema(cl5, 20), ema(cl5, 50)
+    e20_15, e50_15 = ema(cl15, 20), ema(cl15, 50)
+    vw15 = vwap(c15, 64)
+    a15 = atr(c15, 14)[-1]
+    volr = volume_ratio(c15)
+    r15 = rsi(cl15, 14)[-1]
+    range15 = pct(recent_high(c15, 32), recent_low(c15, 32))
+    if range15 < 0.95:
+        return out
+
+    # LONG: BTC not dumping, 4H not hard bearish, 5m reclaim after local pullback.
+    side = "LONG"
+    ok_btc, btc_text, btc_delta = btc_allows(side, btc)
+    if ok_btc and t4 != "TREND_DOWN":
+        pullback = pct(recent_high(c15, 20), recent_low(c5, 10))
+        near_zone = abs(entry - min(max(e20_15[-1], e50_15[-1]), max(entry, vw15))) / entry * 100 <= 2.4
+        reclaim = entry > e20_5[-1] and cl5[-1] > cl5[-2] and cl5[-1] > c5[-1]["open"]
+        impulse_not_late = pct(entry, recent_low(c15, 20)) <= 6.8 and pct(recent_high(c15, 10), entry) <= 3.2
+        if pullback >= 0.35 and near_zone and reclaim and impulse_not_late and r15 >= 45 and not wick_exhaustion(c5, side):
+            swing_low = recent_low(c15, 24)
+            sl = min(swing_low - a15 * 0.16, entry * 0.984)
+            tp1 = max(entry * (1 + MIN_TP1_PRICE_MOVE_PERCENT/100 + 0.0008), entry + (entry - sl) * 0.55)
+            score = 62 + btc_delta + int(s1 * 0.06) + int(s4 * 0.04) + (8 if volr >= 0.7 else 3) + (8 if base in QUALITY_BASES else 2)
+            reason = f"Quality Reclaim LONG: откат не сломан, цена вернулась выше 5m EMA рядом с 15m EMA/VWAP. 1H {t1}, 4H {t4}, RSI15 {r15:.0f}, volume x{volr:.2f}."
+            sig = build_signal(symbol, side, "QUALITY_RECLAIM", "QUALITY RECLAIM", entry, sl, tp1, score, reason,
+                               "сценарий сломан при закреплении ниже зоны reclaim/swing-low", btc_text, "20 минут – 2 часа", 0.55)
+            if sig:
+                out.append(sig)
+
+    # SHORT: BTC not pumping, 4H not hard bullish, 5m reject after local bounce.
+    side = "SHORT"
+    ok_btc, btc_text, btc_delta = btc_allows(side, btc)
+    if ok_btc and t4 != "TREND_UP":
+        bounce = pct(recent_high(c5, 10), recent_low(c15, 20))
+        near_zone = abs(entry - max(min(e20_15[-1], e50_15[-1]), min(entry, vw15))) / entry * 100 <= 2.4
+        reject = entry < e20_5[-1] and cl5[-1] < cl5[-2] and cl5[-1] < c5[-1]["open"]
+        impulse_not_late = pct(recent_high(c15, 20), entry) <= 6.8 and pct(entry, recent_low(c15, 10)) <= 3.2
+        if bounce >= 0.35 and near_zone and reject and impulse_not_late and r15 <= 55 and not wick_exhaustion(c5, side):
+            swing_high = recent_high(c15, 24)
+            sl = max(swing_high + a15 * 0.16, entry * 1.016)
+            tp1 = min(entry * (1 - MIN_TP1_PRICE_MOVE_PERCENT/100 - 0.0008), entry - (sl - entry) * 0.55)
+            score = 62 + btc_delta + int(s1 * 0.06) + int(s4 * 0.04) + (8 if volr >= 0.7 else 3) + (8 if base in QUALITY_BASES else 2)
+            reason = f"Quality Reclaim SHORT: отскок не закрепился, цена вернулась ниже 5m EMA рядом с 15m EMA/VWAP. 1H {t1}, 4H {t4}, RSI15 {r15:.0f}, volume x{volr:.2f}."
+            sig = build_signal(symbol, side, "QUALITY_RECLAIM", "QUALITY RECLAIM", entry, sl, tp1, score, reason,
+                               "сценарий сломан при закреплении выше зоны reject/swing-high", btc_text, "20 минут – 2 часа", 0.55)
+            if sig:
+                out.append(sig)
+    return out
+
 def strategy_extreme_context(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h) -> List[CandidateSignal]:
     out = []
     # Extreme only if recent move is significant; ultra-risk has tiny risk, normal active also allowed.
@@ -1037,6 +1118,7 @@ def analyze_symbol(symbol: str, btc: MarketRegime) -> Optional[CandidateSignal]:
         candidates += strategy_breakout_retest(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_active_trend_continuation(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_pullback_reclaim(symbol, btc, c5, c15, c1h, c4h)
+        candidates += strategy_quality_reclaim(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_extreme_context(symbol, btc, c5, c15, c1h, c4h)
         if not candidates:
             return None
@@ -1420,7 +1502,7 @@ STARTUP_TEXT = (
     f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS} / Workers: {SCAN_WORKERS}.\n\n"
     f"Архитектура: quality universe → BTC → 4H/1H context → 15m confirm → 5m entry.\n"
     f"V11.4 Active Trend: ON — faster scan, quality-first, active trend continuation, TP1 >= 10% ROI.\n"
-    f"Стратегии: TREND_PULLBACK / ACTIVE_TREND_CONTINUATION / PULLBACK_RECLAIM / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
+    f"Стратегии: TREND_PULLBACK / ACTIVE_TREND_CONTINUATION / PULLBACK_RECLAIM / QUALITY_RECLAIM / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
     f"A+ и B: ON, но B = medium-quality с меньшим риском, не мусор.\n"
     f"TP1 filter: минимум {MIN_TP1_ROI_PERCENT:.0f}% ROI при x{LEVERAGE:.0f}.\n"
     f"Ultra-risk: обычные стратегии заблокированы, только EXTREME_CONTEXT с малым риском.\n"
