@@ -19,15 +19,15 @@ from fastapi.responses import HTMLResponse
 # quality universe -> BTC regime -> HTF context -> strategy -> entry near invalidation -> TP1 >= 10% ROI at x10
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V11.6 LIVE OPPORTUNITY BALANCED"
-DEPLOY_MARKER = "V11_6_LIVE_OPPORTUNITY_BALANCED_2026_06_16"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V11.7 STAT SMART OPPORTUNITY"
+DEPLOY_MARKER = "V11_7_STAT_SMART_OPPORTUNITY_2026_06_17"
 
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_6.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_7.json")
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
@@ -35,13 +35,13 @@ MIN_TP1_ROI_PERCENT = float(os.getenv("MIN_TP1_ROI_PERCENT", "10"))
 MIN_TP1_PRICE_MOVE_PERCENT = MIN_TP1_ROI_PERCENT / max(LEVERAGE, 1.0)
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "30"))
-TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "20"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "1200"))
-SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "10"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "25"))
+TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "18"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "1400"))
+SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "12"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5"))
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "600"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "420"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "10"))
 ANALYTICS_TOP_MOVERS = int(os.getenv("ANALYTICS_TOP_MOVERS", "18"))
 ANALYTICS_TOP_SETUPS = int(os.getenv("ANALYTICS_TOP_SETUPS", "8"))
 SEND_ANALYTICS_ON_STARTUP = os.getenv("SEND_ANALYTICS_ON_STARTUP", "false").lower() == "true"
@@ -54,10 +54,10 @@ A_PLUS_RISK_MULTIPLIER = float(os.getenv("A_PLUS_RISK_MULTIPLIER", "1.0"))
 B_RISK_MULTIPLIER = float(os.getenv("B_RISK_MULTIPLIER", "0.25"))
 EXTREME_RISK_MULTIPLIER = float(os.getenv("EXTREME_RISK_MULTIPLIER", "0.12"))
 
-MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "1200000"))
-MIN_ACTIVE_QUOTE_VOLUME_USDT = float(os.getenv("MIN_ACTIVE_QUOTE_VOLUME_USDT", "2500000"))
-DYNAMIC_TOP_N = int(os.getenv("DYNAMIC_TOP_N", "500"))
-DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("DYNAMIC_MIN_CHANGE_PERCENT", "0.4"))
+MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "650000"))
+MIN_ACTIVE_QUOTE_VOLUME_USDT = float(os.getenv("MIN_ACTIVE_QUOTE_VOLUME_USDT", "1200000"))
+DYNAMIC_TOP_N = int(os.getenv("DYNAMIC_TOP_N", "700"))
+DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("DYNAMIC_MIN_CHANGE_PERCENT", "0.25"))
 EXTREME_MIN_CHANGE_PERCENT = float(os.getenv("EXTREME_MIN_CHANGE_PERCENT", "12.0"))
 ULTRA_RISK_5M_MOVE_BLOCK = float(os.getenv("ULTRA_RISK_5M_MOVE_BLOCK", "6.0"))
 ULTRA_RISK_15M_MOVE_BLOCK = float(os.getenv("ULTRA_RISK_15M_MOVE_BLOCK", "9.0"))
@@ -668,7 +668,7 @@ def build_signal(symbol: str, side: str, strategy: str, trade_type: str, entry: 
         return None
     rr = reward / max(risk, entry * 0.0001)
     # Need realistic RR. Swing can have slightly lower tp1 RR, because tp2 is structural.
-    min_rr = 0.42 if trade_type in ["RANGE EDGE", "STRUCTURE SWING", "ACTIVE TREND", "PULLBACK RECLAIM", "QUALITY RECLAIM"] else 0.58
+    min_rr = 0.38 if trade_type in ["RANGE EDGE", "STRUCTURE SWING", "ACTIVE TREND", "PULLBACK RECLAIM", "QUALITY RECLAIM", "LIVE OPPORTUNITY"] else 0.55
     if rr < min_rr:
         return None
     grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= 0.62 else "B"
@@ -1032,6 +1032,76 @@ def strategy_quality_reclaim(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h) 
                 out.append(sig)
     return out
 
+
+def strategy_live_opportunity(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h) -> List[CandidateSignal]:
+    """V11.7 stat-smart live opportunity.
+    Purpose: prevent the bot from being silent while still avoiding ultra-risk noise.
+    It searches for practical 20m-2h futures opportunities: pullback -> reclaim/reject -> TP1 >= 10% ROI at x10.
+    Scores remain A+ 86 / B 78, but good context earns enough points to pass.
+    """
+    out: List[CandidateSignal] = []
+    base = base_from_symbol(symbol)
+    if is_ultra_risk(symbol, c5, c15):
+        return out
+
+    t1, s1, _ = trend_from_candles(c1h)
+    t4, s4, _ = trend_from_candles(c4h)
+    cl5, cl15 = closes(c5), closes(c15)
+    entry = cl5[-1]
+    e20_5, e50_5 = ema(cl5, 20), ema(cl5, 50)
+    e20_15, e50_15 = ema(cl15, 20), ema(cl15, 50)
+    vw15 = vwap(c15, 64)
+    a15 = atr(c15, 14)[-1]
+    volr = volume_ratio(c15)
+    r15 = rsi(cl15, 14)[-1]
+    quality_bonus = 10 if base in QUALITY_BASES else 4
+
+    # LONG: not fighting BTC, not fighting 4H downtrend, local pullback reclaimed.
+    side = "LONG"
+    ok_btc, btc_text, btc_delta = btc_allows(side, btc)
+    if ok_btc and t4 != "TREND_DOWN":
+        pullback_from_15m_high = pct(recent_high(c15, 28), entry)
+        lift_from_local_low = pct(entry, recent_low(c5, 18))
+        near_context_zone = min(abs(entry - e20_15[-1]), abs(entry - e50_15[-1]), abs(entry - vw15)) / entry * 100 <= 3.0
+        reclaimed = entry > e20_5[-1] and cl5[-1] > cl5[-2] and c5[-1]["close"] > c5[-1]["open"]
+        not_overheated = lift_from_local_low <= 4.8 and r15 < 68
+        enough_pullback = pullback_from_15m_high >= 0.25 or near_context_zone
+        if enough_pullback and reclaimed and not_overheated and not wick_exhaustion(c5, side):
+            swing_low = recent_low(c5, 24)
+            sl = min(swing_low - a15 * 0.12, entry * 0.986)
+            base_tp = entry * (1 + MIN_TP1_PRICE_MOVE_PERCENT / 100 + 0.0007)
+            tp1 = max(base_tp, entry + (entry - sl) * 0.45)
+            score = 66 + btc_delta + quality_bonus + (6 if t1 in ["TREND_UP", "RANGE"] else 0) + (5 if t4 in ["TREND_UP", "RANGE"] else 0) + (6 if volr >= 0.75 else 2)
+            reason = f"Live Opportunity LONG: был откат/замедление, затем reclaim 5m EMA рядом с 15m EMA/VWAP. 1H {t1}, 4H {t4}, RSI15 {r15:.0f}, volume x{volr:.2f}."
+            sig = build_signal(symbol, side, "LIVE_OPPORTUNITY", "LIVE OPPORTUNITY", entry, sl, tp1, score, reason,
+                               "сценарий сломан при закреплении ниже локального pullback low / зоны reclaim", btc_text, "20 минут – 2 часа", 0.65)
+            if sig:
+                out.append(sig)
+
+    # SHORT: symmetric rejection after bounce, but not into BTC pump / 4H uptrend.
+    side = "SHORT"
+    ok_btc, btc_text, btc_delta = btc_allows(side, btc)
+    if ok_btc and t4 != "TREND_UP":
+        bounce_from_15m_low = pct(entry, recent_low(c15, 28))
+        drop_from_local_high = pct(recent_high(c5, 18), entry)
+        near_context_zone = min(abs(entry - e20_15[-1]), abs(entry - e50_15[-1]), abs(entry - vw15)) / entry * 100 <= 3.0
+        rejected = entry < e20_5[-1] and cl5[-1] < cl5[-2] and c5[-1]["close"] < c5[-1]["open"]
+        not_overextended = drop_from_local_high <= 4.8 and r15 > 32
+        enough_bounce = bounce_from_15m_low >= 0.25 or near_context_zone
+        if enough_bounce and rejected and not_overextended and not wick_exhaustion(c5, side):
+            swing_high = recent_high(c5, 24)
+            sl = max(swing_high + a15 * 0.12, entry * 1.014)
+            base_tp = entry * (1 - MIN_TP1_PRICE_MOVE_PERCENT / 100 - 0.0007)
+            tp1 = min(base_tp, entry - (sl - entry) * 0.45)
+            score = 66 + btc_delta + quality_bonus + (6 if t1 in ["TREND_DOWN", "RANGE"] else 0) + (5 if t4 in ["TREND_DOWN", "RANGE"] else 0) + (6 if volr >= 0.75 else 2)
+            reason = f"Live Opportunity SHORT: был отскок, затем reject 5m EMA рядом с 15m EMA/VWAP. 1H {t1}, 4H {t4}, RSI15 {r15:.0f}, volume x{volr:.2f}."
+            sig = build_signal(symbol, side, "LIVE_OPPORTUNITY", "LIVE OPPORTUNITY", entry, sl, tp1, score, reason,
+                               "сценарий сломан при закреплении выше локального bounce high / зоны reject", btc_text, "20 минут – 2 часа", 0.65)
+            if sig:
+                out.append(sig)
+    return out
+
+
 def strategy_extreme_context(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h) -> List[CandidateSignal]:
     out = []
     # Extreme only if recent move is significant; ultra-risk has tiny risk, normal active also allowed.
@@ -1119,6 +1189,7 @@ def analyze_symbol(symbol: str, btc: MarketRegime) -> Optional[CandidateSignal]:
         candidates += strategy_active_trend_continuation(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_pullback_reclaim(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_quality_reclaim(symbol, btc, c5, c15, c1h, c4h)
+        candidates += strategy_live_opportunity(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_extreme_context(symbol, btc, c5, c15, c1h, c4h)
         if not candidates:
             return None
@@ -1501,8 +1572,8 @@ STARTUP_TEXT = (
     f"Статус: AUTO SCAN {'ON' if AUTO_SCAN_ENABLED else 'OFF'} / tracking TP-SL ON.\n"
     f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS} / Workers: {SCAN_WORKERS}.\n\n"
     f"Архитектура: quality universe → BTC → 4H/1H context → 15m confirm → 5m entry.\n"
-    f"V11.4 Active Trend: ON — faster scan, quality-first, active trend continuation, TP1 >= 10% ROI.\n"
-    f"Стратегии: TREND_PULLBACK / ACTIVE_TREND_CONTINUATION / PULLBACK_RECLAIM / QUALITY_RECLAIM / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
+    f"V11.7 Stat Smart Opportunity: ON — live opportunity module, fresh state, statistics-aware blocking, TP1 >= 10% ROI.\n"
+    f"Стратегии: TREND_PULLBACK / ACTIVE_TREND_CONTINUATION / PULLBACK_RECLAIM / QUALITY_RECLAIM / LIVE_OPPORTUNITY / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
     f"A+ и B: ON, но B = medium-quality с меньшим риском, не мусор.\n"
     f"TP1 filter: минимум {MIN_TP1_ROI_PERCENT:.0f}% ROI при x{LEVERAGE:.0f}.\n"
     f"Ultra-risk: обычные стратегии заблокированы, только EXTREME_CONTEXT с малым риском.\n"
