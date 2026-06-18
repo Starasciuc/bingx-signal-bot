@@ -19,15 +19,15 @@ from fastapi.responses import HTMLResponse
 # quality universe -> BTC regime -> HTF context -> strategy -> entry near invalidation -> TP1 >= 10% ROI at x10
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V11.9 BALANCED SIGNAL RECOVERY"
-DEPLOY_MARKER = "V11_9_BALANCED_SIGNAL_RECOVERY_2026_06_18"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V11.10 SMART SCAN FIX"
+DEPLOY_MARKER = "V11_10_SMART_SCAN_FIX_2026_06_18"
 
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_9.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_10.json")
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
@@ -35,16 +35,28 @@ MIN_TP1_ROI_PERCENT = float(os.getenv("MIN_TP1_ROI_PERCENT", "10"))
 MIN_TP1_PRICE_MOVE_PERCENT = MIN_TP1_ROI_PERCENT / max(LEVERAGE, 1.0)
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "20"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
 TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "15"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "900"))
-SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "10"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5"))
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "180"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "450"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "160"))
+SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "8"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "4"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "240"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "10"))
 ANALYTICS_TOP_MOVERS = int(os.getenv("ANALYTICS_TOP_MOVERS", "18"))
 ANALYTICS_TOP_SETUPS = int(os.getenv("ANALYTICS_TOP_SETUPS", "8"))
 SEND_ANALYTICS_ON_STARTUP = os.getenv("SEND_ANALYTICS_ON_STARTUP", "false").lower() == "true"
+
+# Smart scan fix: previous versions tried to analyse too many symbols too often.
+# That can hit API limits/timeouts and make the bot look silent.
+# Now the bot preselects the best 120-180 symbols per cycle, caches public data briefly,
+# and sends a rare diagnostic if scans finish with zero signals for a long time.
+CACHE_TTL_TICKERS = int(os.getenv("CACHE_TTL_TICKERS", "20"))
+CACHE_TTL_CONTRACTS = int(os.getenv("CACHE_TTL_CONTRACTS", "300"))
+CACHE_TTL_KLINES = int(os.getenv("CACHE_TTL_KLINES", "18"))
+ZERO_SIGNAL_DIAGNOSTIC_HOURS = float(os.getenv("ZERO_SIGNAL_DIAGNOSTIC_HOURS", "6"))
+ENABLE_ZERO_SIGNAL_DIAGNOSTIC = os.getenv("ENABLE_ZERO_SIGNAL_DIAGNOSTIC", "true").lower() == "true"
+_JSON_CACHE: Dict[str, Tuple[float, Any]] = {}
 
 # Grades. B is not garbage. B = medium quality with reduced risk.
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "85"))
@@ -56,7 +68,7 @@ EXTREME_RISK_MULTIPLIER = float(os.getenv("EXTREME_RISK_MULTIPLIER", "0.12"))
 
 MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "300000"))
 MIN_ACTIVE_QUOTE_VOLUME_USDT = float(os.getenv("MIN_ACTIVE_QUOTE_VOLUME_USDT", "450000"))
-DYNAMIC_TOP_N = int(os.getenv("DYNAMIC_TOP_N", "700"))
+DYNAMIC_TOP_N = int(os.getenv("DYNAMIC_TOP_N", "250"))
 DYNAMIC_MIN_CHANGE_PERCENT = float(os.getenv("DYNAMIC_MIN_CHANGE_PERCENT", "0.10"))
 EXTREME_MIN_CHANGE_PERCENT = float(os.getenv("EXTREME_MIN_CHANGE_PERCENT", "10.0"))
 ULTRA_RISK_5M_MOVE_BLOCK = float(os.getenv("ULTRA_RISK_5M_MOVE_BLOCK", "6.0"))
@@ -376,14 +388,36 @@ def wick_exhaustion(c: List[Dict[str, float]], side: str) -> bool:
 
 # ----------------------------- BingX -----------------------------
 
+def _cache_ttl_for_url(url: str) -> int:
+    if "contracts" in url:
+        return CACHE_TTL_CONTRACTS
+    if "ticker" in url:
+        return CACHE_TTL_TICKERS
+    if "klines" in url:
+        return CACHE_TTL_KLINES
+    return 10
+
+
 def get_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
+    """Public BingX GET with short cache and useful diagnostics.
+    The cache is important: without it, a full scan can easily create thousands
+    of kline requests and get rate-limited, which results in no signals.
+    """
+    key = url + "?" + json.dumps(params or {}, sort_keys=True)
+    ttl = _cache_ttl_for_url(url)
+    cached = _JSON_CACHE.get(key)
+    if cached and now_ts() - cached[0] <= ttl:
+        return cached[1]
     try:
         r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
+            STATE["last_error"] = f"get_json HTTP {r.status_code}: {url} params={params} body={r.text[:160]}"
             return None
-        return r.json()
+        data = r.json()
+        _JSON_CACHE[key] = (now_ts(), data)
+        return data
     except Exception as e:
-        STATE["last_error"] = f"get_json: {e}"
+        STATE["last_error"] = f"get_json: {e} url={url} params={params}"
         return None
 
 
@@ -1523,11 +1557,13 @@ def scan_once(manual: bool = False) -> Dict[str, Any]:
         if len(eligible) >= MAX_SYMBOLS:
             break
 
+    # Smart scan fix: do not analyse 900-1400 symbols with 4 kline requests each.
+    # First symbols are quality + active movers from get_symbols(); analysing too many at once causes API throttling.
+    eligible = eligible[:max(20, min(MAX_ANALYZE_SYMBOLS, MAX_SYMBOLS))]
     checked = len(eligible)
-    workers = max(1, min(SCAN_WORKERS, 12, checked or 1))
+    workers = max(1, min(SCAN_WORKERS, 10, checked or 1))
 
-    # Faster scan: parallel kline analysis with a small worker pool.
-    # This keeps no-signal spam OFF, but lets the bot cover more of the market each minute.
+    # Parallel kline analysis with a controlled worker pool.
     if checked > 0:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {executor.submit(analyze_symbol, symbol, btc): symbol for symbol in eligible}
@@ -1547,11 +1583,13 @@ def scan_once(manual: bool = False) -> Dict[str, Any]:
             continue
         add_active_signal(sig)
         send_telegram(build_signal_message(sig))
+        STATE["last_any_signal_at"] = now_ts()
         sent += 1
 
     summary = {
         "checked": checked,
         "symbols": len(symbols),
+        "max_analyze_symbols": MAX_ANALYZE_SYMBOLS,
         "candidates": len(candidates),
         "sent": sent,
         "btc": asdict(btc),
@@ -1563,8 +1601,41 @@ def scan_once(manual: bool = False) -> Dict[str, Any]:
     STATE["last_scan_at"] = started
     STATE["last_scan_summary"] = summary
     save_state()
-    # no no-signal spam. Manual endpoint returns details.
+    maybe_send_zero_signal_diagnostic(summary)
     return summary
+
+def maybe_send_zero_signal_diagnostic(summary: Dict[str, Any]) -> None:
+    """Rare health report when no signals are produced for many hours.
+    This is not no-signal spam: default is once per 6 hours only, and only when zero candidates/sent.
+    It helps detect API/rate-limit/logic problems in a Background Worker where /scan is not visible.
+    """
+    if not ENABLE_ZERO_SIGNAL_DIAGNOSTIC:
+        return
+    if summary.get("sent", 0) > 0:
+        return
+    now = now_ts()
+    last_signal = int(STATE.get("last_any_signal_at", 0) or 0)
+    last_diag = int(STATE.get("last_zero_signal_diagnostic_at", 0) or 0)
+    if last_signal and now - last_signal < ZERO_SIGNAL_DIAGNOSTIC_HOURS * 3600:
+        return
+    if now - last_diag < ZERO_SIGNAL_DIAGNOSTIC_HOURS * 3600:
+        return
+    STATE["last_zero_signal_diagnostic_at"] = now
+    save_state()
+    btc = summary.get("btc", {})
+    text = (
+        f"🛠 <b>Диагностика скана — сигналов нет</b>\n"
+        f"{APP_NAME}\nDeploy: <code>{DEPLOY_MARKER}</code>\n\n"
+        f"Проверено за цикл: <b>{summary.get('checked')}</b> из {summary.get('symbols')} символов.\n"
+        f"Кандидатов: <b>{summary.get('candidates')}</b> / отправлено: <b>{summary.get('sent')}</b>.\n"
+        f"Workers: {summary.get('workers')} / duration: {summary.get('duration_sec')}s.\n"
+        f"BTC: {btc.get('trend')} — {btc.get('reason')}\n"
+        f"Last error: <code>{str(STATE.get('last_error',''))[:350]}</code>\n\n"
+        f"Это сообщение редкое, чтобы понять: бот живой, но сделки не проходят. "
+        f"Если кандидатов 0 много часов — надо смотреть API/условия входа, а не просто ждать."
+    )
+    send_telegram(text)
+
 
 async def auto_loop() -> None:
     while True:
@@ -1640,9 +1711,9 @@ STARTUP_TEXT = (
     f"✅ {APP_NAME} активирован и работает.\n"
     f"Deploy marker: {DEPLOY_MARKER}\n\n"
     f"Статус: AUTO SCAN {'ON' if AUTO_SCAN_ENABLED else 'OFF'} / tracking TP-SL ON.\n"
-    f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS} / Workers: {SCAN_WORKERS}.\n\n"
+    f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS} / Analyze per scan: {MAX_ANALYZE_SYMBOLS} / Workers: {SCAN_WORKERS}.\n\n"
     f"Архитектура: quality universe → BTC → 4H/1H context → 15m confirm → 5m entry.\n"
-    f"V11.7 Stat Smart Opportunity: ON — live opportunity module, fresh state, statistics-aware blocking, TP1 >= 10% ROI.\n"
+    f"V11.10 Smart Scan Fix: ON — controlled scan load, short cache, quality/dynamic preselection, rare zero-signal diagnostics, TP1 >= 10% ROI.\n"
     f"Стратегии: TREND_PULLBACK / ACTIVE_TREND_CONTINUATION / PULLBACK_RECLAIM / QUALITY_RECLAIM / LIVE_OPPORTUNITY / BTC_ALIGNED_MOMENTUM / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
     f"A+ и B: ON, но B = medium-quality с меньшим риском, не мусор.\n"
     f"TP1 filter: минимум {MIN_TP1_ROI_PERCENT:.0f}% ROI при x{LEVERAGE:.0f}.\n"
