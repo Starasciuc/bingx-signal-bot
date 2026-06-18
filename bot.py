@@ -4,7 +4,7 @@ import json
 import math
 import asyncio
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -19,15 +19,15 @@ from fastapi.responses import HTMLResponse
 # quality universe -> BTC regime -> HTF context -> strategy -> entry near invalidation -> TP1 >= 10% ROI at x10
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V11.10 SMART SCAN FIX"
-DEPLOY_MARKER = "V11_10_SMART_SCAN_FIX_2026_06_18"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V11.12 DIAGNOSTIC BEAR MODE FIX"
+DEPLOY_MARKER = "V11_12_DIAGNOSTIC_BEAR_MODE_FIX_2026_06_18"
 
 app = FastAPI(title=APP_NAME)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_10.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v11_12.json")
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
@@ -54,8 +54,13 @@ SEND_ANALYTICS_ON_STARTUP = os.getenv("SEND_ANALYTICS_ON_STARTUP", "false").lowe
 CACHE_TTL_TICKERS = int(os.getenv("CACHE_TTL_TICKERS", "20"))
 CACHE_TTL_CONTRACTS = int(os.getenv("CACHE_TTL_CONTRACTS", "300"))
 CACHE_TTL_KLINES = int(os.getenv("CACHE_TTL_KLINES", "18"))
-ZERO_SIGNAL_DIAGNOSTIC_HOURS = float(os.getenv("ZERO_SIGNAL_DIAGNOSTIC_HOURS", "6"))
+ZERO_SIGNAL_DIAGNOSTIC_HOURS = float(os.getenv("ZERO_SIGNAL_DIAGNOSTIC_HOURS", "0.5"))
 ENABLE_ZERO_SIGNAL_DIAGNOSTIC = os.getenv("ENABLE_ZERO_SIGNAL_DIAGNOSTIC", "true").lower() == "true"
+SEND_FIRST_SCAN_DIAGNOSTIC = os.getenv("SEND_FIRST_SCAN_DIAGNOSTIC", "true").lower() == "true"
+SCAN_CYCLE_TIMEOUT_SECONDS = int(os.getenv("SCAN_CYCLE_TIMEOUT_SECONDS", "75"))
+NEAR_MISS_LIMIT = int(os.getenv("NEAR_MISS_LIMIT", "8"))
+ENABLE_BEAR_MARKET_SHORT_MODE = os.getenv("ENABLE_BEAR_MARKET_SHORT_MODE", "true").lower() == "true"
+ENABLE_BULL_MARKET_LONG_MODE = os.getenv("ENABLE_BULL_MARKET_LONG_MODE", "true").lower() == "true"
 _JSON_CACHE: Dict[str, Tuple[float, Any]] = {}
 
 # Grades. B is not garbage. B = medium quality with reduced risk.
@@ -160,6 +165,28 @@ def safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def debug_inc(key: str, n: int = 1) -> None:
+    dbg = STATE.setdefault("scan_debug", {})
+    dbg[key] = int(dbg.get(key, 0)) + n
+
+
+def debug_near(symbol: str, side: str, strategy: str, score: int, reason: str, extra: str = "") -> None:
+    dbg = STATE.setdefault("scan_debug", {})
+    rows = dbg.setdefault("near_miss", [])
+    if not isinstance(rows, list):
+        rows = []
+        dbg["near_miss"] = rows
+    rows.append({
+        "symbol": display_symbol(symbol),
+        "side": side,
+        "strategy": strategy,
+        "score": score,
+        "reason": reason,
+        "extra": extra,
+    })
+    rows[:] = rows[-NEAR_MISS_LIMIT:]
 
 
 def load_state() -> None:
@@ -683,6 +710,7 @@ def build_signal(symbol: str, side: str, strategy: str, trade_type: str, entry: 
                  reason: str, invalidation: str, btc_context: str, expected_time: str, risk_mult: float) -> Optional[CandidateSignal]:
     if side == "LONG":
         if not (sl < entry < tp1):
+            debug_inc("invalid_structure")
             return None
         price_move = (tp1 - entry) / entry * 100
         risk = entry - sl
@@ -691,6 +719,7 @@ def build_signal(symbol: str, side: str, strategy: str, trade_type: str, entry: 
         tp3 = entry + max(reward * 3.0, entry * 0.030)
     else:
         if not (tp1 < entry < sl):
+            debug_inc("invalid_structure")
             return None
         price_move = (entry - tp1) / entry * 100
         risk = sl - entry
@@ -699,19 +728,36 @@ def build_signal(symbol: str, side: str, strategy: str, trade_type: str, entry: 
         tp3 = entry - max(reward * 3.0, entry * 0.030)
     roi = price_move * LEVERAGE
     if roi < MIN_TP1_ROI_PERCENT:
+        debug_inc("tp1_roi_block")
+        if roi >= MIN_TP1_ROI_PERCENT * 0.75:
+            debug_near(symbol, side, strategy, score, "TP1 ROI почти прошёл", f"roi={roi:.1f}% need={MIN_TP1_ROI_PERCENT:.1f}%")
         return None
     rr = reward / max(risk, entry * 0.0001)
-    # Need realistic RR. Swing can have slightly lower tp1 RR, because tp2 is structural.
-    min_rr = 0.30 if trade_type in ["RANGE EDGE", "STRUCTURE SWING", "ACTIVE TREND", "PULLBACK RECLAIM", "QUALITY RECLAIM", "LIVE OPPORTUNITY", "BTC ALIGNED MOMENTUM"] else 0.48
+    # Diagnostic Bear Mode: live market entries may accept lower TP1 RR because stop is technical
+    # and TP2/TP3 carry the structural target. Risk multiplier stays reduced for B signals.
+    min_rr = 0.26 if trade_type in [
+        "RANGE EDGE", "STRUCTURE SWING", "ACTIVE TREND", "PULLBACK RECLAIM",
+        "QUALITY RECLAIM", "LIVE OPPORTUNITY", "BTC ALIGNED MOMENTUM",
+        "BEAR MARKET SHORT", "BULL MARKET LONG"
+    ] else 0.42
     if rr < min_rr:
+        debug_inc("rr_block")
+        if rr >= min_rr * 0.75:
+            debug_near(symbol, side, strategy, score, "RR почти прошёл", f"rr={rr:.2f} need={min_rr:.2f}")
         return None
-    grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= 0.55 else "B"
+    grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= 0.50 else "B"
     if grade == "B" and (not ALLOW_B_SIGNALS or score < B_MIN_SCORE):
+        debug_inc("score_block")
+        if score >= B_MIN_SCORE - 4:
+            debug_near(symbol, side, strategy, score, "Score почти прошёл", f"grade=B need={B_MIN_SCORE}")
         return None
     allowed, why = adaptive_allows(strategy, side, grade)
     if not allowed:
+        debug_inc("adaptive_block")
+        debug_near(symbol, side, strategy, score, "Статистика/адаптация заблокировала", why)
         return None
     risk_multiplier = risk_mult * (A_PLUS_RISK_MULTIPLIER if grade == "A+" else B_RISK_MULTIPLIER)
+    debug_inc("built_signals")
     return CandidateSignal(symbol, side, grade, strategy, trade_type, expected_time, entry, tp1, tp2, tp3, sl, score, rr,
                            risk_multiplier, reason, invalidation, btc_context, roi, price_move)
 
@@ -1277,6 +1323,78 @@ def strategy_extreme_context(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h) 
     return out
 
 
+
+def strategy_market_direction_engine(symbol: str, btc: MarketRegime, c5, c15, c1h, c4h) -> List[CandidateSignal]:
+    """V11.12 direction engine.
+    This is the anti-silence module. When BTC is clearly falling/rising, it searches
+    for the practical professional entry: weak bounce -> reject -> SHORT in bearish BTC,
+    or pullback -> reclaim -> LONG in bullish BTC. Ultra-risk candles are still blocked.
+    """
+    out: List[CandidateSignal] = []
+    if is_ultra_risk(symbol, c5, c15):
+        debug_inc("ultra_risk_block")
+        return out
+    base = base_from_symbol(symbol)
+    cl5, cl15, cl1h = closes(c5), closes(c15), closes(c1h)
+    if len(cl5) < 80 or len(cl15) < 80 or len(cl1h) < 80:
+        debug_inc("short_history_block")
+        return out
+    entry = cl5[-1]
+    e20_5, e50_5 = ema(cl5, 20), ema(cl5, 50)
+    e20_15, e50_15 = ema(cl15, 20), ema(cl15, 50)
+    vw15 = vwap(c15, 64)
+    a15 = atr(c15, 14)[-1]
+    r15 = rsi(cl15, 14)[-1]
+    volr = volume_ratio(c15)
+    t1, s1, _ = trend_from_candles(c1h)
+    t4, s4, _ = trend_from_candles(c4h)
+    quality_bonus = 8 if base in QUALITY_BASES else 4
+    volume_bonus = 7 if volr >= 0.70 else (3 if volr >= 0.45 else 0)
+
+    # Bear-market short mode. This should be active when BTC is moving down like 67k -> 63k.
+    if ENABLE_BEAR_MARKET_SHORT_MODE and btc.trend in ["TREND_DOWN", "IMPULSE_DOWN"] and t4 != "TREND_UP":
+        side = "SHORT"
+        ok_btc, btc_text, btc_delta = btc_allows(side, btc)
+        if ok_btc:
+            below_15_context = entry < e20_15[-1] or entry < vw15
+            weak_bounce = pct(entry, recent_low(c15, 20)) >= 0.18 or abs(entry - e20_15[-1]) / entry * 100 <= 2.2 or abs(entry - vw15) / entry * 100 <= 2.2
+            reject_5m = entry < e20_5[-1] or (cl5[-1] < cl5[-2] and cl5[-1] < e50_5[-1])
+            not_bottom_chase = pct(recent_high(c5, 18), entry) <= 4.8 and r15 > 24
+            if below_15_context and weak_bounce and reject_5m and not_bottom_chase:
+                swing_high = recent_high(c5, 24)
+                sl = max(swing_high + a15 * 0.12, entry * 1.010)
+                # Keep TP1 minimum 10% ROI at x10, but allow realistic bear continuation.
+                tp1 = min(entry * (1 - MIN_TP1_PRICE_MOVE_PERCENT / 100 - 0.0005), entry - (sl - entry) * 0.45)
+                score = 64 + btc_delta + quality_bonus + volume_bonus + (5 if t1 in ["TREND_DOWN", "RANGE", "CHOP"] else 0) + (3 if t4 in ["TREND_DOWN", "RANGE"] else 0)
+                reason = f"Bear Market Short: BTC {btc.trend}; альт дал слабый отскок и снова ушёл ниже 5m/15m EMA/VWAP. 1H {t1}, 4H {t4}, RSI15 {r15:.0f}, volume x{volr:.2f}."
+                sig = build_signal(symbol, side, "MARKET_DIRECTION_ENGINE", "BEAR MARKET SHORT", entry, sl, tp1, score, reason,
+                                   "сценарий сломан при закреплении выше зоны weak bounce / 15m EMA-VWAP", btc_text, "15 минут – 2 часа", 0.55)
+                if sig: out.append(sig)
+            else:
+                debug_inc("bear_mode_setup_block")
+
+    # Bull-market long mode.
+    if ENABLE_BULL_MARKET_LONG_MODE and btc.trend in ["TREND_UP", "IMPULSE_UP"] and t4 != "TREND_DOWN":
+        side = "LONG"
+        ok_btc, btc_text, btc_delta = btc_allows(side, btc)
+        if ok_btc:
+            above_15_context = entry > e20_15[-1] or entry > vw15
+            pullback = pct(recent_high(c15, 20), entry) >= 0.18 or abs(entry - e20_15[-1]) / entry * 100 <= 2.2 or abs(entry - vw15) / entry * 100 <= 2.2
+            reclaim_5m = entry > e20_5[-1] or (cl5[-1] > cl5[-2] and cl5[-1] > e50_5[-1])
+            not_top_chase = pct(entry, recent_low(c5, 18)) <= 4.8 and r15 < 76
+            if above_15_context and pullback and reclaim_5m and not_top_chase:
+                swing_low = recent_low(c5, 24)
+                sl = min(swing_low - a15 * 0.12, entry * 0.990)
+                tp1 = max(entry * (1 + MIN_TP1_PRICE_MOVE_PERCENT / 100 + 0.0005), entry + (entry - sl) * 0.45)
+                score = 64 + btc_delta + quality_bonus + volume_bonus + (5 if t1 in ["TREND_UP", "RANGE", "CHOP"] else 0) + (3 if t4 in ["TREND_UP", "RANGE"] else 0)
+                reason = f"Bull Market Long: BTC {btc.trend}; альт сделал откат и reclaim 5m/15m EMA/VWAP. 1H {t1}, 4H {t4}, RSI15 {r15:.0f}, volume x{volr:.2f}."
+                sig = build_signal(symbol, side, "MARKET_DIRECTION_ENGINE", "BULL MARKET LONG", entry, sl, tp1, score, reason,
+                                   "сценарий сломан при закреплении ниже reclaim-зоны / 15m EMA-VWAP", btc_text, "15 минут – 2 часа", 0.55)
+                if sig: out.append(sig)
+            else:
+                debug_inc("bull_mode_setup_block")
+    return out
+
 def analyze_symbol(symbol: str, btc: MarketRegime) -> Optional[CandidateSignal]:
     try:
         c5 = get_klines(symbol, "5m", 180)
@@ -1284,6 +1402,7 @@ def analyze_symbol(symbol: str, btc: MarketRegime) -> Optional[CandidateSignal]:
         c1h = get_klines(symbol, "1h", 260)
         c4h = get_klines(symbol, "4h", 220)
         if not c5 or not c15 or not c1h or not c4h:
+            debug_inc("no_klines")
             return None
         candidates: List[CandidateSignal] = []
         candidates += strategy_trend_pullback(symbol, btc, c5, c15, c1h, c4h)
@@ -1293,6 +1412,7 @@ def analyze_symbol(symbol: str, btc: MarketRegime) -> Optional[CandidateSignal]:
         candidates += strategy_pullback_reclaim(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_quality_reclaim(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_live_opportunity(symbol, btc, c5, c15, c1h, c4h)
+        candidates += strategy_market_direction_engine(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_btc_aligned_momentum(symbol, btc, c5, c15, c1h, c4h)
         candidates += strategy_extreme_context(symbol, btc, c5, c15, c1h, c4h)
         if not candidates:
@@ -1358,7 +1478,7 @@ def build_market_analytics_text(send_to_telegram: bool = False) -> str:
     lines = []
     lines.append(f"📊 <b>Рыночная аналитика {APP_NAME}</b>")
     lines.append(f"Deploy: <code>{DEPLOY_MARKER}</code>\n")
-    lines.append(f"<b>BTC режим:</b> {btc.trend} / confidence {btc.confidence}")
+    lines.append(f"<b>BTC режим:</b> {btc.trend} / confidence {btc.score}")
     lines.append(f"{btc.reason}")
     lines.append(classify_btc_plan(btc))
 
@@ -1531,6 +1651,7 @@ def track_active_signals() -> None:
 
 def scan_once(manual: bool = False) -> Dict[str, Any]:
     started = now_ts()
+    STATE["scan_debug"] = {"near_miss": []}
     btc = get_btc_regime()
     symbols = get_symbols()
     candidates: List[CandidateSignal] = []
@@ -1563,18 +1684,24 @@ def scan_once(manual: bool = False) -> Dict[str, Any]:
     checked = len(eligible)
     workers = max(1, min(SCAN_WORKERS, 10, checked or 1))
 
-    # Parallel kline analysis with a controlled worker pool.
+    # Parallel kline analysis with a controlled worker pool and hard timeout.
+    timed_out = 0
     if checked > 0:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {executor.submit(analyze_symbol, symbol, btc): symbol for symbol in eligible}
-            for future in as_completed(future_map):
-                try:
-                    sig = future.result()
-                except Exception as e:
-                    STATE["last_error"] = f"scan worker {future_map.get(future)}: {e}"
-                    sig = None
-                if sig:
-                    candidates.append(sig)
+            try:
+                for future in as_completed(future_map, timeout=SCAN_CYCLE_TIMEOUT_SECONDS):
+                    try:
+                        sig = future.result(timeout=1)
+                    except Exception as e:
+                        STATE["last_error"] = f"scan worker {future_map.get(future)}: {e}"
+                        sig = None
+                    if sig:
+                        candidates.append(sig)
+            except FuturesTimeoutError:
+                timed_out = sum(1 for f in future_map if not f.done())
+                debug_inc("scan_timeout", timed_out)
+                STATE["last_error"] = f"scan cycle timeout after {SCAN_CYCLE_TIMEOUT_SECONDS}s; unfinished={timed_out}"
 
     candidates.sort(key=lambda s: (s.grade == "A+", s.score, s.rr, s.roi_tp1), reverse=True)
     sent = 0
@@ -1596,46 +1723,65 @@ def scan_once(manual: bool = False) -> Dict[str, Any]:
         "skipped_recent": skipped_recent,
         "workers": workers,
         "duration_sec": now_ts() - started,
+        "timeout_unfinished": timed_out,
+        "debug": STATE.get("scan_debug", {}),
         "time": started,
     }
     STATE["last_scan_at"] = started
     STATE["last_scan_summary"] = summary
+    first_diag_needed = SEND_FIRST_SCAN_DIAGNOSTIC and not STATE.get("first_scan_diagnostic_sent")
+    if first_diag_needed:
+        STATE["first_scan_diagnostic_sent"] = True
     save_state()
+    if first_diag_needed:
+        send_scan_diagnostic(summary, title="🧪 Первый диагностический скан")
     maybe_send_zero_signal_diagnostic(summary)
     return summary
 
+def send_scan_diagnostic(summary: Dict[str, Any], title: str = "🧪 Диагностика скана") -> None:
+    """Send a compact scan report so silence is measurable, not guessed."""
+    btc = summary.get("btc", {}) or {}
+    text = (
+        f"{title}\n"
+        f"{APP_NAME}\nDeploy: <code>{DEPLOY_MARKER}</code>\n\n"
+        f"Проверено: <b>{summary.get('checked')}</b> из {summary.get('symbols')} символов.\n"
+        f"Кандидатов: <b>{summary.get('candidates')}</b> / отправлено: <b>{summary.get('sent')}</b>.\n"
+        f"Пропущено по cooldown/active: {summary.get('skipped_recent')}.\n"
+        f"Workers: {summary.get('workers')} / duration: {float(summary.get('duration_sec') or 0):.1f}s / timeout unfinished: {summary.get('timeout_unfinished', 0)}.\n"
+        f"BTC: {btc.get('trend')} / score {btc.get('score')} / 15m {float(btc.get('fast_change_15m') or 0):+.2f}% / 5m {float(btc.get('fast_change_5m') or 0):+.2f}%.\n"
+        f"Last error: <code>{STATE.get('last_error','') or 'нет'}</code>\n"
+    )
+    dbg = summary.get("debug", {}) or {}
+    if dbg:
+        counters = []
+        for k in ["no_klines", "scan_timeout", "tp1_roi_block", "rr_block", "score_block", "adaptive_block", "ultra_risk_block", "bear_mode_setup_block", "bull_mode_setup_block", "built_signals"]:
+            if int(dbg.get(k, 0) or 0):
+                counters.append(f"{k}: {dbg.get(k)}")
+        if counters:
+            text += "\nБлокировки: " + "; ".join(counters[:10]) + "\n"
+        near = dbg.get("near_miss") or []
+        if near:
+            text += "\nПочти прошли:\n"
+            for row in near[-5:]:
+                text += f"• {row.get('symbol')} {row.get('side')} {row.get('strategy')} score {row.get('score')}: {row.get('reason')} {row.get('extra')}\n"
+    text += "\nЕсли candidates=0, смотри блокировки выше: no_klines/API, score, RR, TP1 или setup. Если scan_timeout > 0 — API/таймауты не давали циклу завершиться."
+    send_telegram(text)
+
+
 def maybe_send_zero_signal_diagnostic(summary: Dict[str, Any]) -> None:
-    """Rare health report when no signals are produced for many hours.
-    This is not no-signal spam: default is once per 6 hours only, and only when zero candidates/sent.
-    It helps detect API/rate-limit/logic problems in a Background Worker where /scan is not visible.
+    """Rare health report when no signals are produced.
+    In V11.11 default is every 30 minutes, not every scan. This lets us see why the bot is silent.
     """
     if not ENABLE_ZERO_SIGNAL_DIAGNOSTIC:
         return
-    if summary.get("sent", 0) > 0:
+    if summary.get("sent", 0) > 0 or summary.get("candidates", 0) > 0:
         return
-    now = now_ts()
-    last_signal = int(STATE.get("last_any_signal_at", 0) or 0)
-    last_diag = int(STATE.get("last_zero_signal_diagnostic_at", 0) or 0)
-    if last_signal and now - last_signal < ZERO_SIGNAL_DIAGNOSTIC_HOURS * 3600:
+    last = STATE.get("last_zero_signal_diagnostic_at", 0) or 0
+    if now_ts() - last < ZERO_SIGNAL_DIAGNOSTIC_HOURS * 3600:
         return
-    if now - last_diag < ZERO_SIGNAL_DIAGNOSTIC_HOURS * 3600:
-        return
-    STATE["last_zero_signal_diagnostic_at"] = now
+    STATE["last_zero_signal_diagnostic_at"] = now_ts()
     save_state()
-    btc = summary.get("btc", {})
-    text = (
-        f"🛠 <b>Диагностика скана — сигналов нет</b>\n"
-        f"{APP_NAME}\nDeploy: <code>{DEPLOY_MARKER}</code>\n\n"
-        f"Проверено за цикл: <b>{summary.get('checked')}</b> из {summary.get('symbols')} символов.\n"
-        f"Кандидатов: <b>{summary.get('candidates')}</b> / отправлено: <b>{summary.get('sent')}</b>.\n"
-        f"Workers: {summary.get('workers')} / duration: {summary.get('duration_sec')}s.\n"
-        f"BTC: {btc.get('trend')} — {btc.get('reason')}\n"
-        f"Last error: <code>{str(STATE.get('last_error',''))[:350]}</code>\n\n"
-        f"Это сообщение редкое, чтобы понять: бот живой, но сделки не проходят. "
-        f"Если кандидатов 0 много часов — надо смотреть API/условия входа, а не просто ждать."
-    )
-    send_telegram(text)
-
+    send_scan_diagnostic(summary, title="🧪 Диагностика: сигналов пока нет")
 
 async def auto_loop() -> None:
     while True:
@@ -1713,8 +1859,8 @@ STARTUP_TEXT = (
     f"Статус: AUTO SCAN {'ON' if AUTO_SCAN_ENABLED else 'OFF'} / tracking TP-SL ON.\n"
     f"Scan interval: {AUTO_SCAN_SECONDS}s / Track interval: {TRACK_SECONDS}s / Max symbols: {MAX_SYMBOLS} / Analyze per scan: {MAX_ANALYZE_SYMBOLS} / Workers: {SCAN_WORKERS}.\n\n"
     f"Архитектура: quality universe → BTC → 4H/1H context → 15m confirm → 5m entry.\n"
-    f"V11.10 Smart Scan Fix: ON — controlled scan load, short cache, quality/dynamic preselection, rare zero-signal diagnostics, TP1 >= 10% ROI.\n"
-    f"Стратегии: TREND_PULLBACK / ACTIVE_TREND_CONTINUATION / PULLBACK_RECLAIM / QUALITY_RECLAIM / LIVE_OPPORTUNITY / BTC_ALIGNED_MOMENTUM / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
+    f"V11.12 Diagnostic Bear Mode Fix: ON — hard scan timeout, rejection counters, near-miss report, Bear Market Short Mode, TP1 >= 10% ROI.\n"
+    f"Стратегии: TREND_PULLBACK / MARKET_DIRECTION_ENGINE / ACTIVE_TREND_CONTINUATION / PULLBACK_RECLAIM / QUALITY_RECLAIM / LIVE_OPPORTUNITY / BTC_ALIGNED_MOMENTUM / RANGE_EDGE / BREAKOUT_RETEST / EXTREME_CONTEXT.\n"
     f"A+ и B: ON, но B = medium-quality с меньшим риском, не мусор.\n"
     f"TP1 filter: минимум {MIN_TP1_ROI_PERCENT:.0f}% ROI при x{LEVERAGE:.0f}.\n"
     f"Ultra-risk: обычные стратегии заблокированы, только EXTREME_CONTEXT с малым риском.\n"
