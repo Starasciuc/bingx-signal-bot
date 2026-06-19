@@ -13,15 +13,15 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 # =========================================================
-# V12.4 LEVEL REVERSAL ANTI-CHASE MODE
+# V12.5 CONFIRMED LEVEL QUALITY MODE
 # One core professional strategy:
 #   Volatility + BTC context + HTF trend + pullback/reclaim/reject
 # Goal:
 #   Send A+ / B futures signals where TP1 target gives at least 10% ROI at x10
 # =========================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V12.4 LEVEL REVERSAL ANTI-CHASE MODE"
-DEPLOY_MARKER = "V12_4_LEVEL_REVERSAL_ANTI_CHASE_MODE_2026_06_19"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V12.5 CONFIRMED LEVEL QUALITY MODE"
+DEPLOY_MARKER = "V12_5_CONFIRMED_LEVEL_QUALITY_MODE_2026_06_19"
 
 app = FastAPI(title=APP_NAME)
 
@@ -30,7 +30,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_4.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_5.json")
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
 AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "75"))
@@ -46,8 +46,8 @@ ACTIVE_MOVER_LIMIT = int(os.getenv("ACTIVE_MOVER_LIMIT", "95"))
 RANDOM_ROTATION_LIMIT = int(os.getenv("RANDOM_ROTATION_LIMIT", "35"))
 
 # Signal quality. User requested around 85 / 76 before; V12 keeps that.
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "82"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "85"))
 
 # 10% ROI at x10 means roughly 1% price movement. Add a small buffer for fees/slippage.
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10"))
@@ -75,7 +75,7 @@ OPPORTUNITY_MIN_SCORE = int(os.getenv("OPPORTUNITY_MIN_SCORE", "74"))
 
 # Cooldown per symbol/side/strategy
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "7200"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "5"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "1"))
 STRICT_HTF_MODE = os.getenv("STRICT_HTF_MODE", "true").lower() == "true"
@@ -87,6 +87,14 @@ ANTI_CHASE_1H_PCT = float(os.getenv("ANTI_CHASE_1H_PCT", "3.0"))
 ANTI_CHASE_4H_PCT = float(os.getenv("ANTI_CHASE_4H_PCT", "6.0"))
 MIN_RETRACE_AFTER_EXTREME_PCT = float(os.getenv("MIN_RETRACE_AFTER_EXTREME_PCT", "1.2"))
 LEVEL_ZONE_PCT = float(os.getenv("LEVEL_ZONE_PCT", "1.8"))
+
+# V12.5 quality confirmation: fewer trades, stronger entries.
+CONFIRM_15M_REQUIRED = os.getenv("CONFIRM_15M_REQUIRED", "true").lower() == "true"
+MIN_CONFIRM_5M_CANDLES = int(os.getenv("MIN_CONFIRM_5M_CANDLES", "2"))
+MAX_WICK_RATIO = float(os.getenv("MAX_WICK_RATIO", "0.58"))
+MIN_BOUNCE_AFTER_DUMP_PCT = float(os.getenv("MIN_BOUNCE_AFTER_DUMP_PCT", "2.0"))
+MIN_PULLBACK_AFTER_PUMP_PCT = float(os.getenv("MIN_PULLBACK_AFTER_PUMP_PCT", "2.0"))
+REQUIRE_LEVEL_PROXIMITY = os.getenv("REQUIRE_LEVEL_PROXIMITY", "true").lower() == "true"
 
 QUALITY_BASES = set(x.strip().upper() for x in os.getenv(
     "QUALITY_BASES",
@@ -672,8 +680,12 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             reclaim = price > ema5_20 and c5[-1]["close"] > c5[-1]["open"]
             near_value = abs(price - ema15_20) / price * 100 < max(1.8, atr15p * 1.8) or abs(price - vwap15) / price * 100 < max(1.8, atr15p * 1.8)
             near_support = near_level(price, lo36, max(LEVEL_ZONE_PCT, atr15p * 1.4)) or near_level(price, lo96, max(LEVEL_ZONE_PCT, atr15p * 1.4))
+            confirm5 = two_candle_confirmation(c5, "LONG")
+            confirm15 = htf_candle_confirmation(c15, "LONG")
+            wick_ok = candle_wick_ratio(c5[-1], "LONG") <= MAX_WICK_RATIO
+            level_ok = near_support or near_value
             # If price already pumped hard, do not chase LONG. LONG is allowed only after a real pullback/reclaim.
-            if extended_up and pulled_back < MIN_RETRACE_AFTER_EXTREME_PCT:
+            if extended_up and pulled_back < MIN_PULLBACK_AFTER_PUMP_PCT:
                 diag["anti_chase_block"] += 1
                 add_near_miss(symbol, side, score, "ANTI_CHASE_LONG", f"цена уже выросла: 1h {move_1h:.1f}%, 4h {move_4h:.1f}%; ждём откат/уровень")
                 continue
@@ -701,8 +713,18 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             if STRICT_HTF_MODE and not (reclaim and near_value):
                 diag["setup_block"] += 1
                 continue
+            if not confirm5 or (CONFIRM_15M_REQUIRED and not confirm15) or not wick_ok:
+                diag["setup_block"] += 1
+                add_near_miss(symbol, side, score, strategy, "LONG заблокирован: нет 2x5m + 15m подтверждения или плохой фитиль")
+                continue
+            if REQUIRE_LEVEL_PROXIMITY and not level_ok:
+                diag["setup_block"] += 1
+                add_near_miss(symbol, side, score, strategy, "LONG заблокирован: вход не рядом с уровнем/EMA/VWAP")
+                continue
             if not (trend_ok and reclaim and near_value):
                 score -= 12
+            score += 6
+            reasons.append("подтверждение: 2 свечи 5m + 15m без плохого фитиля")
             if pulled_back > 5.5:
                 trade_type = "SWING"
                 strategy = "VOLATILITY_SWING_RECLAIM"
@@ -713,8 +735,12 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             reject = price < ema5_20 and c5[-1]["close"] < c5[-1]["open"]
             near_value = abs(price - ema15_20) / price * 100 < max(1.8, atr15p * 1.8) or abs(price - vwap15) / price * 100 < max(1.8, atr15p * 1.8)
             near_resistance = near_level(price, hi36, max(LEVEL_ZONE_PCT, atr15p * 1.4)) or near_level(price, hi96, max(LEVEL_ZONE_PCT, atr15p * 1.4))
+            confirm5 = two_candle_confirmation(c5, "SHORT")
+            confirm15 = htf_candle_confirmation(c15, "SHORT")
+            wick_ok = candle_wick_ratio(c5[-1], "SHORT") <= MAX_WICK_RATIO
+            level_ok = near_resistance or near_value
             # If price already dumped hard, do not chase SHORT. SHORT is allowed only after a bounce into resistance and reject.
-            if extended_down and bounced < MIN_RETRACE_AFTER_EXTREME_PCT:
+            if extended_down and bounced < MIN_BOUNCE_AFTER_DUMP_PCT:
                 diag["anti_chase_block"] += 1
                 add_near_miss(symbol, side, score, "ANTI_CHASE_SHORT", f"цена уже упала: 1h {move_1h:.1f}%, 4h {move_4h:.1f}%; ждём отскок/retest")
                 continue
@@ -752,8 +778,18 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             if STRICT_HTF_MODE and not (reject and near_value):
                 diag["setup_block"] += 1
                 continue
+            if not confirm5 or (CONFIRM_15M_REQUIRED and not confirm15) or not wick_ok:
+                diag["setup_block"] += 1
+                add_near_miss(symbol, side, score, strategy, "SHORT заблокирован: нет 2x5m + 15m подтверждения или плохой фитиль")
+                continue
+            if REQUIRE_LEVEL_PROXIMITY and not level_ok:
+                diag["setup_block"] += 1
+                add_near_miss(symbol, side, score, strategy, "SHORT заблокирован: вход не рядом с сопротивлением/EMA/VWAP")
+                continue
             if not (trend_ok and reject and near_value):
                 score -= 12
+            score += 6
+            reasons.append("подтверждение: 2 свечи 5m + 15m без плохого фитиля")
             if bounced > 5.5:
                 trade_type = "SWING"
                 strategy = "VOLATILITY_SWING_REJECT"
@@ -773,7 +809,7 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
         if roi_tp1 < MIN_TP1_ROI_X10:
             diag["tp1_roi_block"] += 1
             continue
-        if rr < 0.45:
+        if rr < 0.75:
             diag["rr_block"] += 1
             continue
 
@@ -788,7 +824,7 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             continue
         if grade == "B":
             # B is allowed, but only when the higher timeframe is clean and RR is not weak.
-            if rr < 0.75:
+            if rr < 0.95:
                 diag["rr_block"] += 1
                 continue
         if is_disabled(strategy, side, grade):
