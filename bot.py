@@ -20,8 +20,8 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 #   Send A+ / B futures signals where TP1 target gives at least 10% ROI at x10
 # =========================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V12.5 CONFIRMED LEVEL QUALITY MODE"
-DEPLOY_MARKER = "V12_5_CONFIRMED_LEVEL_QUALITY_MODE_2026_06_19"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V12.5.1 CONFIRMED LEVEL QUALITY FIX"
+DEPLOY_MARKER = "V12_5_1_CONFIRMED_LEVEL_QUALITY_FIX_2026_06_19"
 
 app = FastAPI(title=APP_NAME)
 
@@ -30,7 +30,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_5.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_5_1.json")
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
 AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "75"))
@@ -388,6 +388,84 @@ def recent_low(c: List[Dict[str, float]], lookback: int = 36) -> float:
 
 def distance_pct(a: float, b: float) -> float:
     return abs(a - b) / a * 100 if a else 999.0
+
+
+# ---------- CONFIRMATION HELPERS ----------
+def candle_body_pct(candle: Dict[str, float]) -> float:
+    """Body size as % of candle range. Used to avoid signals from pure wicks."""
+    high = float(candle.get("high", 0.0))
+    low = float(candle.get("low", 0.0))
+    op = float(candle.get("open", 0.0))
+    cl = float(candle.get("close", 0.0))
+    rng = max(high - low, 1e-12)
+    return abs(cl - op) / rng
+
+
+def candle_wick_ratio(candle: Dict[str, float], side: str) -> float:
+    """
+    Returns the dangerous wick ratio for the requested side.
+    LONG: upper wick is dangerous because buyer may be exhausted.
+    SHORT: lower wick is dangerous because seller may be exhausted.
+    """
+    high = float(candle.get("high", 0.0))
+    low = float(candle.get("low", 0.0))
+    op = float(candle.get("open", 0.0))
+    cl = float(candle.get("close", 0.0))
+    rng = max(high - low, 1e-12)
+    if side == "LONG":
+        upper = high - max(op, cl)
+        return max(0.0, upper / rng)
+    lower = min(op, cl) - low
+    return max(0.0, lower / rng)
+
+
+def two_candle_confirmation(candles: List[Dict[str, float]], side: str) -> bool:
+    """
+    Confirmation on the last two closed 5m candles.
+    This fixes the runtime error from V12.5 and makes entries stricter:
+    LONG requires two constructive closes/reclaim; SHORT requires two weak closes/reject.
+    """
+    if len(candles) < 4:
+        return False
+    a, b = candles[-2], candles[-1]
+    prev = candles[-3]
+    a_open, a_close = float(a["open"]), float(a["close"])
+    b_open, b_close = float(b["open"]), float(b["close"])
+    prev_close = float(prev["close"])
+    if side == "LONG":
+        return (
+            a_close >= a_open and
+            b_close >= b_open and
+            b_close > a_close and
+            b_close > prev_close and
+            candle_body_pct(b) >= 0.22 and
+            candle_wick_ratio(b, "LONG") <= MAX_WICK_RATIO
+        )
+    return (
+        a_close <= a_open and
+        b_close <= b_open and
+        b_close < a_close and
+        b_close < prev_close and
+        candle_body_pct(b) >= 0.22 and
+        candle_wick_ratio(b, "SHORT") <= MAX_WICK_RATIO
+    )
+
+
+def htf_candle_confirmation(candles: List[Dict[str, float]], side: str) -> bool:
+    """
+    15m confirmation: avoids taking a trade if the higher entry candle disagrees.
+    LONG: 15m close should be constructive, not a rejection wick.
+    SHORT: 15m close should be weak, not a bounce wick.
+    """
+    if len(candles) < 3:
+        return False
+    cur = candles[-1]
+    prev = candles[-2]
+    op, cl = float(cur["open"]), float(cur["close"])
+    prev_cl = float(prev["close"])
+    if side == "LONG":
+        return cl >= op and cl >= prev_cl * 0.998 and candle_wick_ratio(cur, "LONG") <= MAX_WICK_RATIO
+    return cl <= op and cl <= prev_cl * 1.002 and candle_wick_ratio(cur, "SHORT") <= MAX_WICK_RATIO
 
 def near_level(price: float, level: float, pct_zone: float = LEVEL_ZONE_PCT) -> bool:
     if price <= 0 or level <= 0:
@@ -900,7 +978,7 @@ def build_startup_message() -> str:
     return (
         f"✅ <b>{APP_NAME}</b> активирован и работает.\n"
         f"Deploy marker: <code>{DEPLOY_MARKER}</code>\n\n"
-        f"Режим: LEVEL REVERSAL ANTI-CHASE — не шортить дно и не покупать вершину; работать от уровней.\n"
+        f"Режим: CONFIRMED LEVEL QUALITY FIX — вход только после 2x5m + 15m подтверждения и рядом с уровнем.\n"
         f"Цель: TP1 минимум {MIN_TP1_ROI_X10:.0f}% ROI при x{LEVERAGE:g}.\n"
         f"A+ score: {A_PLUS_MIN_SCORE} · B score: {B_MIN_SCORE}.\n"
         f"HTF strict: {STRICT_HTF_MODE} · лимит сигналов/день: {MAX_SIGNALS_PER_DAY}.\n"
