@@ -11,8 +11,8 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.0 PROFESSIONAL LEVEL TRADER"
-DEPLOY_MARKER = "V13_0_PROFESSIONAL_LEVEL_TRADER_2026_06_19"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.1 PROFESSIONAL LEVEL BREAK RETEST TRADER"
+DEPLOY_MARKER = "V13_1_PRO_LEVEL_BREAK_RETEST_TRADER_2026_06_19"
 
 app = FastAPI(title=APP_NAME)
 
@@ -20,7 +20,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_0.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_1.json")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
@@ -35,14 +35,15 @@ B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "85"))
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10"))
 MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1)  # 10% ROI at x10 = 1% price move
 
-MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "3"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "7200"))
-STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "1800"))
+MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "0"))  # 0 = no daily limit; quality filters decide
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1800"))
+STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "900"))
 
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "130"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "500"))
-DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "80"))
+DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "120"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "4"))
 
 # Level-trading guardrails.
 NEAR_LEVEL_MAX_PCT = float(os.getenv("NEAR_LEVEL_MAX_PCT", "0.85"))
@@ -757,6 +758,115 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], counters: Counter) -> Optio
         elif not (resistance_sweep or rejecting_resistance): counters["no_resistance_level_short"] += 1
         elif not short_confirm: counters["no_confirm_short"] += 1
 
+
+    # CONTINUATION FROM BROKEN LEVELS:
+    # If support breaks and price retests it from below, this is a professional SHORT continuation,
+    # not a late short at the bottom. If resistance breaks and price retests it from above, this is LONG continuation,
+    # not buying the top.
+    h1_piv, l1_piv = find_pivots(c1h[-120:], 2, 2)
+    h4_piv, l4_piv = find_pivots(c4h[-100:], 2, 2)
+    prev_support_levels = cluster_levels(l1_piv + l4_piv, 0.65)
+    prev_res_levels = cluster_levels(h1_piv + h4_piv, 0.65)
+
+    broken_supports_above = sorted([(lv, touch) for lv, touch in prev_support_levels if lv > price], key=lambda x: x[0] - price)
+    broken_res_below = sorted([(lv, touch) for lv, touch in prev_res_levels if lv < price], key=lambda x: price - x[0])
+
+    # SHORT after support failed: price below previous support, retested it or EMA/VWAP, then rejected.
+    if broken_supports_above:
+        broken_support, broken_touches = broken_supports_above[0]
+        dist_broken_support = abs(pct(price, broken_support))
+        retested_broken_support = max(x["high"] for x in c15[-5:]) >= broken_support * (1 - max(0.0025, atr_pct/100*0.35))
+        rejected_broken_support = price < broken_support and price < e5 and price < e15 * 1.006 and price < vw15 * 1.010
+        # If the dump is already large, require a real rebound/retest first; otherwise no chase.
+        late_dump_ok = not (move2h < -ANTI_CHASE_MOVE_PCT) or rebound >= max(REBOUND_FOR_LATE_SHORT_PCT, 0.9)
+        btc_short_ok = not btc.get("strong_up")
+        htf_short_ok = t4 != "UP" or btc.get("strong_down")
+        confirm_short_break = two_candle_confirmation(c5, "SHORT") and htf_confirmation(c15, "SHORT")
+        if btc_short_ok and htf_short_ok and late_dump_ok and retested_broken_support and rejected_broken_support and confirm_short_break:
+            sl = max(broken_support, max(x["high"] for x in c15[-5:])) + max(atr15 * 0.65, price * 0.004)
+            # target to nearest lower support, but keep TP1 >= 10% ROI x10.
+            tp1 = min(support * 1.003, price * (1 - max(MIN_TP1_PRICE_MOVE/100, 0.012))) if support < price else price * 0.988
+            if tp1 >= price:
+                tp1 = price * 0.988
+            tp2 = price - (price - tp1) * 1.8
+            tp3 = price - (price - tp1) * 2.8
+            risk = sl - price
+            reward = price - tp1
+            rr = reward / risk if risk > 0 else 0
+            roi = abs(pct(tp1, price)) * LEVERAGE
+            score = 58
+            score += 14 if broken_touches >= 2 else 7
+            score += 10 if retested_broken_support else 0
+            score += 8 if t1 == "DOWN" else 5 if t1 == "RANGE" else 0
+            score += 8 if t4 != "UP" else 0
+            score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
+            score += 8 if rr >= MIN_RR_A else 3 if rr >= MIN_RR_B else 0
+            score += 6 if upper_wick_ratio(last15) > 0.18 else 0
+            score += 6 if btc.get("regime") in ["TREND_DOWN", "IMPULSE_DOWN", "RANGE", "DOWN"] else 0
+            if roi >= MIN_TP1_ROI_X10 and rr >= MIN_RR_B:
+                grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A else "B" if score >= B_MIN_SCORE else "LOW"
+                if grade != "LOW":
+                    reason = (
+                        f"Пробитая поддержка {broken_support:.8g} стала сопротивлением: цена ушла ниже, сделала retest/reject и снова слабее EMA/VWAP. "
+                        f"Это не шорт дна: был отскок от low {rebound:+.2f}% перед входом. "
+                        f"Цель — продолжение к следующей зоне поддержки {support:.8g}. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
+                    )
+                    candidates.append(build_signal(symbol, "SHORT", "PRO_LEVEL_BREAKDOWN_RETEST", "SUPPORT FAILED / RETEST SHORT", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.45))
+            else:
+                counters["breakdown_tp_rr_block"] += 1
+        else:
+            if not btc_short_ok: counters["breakdown_btc_block"] += 1
+            elif not late_dump_ok: counters["breakdown_late_dump_no_retest"] += 1
+            elif not retested_broken_support: counters["breakdown_no_retest"] += 1
+            elif not confirm_short_break: counters["breakdown_no_confirm"] += 1
+
+    # LONG after resistance breakout: price above previous resistance, retested it from above, then reclaimed.
+    if broken_res_below:
+        broken_res, broken_res_touches = broken_res_below[0]
+        retested_broken_res = min(x["low"] for x in c15[-5:]) <= broken_res * (1 + max(0.0025, atr_pct/100*0.35))
+        held_broken_res = price > broken_res and price > e5 and price > e15 * 0.994 and price > vw15 * 0.990
+        # If pump is already large, require real pullback/retest first; otherwise no chase.
+        late_pump_ok = not (move2h > ANTI_CHASE_MOVE_PCT) or pullback <= -max(PULLBACK_FOR_LATE_LONG_PCT, 0.9)
+        btc_long_ok = not btc.get("strong_down")
+        htf_long_ok = t4 != "DOWN" or btc.get("strong_up")
+        confirm_long_break = two_candle_confirmation(c5, "LONG") and htf_confirmation(c15, "LONG")
+        if btc_long_ok and htf_long_ok and late_pump_ok and retested_broken_res and held_broken_res and confirm_long_break:
+            sl = min(broken_res, min(x["low"] for x in c15[-5:])) - max(atr15 * 0.65, price * 0.004)
+            tp1 = max(resistance * 0.997, price * (1 + max(MIN_TP1_PRICE_MOVE/100, 0.012))) if resistance > price else price * 1.012
+            if tp1 <= price:
+                tp1 = price * 1.012
+            tp2 = price + (tp1 - price) * 1.8
+            tp3 = price + (tp1 - price) * 2.8
+            risk = price - sl
+            reward = tp1 - price
+            rr = reward / risk if risk > 0 else 0
+            roi = abs(pct(tp1, price)) * LEVERAGE
+            score = 58
+            score += 14 if broken_res_touches >= 2 else 7
+            score += 10 if retested_broken_res else 0
+            score += 8 if t1 == "UP" else 5 if t1 == "RANGE" else 0
+            score += 8 if t4 != "DOWN" else 0
+            score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
+            score += 8 if rr >= MIN_RR_A else 3 if rr >= MIN_RR_B else 0
+            score += 6 if lower_wick_ratio(last15) > 0.18 else 0
+            score += 6 if btc.get("regime") in ["TREND_UP", "IMPULSE_UP", "RANGE", "UP"] else 0
+            if roi >= MIN_TP1_ROI_X10 and rr >= MIN_RR_B:
+                grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A else "B" if score >= B_MIN_SCORE else "LOW"
+                if grade != "LOW":
+                    reason = (
+                        f"Пробитое сопротивление {broken_res:.8g} стало поддержкой: был откат/retest, уровень удержан, цена снова выше EMA/VWAP. "
+                        f"Это не покупка вершины: был откат от high {pullback:+.2f}% перед входом. "
+                        f"Цель — продолжение к следующему сопротивлению {resistance:.8g}. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
+                    )
+                    candidates.append(build_signal(symbol, "LONG", "PRO_LEVEL_BREAKOUT_RETEST", "RESISTANCE BROKE / RETEST LONG", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.45))
+            else:
+                counters["breakout_tp_rr_block"] += 1
+        else:
+            if not btc_long_ok: counters["breakout_btc_block"] += 1
+            elif not late_pump_ok: counters["breakout_late_pump_no_retest"] += 1
+            elif not retested_broken_res: counters["breakout_no_retest"] += 1
+            elif not confirm_long_break: counters["breakout_no_confirm"] += 1
+
     if not candidates:
         counters["no_candidate"] += 1
         return None
@@ -772,7 +882,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], counters: Counter) -> Optio
 
 def can_send_signal(sig: Dict[str, Any], counters: Counter) -> Tuple[bool, str]:
     reset_daily_counter_if_needed()
-    if STATE["signals_today"].get("count", 0) >= MAX_SIGNALS_PER_DAY:
+    if MAX_SIGNALS_PER_DAY > 0 and STATE["signals_today"].get("count", 0) >= MAX_SIGNALS_PER_DAY:
         counters["daily_limit_block"] += 1
         return False, "daily signal limit"
     if len(STATE.get("active_signals", {})) >= MAX_ACTIVE_SIGNALS:
@@ -824,7 +934,7 @@ def scan_market(send_to_telegram: bool = True, force_diag: bool = False) -> Dict
             counters["analyze_error"] += 1
             STATE["auto"]["last_error"] = f"{sym}: {e}"
     candidates.sort(key=lambda s: (s["grade"] == "A+", s["score"], s["tp1_roi_x10"]), reverse=True)
-    for sig in candidates[:5]:
+    for sig in candidates[:MAX_SIGNALS_PER_SCAN]:
         ok, reason = can_send_signal(sig, counters)
         if not ok:
             continue
@@ -832,8 +942,8 @@ def scan_market(send_to_telegram: bool = True, force_diag: bool = False) -> Dict
         sent.append(sig)
         if send_to_telegram:
             send_telegram_message(signal_message(sig))
-        # quality mode: max 1 signal per scan cycle
-        break
+        if len(sent) >= MAX_SIGNALS_PER_SCAN:
+            break
     result = {
         "checked": counters.get("checked", 0),
         "candidates": len(candidates),
