@@ -13,15 +13,15 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 # =========================================================
-# V12.0 PROFESSIONAL VOLATILITY TREND BOT
+# V12.3 QUALITY HTF SELECTIVE MODE
 # One core professional strategy:
 #   Volatility + BTC context + HTF trend + pullback/reclaim/reject
 # Goal:
 #   Send A+ / B futures signals where TP1 target gives at least 10% ROI at x10
 # =========================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V12.0 PROFESSIONAL VOLATILITY TREND BOT"
-DEPLOY_MARKER = "V12_0_PROFESSIONAL_VOLATILITY_TREND_BOT_2026_06_19"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V12.3 QUALITY HTF SELECTIVE MODE"
+DEPLOY_MARKER = "V12_3_QUALITY_HTF_SELECTIVE_MODE_2026_06_19"
 
 app = FastAPI(title=APP_NAME)
 
@@ -30,24 +30,24 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_0.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_3.json")
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "45"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "75"))
 TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "20"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "7"))
 SCAN_CYCLE_TIMEOUT = int(os.getenv("SCAN_CYCLE_TIMEOUT", "80"))
 
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "500"))
-MAX_ANALYZE_PER_SCAN = int(os.getenv("MAX_ANALYZE_PER_SCAN", "130"))
+MAX_ANALYZE_PER_SCAN = int(os.getenv("MAX_ANALYZE_PER_SCAN", "110"))
 QUALITY_FIRST_LIMIT = int(os.getenv("QUALITY_FIRST_LIMIT", "55"))
 ACTIVE_MOVER_LIMIT = int(os.getenv("ACTIVE_MOVER_LIMIT", "95"))
 RANDOM_ROTATION_LIMIT = int(os.getenv("RANDOM_ROTATION_LIMIT", "35"))
 
 # Signal quality. User requested around 85 / 76 before; V12 keeps that.
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "85"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "76"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "82"))
 
 # 10% ROI at x10 means roughly 1% price movement. Add a small buffer for fees/slippage.
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10"))
@@ -74,8 +74,11 @@ OPPORTUNITY_AFTER_HOURS = float(os.getenv("OPPORTUNITY_AFTER_HOURS", "6"))
 OPPORTUNITY_MIN_SCORE = int(os.getenv("OPPORTUNITY_MIN_SCORE", "74"))
 
 # Cooldown per symbol/side/strategy
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "7200"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
+MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "5"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "1"))
+STRICT_HTF_MODE = os.getenv("STRICT_HTF_MODE", "true").lower() == "true"
 
 QUALITY_BASES = set(x.strip().upper() for x in os.getenv(
     "QUALITY_BASES",
@@ -90,6 +93,23 @@ BLOCKED_BASES = set(x.strip().upper() for x in os.getenv(
 # ---------- STATE ----------
 def now_ts() -> int:
     return int(time.time())
+
+
+def day_key(ts: Optional[int] = None) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts or now_ts()))
+
+
+def daily_sent_count() -> int:
+    return int(STATE.setdefault("daily_sent", {}).get(day_key(), 0))
+
+
+def record_daily_signal() -> None:
+    d = STATE.setdefault("daily_sent", {})
+    k = day_key()
+    d[k] = int(d.get(k, 0)) + 1
+    # keep only recent daily counters
+    for old in list(d.keys())[:-7]:
+        d.pop(old, None)
 
 
 def default_state() -> Dict[str, Any]:
@@ -113,6 +133,7 @@ def default_state() -> Dict[str, Any]:
         "disabled_until": {},
         "last_scan_summary": {},
         "near_miss": [],
+        "daily_sent": {},
     }
 
 
@@ -146,7 +167,18 @@ def tg_enabled() -> bool:
 
 
 def send_telegram(text: str) -> bool:
-    if not tg_enabled():
+    """Send Telegram message and record the exact reason if it fails.
+    This is intentionally noisy in STATE/console because silent Telegram failures
+    were the main reason diagnostics were hard to verify.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        missing = []
+        if not TELEGRAM_BOT_TOKEN:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not TELEGRAM_CHAT_ID:
+            missing.append("TELEGRAM_CHAT_ID")
+        STATE["last_error"] = "telegram disabled: missing " + ", ".join(missing)
+        print(STATE["last_error"], flush=True)
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -157,9 +189,15 @@ def send_telegram(text: str) -> bool:
             "disable_web_page_preview": True,
         }
         r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
-        return r.status_code == 200
+        if r.status_code != 200:
+            STATE["last_error"] = f"telegram http {r.status_code}: {r.text[:250]}"
+            print(STATE["last_error"], flush=True)
+            return False
+        print("telegram sent", flush=True)
+        return True
     except Exception as e:
-        STATE["last_error"] = f"telegram: {e}"
+        STATE["last_error"] = f"telegram exception: {e}"
+        print(STATE["last_error"], flush=True)
         return False
 
 # ---------- MARKET DATA ----------
@@ -593,19 +631,15 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
 
         # BTC alignment
         if side == btc.side_bias:
-            score += 14
+            score += 16
             reasons.append(f"BTC совпадает: {btc.reason}")
         elif btc.side_bias == "BOTH":
-            score += 5
+            score += 4
             reasons.append(f"BTC нейтрален/диапазон: {btc.reason}")
         else:
-            # Still allow rare counter-trend only for quality with strong setup, but penalize.
-            if base_of(symbol) in QUALITY_BASES and abs(move_1h) > 1.8:
-                score -= 8
-                reasons.append("Сделка против BTC, но монета quality и движение сильное")
-            else:
-                diag["btc_block"] += 1
-                continue
+            # V12.3 quality mode: no counter-BTC trades. We prefer fewer, cleaner signals.
+            diag["btc_block"] += 1
+            continue
 
         # HTF trend and setup.
         if side == "LONG":
@@ -621,6 +655,12 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             if near_value: score += 7; reasons.append("вход рядом с EMA/VWAP, не в пустоте")
             if move_1h > 0.7: score += 5; reasons.append(f"монета активна вверх: 1h {move_1h:.2f}%")
             if move_4h > 1.2: score += 4; reasons.append(f"4h движение вверх {move_4h:.2f}%")
+            if STRICT_HTF_MODE and not (trend_ok and htf_ok):
+                diag["htf_block"] += 1
+                continue
+            if STRICT_HTF_MODE and not (reclaim and near_value):
+                diag["setup_block"] += 1
+                continue
             if not (trend_ok and reclaim and near_value):
                 score -= 12
             if pulled_back > 5.5:
@@ -639,6 +679,12 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             if near_value: score += 7; reasons.append("вход рядом с EMA/VWAP, не в пустоте")
             if move_1h < -0.7: score += 5; reasons.append(f"монета активна вниз: 1h {move_1h:.2f}%")
             if move_4h < -1.2: score += 4; reasons.append(f"4h движение вниз {move_4h:.2f}%")
+            if STRICT_HTF_MODE and not (trend_ok and htf_ok):
+                diag["htf_block"] += 1
+                continue
+            if STRICT_HTF_MODE and not (reject and near_value):
+                diag["setup_block"] += 1
+                continue
             if not (trend_ok and reject and near_value):
                 score -= 12
             if bounced > 5.5:
@@ -673,6 +719,11 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             if score >= OPPORTUNITY_MIN_SCORE:
                 add_near_miss(symbol, side, score, strategy, f"score {score}, нужен {B_MIN_SCORE}; ROI TP1 {roi_tp1:.1f}%")
             continue
+        if grade == "B":
+            # B is allowed, but only when the higher timeframe is clean and RR is not weak.
+            if rr < 0.75:
+                diag["rr_block"] += 1
+                continue
         if is_disabled(strategy, side, grade):
             diag["adaptive_block"] += 1
             continue
@@ -746,12 +797,30 @@ def build_startup_message() -> str:
     return (
         f"✅ <b>{APP_NAME}</b> активирован и работает.\n"
         f"Deploy marker: <code>{DEPLOY_MARKER}</code>\n\n"
-        f"Стратегия: Volatility Trend Pullback по принципу confluence.\n"
+        f"Режим: QUALITY HTF SELECTIVE — меньше сделок, выше фильтрация.\n"
         f"Цель: TP1 минимум {MIN_TP1_ROI_X10:.0f}% ROI при x{LEVERAGE:g}.\n"
         f"A+ score: {A_PLUS_MIN_SCORE} · B score: {B_MIN_SCORE}.\n"
+        f"HTF strict: {STRICT_HTF_MODE} · лимит сигналов/день: {MAX_SIGNALS_PER_DAY}.\n"
         f"Скан: каждые {AUTO_SCAN_SECONDS} сек · max analyze {MAX_ANALYZE_PER_SCAN}.\n"
-        f"Статистика и TP/SL tracking: ON."
+        f"Статистика и TP/SL tracking: ON.\n"
+        f"Forced diagnostics: ON — первый отчёт должен прийти сразу после запуска.\n"
+        f"Диагностика включает: checked/candidates/blocks/profit/SL."
     )
+
+
+def get_total_stats_summary() -> Dict[str, Any]:
+    stats = STATE.get("stats", {})
+    g = stats.get("global", {})
+    # Support both old shape {positive, sl} and current shape {all:{positive,sl}}.
+    if isinstance(g.get("all"), dict):
+        pos = int(g.get("all", {}).get("positive", 0))
+        sl = int(g.get("all", {}).get("sl", 0))
+    else:
+        pos = int(g.get("positive", 0))
+        sl = int(g.get("sl", 0))
+    total = pos + sl
+    wr = (pos / total * 100.0) if total else 0.0
+    return {"positive": pos, "sl": sl, "total": total, "wr": wr}
 
 
 def build_diag_message(summary: Dict[str, Any]) -> str:
@@ -761,16 +830,23 @@ def build_diag_message(summary: Dict[str, Any]) -> str:
         near_txt = "\n\n<b>Почти сигналы:</b>\n" + "\n".join(
             f"• {x['symbol']} {x['side']} score {x['score']} — {x['reason']}" for x in near
         )
+    st = get_total_stats_summary()
     return (
-        f"🧪 <b>Диагностика V12</b>\n"
+        f"🧪 <b>Диагностика V12.3 Quality HTF</b>\n"
         f"Проверено: {summary.get('checked', 0)}\n"
         f"Кандидатов: {summary.get('candidates', 0)}\n"
-        f"Отправлено: {summary.get('sent', 0)}\n"
+        f"Отправлено: {summary.get('sent', 0)} / сегодня {daily_sent_count()}/{MAX_SIGNALS_PER_DAY}\n"
         f"BTC: {summary.get('btc', 'n/a')}\n"
-        f"Блоки: btc {summary.get('btc_block', 0)}, score {summary.get('score_block', 0)}, "
-        f"tp1 {summary.get('tp1_roi_block', 0)}, rr {summary.get('rr_block', 0)}, "
+        f"Блоки: btc {summary.get('btc_block', 0)}, htf {summary.get('htf_block', 0)}, setup {summary.get('setup_block', 0)}, "
+        f"score {summary.get('score_block', 0)}, tp1 {summary.get('tp1_roi_block', 0)}, rr {summary.get('rr_block', 0)}, "
         f"vol {summary.get('low_vol_block', 0) + summary.get('too_volatile_block', 0)}, "
-        f"ultra {summary.get('ultra_risk_block', 0)}, klines {summary.get('no_klines_5m', 0) + summary.get('no_klines_htf', 0)}\n"
+        f"ultra {summary.get('ultra_risk_block', 0)}, klines {summary.get('no_klines_5m', 0) + summary.get('no_klines_htf', 0)}, "
+        f"daily {summary.get('daily_limit_block', 0)}\n\n"
+        f"📊 <b>Итог сделок:</b>\n"
+        f"Профитных: {st['positive']}\n"
+        f"Stop Loss: {st['sl']}\n"
+        f"Всего закрыто: {st['total']}\n"
+        f"Win Rate: {st['wr']:.1f}%\n\n"
         f"Last error: {STATE.get('last_error') or '-'}"
         f"{near_txt}"
     )
@@ -807,18 +883,25 @@ def apply_result(sig: Dict[str, Any], result: str) -> None:
 
 
 def build_stats_text() -> str:
-    lines = ["📊 <b>Статистика V12</b>"]
-    for scope, title in [("side", "Стороны"), ("grade", "Grade"), ("strategy", "Стратегии")]:
+    st_total = get_total_stats_summary()
+    lines = [
+        "📊 <b>Статистика V12.3</b>",
+        f"Итого: {st_total['positive']} профит / {st_total['sl']} SL / всего {st_total['total']} / WR {st_total['wr']:.1f}%",
+    ]
+    for scope, title in [("side", "Стороны"), ("grade", "Grade"), ("strategy", "Стратегии"), ("symbol", "Монеты")]:
         lines.append(f"\n<b>{title}:</b>")
         items = STATE.get("stats", {}).get(scope, {})
         if not items:
             lines.append("нет данных")
             continue
-        for k, v in sorted(items.items()):
-            pos, sl = v.get("positive", 0), v.get("sl", 0)
-            total = pos + sl
+        # Sort by most trades first so the useful stats are visible.
+        rows = []
+        for k, v in items.items():
+            pos, sl = int(v.get("positive", 0)), int(v.get("sl", 0))
+            rows.append((pos + sl, k, pos, sl))
+        for total, k, pos, sl in sorted(rows, reverse=True)[:18]:
             wr = pos / total * 100 if total else 0
-            lines.append(f"{k}: {pos} позитив / {sl} SL / WR {wr:.1f}%")
+            lines.append(f"{k}: {pos} профит / {sl} SL / WR {wr:.1f}%")
     return "\n".join(lines)[:3900]
 
 
@@ -901,7 +984,8 @@ def empty_diag() -> Dict[str, int]:
     keys = [
         "checked", "candidates", "sent", "no_klines_5m", "no_klines_htf", "ultra_risk_block",
         "low_vol_block", "too_volatile_block", "volume_block", "not_active_block", "btc_block",
-        "tp1_roi_block", "rr_block", "score_block", "adaptive_block", "cooldown_block"
+        "tp1_roi_block", "rr_block", "score_block", "adaptive_block", "cooldown_block",
+        "htf_block", "setup_block", "daily_limit_block"
     ]
     return {k: 0 for k in keys}
 
@@ -911,8 +995,16 @@ def run_scan_once(force_diag: bool = False) -> Dict[str, Any]:
     diag = empty_diag()
     btc = analyze_btc()
     if not btc:
-        STATE["last_error"] = "BTC klines unavailable"
+        STATE["last_error"] = "BTC klines unavailable — scan cannot build market context"
         diag["btc"] = "unavailable"
+        STATE["last_scan_at"] = now_ts()
+        STATE["last_scan_summary"] = diag
+        save_state()
+        # Critical fix: previous versions returned here without sending diagnostics.
+        if force_diag or now_ts() - STATE.get("last_diag_at", 0) >= DIAG_SECONDS:
+            send_telegram(build_diag_message(diag))
+            STATE["last_diag_at"] = now_ts()
+            save_state()
         return diag
     diag["btc"] = f"{btc.regime} / {btc.reason}"
 
@@ -932,11 +1024,15 @@ def run_scan_once(force_diag: bool = False) -> Dict[str, Any]:
 
     # Sort by score then A+ first.
     best_signals.sort(key=lambda s: (1 if s.grade == "A+" else 0, s.score, s.rr), reverse=True)
-    # Send up to 2 per cycle to avoid spam.
-    for sig in best_signals[:2]:
+    # V12.3 quality mode: send only the best signal, respect daily cap.
+    for sig in best_signals[:MAX_SIGNALS_PER_SCAN]:
+        if daily_sent_count() >= MAX_SIGNALS_PER_DAY:
+            diag["daily_limit_block"] += 1
+            break
         send_telegram(build_signal_message(sig))
         STATE.setdefault("active_signals", []).append(signal_to_dict(sig))
         set_cooldown(sig.symbol, sig.side, sig.strategy)
+        record_daily_signal()
         STATE["last_signal_at"] = now_ts()
         diag["sent"] += 1
 
@@ -954,20 +1050,27 @@ def run_scan_once(force_diag: bool = False) -> Dict[str, Any]:
 
 async def auto_worker() -> None:
     await asyncio.sleep(2)
-    send_telegram(build_startup_message())
-    # First diagnostic scan always.
+    ok = send_telegram(build_startup_message() + "\n\n🧪 Сейчас запускаю обязательный первый диагностический скан.")
+    if not ok:
+        print("startup telegram was not delivered: " + str(STATE.get("last_error")), flush=True)
+    # First diagnostic scan always. It must send a Telegram diagnostic even when BTC/API fails.
     try:
         run_scan_once(force_diag=True)
     except Exception as e:
         STATE["last_error"] = f"first_scan: {e}\n{traceback.format_exc()[-700:]}"
-        send_telegram(f"⚠️ Ошибка первого скана V12: {e}")
         save_state()
+        send_telegram(f"⚠️ <b>Ошибка первого скана V12.3</b>\n<code>{str(e)[:500]}</code>")
     while True:
         try:
             run_scan_once(force_diag=False)
         except Exception as e:
             STATE["last_error"] = f"auto_scan: {e}\n{traceback.format_exc()[-700:]}"
             save_state()
+            # Critical fix: do not keep scan errors silent for hours.
+            if now_ts() - STATE.get("last_diag_at", 0) >= DIAG_SECONDS:
+                send_telegram(f"⚠️ <b>Ошибка auto-scan V12.3</b>\n<code>{str(e)[:700]}</code>")
+                STATE["last_diag_at"] = now_ts()
+                save_state()
         await asyncio.sleep(AUTO_SCAN_SECONDS)
 
 # ---------- ROUTES ----------
