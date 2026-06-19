@@ -13,15 +13,15 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 # =========================================================
-# V12.3 QUALITY HTF SELECTIVE MODE
+# V12.4 LEVEL REVERSAL ANTI-CHASE MODE
 # One core professional strategy:
 #   Volatility + BTC context + HTF trend + pullback/reclaim/reject
 # Goal:
 #   Send A+ / B futures signals where TP1 target gives at least 10% ROI at x10
 # =========================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V12.3 QUALITY HTF SELECTIVE MODE"
-DEPLOY_MARKER = "V12_3_QUALITY_HTF_SELECTIVE_MODE_2026_06_19"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V12.4 LEVEL REVERSAL ANTI-CHASE MODE"
+DEPLOY_MARKER = "V12_4_LEVEL_REVERSAL_ANTI_CHASE_MODE_2026_06_19"
 
 app = FastAPI(title=APP_NAME)
 
@@ -30,7 +30,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_3.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v12_4.json")
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
 AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "75"))
@@ -79,6 +79,14 @@ MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "5"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "1"))
 STRICT_HTF_MODE = os.getenv("STRICT_HTF_MODE", "true").lower() == "true"
+
+# Anti-chase / level reversal filters.
+# If a coin already moved too far, the bot must not chase the same direction.
+# It waits for bounce/retest/reclaim near levels.
+ANTI_CHASE_1H_PCT = float(os.getenv("ANTI_CHASE_1H_PCT", "3.0"))
+ANTI_CHASE_4H_PCT = float(os.getenv("ANTI_CHASE_4H_PCT", "6.0"))
+MIN_RETRACE_AFTER_EXTREME_PCT = float(os.getenv("MIN_RETRACE_AFTER_EXTREME_PCT", "1.2"))
+LEVEL_ZONE_PCT = float(os.getenv("LEVEL_ZONE_PCT", "1.8"))
 
 QUALITY_BASES = set(x.strip().upper() for x in os.getenv(
     "QUALITY_BASES",
@@ -369,6 +377,15 @@ def recent_low(c: List[Dict[str, float]], lookback: int = 36) -> float:
     part = c[-lookback:] if len(c) >= lookback else c
     return min(x["low"] for x in part)
 
+
+def distance_pct(a: float, b: float) -> float:
+    return abs(a - b) / a * 100 if a else 999.0
+
+def near_level(price: float, level: float, pct_zone: float = LEVEL_ZONE_PCT) -> bool:
+    if price <= 0 or level <= 0:
+        return False
+    return abs(price - level) / price * 100 <= pct_zone
+
 # ---------- CONTEXT ----------
 @dataclass
 class BtcContext:
@@ -613,6 +630,12 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
     vwap15 = vwap(c15, 48)
     hi36 = recent_high(c15, 36)
     lo36 = recent_low(c15, 36)
+    hi96 = recent_high(c15, 96)
+    lo96 = recent_low(c15, 96)
+
+    # Anti-chase context: if price already moved far, do not enter late in the same direction.
+    extended_down = move_1h <= -ANTI_CHASE_1H_PCT or move_4h <= -ANTI_CHASE_4H_PCT
+    extended_up = move_1h >= ANTI_CHASE_1H_PCT or move_4h >= ANTI_CHASE_4H_PCT
 
     # Direction priority from BTC. If BTC is bearish, search shorts first; bullish -> longs first.
     sides = ["LONG", "SHORT"]
@@ -637,7 +660,7 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             score += 4
             reasons.append(f"BTC нейтрален/диапазон: {btc.reason}")
         else:
-            # V12.3 quality mode: no counter-BTC trades. We prefer fewer, cleaner signals.
+            # V12.4 level anti-chase mode: no counter-BTC trades. We prefer fewer, cleaner signals.
             diag["btc_block"] += 1
             continue
 
@@ -648,6 +671,23 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             pulled_back = (hi36 - price) / hi36 * 100 if hi36 else 0
             reclaim = price > ema5_20 and c5[-1]["close"] > c5[-1]["open"]
             near_value = abs(price - ema15_20) / price * 100 < max(1.8, atr15p * 1.8) or abs(price - vwap15) / price * 100 < max(1.8, atr15p * 1.8)
+            near_support = near_level(price, lo36, max(LEVEL_ZONE_PCT, atr15p * 1.4)) or near_level(price, lo96, max(LEVEL_ZONE_PCT, atr15p * 1.4))
+            # If price already pumped hard, do not chase LONG. LONG is allowed only after a real pullback/reclaim.
+            if extended_up and pulled_back < MIN_RETRACE_AFTER_EXTREME_PCT:
+                diag["anti_chase_block"] += 1
+                add_near_miss(symbol, side, score, "ANTI_CHASE_LONG", f"цена уже выросла: 1h {move_1h:.1f}%, 4h {move_4h:.1f}%; ждём откат/уровень")
+                continue
+            # If price dumped hard, LONG is not trend-following; it is a level reclaim only. Require support/reclaim.
+            if extended_down:
+                diag["level_reversal_watch"] += 1
+                strategy = "LEVEL_RECLAIM_AFTER_DUMP"
+                trade_type = "STRUCTURE"
+                if not (near_support and reclaim and c5[-1]["close"] > c5[-2]["close"]):
+                    diag["setup_block"] += 1
+                    add_near_miss(symbol, side, score, strategy, f"после падения ждём reclaim поддержки; 1h {move_1h:.1f}%, 4h {move_4h:.1f}%")
+                    continue
+                score += 10
+                reasons.append("после сильного падения бот ищет не chase SHORT, а reclaim поддержки для отскока")
             if trend_ok: score += 10; reasons.append("1H тренд/структура поддерживает LONG")
             if htf_ok: score += 6; reasons.append("4H фон не против LONG")
             if pulled_back >= 0.45: score += 7; reasons.append(f"был откат от локального high {pulled_back:.1f}%")
@@ -672,6 +712,33 @@ def analyze_symbol(symbol: str, btc: BtcContext, diag: Dict[str, int]) -> Option
             bounced = (price - lo36) / lo36 * 100 if lo36 else 0
             reject = price < ema5_20 and c5[-1]["close"] < c5[-1]["open"]
             near_value = abs(price - ema15_20) / price * 100 < max(1.8, atr15p * 1.8) or abs(price - vwap15) / price * 100 < max(1.8, atr15p * 1.8)
+            near_resistance = near_level(price, hi36, max(LEVEL_ZONE_PCT, atr15p * 1.4)) or near_level(price, hi96, max(LEVEL_ZONE_PCT, atr15p * 1.4))
+            # If price already dumped hard, do not chase SHORT. SHORT is allowed only after a bounce into resistance and reject.
+            if extended_down and bounced < MIN_RETRACE_AFTER_EXTREME_PCT:
+                diag["anti_chase_block"] += 1
+                add_near_miss(symbol, side, score, "ANTI_CHASE_SHORT", f"цена уже упала: 1h {move_1h:.1f}%, 4h {move_4h:.1f}%; ждём отскок/retest")
+                continue
+            if extended_down:
+                strategy = "LEVEL_RETEST_SHORT_AFTER_DUMP"
+                trade_type = "STRUCTURE"
+                if not (near_resistance and reject):
+                    diag["setup_block"] += 1
+                    add_near_miss(symbol, side, score, strategy, f"после падения SHORT только от сопротивления после отскока; bounce {bounced:.1f}%")
+                    continue
+                reasons.append("SHORT не на дне: был отскок к сопротивлению и reject")
+                score += 8
+            # If price pumped hard, SHORT can be level-reversal only if high was not broken/held and reject appeared.
+            if extended_up:
+                diag["level_reversal_watch"] += 1
+                strategy = "LEVEL_REJECT_AFTER_PUMP"
+                trade_type = "STRUCTURE"
+                failed_breakout = near_resistance or c15[-1]["close"] < hi36 * 0.995
+                if not (failed_breakout and reject):
+                    diag["setup_block"] += 1
+                    add_near_miss(symbol, side, score, strategy, f"после роста ждём failed breakout/reject уровня; 1h {move_1h:.1f}%, 4h {move_4h:.1f}%")
+                    continue
+                reasons.append("после сильного роста бот ищет failed breakout / reject от сопротивления")
+                score += 10
             if trend_ok: score += 10; reasons.append("1H тренд/структура поддерживает SHORT")
             if htf_ok: score += 6; reasons.append("4H фон не против SHORT")
             if bounced >= 0.45: score += 7; reasons.append(f"был отскок от локального low {bounced:.1f}%")
@@ -797,7 +864,7 @@ def build_startup_message() -> str:
     return (
         f"✅ <b>{APP_NAME}</b> активирован и работает.\n"
         f"Deploy marker: <code>{DEPLOY_MARKER}</code>\n\n"
-        f"Режим: QUALITY HTF SELECTIVE — меньше сделок, выше фильтрация.\n"
+        f"Режим: LEVEL REVERSAL ANTI-CHASE — не шортить дно и не покупать вершину; работать от уровней.\n"
         f"Цель: TP1 минимум {MIN_TP1_ROI_X10:.0f}% ROI при x{LEVERAGE:g}.\n"
         f"A+ score: {A_PLUS_MIN_SCORE} · B score: {B_MIN_SCORE}.\n"
         f"HTF strict: {STRICT_HTF_MODE} · лимит сигналов/день: {MAX_SIGNALS_PER_DAY}.\n"
@@ -832,7 +899,7 @@ def build_diag_message(summary: Dict[str, Any]) -> str:
         )
     st = get_total_stats_summary()
     return (
-        f"🧪 <b>Диагностика V12.3 Quality HTF</b>\n"
+        f"🧪 <b>Диагностика V12.4 Level Reversal Anti-Chase</b>\n"
         f"Проверено: {summary.get('checked', 0)}\n"
         f"Кандидатов: {summary.get('candidates', 0)}\n"
         f"Отправлено: {summary.get('sent', 0)} / сегодня {daily_sent_count()}/{MAX_SIGNALS_PER_DAY}\n"
@@ -841,7 +908,7 @@ def build_diag_message(summary: Dict[str, Any]) -> str:
         f"score {summary.get('score_block', 0)}, tp1 {summary.get('tp1_roi_block', 0)}, rr {summary.get('rr_block', 0)}, "
         f"vol {summary.get('low_vol_block', 0) + summary.get('too_volatile_block', 0)}, "
         f"ultra {summary.get('ultra_risk_block', 0)}, klines {summary.get('no_klines_5m', 0) + summary.get('no_klines_htf', 0)}, "
-        f"daily {summary.get('daily_limit_block', 0)}\n\n"
+        f"daily {summary.get('daily_limit_block', 0)}, anti-chase {summary.get('anti_chase_block', 0)}, level-watch {summary.get('level_reversal_watch', 0)}\n\n"
         f"📊 <b>Итог сделок:</b>\n"
         f"Профитных: {st['positive']}\n"
         f"Stop Loss: {st['sl']}\n"
@@ -885,7 +952,7 @@ def apply_result(sig: Dict[str, Any], result: str) -> None:
 def build_stats_text() -> str:
     st_total = get_total_stats_summary()
     lines = [
-        "📊 <b>Статистика V12.3</b>",
+        "📊 <b>Статистика V12.4 Level Reversal</b>",
         f"Итого: {st_total['positive']} профит / {st_total['sl']} SL / всего {st_total['total']} / WR {st_total['wr']:.1f}%",
     ]
     for scope, title in [("side", "Стороны"), ("grade", "Grade"), ("strategy", "Стратегии"), ("symbol", "Монеты")]:
@@ -985,7 +1052,7 @@ def empty_diag() -> Dict[str, int]:
         "checked", "candidates", "sent", "no_klines_5m", "no_klines_htf", "ultra_risk_block",
         "low_vol_block", "too_volatile_block", "volume_block", "not_active_block", "btc_block",
         "tp1_roi_block", "rr_block", "score_block", "adaptive_block", "cooldown_block",
-        "htf_block", "setup_block", "daily_limit_block"
+        "htf_block", "setup_block", "anti_chase_block", "level_reversal_watch", "daily_limit_block"
     ]
     return {k: 0 for k in keys}
 
@@ -1024,7 +1091,7 @@ def run_scan_once(force_diag: bool = False) -> Dict[str, Any]:
 
     # Sort by score then A+ first.
     best_signals.sort(key=lambda s: (1 if s.grade == "A+" else 0, s.score, s.rr), reverse=True)
-    # V12.3 quality mode: send only the best signal, respect daily cap.
+    # V12.4 level anti-chase mode: send only the best signal, respect daily cap.
     for sig in best_signals[:MAX_SIGNALS_PER_SCAN]:
         if daily_sent_count() >= MAX_SIGNALS_PER_DAY:
             diag["daily_limit_block"] += 1
@@ -1059,7 +1126,7 @@ async def auto_worker() -> None:
     except Exception as e:
         STATE["last_error"] = f"first_scan: {e}\n{traceback.format_exc()[-700:]}"
         save_state()
-        send_telegram(f"⚠️ <b>Ошибка первого скана V12.3</b>\n<code>{str(e)[:500]}</code>")
+        send_telegram(f"⚠️ <b>Ошибка первого скана V12.4</b>\n<code>{str(e)[:500]}</code>")
     while True:
         try:
             run_scan_once(force_diag=False)
@@ -1068,7 +1135,7 @@ async def auto_worker() -> None:
             save_state()
             # Critical fix: do not keep scan errors silent for hours.
             if now_ts() - STATE.get("last_diag_at", 0) >= DIAG_SECONDS:
-                send_telegram(f"⚠️ <b>Ошибка auto-scan V12.3</b>\n<code>{str(e)[:700]}</code>")
+                send_telegram(f"⚠️ <b>Ошибка auto-scan V12.4</b>\n<code>{str(e)[:700]}</code>")
                 STATE["last_diag_at"] = now_ts()
                 save_state()
         await asyncio.sleep(AUTO_SCAN_SECONDS)
