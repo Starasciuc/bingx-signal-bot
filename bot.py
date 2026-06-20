@@ -16,8 +16,8 @@ except Exception:
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.4 API STABILITY LEVEL TRADER"
-DEPLOY_MARKER = "V13_4_API_STABILITY_LEVEL_TRADER_2026_06_20"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.5 BALANCED VERIFIED LEVEL TRADER"
+DEPLOY_MARKER = "V13_5_BALANCED_VERIFIED_LEVEL_TRADER_2026_06_20"
 
 app = FastAPI(title=APP_NAME)
 
@@ -25,7 +25,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_4.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_5.json")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
 REQUEST_BACKOFF = float(os.getenv("REQUEST_BACKOFF", "0.55"))
@@ -38,31 +38,31 @@ AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "20"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "84"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "82"))
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10"))
 MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1)  # 10% ROI at x10 = 1% price move
 
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "0"))  # 0 = no daily limit; quality filters decide
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1800"))
-STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "900"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "10"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1200"))
+STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "600"))
 
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "120"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
-DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "120"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "4"))
+DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "180"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "6"))
 
 # Level-trading guardrails.
 NEAR_LEVEL_MAX_PCT = float(os.getenv("NEAR_LEVEL_MAX_PCT", "1.10"))
-ANTI_CHASE_MOVE_PCT = float(os.getenv("ANTI_CHASE_MOVE_PCT", "6.0"))
+ANTI_CHASE_MOVE_PCT = float(os.getenv("ANTI_CHASE_MOVE_PCT", "7.0"))
 ANTI_CHASE_LOOKBACK_15M = int(os.getenv("ANTI_CHASE_LOOKBACK_15M", "8"))
-REBOUND_FOR_LATE_SHORT_PCT = float(os.getenv("REBOUND_FOR_LATE_SHORT_PCT", "1.4"))
-PULLBACK_FOR_LATE_LONG_PCT = float(os.getenv("PULLBACK_FOR_LATE_LONG_PCT", "1.4"))
-MIN_VOLUME_RATIO_A = float(os.getenv("MIN_VOLUME_RATIO_A", "1.05"))
-MIN_VOLUME_RATIO_B = float(os.getenv("MIN_VOLUME_RATIO_B", "0.85"))
-MIN_RR_A = float(os.getenv("MIN_RR_A", "1.05"))
-MIN_RR_B = float(os.getenv("MIN_RR_B", "0.85"))
+REBOUND_FOR_LATE_SHORT_PCT = float(os.getenv("REBOUND_FOR_LATE_SHORT_PCT", "1.1"))
+PULLBACK_FOR_LATE_LONG_PCT = float(os.getenv("PULLBACK_FOR_LATE_LONG_PCT", "1.1"))
+MIN_VOLUME_RATIO_A = float(os.getenv("MIN_VOLUME_RATIO_A", "1.00"))
+MIN_VOLUME_RATIO_B = float(os.getenv("MIN_VOLUME_RATIO_B", "0.75"))
+MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
+MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
 
 # Professional level verification. These filters are intentionally strict:
 # a signal must come from a real 1H/4H level, not from a random local wick.
@@ -70,8 +70,8 @@ MIN_LEVEL_TOUCHES_A = int(os.getenv("MIN_LEVEL_TOUCHES_A", "3"))
 MIN_LEVEL_TOUCHES_B = int(os.getenv("MIN_LEVEL_TOUCHES_B", "2"))
 MIN_LEVEL_REACTIONS_A = int(os.getenv("MIN_LEVEL_REACTIONS_A", "2"))
 MIN_LEVEL_REACTIONS_B = int(os.getenv("MIN_LEVEL_REACTIONS_B", "1"))
-LEVEL_ENTRY_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_ENTRY_MAX_DISTANCE_PCT", "1.05"))
-BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT = float(os.getenv("BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT", "1.35"))
+LEVEL_ENTRY_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_ENTRY_MAX_DISTANCE_PCT", "1.25"))
+BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT = float(os.getenv("BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT", "1.55"))
 LEVEL_CLOSE_CONFIRM_BUFFER_PCT = float(os.getenv("LEVEL_CLOSE_CONFIRM_BUFFER_PCT", "0.08"))
 MIN_LEVEL_ROOM_PCT = float(os.getenv("MIN_LEVEL_ROOM_PCT", "0.90"))
 MIN_REJECTION_WICK_RATIO = float(os.getenv("MIN_REJECTION_WICK_RATIO", "0.22"))
@@ -1162,7 +1162,7 @@ def build_diag_message(result: Dict[str, Any]) -> str:
     total = p + sl
     wr = p / total * 100 if total else 0
     lines = [
-        "🧪 <b>Диагностика V13.4 API Stability Level Trader</b>",
+        "🧪 <b>Диагностика V13.5 Balanced Verified Level Trader</b>",
         f"Проверено: {result.get('checked', 0)} из universe {blocks.get('universe', 0)}",
         f"Кандидатов: {result.get('candidates', 0)} · отправлено: {result.get('sent', 0)} · время: {result.get('duration', 0)}с",
         f"BTC: {result.get('btc', {}).get('text', 'unknown')}",
@@ -1239,7 +1239,7 @@ async def auto_worker() -> None:
         f"A+ score: {A_PLUS_MIN_SCORE} · B score: {B_MIN_SCORE}.\n"
         f"Лимит: {MAX_SIGNALS_PER_DAY} сигнала/день · active max {MAX_ACTIVE_SIGNALS}.\n"
         "Диагностика и статистика TP/SL: ON.\n"
-        f"API Stability: retries {REQUEST_RETRIES}, throttle {API_MIN_GAP_SECONDS}s, analyze {MAX_ANALYZE_SYMBOLS} symbols."
+        f"Balanced Level Mode: verified 1H/4H levels, anti-chase, analyze {MAX_ANALYZE_SYMBOLS} symbols, max {MAX_SIGNALS_PER_SCAN}/scan."
     )
     send_telegram_message(startup)
     # Force first diagnostic, even if no signal.
