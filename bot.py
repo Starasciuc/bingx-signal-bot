@@ -11,14 +11,14 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.6 — Professional Level Trader Balanced
-# Goal: профессиональная торговля от уровней без молчания.
-# Core idea: verified HTF levels + reclaim/reject/break-retest,
-# anti-chase, BTC context, diagnostics, TP/SL stats.
+# V13.7 — Professional Level Scenario Trader
+# Goal: trade levels like a professional: distinguish reject vs breakout-hold.
+# Core idea: verified HTF levels + scenario switch, no early shorts into breakout,
+# active secondary intraday levels to avoid silence, BTC context, diagnostics, TP/SL stats.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.6 PROFESSIONAL LEVEL BALANCED TRADER"
-DEPLOY_MARKER = "V13_6_PRO_LEVEL_BALANCED_TRADER_2026_06_20"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.7 PROFESSIONAL LEVEL SCENARIO TRADER"
+DEPLOY_MARKER = "V13_7_PRO_LEVEL_SCENARIO_TRADER_2026_06_20"
 
 app = FastAPI(title=APP_NAME)
 
@@ -26,7 +26,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_6.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_7.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -39,7 +39,7 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.10"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "160"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 
 # --- Signal quality ---
@@ -50,8 +50,8 @@ MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1) / 100.0  # 10% ROI x10 ~
 MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
 MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "5"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1200"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "6"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "900"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "600"))
 
 # --- Level parameters ---
@@ -571,6 +571,72 @@ def htf_confirm(c15: List[Dict[str, float]], side: str, level: float) -> bool:
         return last["close"] > level and (last["close"] >= prev["close"] or candle_body_ok(last, side))
     return last["close"] < level and (last["close"] <= prev["close"] or candle_body_ok(last, side))
 
+def closes_above(candles: List[Dict[str, float]], level: float, n: int = 2, buffer: float = 0.0010) -> bool:
+    if len(candles) < n:
+        return False
+    return all(c["close"] > level * (1 + buffer) for c in candles[-n:])
+
+
+def closes_below(candles: List[Dict[str, float]], level: float, n: int = 2, buffer: float = 0.0010) -> bool:
+    if len(candles) < n:
+        return False
+    return all(c["close"] < level * (1 - buffer) for c in candles[-n:])
+
+
+def professional_reject_confirm(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, level: float, ema5: float, vw: float) -> bool:
+    """Reject/reclaim must be confirmed; do not trade a level just because price touched it."""
+    if len(c5) < 4 or len(c15) < 4:
+        return False
+    if side == "SHORT":
+        # Price must have tested above/near resistance, then CLOSED back below it.
+        tested = max(x["high"] for x in c15[-6:]) >= level * (1 - LEVEL_CLUSTER_TOL)
+        failed_hold = not closes_above(c15, level, 2, 0.0008)
+        returned = closes_below(c5, level, 2, 0.0005) and c5[-1]["close"] < max(ema5, vw)
+        momentum_down = c5[-1]["close"] < c5[-2]["close"] and candle_body_ok(c5[-1], "SHORT")
+        return tested and failed_hold and returned and momentum_down
+    else:
+        tested = min(x["low"] for x in c15[-6:]) <= level * (1 + LEVEL_CLUSTER_TOL)
+        failed_break = not closes_below(c15, level, 2, 0.0008)
+        reclaimed = closes_above(c5, level, 2, 0.0005) and c5[-1]["close"] > min(ema5, vw)
+        momentum_up = c5[-1]["close"] > c5[-2]["close"] and candle_body_ok(c5[-1], "LONG")
+        return tested and failed_break and reclaimed and momentum_up
+
+
+def breakout_hold_confirm(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, level: float, ema5: float, vw: float) -> bool:
+    """Breakout-hold mode: if level is accepted, trade retest/continuation, not the opposite reject."""
+    if len(c5) < 4 or len(c15) < 6:
+        return False
+    if side == "LONG":
+        accepted = closes_above(c15, level, 2, 0.0010)
+        retest = min(x["low"] for x in c5[-8:]) <= level * (1 + RETEST_TOL)
+        held = c5[-1]["close"] > level and c5[-1]["close"] > min(ema5, vw)
+        return accepted and retest and held and two_candle_confirmation(c5, "LONG", ema5, vw)
+    else:
+        accepted = closes_below(c15, level, 2, 0.0010)
+        retest = max(x["high"] for x in c5[-8:]) >= level * (1 - RETEST_TOL)
+        held = c5[-1]["close"] < level and c5[-1]["close"] < max(ema5, vw)
+        return accepted and retest and held and two_candle_confirmation(c5, "SHORT", ema5, vw)
+
+
+def build_secondary_intraday_level(c15: List[Dict[str, float]], price: float, kind: str) -> Optional[Dict[str, Any]]:
+    """Fallback active intraday level so the bot works even when 1H/4H levels are far away.
+    It is allowed only as B unless other confirmations are very strong."""
+    if len(c15) < 60:
+        return None
+    if kind == "support":
+        raw = pivot_levels(c15[-80:], "support", 2, 2)
+        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv < price]
+    else:
+        raw = pivot_levels(c15[-80:], "resistance", 2, 2)
+        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv > price]
+    if not levels:
+        return None
+    lv = sorted(levels, key=lambda x: abs(price-x))[0]
+    q = level_quality(c15, lv, kind, 0.70)
+    if q["touches"] < 2 or q["reactions"] < 1:
+        return None
+    return {"level": lv, "score": q["score"], "touches": q["touches"], "reactions": q["reactions"], "noise": q["noise"], "distance": abs(price-lv)/price, "secondary": True}
+
 
 def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> bool:
     b = base_asset(symbol)
@@ -709,6 +775,8 @@ def score_signal(side: str, strategy: str, trade_type: str, level: Dict[str, Any
         cap = min(cap, 80)
     if level.get("touches", 0) > 16:
         cap = min(cap, 84)
+    if level.get("secondary"):
+        cap = min(cap, 86)
     if btc.get("direction") == "BEAR" and side == "LONG" and not strong_reversal:
         cap = min(cap, 80)
     if btc.get("direction") == "BULL" and side == "SHORT" and not strong_reversal:
@@ -820,60 +888,73 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             "reason": reason, "notes": notes, "created_at": now_ts(), "status": "active", "tp1_hit": False,
         })
 
-    # 1. Support holds/reclaims -> LONG
+    # Add secondary 15m levels if HTF levels are too far/missing. This prevents silence,
+    # but these levels are lower priority and can only pass with proper confirmation.
+    if not support:
+        support = build_secondary_intraday_level(c15, price, "support")
+        if support:
+            blocks["secondary_support_used"] = blocks.get("secondary_support_used", 0) + 1
+    if not resistance:
+        resistance = build_secondary_intraday_level(c15, price, "resistance")
+        if resistance:
+            blocks["secondary_resistance_used"] = blocks.get("secondary_resistance_used", 0) + 1
+
+    # Scenario switch rules:
+    # 1) If resistance is accepted above, SHORT reject is forbidden; only LONG retest can pass.
+    # 2) If support is accepted below, LONG reclaim is forbidden; only SHORT retest can pass.
+    # 3) Reject/reclaim requires real close back through the level, not only a wick/touch.
+
+    resistance_accepted_above = bool(resistance and closes_above(c15, resistance["level"], 2, 0.0010))
+    support_accepted_below = bool(support and closes_below(c15, support["level"], 2, 0.0010))
+
+    # 1. Support holds/reclaims -> LONG. Not allowed if support has already accepted below.
     if support:
         s = support["level"]
-        recent_low = min(x["low"] for x in c15[-8:])
-        reclaimed = recent_low <= s * (1 + LEVEL_CLUSTER_TOL) and c15[-1]["close"] > s and price > s
-        strong = reclaimed and vol >= 0.85 and (t1h != "DOWN" or btc.get("direction") != "BEAR")
-        if reclaimed:
+        if support_accepted_below:
+            blocks["support_broken_no_long"] = blocks.get("support_broken_no_long", 0) + 1
+        elif professional_reject_confirm(c5, c15, "LONG", s, e5, vw):
+            strong = vol >= 0.90 and (t1h != "DOWN" or btc.get("direction") != "BEAR")
             add_candidate(
-                "LONG", "PRO_VERIFIED_SUPPORT_RECLAIM", "SUPPORT RECLAIM LONG",
+                "LONG", "PRO_SUPPORT_RECLAIM_CONFIRMED", "SUPPORT RECLAIM LONG",
                 support, resistance,
-                f"Цена сделала touch/sweep поддержки {s:.8g} и закрылась обратно выше. Вход рядом с уровнем, не погоня.",
+                f"Поддержка {s:.8g}: цена сделала тест/вынос и ДВЕ 5m свечи вернулись выше уровня. Это подтверждённый reclaim, не ранний вход.",
                 strong,
             )
 
-    # 2. Resistance rejects -> SHORT
+    # 2. Resistance rejects -> SHORT. Not allowed if resistance has already accepted above.
     if resistance:
         r = resistance["level"]
-        recent_high = max(x["high"] for x in c15[-8:])
-        rejected = recent_high >= r * (1 - LEVEL_CLUSTER_TOL) and c15[-1]["close"] < r and price < r
-        strong = rejected and vol >= 0.85 and (t1h != "UP" or btc.get("direction") != "BULL")
-        if rejected:
+        if resistance_accepted_above:
+            blocks["resistance_broken_no_short"] = blocks.get("resistance_broken_no_short", 0) + 1
+        elif professional_reject_confirm(c5, c15, "SHORT", r, e5, vw):
+            strong = vol >= 0.90 and (t1h != "UP" or btc.get("direction") != "BULL")
             add_candidate(
-                "SHORT", "PRO_VERIFIED_RESISTANCE_REJECT", "RESISTANCE REJECT SHORT",
+                "SHORT", "PRO_RESISTANCE_REJECT_CONFIRMED", "RESISTANCE REJECT SHORT",
                 resistance, support,
-                f"Цена пришла к сопротивлению {r:.8g}, не закрепилась выше и вернулась ниже. Работа от уровня.",
+                f"Сопротивление {r:.8g}: цена не закрепилась выше, две 5m свечи вернулись ниже уровня и продавец подтвердил reject.",
                 strong,
             )
 
-    # 3. Support broke and retested from below -> SHORT
+    # 3. Support broke and retested from below -> SHORT.
     if support:
         s = support["level"]
-        was_below = any(x["close"] < s * (1 - LEVEL_CLUSTER_TOL) for x in c15[-10:-2])
-        retest = max(x["high"] for x in c15[-4:]) >= s * (1 - RETEST_TOL) and price < s
-        rejected = c5[-1]["close"] < min(e5, vw) and candle_body_ok(c5[-1], "SHORT")
-        if was_below and retest and rejected:
+        if breakout_hold_confirm(c5, c15, "SHORT", s, e5, vw):
             add_candidate(
-                "SHORT", "PRO_SUPPORT_BREAK_RETEST_VERIFIED", "SUPPORT FAILED / RETEST SHORT",
+                "SHORT", "PRO_SUPPORT_BREAK_RETEST_CONFIRMED", "SUPPORT FAILED / RETEST SHORT",
                 support, None,
-                f"Поддержка {s:.8g} была пробита, затем цена сделала retest снизу и снова отвернулась вниз.",
-                vol >= 0.85,
+                f"Поддержка {s:.8g} принята ниже: цена закрепилась под уровнем, retest снизу не вернул уровень. SHORT по подтверждённому break-retest.",
+                vol >= 0.80,
             )
 
-    # 4. Resistance broke and retested from above -> LONG
+    # 4. Resistance broke and retested from above -> LONG.
     if resistance:
         r = resistance["level"]
-        was_above = any(x["close"] > r * (1 + LEVEL_CLUSTER_TOL) for x in c15[-10:-2])
-        retest = min(x["low"] for x in c15[-4:]) <= r * (1 + RETEST_TOL) and price > r
-        reclaimed = c5[-1]["close"] > max(e5, vw) and candle_body_ok(c5[-1], "LONG")
-        if was_above and retest and reclaimed:
+        if breakout_hold_confirm(c5, c15, "LONG", r, e5, vw):
             add_candidate(
-                "LONG", "PRO_RESISTANCE_BREAK_RETEST_VERIFIED", "RESISTANCE BREAK / RETEST LONG",
+                "LONG", "PRO_RESISTANCE_BREAK_RETEST_CONFIRMED", "RESISTANCE BREAK / RETEST LONG",
                 resistance, None,
-                f"Сопротивление {r:.8g} было пробито, retest удержался сверху как поддержка.",
-                vol >= 0.85,
+                f"Сопротивление {r:.8g} принято выше: цена закрепилась над уровнем, retest сверху удержан. LONG по подтверждённому breakout-retest.",
+                vol >= 0.80,
             )
 
     if not candidates:
@@ -920,7 +1001,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:10]]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.6 Level Trader\n"
+        f"🧪 Диагностика V13.7 Level Trader\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
