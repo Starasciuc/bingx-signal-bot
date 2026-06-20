@@ -11,14 +11,14 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.7 — Professional Level Scenario Trader
-# Goal: trade levels like a professional: distinguish reject vs breakout-hold.
+# V13.8 — Calm Level Momentum Trader
+# Goal: professional level trading plus calm breakout-pullback continuation. Capture moves like BEAT without chasing tops.
 # Core idea: verified HTF levels + scenario switch, no early shorts into breakout,
 # active secondary intraday levels to avoid silence, BTC context, diagnostics, TP/SL stats.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.7 PROFESSIONAL LEVEL SCENARIO TRADER"
-DEPLOY_MARKER = "V13_7_PRO_LEVEL_SCENARIO_TRADER_2026_06_20"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.8 CALM LEVEL MOMENTUM TRADER"
+DEPLOY_MARKER = "V13_8_CALM_LEVEL_MOMENTUM_TRADER_2026_06_20"
 
 app = FastAPI(title=APP_NAME)
 
@@ -26,7 +26,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_7.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_8.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -51,6 +51,8 @@ MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
 MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "6"))
+# V13.8: do not flood, but do not silence good momentum-pullback opportunities
+MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "0"))  # 0 = no hard daily cap
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "900"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "600"))
 
@@ -638,6 +640,70 @@ def build_secondary_intraday_level(c15: List[Dict[str, float]], price: float, ki
     return {"level": lv, "score": q["score"], "touches": q["touches"], "reactions": q["reactions"], "noise": q["noise"], "distance": abs(price-lv)/price, "secondary": True}
 
 
+def recent_broken_level(c15: List[Dict[str, float]], price: float, side: str) -> Optional[Dict[str, Any]]:
+    """V13.8: find a recently broken level now acting as support/resistance.
+    This is for calm continuation trades: breakout -> pullback -> hold/reject -> continuation.
+    It prevents the bot from only trading old HTF levels and missing clean trend moves.
+    """
+    if len(c15) < 70 or price <= 0:
+        return None
+    if side == "LONG":
+        raw = pivot_levels(c15[-100:-3], "resistance", 2, 2)
+        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv < price and abs(price - lv) / price <= RETEST_TOL]
+        kind = "resistance"
+    else:
+        raw = pivot_levels(c15[-100:-3], "support", 2, 2)
+        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv > price and abs(price - lv) / price <= RETEST_TOL]
+        kind = "support"
+    if not levels:
+        return None
+    lv = sorted(levels, key=lambda x: abs(price - x))[0]
+    q = level_quality(c15, lv, kind, 0.75)
+    # For continuation we accept fewer touches, but not zero-quality random levels.
+    if q["touches"] < 2 or q["reactions"] < 1:
+        return None
+    return {
+        "level": lv,
+        "score": min(q["score"], 42),
+        "touches": q["touches"],
+        "reactions": q["reactions"],
+        "noise": q["noise"],
+        "distance": abs(price - lv) / price,
+        "secondary": True,
+        "continuation": True,
+    }
+
+
+def calm_momentum_context(c15: List[Dict[str, float]], c1h: List[Dict[str, float]], side: str) -> bool:
+    """Trend must be real but not exhausted. We want the pullback in an active move, not a late chase."""
+    if len(c15) < 40 or len(c1h) < 40:
+        return False
+    ch1h = (c15[-1]["close"] - c15[-4]["close"]) / max(c15[-4]["close"], 1e-12)
+    ch4h = (c15[-1]["close"] - c15[-16]["close"]) / max(c15[-16]["close"], 1e-12)
+    t1h = trend_state(c1h)
+    if side == "LONG":
+        # strong enough to matter, but not a vertical overextension
+        return t1h != "DOWN" and ch1h > 0.0015 and ch4h > 0.003 and ch4h < 0.090
+    return t1h != "UP" and ch1h < -0.0015 and ch4h < -0.003 and ch4h > -0.090
+
+
+def calm_pullback_confirmation(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, level: float, ema5: float, vw: float) -> bool:
+    """Confirm pullback/retest, not a chase. Similar to how a discretionary trader enters after level retest."""
+    if len(c5) < 12 or len(c15) < 8:
+        return False
+    if side == "LONG":
+        had_pullback = min(x["low"] for x in c5[-10:]) <= level * (1 + RETEST_TOL)
+        held_level = c5[-1]["close"] > level and c5[-2]["close"] > level * 0.998
+        reclaimed_ma = c5[-1]["close"] > min(ema5, vw) and c5[-1]["close"] > c5[-2]["close"]
+        htf_ok = c15[-1]["close"] >= c15[-2]["close"] or c15[-1]["close"] > level
+        return had_pullback and held_level and reclaimed_ma and htf_ok and two_candle_confirmation(c5, "LONG", ema5, vw)
+    had_pullback = max(x["high"] for x in c5[-10:]) >= level * (1 - RETEST_TOL)
+    held_level = c5[-1]["close"] < level and c5[-2]["close"] < level * 1.002
+    rejected_ma = c5[-1]["close"] < max(ema5, vw) and c5[-1]["close"] < c5[-2]["close"]
+    htf_ok = c15[-1]["close"] <= c15[-2]["close"] or c15[-1]["close"] < level
+    return had_pullback and held_level and rejected_ma and htf_ok and two_candle_confirmation(c5, "SHORT", ema5, vw)
+
+
 def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> bool:
     b = base_asset(symbol)
     if any(k in b for k in ULTRA_RISK_KEYWORDS):
@@ -955,6 +1021,28 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 resistance, None,
                 f"Сопротивление {r:.8g} принято выше: цена закрепилась над уровнем, retest сверху удержан. LONG по подтверждённому breakout-retest.",
                 vol >= 0.80,
+            )
+
+    # 5. V13.8 calm continuation: trend move -> broken intraday level -> pullback -> hold/reject.
+    # This is the mode that can catch moves like BEAT without buying a vertical top.
+    if btc.get("direction") != "BEAR" and calm_momentum_context(c15, c1h, "LONG"):
+        br = recent_broken_level(c15, price, "LONG")
+        if br and calm_pullback_confirmation(c5, c15, "LONG", br["level"], e5, vw):
+            add_candidate(
+                "LONG", "PRO_CALM_BREAKOUT_PULLBACK_LONG", "CALM BREAKOUT PULLBACK LONG",
+                br, resistance,
+                f"Активное движение вверх: пробитый intraday-уровень {br['level']:.8g} удержан на откате. Это не погоня за свечой, а вход после retest/reclaim.",
+                vol >= 0.75 and t1h != "DOWN",
+            )
+
+    if btc.get("direction") != "BULL" and calm_momentum_context(c15, c1h, "SHORT"):
+        br = recent_broken_level(c15, price, "SHORT")
+        if br and calm_pullback_confirmation(c5, c15, "SHORT", br["level"], e5, vw):
+            add_candidate(
+                "SHORT", "PRO_CALM_BREAKDOWN_PULLBACK_SHORT", "CALM BREAKDOWN PULLBACK SHORT",
+                br, support,
+                f"Активное движение вниз: пробитый intraday-уровень {br['level']:.8g} удержан снизу после отскока. SHORT после retest, не догоняющий вход на дне.",
+                vol >= 0.75 and t1h != "UP",
             )
 
     if not candidates:
