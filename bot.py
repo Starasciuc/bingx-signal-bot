@@ -11,8 +11,8 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.1 PROFESSIONAL LEVEL BREAK RETEST TRADER"
-DEPLOY_MARKER = "V13_1_PRO_LEVEL_BREAK_RETEST_TRADER_2026_06_19"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.2 PROFESSIONAL LEVEL VERIFICATION TRADER"
+DEPLOY_MARKER = "V13_2_PRO_LEVEL_VERIFICATION_TRADER_2026_06_20"
 
 app = FastAPI(title=APP_NAME)
 
@@ -20,7 +20,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_1.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_2.json")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
@@ -30,8 +30,8 @@ AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "75"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "20"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "85"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "92"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "88"))
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10"))
 MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1)  # 10% ROI at x10 = 1% price move
 
@@ -53,8 +53,22 @@ REBOUND_FOR_LATE_SHORT_PCT = float(os.getenv("REBOUND_FOR_LATE_SHORT_PCT", "1.4"
 PULLBACK_FOR_LATE_LONG_PCT = float(os.getenv("PULLBACK_FOR_LATE_LONG_PCT", "1.4"))
 MIN_VOLUME_RATIO_A = float(os.getenv("MIN_VOLUME_RATIO_A", "1.12"))
 MIN_VOLUME_RATIO_B = float(os.getenv("MIN_VOLUME_RATIO_B", "0.95"))
-MIN_RR_A = float(os.getenv("MIN_RR_A", "1.15"))
-MIN_RR_B = float(os.getenv("MIN_RR_B", "0.90"))
+MIN_RR_A = float(os.getenv("MIN_RR_A", "1.25"))
+MIN_RR_B = float(os.getenv("MIN_RR_B", "1.05"))
+
+# Professional level verification. These filters are intentionally strict:
+# a signal must come from a real 1H/4H level, not from a random local wick.
+MIN_LEVEL_TOUCHES_A = int(os.getenv("MIN_LEVEL_TOUCHES_A", "4"))
+MIN_LEVEL_TOUCHES_B = int(os.getenv("MIN_LEVEL_TOUCHES_B", "3"))
+MIN_LEVEL_REACTIONS_A = int(os.getenv("MIN_LEVEL_REACTIONS_A", "2"))
+MIN_LEVEL_REACTIONS_B = int(os.getenv("MIN_LEVEL_REACTIONS_B", "1"))
+LEVEL_ENTRY_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_ENTRY_MAX_DISTANCE_PCT", "0.75"))
+BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT = float(os.getenv("BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT", "1.05"))
+LEVEL_CLOSE_CONFIRM_BUFFER_PCT = float(os.getenv("LEVEL_CLOSE_CONFIRM_BUFFER_PCT", "0.08"))
+MIN_LEVEL_ROOM_PCT = float(os.getenv("MIN_LEVEL_ROOM_PCT", "1.05"))
+MIN_REJECTION_WICK_RATIO = float(os.getenv("MIN_REJECTION_WICK_RATIO", "0.28"))
+MIN_CONFIRM_BODY_RATIO = float(os.getenv("MIN_CONFIRM_BODY_RATIO", "0.35"))
+PROTECT_AFTER_POOR_STATS = os.getenv("PROTECT_AFTER_POOR_STATS", "true").lower() == "true"
 
 QUALITY_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "LINK-USDT", "AVAX-USDT",
@@ -218,17 +232,33 @@ def get_wr_for_strategy_side(strategy: str, side: str, grade: str = "") -> Tuple
     return profit, sl, wr
 
 
+def consecutive_sl_for_strategy_side(strategy: str, side: str) -> int:
+    n = 0
+    for sig in reversed(STATE.get("closed_signals", [])[-50:]):
+        if sig.get("strategy") == strategy and sig.get("side") == side:
+            if sig.get("result") == "sl":
+                n += 1
+            else:
+                break
+    return n
+
+
 def adaptive_allows(strategy: str, side: str, grade: str) -> Tuple[bool, str]:
-    # Block only with enough evidence, not after 1 unlucky trade.
+    # Professional capital protection: when a specific setup-side is losing, stop it quickly.
+    if not PROTECT_AFTER_POOR_STATS:
+        return True, ""
     profit, sl, wr = get_wr_for_strategy_side(strategy, side)
-    if profit + sl >= 5 and wr < 35:
-        return False, f"adaptive_block: {strategy} {side} WR {wr:.1f}% после {profit+sl} сделок"
+    total = profit + sl
+    consec = consecutive_sl_for_strategy_side(strategy, side)
+    if consec >= 2:
+        return False, f"adaptive_block: {strategy} {side} имеет {consec} SL подряд"
+    if total >= 3 and wr < 45:
+        return False, f"adaptive_block: {strategy} {side} WR {wr:.1f}% после {total} сделок"
     if grade == "B":
         p2, s2, wr2 = get_wr_for_strategy_side(strategy, side, "B")
-        if p2 + s2 >= 4 and wr2 < 40:
+        if p2 + s2 >= 2 and wr2 < 50:
             return False, f"adaptive_block: B {strategy} {side} WR {wr2:.1f}%"
     return True, ""
-
 
 def send_telegram_message(text: str) -> Dict[str, Any]:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -493,6 +523,97 @@ def get_levels(c1h: List[Dict[str, float]], c4h: List[Dict[str, float]], price: 
     }
 
 
+
+def level_touch_reaction_stats(candles: List[Dict[str, float]], level: float, kind: str,
+                               tolerance_pct: float = 0.65, lookahead: int = 4) -> Dict[str, Any]:
+    """Count real touches and reactions around a level.
+    kind='support': lows near level followed by bounce.
+    kind='resistance': highs near level followed by rejection.
+    """
+    touches = 0
+    reactions = 0
+    last_touch_ago = 9999
+    if not candles or level <= 0:
+        return {"touches": 0, "reactions": 0, "last_touch_ago": last_touch_ago}
+    n = len(candles)
+    for i, c in enumerate(candles[:-1]):
+        near = False
+        if kind == "support":
+            near = abs(pct(c["low"], level)) <= tolerance_pct or (c["low"] <= level <= c["high"])
+        else:
+            near = abs(pct(c["high"], level)) <= tolerance_pct or (c["low"] <= level <= c["high"])
+        if not near:
+            continue
+        touches += 1
+        last_touch_ago = min(last_touch_ago, n - 1 - i)
+        future = candles[i+1:i+1+lookahead]
+        if not future:
+            continue
+        if kind == "support":
+            best = max(x["high"] for x in future)
+            if pct(best, level) >= 0.45:
+                reactions += 1
+        else:
+            best = min(x["low"] for x in future)
+            if pct(best, level) <= -0.45:
+                reactions += 1
+    return {"touches": touches, "reactions": reactions, "last_touch_ago": last_touch_ago}
+
+
+def verify_level(c1h: List[Dict[str, float]], c4h: List[Dict[str, float]], level: float, kind: str) -> Dict[str, Any]:
+    s1 = level_touch_reaction_stats(c1h[-140:], level, kind, tolerance_pct=0.65, lookahead=5)
+    s4 = level_touch_reaction_stats(c4h[-100:], level, kind, tolerance_pct=0.85, lookahead=3)
+    touches = s1["touches"] + 2 * s4["touches"]
+    reactions = s1["reactions"] + 2 * s4["reactions"]
+    score = touches + reactions * 2
+    valid_b = touches >= MIN_LEVEL_TOUCHES_B and reactions >= MIN_LEVEL_REACTIONS_B
+    valid_a = touches >= MIN_LEVEL_TOUCHES_A and reactions >= MIN_LEVEL_REACTIONS_A
+    return {
+        "touches": touches,
+        "reactions": reactions,
+        "score": score,
+        "valid_b": valid_b,
+        "valid_a": valid_a,
+        "last_touch_1h": s1["last_touch_ago"],
+        "last_touch_4h": s4["last_touch_ago"],
+    }
+
+
+def close_confirmed_relative(candles: List[Dict[str, float]], level: float, side: str, n: int = 2) -> bool:
+    if len(candles) < n or level <= 0:
+        return False
+    buf_up = 1 + LEVEL_CLOSE_CONFIRM_BUFFER_PCT / 100
+    buf_dn = 1 - LEVEL_CLOSE_CONFIRM_BUFFER_PCT / 100
+    recent = candles[-n:]
+    if side == "ABOVE":
+        return all(c["close"] > level * buf_up for c in recent)
+    return all(c["close"] < level * buf_dn for c in recent)
+
+
+def strong_rejection_candle(candle: Dict[str, float], side: str) -> bool:
+    if side == "SHORT":
+        return upper_wick_ratio(candle) >= MIN_REJECTION_WICK_RATIO and candle["close"] < (candle["high"] + candle["low"]) / 2
+    return lower_wick_ratio(candle) >= MIN_REJECTION_WICK_RATIO and candle["close"] > (candle["high"] + candle["low"]) / 2
+
+
+def decisive_confirmation(candles5: List[Dict[str, float]], candles15: List[Dict[str, float]], side: str) -> bool:
+    if len(candles5) < 3 or len(candles15) < 2:
+        return False
+    last5 = candles5[-1]
+    last15 = candles15[-1]
+    if body_ratio(last5) < MIN_CONFIRM_BODY_RATIO and body_ratio(last15) < MIN_CONFIRM_BODY_RATIO:
+        return False
+    return two_candle_confirmation(candles5, side) and htf_confirmation(candles15, side)
+
+
+def next_level_room_ok(entry: float, target_level: float, side: str) -> bool:
+    if entry <= 0 or target_level <= 0:
+        return False
+    if side == "LONG":
+        return target_level > entry and pct(target_level, entry) >= MIN_LEVEL_ROOM_PCT
+    return target_level < entry and abs(pct(target_level, entry)) >= MIN_LEVEL_ROOM_PCT
+
+
 def classify_trend(candles: List[Dict[str, float]]) -> str:
     vals = closes(candles)
     if len(vals) < 60:
@@ -620,16 +741,16 @@ def signal_message(sig: Dict[str, Any]) -> str:
 
 def analyze_symbol(symbol: str, btc: Dict[str, Any], counters: Counter) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
-    c15 = get_klines(symbol, "15m", 180)
+    c15 = get_klines(symbol, "15m", 200)
     if not c15:
         counters["no_klines_15m"] += 1
         return None
     if is_ultra_risk(symbol, c15):
         counters["ultra_risk_block"] += 1
         return None
-    c5 = get_klines(symbol, "5m", 160)
-    c1h = get_klines(symbol, "1h", 180)
-    c4h = get_klines(symbol, "4h", 120)
+    c5 = get_klines(symbol, "5m", 180)
+    c1h = get_klines(symbol, "1h", 200)
+    c4h = get_klines(symbol, "4h", 140)
     if not c5 or not c1h or not c4h:
         counters["no_klines_htf"] += 1
         return None
@@ -640,8 +761,11 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], counters: Counter) -> Optio
         return None
 
     levels = get_levels(c1h, c4h, price)
-    support, support_touches = levels["support"]
-    resistance, resistance_touches = levels["resistance"]
+    support, _support_cluster_touches = levels["support"]
+    resistance, _res_cluster_touches = levels["resistance"]
+    support_q = verify_level(c1h, c4h, support, "support")
+    resistance_q = verify_level(c1h, c4h, resistance, "resistance")
+
     atr15 = atr(c15, 14)
     atr_pct = atr15 / price * 100 if price else 0
     volr = volume_ratio(c15, 30)
@@ -654,218 +778,193 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], counters: Counter) -> Optio
     e15 = ema(closes(c15[-80:]), 20)
     vw15 = vwap(c15, 48)
     last15 = c15[-1]
-    last5 = c5[-1]
 
     candidates: List[Dict[str, Any]] = []
+    entry_max_dist = max(LEVEL_ENTRY_MAX_DISTANCE_PCT, atr_pct * 0.85)
+    retest_max_dist = max(BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT, atr_pct * 1.00)
 
-    # LONG: professional level bounce/reclaim from support, not chasing after a pump.
+    # 1) SUPPORT HOLD / RECLAIM -> LONG.
     dist_support = abs(pct(price, support)) if support else 999
-    support_sweep = min(x["low"] for x in c15[-4:]) < support * (1 - max(0.0015, atr_pct/100*0.25)) and price > support
-    holding_support = dist_support <= max(NEAR_LEVEL_MAX_PCT, atr_pct * 1.2) and price > support
-    long_reclaim = price > e5 and price > e15 * 0.995 and price > vw15 * 0.992
-    long_confirm = two_candle_confirmation(c5, "LONG") and htf_confirmation(c15, "LONG")
+    support_touched_recently = min(x["low"] for x in c15[-8:]) <= support * (1 + max(0.0025, atr_pct / 100 * 0.35))
+    support_sweep = min(x["low"] for x in c15[-6:]) < support * (1 - max(0.0015, atr_pct / 100 * 0.25)) and price > support
+    reclaim_support = close_confirmed_relative(c5, support, "ABOVE", 2) and price > e5 and price > e15 * 0.996 and price > vw15 * 0.992
+    long_confirm = decisive_confirmation(c5, c15, "LONG") and strong_rejection_candle(last15, "LONG")
     no_late_long = not (move2h > ANTI_CHASE_MOVE_PCT and pullback > -PULLBACK_FOR_LATE_LONG_PCT)
     btc_allows_long = not btc.get("strong_down")
     htf_allows_long = t4 != "DOWN" and (t1 in ["UP", "RANGE"] or support_sweep)
+    support_valid = support_q["valid_b"]
+    room_long = next_level_room_ok(price, resistance, "LONG")
 
-    if btc_allows_long and htf_allows_long and no_late_long and (support_sweep or holding_support) and long_reclaim and long_confirm:
-        sl = min(support, min(x["low"] for x in c15[-5:])) - max(atr15 * 0.55, price * 0.0035)
-        # target to resistance; require enough room. If resistance too close, use measured move but still level-aware.
-        natural_tp1 = min(resistance * 0.995, price * (1 + max(MIN_TP1_PRICE_MOVE/100, 0.012)))
-        if natural_tp1 <= price:
-            natural_tp1 = price * 1.012
-        tp1 = natural_tp1
-        tp2 = min(resistance * 1.002, price + (tp1 - price) * 1.8) if resistance > price else price + (tp1 - price) * 1.8
+    if btc_allows_long and htf_allows_long and support_valid and no_late_long and room_long and dist_support <= entry_max_dist and support_touched_recently and reclaim_support and long_confirm:
+        sl = min(support, min(x["low"] for x in c15[-8:])) - max(atr15 * 0.90, price * 0.0055)
+        tp1 = min(resistance * 0.995, price * (1 + max(MIN_TP1_PRICE_MOVE / 100, 0.012)))
+        if tp1 <= price:
+            tp1 = price * 1.012
+        tp2 = min(resistance * 1.002, price + (tp1 - price) * 1.8)
         tp3 = price + (tp1 - price) * 2.8
         risk = price - sl
         reward = tp1 - price
         rr = reward / risk if risk > 0 else 0
         roi = abs(pct(tp1, price)) * LEVERAGE
-        score = 50
+        score = 48 + min(22, support_q["score"] * 2)
         score += 12 if support_sweep else 6
-        score += 10 if support_touches >= 2 else 4
         score += 10 if t1 == "UP" else 5 if t1 == "RANGE" else 0
         score += 8 if t4 != "DOWN" else 0
         score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-        score += 8 if rr >= MIN_RR_A else 3 if rr >= MIN_RR_B else 0
-        score += 6 if lower_wick_ratio(last15) > 0.25 else 0
-        score += 5 if btc.get("regime") in ["TREND_UP", "RANGE", "UP"] else 0
-        if roi >= MIN_TP1_ROI_X10 and rr >= MIN_RR_B:
-            grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A else "B" if score >= B_MIN_SCORE else "LOW"
-            if grade != "LOW":
-                reason = (
-                    f"Цена работает от поддержки {support:.8g}: sweep/удержание уровня, возврат выше EMA/VWAP. "
-                    f"Это не покупка вершины: движение за 2ч {move2h:+.2f}%, откат от high {pullback:+.2f}%. "
-                    f"1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-                )
-                candidates.append(build_signal(symbol, "LONG", "PRO_LEVEL_RECLAIM", "LEVEL BOUNCE / RECLAIM", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.45))
-        else:
-            counters["long_tp_rr_block"] += 1
+        score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
+        score += 6 if btc.get("regime") in ["TREND_UP", "RANGE", "UP"] else 0
+        grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and support_q["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
+        if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
+            reason = (
+                f"Верифицированная поддержка {support:.8g}: touches {support_q['touches']}, reactions {support_q['reactions']}. "
+                f"Цена сделала touch/sweep и закрылась обратно выше уровня, EMA/VWAP подтверждают reclaim. "
+                f"Вход рядом с уровнем ({dist_support:.2f}%), не погоня. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
+            )
+            candidates.append(build_signal(symbol, "LONG", "PRO_VERIFIED_SUPPORT_RECLAIM", "VERIFIED SUPPORT / RECLAIM LONG", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
     else:
-        if not btc_allows_long: counters["btc_long_block"] += 1
-        elif not htf_allows_long: counters["htf_long_block"] += 1
-        elif not no_late_long: counters["anti_chase_long_block"] += 1
-        elif not (support_sweep or holding_support): counters["no_support_level_long"] += 1
+        if not support_valid: counters["weak_support_level"] += 1
+        elif not room_long: counters["no_room_to_resistance_long"] += 1
+        elif dist_support > entry_max_dist: counters["entry_too_far_from_support"] += 1
+        elif not support_touched_recently: counters["support_not_touched_recently"] += 1
+        elif not reclaim_support: counters["no_support_reclaim"] += 1
         elif not long_confirm: counters["no_confirm_long"] += 1
 
-    # SHORT: professional resistance reject/retest, not shorting a dump at the bottom.
-    dist_res = abs(pct(price, resistance)) if resistance else 999
-    resistance_sweep = max(x["high"] for x in c15[-4:]) > resistance * (1 + max(0.0015, atr_pct/100*0.25)) and price < resistance
-    rejecting_resistance = dist_res <= max(NEAR_LEVEL_MAX_PCT, atr_pct * 1.2) and price < resistance
-    short_reject = price < e5 and price < e15 * 1.005 and price < vw15 * 1.008
-    short_confirm = two_candle_confirmation(c5, "SHORT") and htf_confirmation(c15, "SHORT")
-    # If already dumped, short only after meaningful rebound to resistance/EMA and rejection.
+    # 2) RESISTANCE HOLD / REJECT -> SHORT.
+    dist_resistance = abs(pct(price, resistance)) if resistance else 999
+    resistance_touched_recently = max(x["high"] for x in c15[-8:]) >= resistance * (1 - max(0.0025, atr_pct / 100 * 0.35))
+    resistance_sweep = max(x["high"] for x in c15[-6:]) > resistance * (1 + max(0.0015, atr_pct / 100 * 0.25)) and price < resistance
+    reject_resistance = close_confirmed_relative(c5, resistance, "BELOW", 2) and price < e5 and price < e15 * 1.004 and price < vw15 * 1.006
+    short_confirm = decisive_confirmation(c5, c15, "SHORT") and strong_rejection_candle(last15, "SHORT")
     no_late_short = not (move2h < -ANTI_CHASE_MOVE_PCT and rebound < REBOUND_FOR_LATE_SHORT_PCT)
     btc_allows_short = not btc.get("strong_up")
     htf_allows_short = t4 != "UP" and (t1 in ["DOWN", "RANGE"] or resistance_sweep)
+    resistance_valid = resistance_q["valid_b"]
+    room_short = next_level_room_ok(price, support, "SHORT")
 
-    if btc_allows_short and htf_allows_short and no_late_short and (resistance_sweep or rejecting_resistance) and short_reject and short_confirm:
-        sl = max(resistance, max(x["high"] for x in c15[-5:])) + max(atr15 * 0.55, price * 0.0035)
-        natural_tp1 = max(support * 1.005, price * (1 - max(MIN_TP1_PRICE_MOVE/100, 0.012)))
-        if natural_tp1 >= price:
-            natural_tp1 = price * 0.988
-        tp1 = natural_tp1
-        tp2 = max(support * 0.998, price - (price - tp1) * 1.8) if support < price else price - (price - tp1) * 1.8
+    if btc_allows_short and htf_allows_short and resistance_valid and no_late_short and room_short and dist_resistance <= entry_max_dist and resistance_touched_recently and reject_resistance and short_confirm:
+        sl = max(resistance, max(x["high"] for x in c15[-8:])) + max(atr15 * 0.90, price * 0.0055)
+        tp1 = max(support * 1.005, price * (1 - max(MIN_TP1_PRICE_MOVE / 100, 0.012)))
+        if tp1 >= price:
+            tp1 = price * 0.988
+        tp2 = max(support * 0.998, price - (price - tp1) * 1.8)
         tp3 = price - (price - tp1) * 2.8
         risk = sl - price
         reward = price - tp1
         rr = reward / risk if risk > 0 else 0
         roi = abs(pct(tp1, price)) * LEVERAGE
-        score = 50
+        score = 48 + min(22, resistance_q["score"] * 2)
         score += 12 if resistance_sweep else 6
-        score += 10 if resistance_touches >= 2 else 4
         score += 10 if t1 == "DOWN" else 5 if t1 == "RANGE" else 0
         score += 8 if t4 != "UP" else 0
         score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-        score += 8 if rr >= MIN_RR_A else 3 if rr >= MIN_RR_B else 0
-        score += 6 if upper_wick_ratio(last15) > 0.25 else 0
-        score += 5 if btc.get("regime") in ["TREND_DOWN", "IMPULSE_DOWN", "RANGE", "DOWN"] else 0
-        if roi >= MIN_TP1_ROI_X10 and rr >= MIN_RR_B:
-            grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A else "B" if score >= B_MIN_SCORE else "LOW"
-            if grade != "LOW":
-                reason = (
-                    f"Цена работает от сопротивления {resistance:.8g}: sweep/reject или удержание ниже уровня, возврат ниже EMA/VWAP. "
-                    f"Это не шорт дна: движение за 2ч {move2h:+.2f}%, отскок от low {rebound:+.2f}%. "
-                    f"1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-                )
-                candidates.append(build_signal(symbol, "SHORT", "PRO_LEVEL_REJECT", "LEVEL REJECT / RETEST", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.45))
-        else:
-            counters["short_tp_rr_block"] += 1
+        score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
+        score += 6 if btc.get("regime") in ["TREND_DOWN", "IMPULSE_DOWN", "RANGE", "DOWN"] else 0
+        grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and resistance_q["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
+        if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
+            reason = (
+                f"Верифицированное сопротивление {resistance:.8g}: touches {resistance_q['touches']}, reactions {resistance_q['reactions']}. "
+                f"Цена сделала touch/sweep и закрылась обратно ниже уровня, EMA/VWAP подтверждают reject. "
+                f"Вход рядом с уровнем ({dist_resistance:.2f}%), не поздний short после падения. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
+            )
+            candidates.append(build_signal(symbol, "SHORT", "PRO_VERIFIED_RESISTANCE_REJECT", "VERIFIED RESISTANCE / REJECT SHORT", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
     else:
-        if not btc_allows_short: counters["btc_short_block"] += 1
-        elif not htf_allows_short: counters["htf_short_block"] += 1
-        elif not no_late_short: counters["anti_chase_short_block"] += 1
-        elif not (resistance_sweep or rejecting_resistance): counters["no_resistance_level_short"] += 1
+        if not resistance_valid: counters["weak_resistance_level"] += 1
+        elif not room_short: counters["no_room_to_support_short"] += 1
+        elif dist_resistance > entry_max_dist: counters["entry_too_far_from_resistance"] += 1
+        elif not resistance_touched_recently: counters["resistance_not_touched_recently"] += 1
+        elif not reject_resistance: counters["no_resistance_reject"] += 1
         elif not short_confirm: counters["no_confirm_short"] += 1
 
-
-    # CONTINUATION FROM BROKEN LEVELS:
-    # If support breaks and price retests it from below, this is a professional SHORT continuation,
-    # not a late short at the bottom. If resistance breaks and price retests it from above, this is LONG continuation,
-    # not buying the top.
-    h1_piv, l1_piv = find_pivots(c1h[-120:], 2, 2)
+    # 3) SUPPORT FAILED -> RETEST -> SHORT.
+    h1_piv, l1_piv = find_pivots(c1h[-140:], 2, 2)
     h4_piv, l4_piv = find_pivots(c4h[-100:], 2, 2)
     prev_support_levels = cluster_levels(l1_piv + l4_piv, 0.65)
     prev_res_levels = cluster_levels(h1_piv + h4_piv, 0.65)
-
     broken_supports_above = sorted([(lv, touch) for lv, touch in prev_support_levels if lv > price], key=lambda x: x[0] - price)
     broken_res_below = sorted([(lv, touch) for lv, touch in prev_res_levels if lv < price], key=lambda x: price - x[0])
 
-    # SHORT after support failed: price below previous support, retested it or EMA/VWAP, then rejected.
     if broken_supports_above:
-        broken_support, broken_touches = broken_supports_above[0]
-        dist_broken_support = abs(pct(price, broken_support))
-        retested_broken_support = max(x["high"] for x in c15[-5:]) >= broken_support * (1 - max(0.0025, atr_pct/100*0.35))
-        rejected_broken_support = price < broken_support and price < e5 and price < e15 * 1.006 and price < vw15 * 1.010
-        # If the dump is already large, require a real rebound/retest first; otherwise no chase.
-        late_dump_ok = not (move2h < -ANTI_CHASE_MOVE_PCT) or rebound >= max(REBOUND_FOR_LATE_SHORT_PCT, 0.9)
-        btc_short_ok = not btc.get("strong_up")
-        htf_short_ok = t4 != "UP" or btc.get("strong_down")
-        confirm_short_break = two_candle_confirmation(c5, "SHORT") and htf_confirmation(c15, "SHORT")
-        if btc_short_ok and htf_short_ok and late_dump_ok and retested_broken_support and rejected_broken_support and confirm_short_break:
-            sl = max(broken_support, max(x["high"] for x in c15[-5:])) + max(atr15 * 0.65, price * 0.004)
-            # target to nearest lower support, but keep TP1 >= 10% ROI x10.
-            tp1 = min(support * 1.003, price * (1 - max(MIN_TP1_PRICE_MOVE/100, 0.012))) if support < price else price * 0.988
+        broken_support, _ = broken_supports_above[0]
+        bq = verify_level(c1h, c4h, broken_support, "support")
+        dist_broken = abs(pct(price, broken_support))
+        retested = max(x["high"] for x in c15[-8:]) >= broken_support * (1 - max(0.0025, atr_pct / 100 * 0.35))
+        failed = close_confirmed_relative(c5, broken_support, "BELOW", 2) and price < e5 and price < e15 * 1.003 and price < vw15 * 1.006
+        late_dump_ok = not (move2h < -ANTI_CHASE_MOVE_PCT) or rebound >= max(REBOUND_FOR_LATE_SHORT_PCT, 1.0)
+        confirm = decisive_confirmation(c5, c15, "SHORT") and strong_rejection_candle(last15, "SHORT")
+        room = next_level_room_ok(price, support, "SHORT")
+        if bq["valid_b"] and btc_allows_short and t4 != "UP" and late_dump_ok and room and dist_broken <= retest_max_dist and retested and failed and confirm:
+            sl = max(broken_support, max(x["high"] for x in c15[-8:])) + max(atr15 * 0.95, price * 0.006)
+            tp1 = max(support * 1.005, price * (1 - max(MIN_TP1_PRICE_MOVE / 100, 0.012))) if support < price else price * 0.988
             if tp1 >= price:
                 tp1 = price * 0.988
-            tp2 = price - (price - tp1) * 1.8
+            tp2 = max(support * 0.998, price - (price - tp1) * 1.8) if support < price else price - (price - tp1) * 1.8
             tp3 = price - (price - tp1) * 2.8
             risk = sl - price
             reward = price - tp1
             rr = reward / risk if risk > 0 else 0
             roi = abs(pct(tp1, price)) * LEVERAGE
-            score = 58
-            score += 14 if broken_touches >= 2 else 7
-            score += 10 if retested_broken_support else 0
-            score += 8 if t1 == "DOWN" else 5 if t1 == "RANGE" else 0
-            score += 8 if t4 != "UP" else 0
+            score = 52 + min(24, bq["score"] * 2)
+            score += 10 if retested else 0
+            score += 8 if t1 == "DOWN" else 4 if t1 == "RANGE" else 0
             score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-            score += 8 if rr >= MIN_RR_A else 3 if rr >= MIN_RR_B else 0
-            score += 6 if upper_wick_ratio(last15) > 0.18 else 0
+            score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
             score += 6 if btc.get("regime") in ["TREND_DOWN", "IMPULSE_DOWN", "RANGE", "DOWN"] else 0
-            if roi >= MIN_TP1_ROI_X10 and rr >= MIN_RR_B:
-                grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A else "B" if score >= B_MIN_SCORE else "LOW"
-                if grade != "LOW":
-                    reason = (
-                        f"Пробитая поддержка {broken_support:.8g} стала сопротивлением: цена ушла ниже, сделала retest/reject и снова слабее EMA/VWAP. "
-                        f"Это не шорт дна: был отскок от low {rebound:+.2f}% перед входом. "
-                        f"Цель — продолжение к следующей зоне поддержки {support:.8g}. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-                    )
-                    candidates.append(build_signal(symbol, "SHORT", "PRO_LEVEL_BREAKDOWN_RETEST", "SUPPORT FAILED / RETEST SHORT", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.45))
-            else:
-                counters["breakdown_tp_rr_block"] += 1
+            grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and bq["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
+            if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
+                reason = (
+                    f"Поддержка {broken_support:.8g} была верифицирована (touches {bq['touches']}, reactions {bq['reactions']}), затем сломана. "
+                    f"Цена сделала retest снизу и снова закрылась ниже — поддержка стала сопротивлением. "
+                    f"Это не short на дне: вход рядом с retest ({dist_broken:.2f}%). 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
+                )
+                candidates.append(build_signal(symbol, "SHORT", "PRO_SUPPORT_BREAK_RETEST_VERIFIED", "VERIFIED SUPPORT FAILED / RETEST SHORT", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
         else:
-            if not btc_short_ok: counters["breakdown_btc_block"] += 1
-            elif not late_dump_ok: counters["breakdown_late_dump_no_retest"] += 1
-            elif not retested_broken_support: counters["breakdown_no_retest"] += 1
-            elif not confirm_short_break: counters["breakdown_no_confirm"] += 1
+            if not bq["valid_b"]: counters["weak_broken_support"] += 1
+            elif dist_broken > retest_max_dist: counters["entry_too_far_from_broken_support"] += 1
+            elif not retested: counters["broken_support_no_retest"] += 1
+            elif not failed: counters["broken_support_no_failed_retest"] += 1
+            elif not confirm: counters["broken_support_no_confirm"] += 1
 
-    # LONG after resistance breakout: price above previous resistance, retested it from above, then reclaimed.
+    # 4) RESISTANCE BROKE -> RETEST -> LONG.
     if broken_res_below:
-        broken_res, broken_res_touches = broken_res_below[0]
-        retested_broken_res = min(x["low"] for x in c15[-5:]) <= broken_res * (1 + max(0.0025, atr_pct/100*0.35))
-        held_broken_res = price > broken_res and price > e5 and price > e15 * 0.994 and price > vw15 * 0.990
-        # If pump is already large, require real pullback/retest first; otherwise no chase.
-        late_pump_ok = not (move2h > ANTI_CHASE_MOVE_PCT) or pullback <= -max(PULLBACK_FOR_LATE_LONG_PCT, 0.9)
-        btc_long_ok = not btc.get("strong_down")
-        htf_long_ok = t4 != "DOWN" or btc.get("strong_up")
-        confirm_long_break = two_candle_confirmation(c5, "LONG") and htf_confirmation(c15, "LONG")
-        if btc_long_ok and htf_long_ok and late_pump_ok and retested_broken_res and held_broken_res and confirm_long_break:
-            sl = min(broken_res, min(x["low"] for x in c15[-5:])) - max(atr15 * 0.65, price * 0.004)
-            tp1 = max(resistance * 0.997, price * (1 + max(MIN_TP1_PRICE_MOVE/100, 0.012))) if resistance > price else price * 1.012
+        broken_res, _ = broken_res_below[0]
+        rq = verify_level(c1h, c4h, broken_res, "resistance")
+        dist_broken = abs(pct(price, broken_res))
+        retested = min(x["low"] for x in c15[-8:]) <= broken_res * (1 + max(0.0025, atr_pct / 100 * 0.35))
+        held = close_confirmed_relative(c5, broken_res, "ABOVE", 2) and price > e5 and price > e15 * 0.997 and price > vw15 * 0.994
+        late_pump_ok = not (move2h > ANTI_CHASE_MOVE_PCT) or pullback <= -max(PULLBACK_FOR_LATE_LONG_PCT, 1.0)
+        confirm = decisive_confirmation(c5, c15, "LONG") and strong_rejection_candle(last15, "LONG")
+        room = next_level_room_ok(price, resistance, "LONG")
+        if rq["valid_b"] and btc_allows_long and t4 != "DOWN" and late_pump_ok and room and dist_broken <= retest_max_dist and retested and held and confirm:
+            sl = min(broken_res, min(x["low"] for x in c15[-8:])) - max(atr15 * 0.95, price * 0.006)
+            tp1 = min(resistance * 0.995, price * (1 + max(MIN_TP1_PRICE_MOVE / 100, 0.012))) if resistance > price else price * 1.012
             if tp1 <= price:
                 tp1 = price * 1.012
-            tp2 = price + (tp1 - price) * 1.8
+            tp2 = min(resistance * 1.002, price + (tp1 - price) * 1.8) if resistance > price else price + (tp1 - price) * 1.8
             tp3 = price + (tp1 - price) * 2.8
             risk = price - sl
             reward = tp1 - price
             rr = reward / risk if risk > 0 else 0
             roi = abs(pct(tp1, price)) * LEVERAGE
-            score = 58
-            score += 14 if broken_res_touches >= 2 else 7
-            score += 10 if retested_broken_res else 0
-            score += 8 if t1 == "UP" else 5 if t1 == "RANGE" else 0
-            score += 8 if t4 != "DOWN" else 0
+            score = 52 + min(24, rq["score"] * 2)
+            score += 10 if retested else 0
+            score += 8 if t1 == "UP" else 4 if t1 == "RANGE" else 0
             score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-            score += 8 if rr >= MIN_RR_A else 3 if rr >= MIN_RR_B else 0
-            score += 6 if lower_wick_ratio(last15) > 0.18 else 0
+            score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
             score += 6 if btc.get("regime") in ["TREND_UP", "IMPULSE_UP", "RANGE", "UP"] else 0
-            if roi >= MIN_TP1_ROI_X10 and rr >= MIN_RR_B:
-                grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A else "B" if score >= B_MIN_SCORE else "LOW"
-                if grade != "LOW":
-                    reason = (
-                        f"Пробитое сопротивление {broken_res:.8g} стало поддержкой: был откат/retest, уровень удержан, цена снова выше EMA/VWAP. "
-                        f"Это не покупка вершины: был откат от high {pullback:+.2f}% перед входом. "
-                        f"Цель — продолжение к следующему сопротивлению {resistance:.8g}. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-                    )
-                    candidates.append(build_signal(symbol, "LONG", "PRO_LEVEL_BREAKOUT_RETEST", "RESISTANCE BROKE / RETEST LONG", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.45))
-            else:
-                counters["breakout_tp_rr_block"] += 1
+            grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and rq["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
+            if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
+                reason = (
+                    f"Сопротивление {broken_res:.8g} было верифицировано (touches {rq['touches']}, reactions {rq['reactions']}), затем пробито. "
+                    f"Цена сделала retest сверху и удержала уровень как поддержку. "
+                    f"Это не long на вершине: вход рядом с retest ({dist_broken:.2f}%). 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
+                )
+                candidates.append(build_signal(symbol, "LONG", "PRO_RESISTANCE_BREAK_RETEST_VERIFIED", "VERIFIED RESISTANCE BROKE / RETEST LONG", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
         else:
-            if not btc_long_ok: counters["breakout_btc_block"] += 1
-            elif not late_pump_ok: counters["breakout_late_pump_no_retest"] += 1
-            elif not retested_broken_res: counters["breakout_no_retest"] += 1
-            elif not confirm_long_break: counters["breakout_no_confirm"] += 1
+            if not rq["valid_b"]: counters["weak_broken_resistance"] += 1
+            elif dist_broken > retest_max_dist: counters["entry_too_far_from_broken_resistance"] += 1
+            elif not retested: counters["broken_resistance_no_retest"] += 1
+            elif not held: counters["broken_resistance_not_held"] += 1
+            elif not confirm: counters["broken_resistance_no_confirm"] += 1
 
     if not candidates:
         counters["no_candidate"] += 1
@@ -878,7 +977,6 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], counters: Counter) -> Optio
         counters[reason] += 1
         return None
     return best
-
 
 def can_send_signal(sig: Dict[str, Any], counters: Counter) -> Tuple[bool, str]:
     reset_daily_counter_if_needed()
@@ -1047,8 +1145,8 @@ async def auto_worker() -> None:
     startup = (
         f"✅ <b>{APP_NAME}</b> активирован и работает.\n"
         f"Deploy marker: <code>{DEPLOY_MARKER}</code>\n\n"
-        "Режим: PROFESSIONAL LEVEL TRADER — качество важнее количества.\n"
-        "Логика: уровни 1H/4H → подтверждение 15m/5m → anti-chase → TP1 минимум 10% ROI при x10.\n"
+        "Режим: PROFESSIONAL LEVEL VERIFICATION — только подтверждённые 1H/4H уровни.\n"
+        "Логика: level touch/reaction → sweep/retest → 2 свечи 5m + 15m → вход рядом с уровнем.\n"
         f"A+ score: {A_PLUS_MIN_SCORE} · B score: {B_MIN_SCORE}.\n"
         f"Лимит: {MAX_SIGNALS_PER_DAY} сигнала/день · active max {MAX_ACTIVE_SIGNALS}.\n"
         "Диагностика и статистика TP/SL: ON."
