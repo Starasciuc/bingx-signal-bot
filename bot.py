@@ -11,8 +11,8 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.2 PROFESSIONAL LEVEL VERIFICATION TRADER"
-DEPLOY_MARKER = "V13_2_PRO_LEVEL_VERIFICATION_TRADER_2026_06_20"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.3 VERIFIED LEVEL ACTIVE TRADER"
+DEPLOY_MARKER = "V13_3_VERIFIED_LEVEL_ACTIVE_TRADER_2026_06_20"
 
 app = FastAPI(title=APP_NAME)
 
@@ -20,18 +20,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_2.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_3.json")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "75"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "20"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "92"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "88"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "84"))
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10"))
 MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1)  # 10% ROI at x10 = 1% price move
 
@@ -40,34 +40,34 @@ MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1800"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "900"))
 
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
-MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "500"))
-DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "120"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
+MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "650"))
+DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "200"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "4"))
 
 # Level-trading guardrails.
-NEAR_LEVEL_MAX_PCT = float(os.getenv("NEAR_LEVEL_MAX_PCT", "0.85"))
+NEAR_LEVEL_MAX_PCT = float(os.getenv("NEAR_LEVEL_MAX_PCT", "1.10"))
 ANTI_CHASE_MOVE_PCT = float(os.getenv("ANTI_CHASE_MOVE_PCT", "6.0"))
 ANTI_CHASE_LOOKBACK_15M = int(os.getenv("ANTI_CHASE_LOOKBACK_15M", "8"))
 REBOUND_FOR_LATE_SHORT_PCT = float(os.getenv("REBOUND_FOR_LATE_SHORT_PCT", "1.4"))
 PULLBACK_FOR_LATE_LONG_PCT = float(os.getenv("PULLBACK_FOR_LATE_LONG_PCT", "1.4"))
-MIN_VOLUME_RATIO_A = float(os.getenv("MIN_VOLUME_RATIO_A", "1.12"))
-MIN_VOLUME_RATIO_B = float(os.getenv("MIN_VOLUME_RATIO_B", "0.95"))
-MIN_RR_A = float(os.getenv("MIN_RR_A", "1.25"))
-MIN_RR_B = float(os.getenv("MIN_RR_B", "1.05"))
+MIN_VOLUME_RATIO_A = float(os.getenv("MIN_VOLUME_RATIO_A", "1.05"))
+MIN_VOLUME_RATIO_B = float(os.getenv("MIN_VOLUME_RATIO_B", "0.85"))
+MIN_RR_A = float(os.getenv("MIN_RR_A", "1.05"))
+MIN_RR_B = float(os.getenv("MIN_RR_B", "0.85"))
 
 # Professional level verification. These filters are intentionally strict:
 # a signal must come from a real 1H/4H level, not from a random local wick.
-MIN_LEVEL_TOUCHES_A = int(os.getenv("MIN_LEVEL_TOUCHES_A", "4"))
-MIN_LEVEL_TOUCHES_B = int(os.getenv("MIN_LEVEL_TOUCHES_B", "3"))
+MIN_LEVEL_TOUCHES_A = int(os.getenv("MIN_LEVEL_TOUCHES_A", "3"))
+MIN_LEVEL_TOUCHES_B = int(os.getenv("MIN_LEVEL_TOUCHES_B", "2"))
 MIN_LEVEL_REACTIONS_A = int(os.getenv("MIN_LEVEL_REACTIONS_A", "2"))
 MIN_LEVEL_REACTIONS_B = int(os.getenv("MIN_LEVEL_REACTIONS_B", "1"))
-LEVEL_ENTRY_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_ENTRY_MAX_DISTANCE_PCT", "0.75"))
-BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT = float(os.getenv("BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT", "1.05"))
+LEVEL_ENTRY_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_ENTRY_MAX_DISTANCE_PCT", "1.05"))
+BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT = float(os.getenv("BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT", "1.35"))
 LEVEL_CLOSE_CONFIRM_BUFFER_PCT = float(os.getenv("LEVEL_CLOSE_CONFIRM_BUFFER_PCT", "0.08"))
-MIN_LEVEL_ROOM_PCT = float(os.getenv("MIN_LEVEL_ROOM_PCT", "1.05"))
-MIN_REJECTION_WICK_RATIO = float(os.getenv("MIN_REJECTION_WICK_RATIO", "0.28"))
-MIN_CONFIRM_BODY_RATIO = float(os.getenv("MIN_CONFIRM_BODY_RATIO", "0.35"))
+MIN_LEVEL_ROOM_PCT = float(os.getenv("MIN_LEVEL_ROOM_PCT", "0.90"))
+MIN_REJECTION_WICK_RATIO = float(os.getenv("MIN_REJECTION_WICK_RATIO", "0.22"))
+MIN_CONFIRM_BODY_RATIO = float(os.getenv("MIN_CONFIRM_BODY_RATIO", "0.25"))
 PROTECT_AFTER_POOR_STATS = os.getenv("PROTECT_AFTER_POOR_STATS", "true").lower() == "true"
 
 QUALITY_SYMBOLS = [
@@ -1073,7 +1073,7 @@ def build_diag_message(result: Dict[str, Any]) -> str:
     total = p + sl
     wr = p / total * 100 if total else 0
     lines = [
-        "🧪 <b>Диагностика V13 Level Trader</b>",
+        "🧪 <b>Диагностика V13.3 Level Trader</b>",
         f"Проверено: {result.get('checked', 0)} из universe {blocks.get('universe', 0)}",
         f"Кандидатов: {result.get('candidates', 0)} · отправлено: {result.get('sent', 0)} · время: {result.get('duration', 0)}с",
         f"BTC: {result.get('btc', {}).get('text', 'unknown')}",
