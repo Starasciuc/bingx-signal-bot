@@ -8,11 +8,16 @@ from typing import Optional, List, Dict, Any, Tuple
 from collections import Counter, defaultdict
 
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.3 VERIFIED LEVEL ACTIVE TRADER"
-DEPLOY_MARKER = "V13_3_VERIFIED_LEVEL_ACTIVE_TRADER_2026_06_20"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.4 API STABILITY LEVEL TRADER"
+DEPLOY_MARKER = "V13_4_API_STABILITY_LEVEL_TRADER_2026_06_20"
 
 app = FastAPI(title=APP_NAME)
 
@@ -20,8 +25,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_3.json")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_4.json")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+REQUEST_BACKOFF = float(os.getenv("REQUEST_BACKOFF", "0.55"))
+API_MIN_GAP_SECONDS = float(os.getenv("API_MIN_GAP_SECONDS", "0.12"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
@@ -40,9 +48,9 @@ MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1800"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "900"))
 
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
-MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "650"))
-DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "200"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "120"))
+MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
+DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "120"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "4"))
 
 # Level-trading guardrails.
@@ -276,19 +284,101 @@ def send_telegram_message(text: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+_HTTP_SESSION = requests.Session()
+if Retry is not None:
+    _retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        status=2,
+        backoff_factor=0.35,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    _HTTP_SESSION.mount("https://", HTTPAdapter(max_retries=_retry, pool_connections=16, pool_maxsize=16))
+    _HTTP_SESSION.mount("http://", HTTPAdapter(max_retries=_retry, pool_connections=16, pool_maxsize=16))
+_LAST_API_CALL_TS = 0.0
+
+
+def _api_throttle() -> None:
+    """Small global throttle so BingX does not reset Render's connection during scan bursts."""
+    global _LAST_API_CALL_TS
+    gap = API_MIN_GAP_SECONDS
+    now = time.time()
+    wait = (_LAST_API_CALL_TS + gap) - now
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_API_CALL_TS = time.time()
+
+
 def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     url = path if path.startswith("http") else f"{BINGX_BASE_URL}{path}"
-    try:
-        r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        return r.json()
-    except Exception as e:
-        STATE["auto"]["last_error"] = f"get_json {path}: {e}"
-        return None
+    last_err = ""
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            _api_throttle()
+            r = _HTTP_SESSION.get(url, params=params, timeout=(5, REQUEST_TIMEOUT))
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}"
+                time.sleep(REQUEST_BACKOFF * attempt)
+                continue
+            r.raise_for_status()
+            try:
+                return r.json()
+            except Exception as e:
+                last_err = f"json_decode: {e}"
+                time.sleep(REQUEST_BACKOFF * attempt)
+                continue
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)
+            # ConnectionResetError(104) and timeouts usually recover on the next try.
+            time.sleep(REQUEST_BACKOFF * attempt)
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(REQUEST_BACKOFF * attempt)
+    STATE["auto"]["last_error"] = f"get_json {path}: {last_err}"
+    return None
 
 
 _KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, Optional[List[Dict[str, float]]]]] = {}
 _TICKER_CACHE: Tuple[int, Dict[str, Dict[str, Any]]] = (0, {})
 _SYMBOL_CACHE: Tuple[int, List[str]] = (0, [])
+
+
+def _parse_klines_payload(data: Optional[Dict[str, Any]], limit: int) -> Optional[List[Dict[str, float]]]:
+    raw = (data or {}).get("data") or []
+    if isinstance(raw, dict):
+        raw = raw.get("klines") or raw.get("data") or raw.get("list") or []
+    candles = []
+    for c in raw:
+        try:
+            if isinstance(c, (list, tuple)):
+                # Common kline shape: [time, open, high, low, close, volume, ...]
+                if len(c) < 6:
+                    continue
+                candles.append({
+                    "time": int(float(c[0])),
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "volume": float(c[5]),
+                })
+            else:
+                candles.append({
+                    "time": int(c.get("time") or c.get("T") or c.get("t") or 0),
+                    "open": float(c.get("open") or c.get("o")),
+                    "high": float(c.get("high") or c.get("h")),
+                    "low": float(c.get("low") or c.get("l")),
+                    "close": float(c.get("close") or c.get("c")),
+                    "volume": float(c.get("volume") or c.get("v") or 0),
+                })
+        except Exception:
+            continue
+    candles.sort(key=lambda x: x["time"])
+    min_needed = max(25, min(limit // 4, 60))
+    return candles if len(candles) >= min_needed else None
 
 
 def get_klines(symbol: str, interval: str, limit: int = 240, ttl: int = 40) -> Optional[List[Dict[str, float]]]:
@@ -297,23 +387,22 @@ def get_klines(symbol: str, interval: str, limit: int = 240, ttl: int = 40) -> O
     ts, cached = _KLINE_CACHE.get(key, (0, None))
     if now_ts() - ts < ttl:
         return cached
-    data = get_json("/openApi/swap/v3/quote/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    raw = (data or {}).get("data") or []
-    candles = []
-    for c in raw:
-        try:
-            candles.append({
-                "time": int(c.get("time") or c.get("T") or 0),
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
-                "volume": float(c.get("volume", 0)),
-            })
-        except Exception:
-            continue
-    candles.sort(key=lambda x: x["time"])
-    result = candles if len(candles) >= max(30, min(limit // 3, 80)) else None
+
+    endpoints = [
+        "/openApi/swap/v3/quote/klines",
+        "/openApi/swap/v2/quote/klines",
+    ]
+    result = None
+    for endpoint in endpoints:
+        data = get_json(endpoint, {"symbol": symbol, "interval": interval, "limit": limit})
+        result = _parse_klines_payload(data, limit)
+        if result:
+            break
+        # brief pause before trying fallback endpoint
+        time.sleep(0.15)
+
+    if not result:
+        STATE["auto"]["last_error"] = f"no_klines {symbol} {interval}; last_api_error={STATE['auto'].get('last_error','')}"
     _KLINE_CACHE[key] = (now_ts(), result)
     return result
 
@@ -1073,7 +1162,7 @@ def build_diag_message(result: Dict[str, Any]) -> str:
     total = p + sl
     wr = p / total * 100 if total else 0
     lines = [
-        "🧪 <b>Диагностика V13.3 Level Trader</b>",
+        "🧪 <b>Диагностика V13.4 API Stability Level Trader</b>",
         f"Проверено: {result.get('checked', 0)} из universe {blocks.get('universe', 0)}",
         f"Кандидатов: {result.get('candidates', 0)} · отправлено: {result.get('sent', 0)} · время: {result.get('duration', 0)}с",
         f"BTC: {result.get('btc', {}).get('text', 'unknown')}",
@@ -1145,11 +1234,12 @@ async def auto_worker() -> None:
     startup = (
         f"✅ <b>{APP_NAME}</b> активирован и работает.\n"
         f"Deploy marker: <code>{DEPLOY_MARKER}</code>\n\n"
-        "Режим: PROFESSIONAL LEVEL VERIFICATION — только подтверждённые 1H/4H уровни.\n"
+        "Режим: API STABILITY + PROFESSIONAL LEVEL VERIFICATION — стабильные свечи + подтверждённые 1H/4H уровни.\n"
         "Логика: level touch/reaction → sweep/retest → 2 свечи 5m + 15m → вход рядом с уровнем.\n"
         f"A+ score: {A_PLUS_MIN_SCORE} · B score: {B_MIN_SCORE}.\n"
         f"Лимит: {MAX_SIGNALS_PER_DAY} сигнала/день · active max {MAX_ACTIVE_SIGNALS}.\n"
-        "Диагностика и статистика TP/SL: ON."
+        "Диагностика и статистика TP/SL: ON.\n"
+        f"API Stability: retries {REQUEST_RETRIES}, throttle {API_MIN_GAP_SECONDS}s, analyze {MAX_ANALYZE_SYMBOLS} symbols."
     )
     send_telegram_message(startup)
     # Force first diagnostic, even if no signal.
