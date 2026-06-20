@@ -4,112 +4,113 @@ import json
 import math
 import random
 import asyncio
-from typing import Optional, List, Dict, Any, Tuple
-from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-try:
-    from urllib3.util.retry import Retry
-except Exception:
-    Retry = None
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.5 BALANCED VERIFIED LEVEL TRADER"
-DEPLOY_MARKER = "V13_5_BALANCED_VERIFIED_LEVEL_TRADER_2026_06_20"
+# ============================================================
+# V13.6 — Professional Level Trader Balanced
+# Goal: профессиональная торговля от уровней без молчания.
+# Core idea: verified HTF levels + reclaim/reject/break-retest,
+# anti-chase, BTC context, diagnostics, TP/SL stats.
+# ============================================================
+
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.6 PROFESSIONAL LEVEL BALANCED TRADER"
+DEPLOY_MARKER = "V13_6_PRO_LEVEL_BALANCED_TRADER_2026_06_20"
 
 app = FastAPI(title=APP_NAME)
 
+BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-BINGX_BASE_URL = "https://open-api.bingx.com"
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_5.json")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
-REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
-REQUEST_BACKOFF = float(os.getenv("REQUEST_BACKOFF", "0.55"))
-API_MIN_GAP_SECONDS = float(os.getenv("API_MIN_GAP_SECONDS", "0.12"))
-LEVERAGE = float(os.getenv("LEVERAGE", "10"))
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_6.json")
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
+# --- Scan stability ---
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
 AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
 AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "20"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
+API_RETRIES = int(os.getenv("API_RETRIES", "3"))
+API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.10"))
+MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "160"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 
+# --- Signal quality ---
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
 B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "82"))
-MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10"))
-MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1)  # 10% ROI at x10 = 1% price move
-
-MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "0"))  # 0 = no daily limit; quality filters decide
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "10"))
+MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10.0"))
+MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1) / 100.0  # 10% ROI x10 ~= 1% price
+MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
+MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "5"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1200"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "600"))
 
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
-MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
-DYNAMIC_MOVERS_LIMIT = int(os.getenv("DYNAMIC_MOVERS_LIMIT", "180"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "6"))
-
-# Level-trading guardrails.
-NEAR_LEVEL_MAX_PCT = float(os.getenv("NEAR_LEVEL_MAX_PCT", "1.10"))
-ANTI_CHASE_MOVE_PCT = float(os.getenv("ANTI_CHASE_MOVE_PCT", "7.0"))
-ANTI_CHASE_LOOKBACK_15M = int(os.getenv("ANTI_CHASE_LOOKBACK_15M", "8"))
-REBOUND_FOR_LATE_SHORT_PCT = float(os.getenv("REBOUND_FOR_LATE_SHORT_PCT", "1.1"))
-PULLBACK_FOR_LATE_LONG_PCT = float(os.getenv("PULLBACK_FOR_LATE_LONG_PCT", "1.1"))
-MIN_VOLUME_RATIO_A = float(os.getenv("MIN_VOLUME_RATIO_A", "1.00"))
-MIN_VOLUME_RATIO_B = float(os.getenv("MIN_VOLUME_RATIO_B", "0.75"))
-MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
-MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
-
-# Professional level verification. These filters are intentionally strict:
-# a signal must come from a real 1H/4H level, not from a random local wick.
+# --- Level parameters ---
+LEVEL_CLUSTER_TOL = float(os.getenv("LEVEL_CLUSTER_TOL", "0.0065"))  # 0.65%
+LEVEL_NEAR_TOL = float(os.getenv("LEVEL_NEAR_TOL", "0.0125"))      # 1.25%
+RETEST_TOL = float(os.getenv("RETEST_TOL", "0.016"))               # 1.6%
 MIN_LEVEL_TOUCHES_A = int(os.getenv("MIN_LEVEL_TOUCHES_A", "3"))
 MIN_LEVEL_TOUCHES_B = int(os.getenv("MIN_LEVEL_TOUCHES_B", "2"))
-MIN_LEVEL_REACTIONS_A = int(os.getenv("MIN_LEVEL_REACTIONS_A", "2"))
-MIN_LEVEL_REACTIONS_B = int(os.getenv("MIN_LEVEL_REACTIONS_B", "1"))
-LEVEL_ENTRY_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_ENTRY_MAX_DISTANCE_PCT", "1.25"))
-BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT = float(os.getenv("BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT", "1.55"))
-LEVEL_CLOSE_CONFIRM_BUFFER_PCT = float(os.getenv("LEVEL_CLOSE_CONFIRM_BUFFER_PCT", "0.08"))
-MIN_LEVEL_ROOM_PCT = float(os.getenv("MIN_LEVEL_ROOM_PCT", "0.90"))
-MIN_REJECTION_WICK_RATIO = float(os.getenv("MIN_REJECTION_WICK_RATIO", "0.22"))
-MIN_CONFIRM_BODY_RATIO = float(os.getenv("MIN_CONFIRM_BODY_RATIO", "0.25"))
-PROTECT_AFTER_POOR_STATS = os.getenv("PROTECT_AFTER_POOR_STATS", "true").lower() == "true"
+MIN_REACTIONS_A = int(os.getenv("MIN_REACTIONS_A", "2"))
+MIN_REACTIONS_B = int(os.getenv("MIN_REACTIONS_B", "1"))
+MAX_TOUCHES_EFFECTIVE = int(os.getenv("MAX_TOUCHES_EFFECTIVE", "7"))
 
-QUALITY_SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "LINK-USDT", "AVAX-USDT",
-    "AAVE-USDT", "SUI-USDT", "TAO-USDT", "NEAR-USDT", "INJ-USDT", "APT-USDT", "ARB-USDT",
-    "OP-USDT", "ADA-USDT", "DOGE-USDT", "DOT-USDT", "LTC-USDT", "UNI-USDT", "TRX-USDT",
-    "FIL-USDT", "ETC-USDT", "ATOM-USDT", "WLD-USDT", "SEI-USDT", "TIA-USDT", "TONCOIN-USDT",
-]
+# --- Volume / confirmation ---
+MIN_VOLUME_A = float(os.getenv("MIN_VOLUME_A", "0.95"))
+MIN_VOLUME_B = float(os.getenv("MIN_VOLUME_B", "0.70"))
+LOW_VOLUME_CAP = int(os.getenv("LOW_VOLUME_CAP", "78"))
+VERY_LOW_VOLUME = float(os.getenv("VERY_LOW_VOLUME", "0.60"))
+REQUIRE_15M_CONFIRM = os.getenv("REQUIRE_15M_CONFIRM", "true").lower() == "true"
 
-ULTRA_RISK_KEYWORDS = [
-    "1000", "PEPE", "BONK", "WIF", "MEME", "DOGS", "CAT", "HMSTR", "GOBLIN", "FART", "BABY",
-    "MOODENG", "PNUT", "GOAT", "BOME", "TURBO", "PUMP", "SHIB", "FLOKI", "MOG", "SATS",
-]
+# --- Anti-chase ---
+BIG_MOVE_6H = float(os.getenv("BIG_MOVE_6H", "0.060"))       # 6%
+BIG_MOVE_24H = float(os.getenv("BIG_MOVE_24H", "0.120"))     # 12%
+REQUIRED_PULLBACK_AFTER_BIG_MOVE = float(os.getenv("REQUIRED_PULLBACK_AFTER_BIG_MOVE", "0.012"))
+ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.060"))  # 6% candle
+ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.090"))
 
+# --- Risk multipliers ---
+A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.70"))
+B_RISK_MULT = float(os.getenv("B_RISK_MULT", "0.25"))
+FAR_SL_RISK_MULT = float(os.getenv("FAR_SL_RISK_MULT", "0.15"))
+TP1_CLOSE_PERCENT = float(os.getenv("TP1_CLOSE_PERCENT", "70"))
+
+QUALITY_BASES = {
+    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
+    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "MATIC", "TON", "LTC", "BCH", "ETC", "FIL", "ATOM",
+    "UNI", "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI"
+}
+
+ULTRA_RISK_KEYWORDS = {
+    "1000", "PEPE", "BONK", "WIF", "MEME", "DOGS", "CATI", "HMSTR", "GOBLIN", "MOG", "TURBO",
+    "BOME", "NEIRO", "PNUT", "MOODENG", "ACT", "GOAT", "FIGHT", "BLEND", "VELVET", "MAGMA"
+}
+
+FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
+    "BTC","ETH","SOL","BNB","XRP","LINK","AVAX","AAVE","SUI","TAO","NEAR","INJ","OP","ARB",
+    "APT","TIA","ADA","DOT","LTC","BCH","ETC","FIL","ATOM","UNI","RUNE","SEI","FET","WLD",
+    "DOGE","TRX","ENA","JUP","ORDI"
+]]
+
+STATE: Dict[str, Any] = {}
+KLINE_CACHE: Dict[str, Tuple[float, Optional[List[Dict[str, float]]]]] = {}
+TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
+
+# ============================================================
+# State / utilities
+# ============================================================
 
 def now_ts() -> int:
     return int(time.time())
-
-
-def normalize_symbol(symbol: str) -> str:
-    s = (symbol or "").upper().replace("/", "-").replace("_", "-")
-    if s.endswith("USDT") and "-" not in s:
-        s = s[:-4] + "-USDT"
-    return s
-
-
-def display_symbol(symbol: str) -> str:
-    return normalize_symbol(symbol).replace("-", "/")
-
-
-def pct(a: float, b: float) -> float:
-    if b == 0:
-        return 0.0
-    return (a - b) / b * 100.0
 
 
 def safe_float(x: Any, default: float = 0.0) -> float:
@@ -119,371 +120,248 @@ def safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def normalize_symbol(symbol: str) -> str:
+    s = symbol.replace("/", "-").upper()
+    if s.endswith("USDT") and "-" not in s:
+        s = s.replace("USDT", "-USDT")
+    return s
+
+
+def display_symbol(symbol: str) -> str:
+    return normalize_symbol(symbol).replace("-", "/")
+
+
+def base_asset(symbol: str) -> str:
+    return normalize_symbol(symbol).split("-")[0]
+
+
 def load_state() -> Dict[str, Any]:
-    base = {
-        "active_signals": {},
-        "closed_signals": [],
-        "stats": {
-            "profit": 0,
-            "sl": 0,
-            "by_side": {},
-            "by_grade": {},
-            "by_strategy": {},
-            "by_symbol": {},
-            "by_setup": {},
-        },
-        "blocks": {},
-        "cooldowns": {},
-        "auto": {
-            "last_scan_time": 0,
-            "last_track_time": 0,
-            "last_diag_time": 0,
-            "last_error": "",
-            "last_scan_result": {},
-        },
-        "signals_today": {"date": "", "count": 0},
-    }
+    if not os.path.exists(STATE_FILE):
+        return default_state()
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # shallow merge to keep compatibility
-            for k, v in base.items():
-                data.setdefault(k, v)
-            data["stats"].setdefault("by_setup", {})
-            return data
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        base = default_state()
+        base.update(data if isinstance(data, dict) else {})
+        return base
     except Exception:
-        pass
-    return base
-
-
-STATE = load_state()
+        return default_state()
 
 
 def save_state() -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(STATE, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        STATE.setdefault("auto", {})["last_error"] = f"save_state: {e}"
+    except Exception:
+        pass
 
 
-def day_key() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime())
+def default_state() -> Dict[str, Any]:
+    return {
+        "active_signals": [],
+        "stats": {
+            "total": {"profit": 0, "sl": 0},
+            "side": {},
+            "grade": {},
+            "strategy": {},
+            "type": {},
+            "symbol": {},
+            "strategy_side_grade": {},
+            "strategy_side": {},
+        },
+        "pair_cooldown": {},
+        "strategy_cooldown": {},
+        "hard_block_until": {},
+        "last_diag_ts": 0,
+        "last_scan": {},
+        "last_error": "",
+        "startup_sent": False,
+    }
 
 
-def reset_daily_counter_if_needed() -> None:
-    d = day_key()
-    if STATE.get("signals_today", {}).get("date") != d:
-        STATE["signals_today"] = {"date": d, "count": 0}
+def inc_stat(bucket: str, key: str, result: str) -> None:
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    d = stats.setdefault(bucket, {})
+    item = d.setdefault(key, {"profit": 0, "sl": 0})
+    item[result] = item.get(result, 0) + 1
 
 
-def stat_bucket(name: str, key: str) -> Dict[str, int]:
-    b = STATE["stats"].setdefault(name, {})
-    if key not in b:
-        b[key] = {"profit": 0, "sl": 0}
-    return b[key]
+def apply_result(signal: Dict[str, Any], result: str) -> None:
+    if result not in ("profit", "sl"):
+        return
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    stats.setdefault("total", {"profit": 0, "sl": 0})[result] += 1
+    inc_stat("side", signal.get("side", "?"), result)
+    inc_stat("grade", signal.get("grade", "?"), result)
+    inc_stat("strategy", signal.get("strategy", "?"), result)
+    inc_stat("type", signal.get("trade_type", "?"), result)
+    inc_stat("symbol", signal.get("symbol", "?"), result)
+    inc_stat("strategy_side_grade", f"{signal.get('strategy')}:{signal.get('side')}:{signal.get('grade')}", result)
+    inc_stat("strategy_side", f"{signal.get('strategy')}:{signal.get('side')}", result)
 
+    # adaptive hard block: if a strategy+side has poor fresh stats, block for 12h
+    ss = f"{signal.get('strategy')}:{signal.get('side')}"
+    item = stats.get("strategy_side", {}).get(ss, {})
+    closed = item.get("profit", 0) + item.get("sl", 0)
+    wr = (item.get("profit", 0) / closed * 100.0) if closed else 0.0
+    if closed >= 4 and wr < 35:
+        STATE.setdefault("hard_block_until", {})[ss] = now_ts() + 12 * 3600
 
-def wr_text(profit: int, sl: int) -> str:
-    total = profit + sl
-    wr = (profit / total * 100.0) if total else 0.0
-    return f"{profit} профит / {sl} SL / WR {wr:.1f}%"
-
-
-def build_stats_text() -> str:
-    st = STATE.get("stats", {})
-    profit = int(st.get("profit", 0))
-    sl = int(st.get("sl", 0))
-    total = profit + sl
-    wr = profit / total * 100 if total else 0
-    lines = [
-        "📊 <b>Статистика</b>",
-        f"Итого: {profit} профит / {sl} SL / WR {wr:.1f}%",
-    ]
-    for title, key in [("Стороны", "by_side"), ("Классы", "by_grade"), ("Стратегии", "by_strategy"), ("Типы", "by_setup")]:
-        data = st.get(key, {}) or {}
-        if data:
-            lines.append(f"\n<b>{title}:</b>")
-            for k, v in sorted(data.items()):
-                lines.append(f"{k}: {wr_text(int(v.get('profit', 0)), int(v.get('sl', 0)))}")
-    return "\n".join(lines)
-
-
-def update_stats(signal: Dict[str, Any], result: str) -> None:
-    positive = result == "profit"
-    STATE["stats"]["profit" if positive else "sl"] = int(STATE["stats"].get("profit" if positive else "sl", 0)) + 1
-    fields = [
-        ("by_side", signal.get("side", "?")),
-        ("by_grade", signal.get("grade", "?")),
-        ("by_strategy", signal.get("strategy", "?")),
-        ("by_symbol", signal.get("symbol", "?")),
-        ("by_setup", signal.get("setup_type", "?")),
-    ]
-    for bucket, key in fields:
-        b = stat_bucket(bucket, key)
-        b["profit" if positive else "sl"] = int(b.get("profit" if positive else "sl", 0)) + 1
     save_state()
 
 
-def get_wr_for_strategy_side(strategy: str, side: str, grade: str = "") -> Tuple[int, int, float]:
-    # Stats in this clean bot are mostly broad; block by strategy+side in closed list.
-    profit = sl = 0
-    for s in STATE.get("closed_signals", [])[-200:]:
-        if s.get("strategy") == strategy and s.get("side") == side and (not grade or s.get("grade") == grade):
-            if s.get("result") == "profit":
-                profit += 1
-            elif s.get("result") == "sl":
-                sl += 1
-    total = profit + sl
-    wr = profit / total * 100 if total else 50.0
-    return profit, sl, wr
+def wr_text(item: Dict[str, int]) -> str:
+    p = item.get("profit", 0)
+    s = item.get("sl", 0)
+    t = p + s
+    wr = p / t * 100 if t else 0.0
+    return f"{p} профит / {s} SL / WR {wr:.1f}%"
 
 
-def consecutive_sl_for_strategy_side(strategy: str, side: str) -> int:
-    n = 0
-    for sig in reversed(STATE.get("closed_signals", [])[-50:]):
-        if sig.get("strategy") == strategy and sig.get("side") == side:
-            if sig.get("result") == "sl":
-                n += 1
-            else:
-                break
-    return n
+def build_stats_text() -> str:
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    lines = ["📊 Статистика", f"Итого: {wr_text(stats.get('total', {}))}"]
+    for title, key in [("Стороны", "side"), ("Классы", "grade"), ("Стратегии", "strategy"), ("Типы", "type")]:
+        data = stats.get(key, {})
+        if data:
+            lines.append(f"\n{title}:")
+            for k, v in sorted(data.items(), key=lambda kv: -(kv[1].get("profit",0)+kv[1].get("sl",0)))[:10]:
+                lines.append(f"{k}: {wr_text(v)}")
+    return "\n".join(lines)
 
+# ============================================================
+# Telegram / API
+# ============================================================
 
-def adaptive_allows(strategy: str, side: str, grade: str) -> Tuple[bool, str]:
-    # Professional capital protection: when a specific setup-side is losing, stop it quickly.
-    if not PROTECT_AFTER_POOR_STATS:
-        return True, ""
-    profit, sl, wr = get_wr_for_strategy_side(strategy, side)
-    total = profit + sl
-    consec = consecutive_sl_for_strategy_side(strategy, side)
-    if consec >= 2:
-        return False, f"adaptive_block: {strategy} {side} имеет {consec} SL подряд"
-    if total >= 3 and wr < 45:
-        return False, f"adaptive_block: {strategy} {side} WR {wr:.1f}% после {total} сделок"
-    if grade == "B":
-        p2, s2, wr2 = get_wr_for_strategy_side(strategy, side, "B")
-        if p2 + s2 >= 2 and wr2 < 50:
-            return False, f"adaptive_block: B {strategy} {side} WR {wr2:.1f}%"
-    return True, ""
-
-def send_telegram_message(text: str) -> Dict[str, Any]:
+def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не указаны"}
+        STATE["last_error"] = "Telegram env missing: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+        save_state()
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text[:3900],
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }, timeout=REQUEST_TIMEOUT)
-        return r.json()
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]}, timeout=10)
+        if not r.ok:
+            STATE["last_error"] = f"Telegram error {r.status_code}: {r.text[:200]}"
+            save_state()
+            return False
+        return True
     except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-_HTTP_SESSION = requests.Session()
-if Retry is not None:
-    _retry = Retry(
-        total=2,
-        connect=2,
-        read=2,
-        status=2,
-        backoff_factor=0.35,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST"]),
-        raise_on_status=False,
-    )
-    _HTTP_SESSION.mount("https://", HTTPAdapter(max_retries=_retry, pool_connections=16, pool_maxsize=16))
-    _HTTP_SESSION.mount("http://", HTTPAdapter(max_retries=_retry, pool_connections=16, pool_maxsize=16))
-_LAST_API_CALL_TS = 0.0
-
-
-def _api_throttle() -> None:
-    """Small global throttle so BingX does not reset Render's connection during scan bursts."""
-    global _LAST_API_CALL_TS
-    gap = API_MIN_GAP_SECONDS
-    now = time.time()
-    wait = (_LAST_API_CALL_TS + gap) - now
-    if wait > 0:
-        time.sleep(wait)
-    _LAST_API_CALL_TS = time.time()
+        STATE["last_error"] = f"Telegram exception: {repr(e)}"
+        save_state()
+        return False
 
 
 def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    url = path if path.startswith("http") else f"{BINGX_BASE_URL}{path}"
-    last_err = ""
-    for attempt in range(1, REQUEST_RETRIES + 1):
+    url = BINGX_BASE_URL + path
+    last_err = None
+    for attempt in range(API_RETRIES):
         try:
-            _api_throttle()
-            r = _HTTP_SESSION.get(url, params=params, timeout=(5, REQUEST_TIMEOUT))
+            time.sleep(API_THROTTLE_SECONDS)
+            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HTTP {r.status_code}"
-                time.sleep(REQUEST_BACKOFF * attempt)
+                last_err = f"HTTP {r.status_code} {path}"
+                time.sleep(0.25 * (attempt + 1))
                 continue
-            r.raise_for_status()
-            try:
-                return r.json()
-            except Exception as e:
-                last_err = f"json_decode: {e}"
-                time.sleep(REQUEST_BACKOFF * attempt)
-                continue
-        except requests.exceptions.RequestException as e:
-            last_err = str(e)
-            # ConnectionResetError(104) and timeouts usually recover on the next try.
-            time.sleep(REQUEST_BACKOFF * attempt)
+            data = r.json()
+            return data
         except Exception as e:
-            last_err = str(e)
-            time.sleep(REQUEST_BACKOFF * attempt)
-    STATE["auto"]["last_error"] = f"get_json {path}: {last_err}"
+            last_err = f"get_json {path}: {repr(e)}"
+            time.sleep(0.35 * (attempt + 1))
+    STATE["last_error"] = last_err or "unknown API error"
+    save_state()
     return None
 
 
-_KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, Optional[List[Dict[str, float]]]]] = {}
-_TICKER_CACHE: Tuple[int, Dict[str, Dict[str, Any]]] = (0, {})
-_SYMBOL_CACHE: Tuple[int, List[str]] = (0, [])
-
-
-def _parse_klines_payload(data: Optional[Dict[str, Any]], limit: int) -> Optional[List[Dict[str, float]]]:
-    raw = (data or {}).get("data") or []
-    if isinstance(raw, dict):
-        raw = raw.get("klines") or raw.get("data") or raw.get("list") or []
-    candles = []
+def parse_klines(raw: Any) -> Optional[List[Dict[str, float]]]:
+    if not raw:
+        return None
+    candles: List[Dict[str, float]] = []
     for c in raw:
         try:
-            if isinstance(c, (list, tuple)):
-                # Common kline shape: [time, open, high, low, close, volume, ...]
-                if len(c) < 6:
-                    continue
+            if isinstance(c, dict):
                 candles.append({
-                    "time": int(float(c[0])),
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4]),
-                    "volume": float(c[5]),
+                    "time": int(c.get("time") or c.get("openTime") or c.get("T") or 0),
+                    "open": float(c.get("open")),
+                    "high": float(c.get("high")),
+                    "low": float(c.get("low")),
+                    "close": float(c.get("close")),
+                    "volume": float(c.get("volume") or c.get("vol") or 0),
                 })
-            else:
+            elif isinstance(c, (list, tuple)) and len(c) >= 6:
                 candles.append({
-                    "time": int(c.get("time") or c.get("T") or c.get("t") or 0),
-                    "open": float(c.get("open") or c.get("o")),
-                    "high": float(c.get("high") or c.get("h")),
-                    "low": float(c.get("low") or c.get("l")),
-                    "close": float(c.get("close") or c.get("c")),
-                    "volume": float(c.get("volume") or c.get("v") or 0),
+                    "time": int(c[0]), "open": float(c[1]), "high": float(c[2]),
+                    "low": float(c[3]), "close": float(c[4]), "volume": float(c[5]),
                 })
         except Exception:
             continue
+    candles = [x for x in candles if x["open"] > 0 and x["high"] > 0 and x["low"] > 0 and x["close"] > 0]
     candles.sort(key=lambda x: x["time"])
-    min_needed = max(25, min(limit // 4, 60))
-    return candles if len(candles) >= min_needed else None
+    return candles if len(candles) >= 40 else None
 
 
-def get_klines(symbol: str, interval: str, limit: int = 240, ttl: int = 40) -> Optional[List[Dict[str, float]]]:
+def get_klines(symbol: str, interval: str, limit: int = 180, cache_seconds: int = 30) -> Optional[List[Dict[str, float]]]:
     symbol = normalize_symbol(symbol)
-    key = (symbol, interval, limit)
-    ts, cached = _KLINE_CACHE.get(key, (0, None))
-    if now_ts() - ts < ttl:
-        return cached
+    key = f"{symbol}:{interval}:{limit}"
+    cached = KLINE_CACHE.get(key)
+    if cached and time.time() - cached[0] < cache_seconds:
+        return cached[1]
 
     endpoints = [
         "/openApi/swap/v3/quote/klines",
         "/openApi/swap/v2/quote/klines",
     ]
-    result = None
-    for endpoint in endpoints:
-        data = get_json(endpoint, {"symbol": symbol, "interval": interval, "limit": limit})
-        result = _parse_klines_payload(data, limit)
-        if result:
-            break
-        # brief pause before trying fallback endpoint
-        time.sleep(0.15)
-
-    if not result:
-        STATE["auto"]["last_error"] = f"no_klines {symbol} {interval}; last_api_error={STATE['auto'].get('last_error','')}"
-    _KLINE_CACHE[key] = (now_ts(), result)
-    return result
-
-
-def get_tickers() -> Dict[str, Dict[str, Any]]:
-    global _TICKER_CACHE
-    ts, cached = _TICKER_CACHE
-    if now_ts() - ts < 45 and cached:
-        return cached
-    data = get_json("/openApi/swap/v2/quote/ticker")
-    out = {}
-    raw = (data or {}).get("data") or []
-    if isinstance(raw, dict):
-        raw = [raw]
-    for t in raw:
-        sym = normalize_symbol(str(t.get("symbol", "")))
-        if not sym.endswith("-USDT"):
+    for ep in endpoints:
+        data = get_json(ep, {"symbol": symbol, "interval": interval, "limit": limit})
+        if not data:
             continue
-        out[sym] = t
-    _TICKER_CACHE = (now_ts(), out)
-    return out
+        raw = data.get("data")
+        candles = parse_klines(raw)
+        if candles:
+            KLINE_CACHE[key] = (time.time(), candles)
+            return candles
+    KLINE_CACHE[key] = (time.time(), None)
+    return None
 
 
-def is_ultra_risk(symbol: str, candles15: Optional[List[Dict[str, float]]] = None) -> bool:
-    s = normalize_symbol(symbol).replace("-USDT", "")
-    if any(k in s for k in ULTRA_RISK_KEYWORDS):
-        return True
-    if candles15 and len(candles15) >= 20:
-        # block coins with insane candle bodies/wicks.
-        for c in candles15[-12:]:
-            if c["open"] > 0 and (c["high"] - c["low"]) / c["open"] * 100 >= 9:
-                return True
-        if candles15[-1]["close"] > 0:
-            recent = pct(candles15[-1]["close"], candles15[-12]["close"])
-            if abs(recent) >= 22:
-                return True
-    return False
+def is_good_contract_symbol(symbol: str) -> bool:
+    s = normalize_symbol(symbol)
+    if not s.endswith("-USDT"):
+        return False
+    b = base_asset(s)
+    if any(x in b for x in ["USD", "USDC", "BULL", "BEAR"]):
+        return False
+    return True
 
 
 def get_symbols() -> List[str]:
-    global _SYMBOL_CACHE
-    ts, cached = _SYMBOL_CACHE
-    if now_ts() - ts < 300 and cached:
-        return cached
+    cached = TICKER_CACHE.get("symbols")
+    if cached and time.time() - cached[0] < 600:
+        return cached[1] or FALLBACK_SYMBOLS
     data = get_json("/openApi/swap/v2/quote/contracts")
-    result = []
-    for item in (data or {}).get("data", []) or []:
-        sym = normalize_symbol(str(item.get("symbol", "")))
-        if sym.endswith("-USDT") and not any(x in sym for x in ["USDC", "BUSD"]):
-            result.append(sym)
-    if not result:
-        result = QUALITY_SYMBOLS[:]
-    result = list(dict.fromkeys(result))[:MAX_CONTRACTS]
-    _SYMBOL_CACHE = (now_ts(), result)
+    out: List[str] = []
+    if data and isinstance(data.get("data"), list):
+        for item in data.get("data", []):
+            s = item.get("symbol")
+            if s and is_good_contract_symbol(s):
+                out.append(normalize_symbol(s))
+    if not out:
+        out = FALLBACK_SYMBOLS[:]
+    # Quality first, then random rotation
+    quality = [s for s in out if base_asset(s) in QUALITY_BASES]
+    rest = [s for s in out if base_asset(s) not in QUALITY_BASES]
+    random.shuffle(rest)
+    result = (quality + rest)[:MAX_CONTRACTS]
+    TICKER_CACHE["symbols"] = (time.time(), result)
     return result
 
+# ============================================================
+# Indicators / market context
+# ============================================================
 
-def get_scan_universe() -> List[str]:
-    tickers = get_tickers()
-    all_symbols = get_symbols()
-    dynamic = []
-    for sym, t in tickers.items():
-        if sym not in all_symbols:
-            continue
-        chg = safe_float(t.get("priceChangePercent") or t.get("priceChangeRate") or t.get("changeRate"), 0)
-        # Some APIs return 0.12 for 12%, some return 12. Normalize approximately.
-        chg_abs = abs(chg * 100 if abs(chg) < 1 else chg)
-        quote_vol = safe_float(t.get("quoteVolume") or t.get("volume") or 0)
-        if chg_abs >= 0.6:
-            dynamic.append((chg_abs, quote_vol, sym))
-    dynamic.sort(reverse=True)
-    quality = [s for s in QUALITY_SYMBOLS if s in all_symbols]
-    dyn = [s for _, _, s in dynamic[:DYNAMIC_MOVERS_LIMIT]]
-    rest = [s for s in all_symbols if s not in set(quality + dyn)]
-    random.shuffle(rest)
-    return list(dict.fromkeys(quality + dyn + rest))[:MAX_ANALYZE_SYMBOLS]
-
-
-def closes(c: List[Dict[str, float]]) -> List[float]:
-    return [x["close"] for x in c]
-
+def closes(c: List[Dict[str, float]]) -> List[float]: return [x["close"] for x in c]
+def highs(c: List[Dict[str, float]]) -> List[float]: return [x["high"] for x in c]
+def lows(c: List[Dict[str, float]]) -> List[float]: return [x["low"] for x in c]
 
 def ema(values: List[float], period: int) -> float:
     if not values:
@@ -497,779 +375,725 @@ def ema(values: List[float], period: int) -> float:
     return e
 
 
-def atr(candles: List[Dict[str, float]], period: int = 14) -> float:
+def vwap(candles: List[Dict[str, float]], n: int = 48) -> float:
+    part = candles[-n:] if len(candles) >= n else candles
+    pv = sum(((x["high"] + x["low"] + x["close"]) / 3) * max(x["volume"], 0) for x in part)
+    vv = sum(max(x["volume"], 0) for x in part)
+    return pv / vv if vv > 0 else (part[-1]["close"] if part else 0.0)
+
+
+def atr(candles: List[Dict[str, float]], n: int = 14) -> float:
     if len(candles) < 2:
         return 0.0
     trs = []
     for i in range(1, len(candles)):
         h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if not trs:
+    part = trs[-n:] if len(trs) >= n else trs
+    return sum(part) / len(part) if part else 0.0
+
+
+def percent_change(candles: List[Dict[str, float]], bars: int) -> float:
+    if len(candles) <= bars:
         return 0.0
-    return sum(trs[-period:]) / min(period, len(trs))
+    a = candles[-bars]["close"]
+    b = candles[-1]["close"]
+    return (b - a) / a if a else 0.0
 
 
-def vwap(candles: List[Dict[str, float]], lookback: int = 48) -> float:
-    sub = candles[-lookback:]
-    pv = sum(((x["high"] + x["low"] + x["close"]) / 3) * max(x["volume"], 0) for x in sub)
-    vol = sum(max(x["volume"], 0) for x in sub)
-    return pv / vol if vol > 0 else (sum(closes(sub)) / len(sub) if sub else 0.0)
-
-
-def volume_ratio(candles: List[Dict[str, float]], lookback: int = 30) -> float:
-    if len(candles) < 5:
+def volume_ratio(candles: List[Dict[str, float]], n: int = 30) -> float:
+    if len(candles) < n + 2:
         return 1.0
-    last = candles[-1]["volume"]
-    prev = [x["volume"] for x in candles[-lookback-1:-1] if x["volume"] > 0]
-    avg = sum(prev) / len(prev) if prev else last
-    return last / avg if avg else 1.0
+    cur = candles[-1]["volume"]
+    avg = sum(x["volume"] for x in candles[-n-1:-1]) / n
+    return cur / avg if avg > 0 else 1.0
 
 
-def body_ratio(c: Dict[str, float]) -> float:
-    rng = c["high"] - c["low"]
-    if rng <= 0:
-        return 0.0
-    return abs(c["close"] - c["open"]) / rng
-
-
-def upper_wick_ratio(c: Dict[str, float]) -> float:
-    rng = c["high"] - c["low"]
-    if rng <= 0:
-        return 0.0
-    return (c["high"] - max(c["open"], c["close"])) / rng
-
-
-def lower_wick_ratio(c: Dict[str, float]) -> float:
-    rng = c["high"] - c["low"]
-    if rng <= 0:
-        return 0.0
-    return (min(c["open"], c["close"]) - c["low"]) / rng
-
-
-def two_candle_confirmation(candles: List[Dict[str, float]], side: str) -> bool:
-    if len(candles) < 3:
-        return False
-    a, b = candles[-2], candles[-1]
-    if side == "LONG":
-        return a["close"] > a["open"] and b["close"] > b["open"] and b["close"] >= a["close"] and upper_wick_ratio(b) < 0.55
-    return a["close"] < a["open"] and b["close"] < b["open"] and b["close"] <= a["close"] and lower_wick_ratio(b) < 0.55
-
-
-def htf_confirmation(candles15: List[Dict[str, float]], side: str) -> bool:
-    if len(candles15) < 5:
-        return False
-    last = candles15[-1]
-    e20 = ema(closes(candles15[-40:]), 20)
-    vw = vwap(candles15, 48)
-    if side == "LONG":
-        return last["close"] > e20 and last["close"] > vw * 0.995 and lower_wick_ratio(last) > 0.10
-    return last["close"] < e20 and last["close"] < vw * 1.005 and upper_wick_ratio(last) > 0.10
-
-
-def find_pivots(candles: List[Dict[str, float]], left: int = 2, right: int = 2) -> Tuple[List[float], List[float]]:
-    highs, lows = [], []
-    if len(candles) < left + right + 3:
-        return highs, lows
-    for i in range(left, len(candles) - right):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        if all(h >= candles[j]["high"] for j in range(i-left, i+right+1) if j != i):
-            highs.append(h)
-        if all(l <= candles[j]["low"] for j in range(i-left, i+right+1) if j != i):
-            lows.append(l)
-    return highs[-12:], lows[-12:]
-
-
-def cluster_levels(levels: List[float], tolerance_pct: float = 0.55) -> List[Tuple[float, int]]:
-    clusters: List[List[float]] = []
-    for lv in sorted([x for x in levels if x > 0]):
-        placed = False
-        for cl in clusters:
-            center = sum(cl) / len(cl)
-            if abs(pct(lv, center)) <= tolerance_pct:
-                cl.append(lv)
-                placed = True
-                break
-        if not placed:
-            clusters.append([lv])
-    out = [(sum(cl) / len(cl), len(cl)) for cl in clusters]
-    out.sort(key=lambda x: x[1], reverse=True)
-    return out[:10]
-
-
-def get_levels(c1h: List[Dict[str, float]], c4h: List[Dict[str, float]], price: float) -> Dict[str, Any]:
-    h1, l1 = find_pivots(c1h[-120:], 2, 2)
-    h4, l4 = find_pivots(c4h[-100:], 2, 2)
-    high_levels = cluster_levels(h1 + h4, 0.65)
-    low_levels = cluster_levels(l1 + l4, 0.65)
-    supports = sorted([(lv, touches) for lv, touches in low_levels if lv < price], key=lambda x: price - x[0])
-    resistances = sorted([(lv, touches) for lv, touches in high_levels if lv > price], key=lambda x: x[0] - price)
-    return {
-        "support": supports[0] if supports else (min([x["low"] for x in c1h[-48:]]), 1),
-        "resistance": resistances[0] if resistances else (max([x["high"] for x in c1h[-48:]]), 1),
-        "supports": supports[:4],
-        "resistances": resistances[:4],
-    }
-
-
-
-def level_touch_reaction_stats(candles: List[Dict[str, float]], level: float, kind: str,
-                               tolerance_pct: float = 0.65, lookahead: int = 4) -> Dict[str, Any]:
-    """Count real touches and reactions around a level.
-    kind='support': lows near level followed by bounce.
-    kind='resistance': highs near level followed by rejection.
-    """
-    touches = 0
-    reactions = 0
-    last_touch_ago = 9999
-    if not candles or level <= 0:
-        return {"touches": 0, "reactions": 0, "last_touch_ago": last_touch_ago}
-    n = len(candles)
-    for i, c in enumerate(candles[:-1]):
-        near = False
-        if kind == "support":
-            near = abs(pct(c["low"], level)) <= tolerance_pct or (c["low"] <= level <= c["high"])
-        else:
-            near = abs(pct(c["high"], level)) <= tolerance_pct or (c["low"] <= level <= c["high"])
-        if not near:
-            continue
-        touches += 1
-        last_touch_ago = min(last_touch_ago, n - 1 - i)
-        future = candles[i+1:i+1+lookahead]
-        if not future:
-            continue
-        if kind == "support":
-            best = max(x["high"] for x in future)
-            if pct(best, level) >= 0.45:
-                reactions += 1
-        else:
-            best = min(x["low"] for x in future)
-            if pct(best, level) <= -0.45:
-                reactions += 1
-    return {"touches": touches, "reactions": reactions, "last_touch_ago": last_touch_ago}
-
-
-def verify_level(c1h: List[Dict[str, float]], c4h: List[Dict[str, float]], level: float, kind: str) -> Dict[str, Any]:
-    s1 = level_touch_reaction_stats(c1h[-140:], level, kind, tolerance_pct=0.65, lookahead=5)
-    s4 = level_touch_reaction_stats(c4h[-100:], level, kind, tolerance_pct=0.85, lookahead=3)
-    touches = s1["touches"] + 2 * s4["touches"]
-    reactions = s1["reactions"] + 2 * s4["reactions"]
-    score = touches + reactions * 2
-    valid_b = touches >= MIN_LEVEL_TOUCHES_B and reactions >= MIN_LEVEL_REACTIONS_B
-    valid_a = touches >= MIN_LEVEL_TOUCHES_A and reactions >= MIN_LEVEL_REACTIONS_A
-    return {
-        "touches": touches,
-        "reactions": reactions,
-        "score": score,
-        "valid_b": valid_b,
-        "valid_a": valid_a,
-        "last_touch_1h": s1["last_touch_ago"],
-        "last_touch_4h": s4["last_touch_ago"],
-    }
-
-
-def close_confirmed_relative(candles: List[Dict[str, float]], level: float, side: str, n: int = 2) -> bool:
-    if len(candles) < n or level <= 0:
-        return False
-    buf_up = 1 + LEVEL_CLOSE_CONFIRM_BUFFER_PCT / 100
-    buf_dn = 1 - LEVEL_CLOSE_CONFIRM_BUFFER_PCT / 100
-    recent = candles[-n:]
-    if side == "ABOVE":
-        return all(c["close"] > level * buf_up for c in recent)
-    return all(c["close"] < level * buf_dn for c in recent)
-
-
-def strong_rejection_candle(candle: Dict[str, float], side: str) -> bool:
-    if side == "SHORT":
-        return upper_wick_ratio(candle) >= MIN_REJECTION_WICK_RATIO and candle["close"] < (candle["high"] + candle["low"]) / 2
-    return lower_wick_ratio(candle) >= MIN_REJECTION_WICK_RATIO and candle["close"] > (candle["high"] + candle["low"]) / 2
-
-
-def decisive_confirmation(candles5: List[Dict[str, float]], candles15: List[Dict[str, float]], side: str) -> bool:
-    if len(candles5) < 3 or len(candles15) < 2:
-        return False
-    last5 = candles5[-1]
-    last15 = candles15[-1]
-    if body_ratio(last5) < MIN_CONFIRM_BODY_RATIO and body_ratio(last15) < MIN_CONFIRM_BODY_RATIO:
-        return False
-    return two_candle_confirmation(candles5, side) and htf_confirmation(candles15, side)
-
-
-def next_level_room_ok(entry: float, target_level: float, side: str) -> bool:
-    if entry <= 0 or target_level <= 0:
-        return False
-    if side == "LONG":
-        return target_level > entry and pct(target_level, entry) >= MIN_LEVEL_ROOM_PCT
-    return target_level < entry and abs(pct(target_level, entry)) >= MIN_LEVEL_ROOM_PCT
-
-
-def classify_trend(candles: List[Dict[str, float]]) -> str:
-    vals = closes(candles)
-    if len(vals) < 60:
+def trend_state(candles: List[Dict[str, float]]) -> str:
+    cs = closes(candles)
+    if len(cs) < 60:
         return "UNKNOWN"
-    e20 = ema(vals[-80:], 20)
-    e50 = ema(vals[-100:], 50)
-    last = vals[-1]
-    move = pct(last, vals[-12]) if len(vals) >= 12 else 0
-    if last > e20 > e50 and move > 0.4:
+    e21 = ema(cs, 21)
+    e55 = ema(cs, 55)
+    price = cs[-1]
+    ch = percent_change(candles, min(20, len(candles)-1))
+    if price > e21 > e55 and ch > 0.003:
         return "UP"
-    if last < e20 < e50 and move < -0.4:
+    if price < e21 < e55 and ch < -0.003:
         return "DOWN"
     return "RANGE"
 
 
 def btc_context() -> Dict[str, Any]:
-    c15 = get_klines("BTC-USDT", "15m", 120, ttl=30) or []
-    c1h = get_klines("BTC-USDT", "1h", 120, ttl=60) or []
-    c4h = get_klines("BTC-USDT", "4h", 120, ttl=120) or []
-    ctx = {"ok": False, "regime": "UNKNOWN", "strong_up": False, "strong_down": False, "text": "BTC data unavailable"}
-    if len(c15) < 20 or len(c1h) < 30:
-        return ctx
-    m15 = pct(c15[-1]["close"], c15[-8]["close"])
-    h1 = pct(c1h[-1]["close"], c1h[-6]["close"])
-    t1 = classify_trend(c1h)
-    t4 = classify_trend(c4h) if len(c4h) >= 60 else "UNKNOWN"
-    strong_down = m15 <= -0.8 or h1 <= -1.8 or (t1 == "DOWN" and h1 < -0.8)
-    strong_up = m15 >= 0.8 or h1 >= 1.8 or (t1 == "UP" and h1 > 0.8)
-    if strong_down:
-        regime = "IMPULSE_DOWN" if m15 <= -1.2 else "TREND_DOWN"
-    elif strong_up:
-        regime = "IMPULSE_UP" if m15 >= 1.2 else "TREND_UP"
-    elif t1 == "RANGE":
-        regime = "RANGE"
-    else:
-        regime = t1
+    c15 = get_klines("BTC-USDT", "15m", 120, cache_seconds=45)
+    c1h = get_klines("BTC-USDT", "1h", 180, cache_seconds=120)
+    c4h = get_klines("BTC-USDT", "4h", 120, cache_seconds=240)
+    if not c15 or not c1h or not c4h:
+        return {"ok": False, "text": "BTC data unavailable", "direction": "UNKNOWN"}
+    ch15 = percent_change(c15, 4)
+    ch6h = percent_change(c15, 24)
+    t1h = trend_state(c1h)
+    t4h = trend_state(c4h)
+    direction = "RANGE"
+    if ch6h < -0.018 or (t1h == "DOWN" and ch15 < -0.002):
+        direction = "BEAR"
+    elif ch6h > 0.018 or (t1h == "UP" and ch15 > 0.002):
+        direction = "BULL"
     return {
         "ok": True,
-        "regime": regime,
-        "strong_up": strong_up,
-        "strong_down": strong_down,
-        "t1h": t1,
-        "t4h": t4,
-        "m15": m15,
-        "h1": h1,
-        "text": f"BTC {regime}: 15m {m15:+.2f}%, 6h {h1:+.2f}%, 1H {t1}, 4H {t4}",
+        "direction": direction,
+        "t1h": t1h,
+        "t4h": t4h,
+        "ch15": ch15,
+        "ch6h": ch6h,
+        "text": f"BTC {direction}: 15m {ch15*100:+.2f}%, 6h {ch6h*100:+.2f}%, 1H {t1h}, 4H {t4h}",
     }
 
+# ============================================================
+# Professional level verification
+# ============================================================
 
-def recent_move(candles: List[Dict[str, float]], lookback: int) -> float:
-    if len(candles) <= lookback:
-        return 0.0
-    return pct(candles[-1]["close"], candles[-lookback]["close"])
-
-
-def rebound_from_recent_low(candles: List[Dict[str, float]], lookback: int = 12) -> float:
-    sub = candles[-lookback:]
-    low = min(x["low"] for x in sub) if sub else 0
-    return pct(candles[-1]["close"], low) if low else 0
-
-
-def pullback_from_recent_high(candles: List[Dict[str, float]], lookback: int = 12) -> float:
-    sub = candles[-lookback:]
-    high = max(x["high"] for x in sub) if sub else 0
-    return pct(candles[-1]["close"], high) if high else 0
+def pivot_levels(candles: List[Dict[str, float]], kind: str, left: int = 3, right: int = 3) -> List[float]:
+    vals = []
+    for i in range(left, len(candles) - right):
+        window = candles[i-left:i+right+1]
+        if kind == "support":
+            if candles[i]["low"] == min(x["low"] for x in window):
+                vals.append(candles[i]["low"])
+        else:
+            if candles[i]["high"] == max(x["high"] for x in window):
+                vals.append(candles[i]["high"])
+    return vals
 
 
-def build_signal(symbol: str, side: str, strategy: str, setup_type: str, grade: str, score: int,
-                 entry: float, sl: float, tp1: float, tp2: float, tp3: float,
-                 reason: str, btc: Dict[str, Any], levels: Dict[str, Any], risk_mult: float) -> Dict[str, Any]:
-    sid = f"{normalize_symbol(symbol)}-{side}-{int(time.time())}-{random.randint(100,999)}"
-    move_tp1 = abs(pct(tp1, entry))
-    risk_pct = abs(pct(sl, entry))
-    return {
-        "id": sid,
-        "symbol": normalize_symbol(symbol),
-        "side": side,
-        "strategy": strategy,
-        "setup_type": setup_type,
-        "grade": grade,
-        "score": score,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "risk_multiplier": risk_mult,
-        "opened_at": now_ts(),
-        "status": "active",
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "tp3_hit": False,
-        "reason": reason,
-        "btc_text": btc.get("text", ""),
-        "support": levels.get("support", [0])[0],
-        "resistance": levels.get("resistance", [0])[0],
-        "tp1_roi_x10": move_tp1 * LEVERAGE,
-        "risk_roi_x10": risk_pct * LEVERAGE,
-    }
+def cluster_levels(levels: List[float], tol: float) -> List[float]:
+    levels = sorted([x for x in levels if x > 0])
+    if not levels:
+        return []
+    clusters: List[List[float]] = [[levels[0]]]
+    for lv in levels[1:]:
+        ref = sum(clusters[-1]) / len(clusters[-1])
+        if abs(lv - ref) / ref <= tol:
+            clusters[-1].append(lv)
+        else:
+            clusters.append([lv])
+    return [sum(c) / len(c) for c in clusters]
 
 
-def signal_message(sig: Dict[str, Any]) -> str:
-    direction = "🟢 LONG" if sig["side"] == "LONG" else "🔴 SHORT"
-    risk_note = "меньший риск" if sig["grade"] == "B" else "основной риск"
-    return "\n".join([
-        f"{direction} <b>{display_symbol(sig['symbol'])}</b>",
-        f"Класс: <b>{sig['grade']}</b> · Score {sig['score']} · {sig['setup_type']}",
-        f"Стратегия: <b>{sig['strategy']}</b>",
-        "",
-        f"Вход: <code>{sig['entry']:.8g}</code>",
-        f"TP1: <code>{sig['tp1']:.8g}</code> · ≈ {sig['tp1_roi_x10']:.1f}% ROI при x{LEVERAGE:g}",
-        f"TP2: <code>{sig['tp2']:.8g}</code>",
-        f"TP3: <code>{sig['tp3']:.8g}</code>",
-        f"SL: <code>{sig['sl']:.8g}</code> · риск до SL ≈ {sig['risk_roi_x10']:.1f}% ROI при x{LEVERAGE:g}",
-        f"Риск: {risk_note} · multiplier x{sig.get('risk_multiplier', 1):.2f}",
-        "",
-        "📌 <b>Профессиональная логика уровня:</b>",
-        sig.get("reason", ""),
-        "",
-        f"BTC: {sig.get('btc_text', '')}",
-        f"Support: {sig.get('support', 0):.8g} · Resistance: {sig.get('resistance', 0):.8g}",
-        "\nСделка не является гарантией прибыли. SL возможен; размер позиции должен соответствовать риску.",
-    ])
+def level_quality(candles: List[Dict[str, float]], level: float, kind: str, tf_weight: float = 1.0) -> Dict[str, Any]:
+    if not candles or level <= 0:
+        return {"score": 0, "touches": 0, "reactions": 0, "noise": True}
+    tol = LEVEL_CLUSTER_TOL
+    avg_atr = atr(candles, 14)
+    min_reaction = max(level * 0.004, avg_atr * 0.9)
+    touches = 0
+    reactions = 0
+    last_touch_i = -999
+    for i, c in enumerate(candles[-160:]):
+        idx = len(candles) - min(160, len(candles)) + i
+        touched = False
+        if kind == "support":
+            touched = abs(c["low"] - level) / level <= tol or (c["low"] <= level <= c["high"])
+            reacted = touched and (c["high"] - level) >= min_reaction
+        else:
+            touched = abs(c["high"] - level) / level <= tol or (c["low"] <= level <= c["high"])
+            reacted = touched and (level - c["low"]) >= min_reaction
+        if touched and idx - last_touch_i >= 4:  # separate touches only
+            touches += 1
+            last_touch_i = idx
+            if reacted:
+                reactions += 1
+    # Cap excessive touches: too many touches = noisy zone, not magical level
+    effective = min(touches, MAX_TOUCHES_EFFECTIVE)
+    noise_penalty = 0
+    if touches > 14:
+        noise_penalty = 8
+    score = (effective * 8 + min(reactions, 6) * 9) * tf_weight - noise_penalty
+    return {"score": max(0, score), "touches": touches, "reactions": reactions, "noise": touches > 18}
 
 
-def analyze_symbol(symbol: str, btc: Dict[str, Any], counters: Counter) -> Optional[Dict[str, Any]]:
+def verified_levels(c1h: List[Dict[str, float]], c4h: List[Dict[str, float]]) -> Dict[str, Any]:
+    price = c1h[-1]["close"]
+    raw_sup = pivot_levels(c1h[-140:], "support") + pivot_levels(c4h[-100:], "support")
+    raw_res = pivot_levels(c1h[-140:], "resistance") + pivot_levels(c4h[-100:], "resistance")
+    supports = [lv for lv in cluster_levels(raw_sup, LEVEL_CLUSTER_TOL) if lv < price]
+    resistances = [lv for lv in cluster_levels(raw_res, LEVEL_CLUSTER_TOL) if lv > price]
+    supports = sorted(supports, key=lambda x: abs(price - x))[:5]
+    resistances = sorted(resistances, key=lambda x: abs(price - x))[:5]
+
+    def best(levels: List[float], kind: str) -> Optional[Dict[str, Any]]:
+        out = []
+        for lv in levels:
+            q1 = level_quality(c1h, lv, kind, 1.0)
+            q4 = level_quality(c4h, lv, kind, 1.25)
+            q = {
+                "level": lv,
+                "score": q1["score"] + q4["score"],
+                "touches": q1["touches"] + q4["touches"],
+                "reactions": q1["reactions"] + q4["reactions"],
+                "noise": q1["noise"] or q4["noise"],
+                "distance": abs(price - lv) / price,
+            }
+            out.append(q)
+        return sorted(out, key=lambda z: (z["score"], -z["distance"]), reverse=True)[0] if out else None
+    return {"support": best(supports, "support"), "resistance": best(resistances, "resistance")}
+
+# ============================================================
+# Confirmation / signal construction
+# ============================================================
+
+def candle_body_ok(c: Dict[str, float], side: str) -> bool:
+    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+    rng = max(h - l, 1e-12)
+    body = abs(cl - o) / rng
+    upper = (h - max(o, cl)) / rng
+    lower = (min(o, cl) - l) / rng
+    if side == "LONG":
+        return cl > o and body >= 0.22 and upper <= 0.55
+    return cl < o and body >= 0.22 and lower <= 0.55
+
+
+def two_candle_confirmation(c5: List[Dict[str, float]], side: str, ema5: float, vw: float) -> bool:
+    if len(c5) < 4:
+        return False
+    a, b = c5[-2], c5[-1]
+    if side == "LONG":
+        return a["close"] > ema5 and b["close"] > ema5 and b["close"] > min(vw, ema5) and candle_body_ok(b, side)
+    return a["close"] < ema5 and b["close"] < ema5 and b["close"] < max(vw, ema5) and candle_body_ok(b, side)
+
+
+def htf_confirm(c15: List[Dict[str, float]], side: str, level: float) -> bool:
+    if len(c15) < 3:
+        return False
+    last = c15[-1]
+    prev = c15[-2]
+    if side == "LONG":
+        return last["close"] > level and (last["close"] >= prev["close"] or candle_body_ok(last, side))
+    return last["close"] < level and (last["close"] <= prev["close"] or candle_body_ok(last, side))
+
+
+def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> bool:
+    b = base_asset(symbol)
+    if any(k in b for k in ULTRA_RISK_KEYWORDS):
+        return True
+    for c in c5[-20:]:
+        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_5M_CANDLE:
+            return True
+    for c in c15[-12:]:
+        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_15M_CANDLE:
+            return True
+    return False
+
+
+def anti_chase_ok(side: str, c15: List[Dict[str, float]], current: float, near_level: bool) -> Tuple[bool, str]:
+    ch6h = percent_change(c15, 24)
+    ch24h = percent_change(c15, min(96, len(c15)-1))
+    recent_high = max(x["high"] for x in c15[-24:])
+    recent_low = min(x["low"] for x in c15[-24:])
+    pullback_from_high = (recent_high - current) / recent_high if recent_high else 0
+    bounce_from_low = (current - recent_low) / recent_low if recent_low else 0
+
+    if side == "SHORT" and (ch6h < -BIG_MOVE_6H or ch24h < -BIG_MOVE_24H):
+        if not near_level and bounce_from_low < REQUIRED_PULLBACK_AFTER_BIG_MOVE:
+            return False, f"late SHORT blocked: move6h {ch6h*100:.1f}%, bounce only {bounce_from_low*100:.1f}%"
+    if side == "LONG" and (ch6h > BIG_MOVE_6H or ch24h > BIG_MOVE_24H):
+        if not near_level and pullback_from_high < REQUIRED_PULLBACK_AFTER_BIG_MOVE:
+            return False, f"late LONG blocked: move6h {ch6h*100:.1f}%, pullback only {pullback_from_high*100:.1f}%"
+    return True, "ok"
+
+
+def calculate_trade(symbol: str, side: str, entry: float, level: float, opposite: Optional[Dict[str, Any]], candles: List[Dict[str, float]]) -> Dict[str, float]:
+    a = atr(candles, 14)
+    buffer = max(entry * 0.0025, a * 0.45)
+    if side == "LONG":
+        recent_low = min(x["low"] for x in candles[-12:])
+        sl = min(level, recent_low) - buffer
+        min_tp1 = entry * (1 + MIN_TP1_PRICE_MOVE * 1.05)
+        structural = opposite["level"] if opposite else entry * 1.025
+        tp1 = max(min_tp1, min(structural, entry * 1.032))
+        if tp1 <= entry:
+            tp1 = min_tp1
+        tp2 = entry + (tp1 - entry) * 1.8
+        tp3 = entry + (tp1 - entry) * 2.8
+    else:
+        recent_high = max(x["high"] for x in candles[-12:])
+        sl = max(level, recent_high) + buffer
+        min_tp1 = entry * (1 - MIN_TP1_PRICE_MOVE * 1.05)
+        structural = opposite["level"] if opposite else entry * 0.975
+        tp1 = min(min_tp1, max(structural, entry * 0.968))
+        if tp1 >= entry:
+            tp1 = min_tp1
+        tp2 = entry - (entry - tp1) * 1.8
+        tp3 = entry - (entry - tp1) * 2.8
+    risk = abs(entry - sl)
+    reward = abs(tp1 - entry)
+    rr = reward / risk if risk > 0 else 0.0
+    roi_tp1 = reward / entry * LEVERAGE * 100
+    roi_sl = risk / entry * LEVERAGE * 100
+    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr, "roi_tp1": roi_tp1, "roi_sl": roi_sl}
+
+
+def score_signal(side: str, strategy: str, trade_type: str, level: Dict[str, Any], btc: Dict[str, Any], t1h: str, t4h: str, vol: float, rr: float, dist: float, strong_reversal: bool) -> Tuple[int, List[str]]:
+    score = 45
+    notes = []
+
+    # level quality: cap touches effect; reaction matters more than touch count
+    touches_eff = min(level.get("touches", 0), MAX_TOUCHES_EFFECTIVE)
+    reactions_eff = min(level.get("reactions", 0), 6)
+    score += touches_eff * 3 + reactions_eff * 5
+    if level.get("noise"):
+        score -= 8
+        notes.append("level noisy/excessive touches")
+
+    if dist <= 0.004:
+        score += 10
+    elif dist <= LEVEL_NEAR_TOL:
+        score += 6
+    else:
+        score -= 4
+
+    # BTC alignment
+    btc_dir = btc.get("direction")
+    if side == "LONG":
+        if btc_dir == "BULL": score += 10
+        elif btc_dir == "RANGE": score += 3
+        elif btc_dir == "BEAR": score -= 14; notes.append("BTC bearish vs LONG")
+    else:
+        if btc_dir == "BEAR": score += 10
+        elif btc_dir == "RANGE": score += 3
+        elif btc_dir == "BULL": score -= 14; notes.append("BTC bullish vs SHORT")
+
+    # HTF alignment
+    against_1h = (side == "LONG" and t1h == "DOWN") or (side == "SHORT" and t1h == "UP")
+    against_4h = (side == "LONG" and t4h == "DOWN") or (side == "SHORT" and t4h == "UP")
+    with_1h = (side == "LONG" and t1h == "UP") or (side == "SHORT" and t1h == "DOWN")
+    with_4h = (side == "LONG" and t4h == "UP") or (side == "SHORT" and t4h == "DOWN")
+    if with_1h: score += 8
+    if with_4h: score += 8
+    if against_1h:
+        score -= 10
+        notes.append("1H против")
+    if against_4h:
+        score -= 8
+        notes.append("4H против")
+
+    if strong_reversal:
+        score += 10
+        notes.append("strong reclaim/reject")
+
+    if vol >= 1.25: score += 8
+    elif vol >= 0.95: score += 4
+    elif vol < VERY_LOW_VOLUME:
+        score -= 12
+        notes.append(f"very low volume x{vol:.2f}")
+    elif vol < MIN_VOLUME_B:
+        score -= 6
+        notes.append(f"low volume x{vol:.2f}")
+
+    if rr >= 1.25: score += 8
+    elif rr >= 1.0: score += 5
+    elif rr >= 0.75: score += 1
+    else:
+        score -= 8
+        notes.append(f"weak RR {rr:.2f}")
+
+    # Professional caps: no fake Score 100 if core flaws exist
+    cap = 100
+    if vol < VERY_LOW_VOLUME:
+        cap = min(cap, LOW_VOLUME_CAP)
+    if rr < 0.85:
+        cap = min(cap, 82)
+    if against_1h and not strong_reversal:
+        cap = min(cap, 82)
+    if against_4h and not strong_reversal:
+        cap = min(cap, 80)
+    if level.get("touches", 0) > 16:
+        cap = min(cap, 84)
+    if btc.get("direction") == "BEAR" and side == "LONG" and not strong_reversal:
+        cap = min(cap, 80)
+    if btc.get("direction") == "BULL" and side == "SHORT" and not strong_reversal:
+        cap = min(cap, 80)
+
+    return max(0, min(int(score), cap)), notes
+
+
+def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
+    t = now_ts()
+    if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
+        return False, "pair cooldown"
+    if t < STATE.setdefault("strategy_cooldown", {}).get(strategy, 0):
+        return False, "strategy cooldown"
+    if t < STATE.setdefault("hard_block_until", {}).get(strategy, 0):
+        return False, "strategy hard block"
+    return True, "ok"
+
+
+def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], near_miss: List[str]) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
-    c15 = get_klines(symbol, "15m", 200)
+    c15 = get_klines(symbol, "15m", 180)
     if not c15:
-        counters["no_klines_15m"] += 1
+        blocks["no_klines_15m"] = blocks.get("no_klines_15m", 0) + 1
         return None
-    if is_ultra_risk(symbol, c15):
-        counters["ultra_risk_block"] += 1
+    c5 = get_klines(symbol, "5m", 160)
+    if not c5:
+        blocks["no_klines_5m"] = blocks.get("no_klines_5m", 0) + 1
         return None
-    c5 = get_klines(symbol, "5m", 180)
-    c1h = get_klines(symbol, "1h", 200)
-    c4h = get_klines(symbol, "4h", 140)
-    if not c5 or not c1h or not c4h:
-        counters["no_klines_htf"] += 1
+    c1h = get_klines(symbol, "1h", 180)
+    c4h = get_klines(symbol, "4h", 120)
+    if not c1h or not c4h:
+        blocks["no_htf"] = blocks.get("no_htf", 0) + 1
+        return None
+
+    if ultra_risk_symbol(symbol, c5, c15):
+        blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
         return None
 
     price = c5[-1]["close"]
-    if price <= 0:
-        counters["bad_price"] += 1
-        return None
-
-    levels = get_levels(c1h, c4h, price)
-    support, _support_cluster_touches = levels["support"]
-    resistance, _res_cluster_touches = levels["resistance"]
-    support_q = verify_level(c1h, c4h, support, "support")
-    resistance_q = verify_level(c1h, c4h, resistance, "resistance")
-
-    atr15 = atr(c15, 14)
-    atr_pct = atr15 / price * 100 if price else 0
-    volr = volume_ratio(c15, 30)
-    t1 = classify_trend(c1h)
-    t4 = classify_trend(c4h)
-    move2h = recent_move(c15, ANTI_CHASE_LOOKBACK_15M)
-    rebound = rebound_from_recent_low(c15, ANTI_CHASE_LOOKBACK_15M)
-    pullback = pullback_from_recent_high(c15, ANTI_CHASE_LOOKBACK_15M)
-    e5 = ema(closes(c5[-80:]), 20)
-    e15 = ema(closes(c15[-80:]), 20)
-    vw15 = vwap(c15, 48)
-    last15 = c15[-1]
+    e5 = ema(closes(c5), 21)
+    vw = vwap(c5, 48)
+    vol = volume_ratio(c15, 30)
+    t1h = trend_state(c1h)
+    t4h = trend_state(c4h)
+    lv = verified_levels(c1h, c4h)
+    support = lv.get("support")
+    resistance = lv.get("resistance")
 
     candidates: List[Dict[str, Any]] = []
-    entry_max_dist = max(LEVEL_ENTRY_MAX_DISTANCE_PCT, atr_pct * 0.85)
-    retest_max_dist = max(BROKEN_LEVEL_RETEST_MAX_DISTANCE_PCT, atr_pct * 1.00)
 
-    # 1) SUPPORT HOLD / RECLAIM -> LONG.
-    dist_support = abs(pct(price, support)) if support else 999
-    support_touched_recently = min(x["low"] for x in c15[-8:]) <= support * (1 + max(0.0025, atr_pct / 100 * 0.35))
-    support_sweep = min(x["low"] for x in c15[-6:]) < support * (1 - max(0.0015, atr_pct / 100 * 0.25)) and price > support
-    reclaim_support = close_confirmed_relative(c5, support, "ABOVE", 2) and price > e5 and price > e15 * 0.996 and price > vw15 * 0.992
-    long_confirm = decisive_confirmation(c5, c15, "LONG") and strong_rejection_candle(last15, "LONG")
-    no_late_long = not (move2h > ANTI_CHASE_MOVE_PCT and pullback > -PULLBACK_FOR_LATE_LONG_PCT)
-    btc_allows_long = not btc.get("strong_down")
-    htf_allows_long = t4 != "DOWN" and (t1 in ["UP", "RANGE"] or support_sweep)
-    support_valid = support_q["valid_b"]
-    room_long = next_level_room_ok(price, resistance, "LONG")
+    def add_candidate(side: str, strategy: str, trade_type: str, level: Dict[str, Any], opposite: Optional[Dict[str, Any]], reason: str, strong: bool):
+        if not level:
+            return
+        dist = abs(price - level["level"]) / price
+        if dist > max(LEVEL_NEAR_TOL, RETEST_TOL):
+            blocks["level_distance_block"] = blocks.get("level_distance_block", 0) + 1
+            return
+        min_touches = MIN_LEVEL_TOUCHES_A if strong else MIN_LEVEL_TOUCHES_B
+        min_reacts = MIN_REACTIONS_A if strong else MIN_REACTIONS_B
+        if level.get("touches", 0) < min_touches or level.get("reactions", 0) < min_reacts:
+            blocks["weak_level_block"] = blocks.get("weak_level_block", 0) + 1
+            return
+        if REQUIRE_15M_CONFIRM and not htf_confirm(c15, side, level["level"]):
+            blocks["confirm_15m_block"] = blocks.get("confirm_15m_block", 0) + 1
+            return
+        if not two_candle_confirmation(c5, side, e5, vw):
+            blocks["confirm_5m_block"] = blocks.get("confirm_5m_block", 0) + 1
+            return
+        ok, chase_reason = anti_chase_ok(side, c15, price, dist <= RETEST_TOL)
+        if not ok:
+            blocks["anti_chase_block"] = blocks.get("anti_chase_block", 0) + 1
+            return
+        co, co_reason = cooldown_ok(symbol, strategy)
+        if not co:
+            blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
+            return
 
-    if btc_allows_long and htf_allows_long and support_valid and no_late_long and room_long and dist_support <= entry_max_dist and support_touched_recently and reclaim_support and long_confirm:
-        sl = min(support, min(x["low"] for x in c15[-8:])) - max(atr15 * 0.90, price * 0.0055)
-        tp1 = min(resistance * 0.995, price * (1 + max(MIN_TP1_PRICE_MOVE / 100, 0.012)))
-        if tp1 <= price:
-            tp1 = price * 1.012
-        tp2 = min(resistance * 1.002, price + (tp1 - price) * 1.8)
-        tp3 = price + (tp1 - price) * 2.8
-        risk = price - sl
-        reward = tp1 - price
-        rr = reward / risk if risk > 0 else 0
-        roi = abs(pct(tp1, price)) * LEVERAGE
-        score = 48 + min(22, support_q["score"] * 2)
-        score += 12 if support_sweep else 6
-        score += 10 if t1 == "UP" else 5 if t1 == "RANGE" else 0
-        score += 8 if t4 != "DOWN" else 0
-        score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-        score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
-        score += 6 if btc.get("regime") in ["TREND_UP", "RANGE", "UP"] else 0
-        grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and support_q["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
-        if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
-            reason = (
-                f"Верифицированная поддержка {support:.8g}: touches {support_q['touches']}, reactions {support_q['reactions']}. "
-                f"Цена сделала touch/sweep и закрылась обратно выше уровня, EMA/VWAP подтверждают reclaim. "
-                f"Вход рядом с уровнем ({dist_support:.2f}%), не погоня. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-            )
-            candidates.append(build_signal(symbol, "LONG", "PRO_VERIFIED_SUPPORT_RECLAIM", "VERIFIED SUPPORT / RECLAIM LONG", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
-    else:
-        if not support_valid: counters["weak_support_level"] += 1
-        elif not room_long: counters["no_room_to_resistance_long"] += 1
-        elif dist_support > entry_max_dist: counters["entry_too_far_from_support"] += 1
-        elif not support_touched_recently: counters["support_not_touched_recently"] += 1
-        elif not reclaim_support: counters["no_support_reclaim"] += 1
-        elif not long_confirm: counters["no_confirm_long"] += 1
-
-    # 2) RESISTANCE HOLD / REJECT -> SHORT.
-    dist_resistance = abs(pct(price, resistance)) if resistance else 999
-    resistance_touched_recently = max(x["high"] for x in c15[-8:]) >= resistance * (1 - max(0.0025, atr_pct / 100 * 0.35))
-    resistance_sweep = max(x["high"] for x in c15[-6:]) > resistance * (1 + max(0.0015, atr_pct / 100 * 0.25)) and price < resistance
-    reject_resistance = close_confirmed_relative(c5, resistance, "BELOW", 2) and price < e5 and price < e15 * 1.004 and price < vw15 * 1.006
-    short_confirm = decisive_confirmation(c5, c15, "SHORT") and strong_rejection_candle(last15, "SHORT")
-    no_late_short = not (move2h < -ANTI_CHASE_MOVE_PCT and rebound < REBOUND_FOR_LATE_SHORT_PCT)
-    btc_allows_short = not btc.get("strong_up")
-    htf_allows_short = t4 != "UP" and (t1 in ["DOWN", "RANGE"] or resistance_sweep)
-    resistance_valid = resistance_q["valid_b"]
-    room_short = next_level_room_ok(price, support, "SHORT")
-
-    if btc_allows_short and htf_allows_short and resistance_valid and no_late_short and room_short and dist_resistance <= entry_max_dist and resistance_touched_recently and reject_resistance and short_confirm:
-        sl = max(resistance, max(x["high"] for x in c15[-8:])) + max(atr15 * 0.90, price * 0.0055)
-        tp1 = max(support * 1.005, price * (1 - max(MIN_TP1_PRICE_MOVE / 100, 0.012)))
-        if tp1 >= price:
-            tp1 = price * 0.988
-        tp2 = max(support * 0.998, price - (price - tp1) * 1.8)
-        tp3 = price - (price - tp1) * 2.8
-        risk = sl - price
-        reward = price - tp1
-        rr = reward / risk if risk > 0 else 0
-        roi = abs(pct(tp1, price)) * LEVERAGE
-        score = 48 + min(22, resistance_q["score"] * 2)
-        score += 12 if resistance_sweep else 6
-        score += 10 if t1 == "DOWN" else 5 if t1 == "RANGE" else 0
-        score += 8 if t4 != "UP" else 0
-        score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-        score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
-        score += 6 if btc.get("regime") in ["TREND_DOWN", "IMPULSE_DOWN", "RANGE", "DOWN"] else 0
-        grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and resistance_q["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
-        if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
-            reason = (
-                f"Верифицированное сопротивление {resistance:.8g}: touches {resistance_q['touches']}, reactions {resistance_q['reactions']}. "
-                f"Цена сделала touch/sweep и закрылась обратно ниже уровня, EMA/VWAP подтверждают reject. "
-                f"Вход рядом с уровнем ({dist_resistance:.2f}%), не поздний short после падения. 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-            )
-            candidates.append(build_signal(symbol, "SHORT", "PRO_VERIFIED_RESISTANCE_REJECT", "VERIFIED RESISTANCE / REJECT SHORT", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
-    else:
-        if not resistance_valid: counters["weak_resistance_level"] += 1
-        elif not room_short: counters["no_room_to_support_short"] += 1
-        elif dist_resistance > entry_max_dist: counters["entry_too_far_from_resistance"] += 1
-        elif not resistance_touched_recently: counters["resistance_not_touched_recently"] += 1
-        elif not reject_resistance: counters["no_resistance_reject"] += 1
-        elif not short_confirm: counters["no_confirm_short"] += 1
-
-    # 3) SUPPORT FAILED -> RETEST -> SHORT.
-    h1_piv, l1_piv = find_pivots(c1h[-140:], 2, 2)
-    h4_piv, l4_piv = find_pivots(c4h[-100:], 2, 2)
-    prev_support_levels = cluster_levels(l1_piv + l4_piv, 0.65)
-    prev_res_levels = cluster_levels(h1_piv + h4_piv, 0.65)
-    broken_supports_above = sorted([(lv, touch) for lv, touch in prev_support_levels if lv > price], key=lambda x: x[0] - price)
-    broken_res_below = sorted([(lv, touch) for lv, touch in prev_res_levels if lv < price], key=lambda x: price - x[0])
-
-    if broken_supports_above:
-        broken_support, _ = broken_supports_above[0]
-        bq = verify_level(c1h, c4h, broken_support, "support")
-        dist_broken = abs(pct(price, broken_support))
-        retested = max(x["high"] for x in c15[-8:]) >= broken_support * (1 - max(0.0025, atr_pct / 100 * 0.35))
-        failed = close_confirmed_relative(c5, broken_support, "BELOW", 2) and price < e5 and price < e15 * 1.003 and price < vw15 * 1.006
-        late_dump_ok = not (move2h < -ANTI_CHASE_MOVE_PCT) or rebound >= max(REBOUND_FOR_LATE_SHORT_PCT, 1.0)
-        confirm = decisive_confirmation(c5, c15, "SHORT") and strong_rejection_candle(last15, "SHORT")
-        room = next_level_room_ok(price, support, "SHORT")
-        if bq["valid_b"] and btc_allows_short and t4 != "UP" and late_dump_ok and room and dist_broken <= retest_max_dist and retested and failed and confirm:
-            sl = max(broken_support, max(x["high"] for x in c15[-8:])) + max(atr15 * 0.95, price * 0.006)
-            tp1 = max(support * 1.005, price * (1 - max(MIN_TP1_PRICE_MOVE / 100, 0.012))) if support < price else price * 0.988
-            if tp1 >= price:
-                tp1 = price * 0.988
-            tp2 = max(support * 0.998, price - (price - tp1) * 1.8) if support < price else price - (price - tp1) * 1.8
-            tp3 = price - (price - tp1) * 2.8
-            risk = sl - price
-            reward = price - tp1
-            rr = reward / risk if risk > 0 else 0
-            roi = abs(pct(tp1, price)) * LEVERAGE
-            score = 52 + min(24, bq["score"] * 2)
-            score += 10 if retested else 0
-            score += 8 if t1 == "DOWN" else 4 if t1 == "RANGE" else 0
-            score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-            score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
-            score += 6 if btc.get("regime") in ["TREND_DOWN", "IMPULSE_DOWN", "RANGE", "DOWN"] else 0
-            grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and bq["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
-            if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
-                reason = (
-                    f"Поддержка {broken_support:.8g} была верифицирована (touches {bq['touches']}, reactions {bq['reactions']}), затем сломана. "
-                    f"Цена сделала retest снизу и снова закрылась ниже — поддержка стала сопротивлением. "
-                    f"Это не short на дне: вход рядом с retest ({dist_broken:.2f}%). 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-                )
-                candidates.append(build_signal(symbol, "SHORT", "PRO_SUPPORT_BREAK_RETEST_VERIFIED", "VERIFIED SUPPORT FAILED / RETEST SHORT", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
+        tr = calculate_trade(symbol, side, price, level["level"], opposite, c15)
+        if tr["roi_tp1"] < MIN_TP1_ROI_X10:
+            blocks["tp1_roi_block"] = blocks.get("tp1_roi_block", 0) + 1
+            return
+        score, notes = score_signal(side, strategy, trade_type, level, btc, t1h, t4h, vol, tr["rr"], dist, strong)
+        grade = None
+        min_rr = None
+        if score >= A_PLUS_MIN_SCORE and tr["rr"] >= MIN_RR_A and vol >= MIN_VOLUME_A:
+            grade = "A+"
+            min_rr = MIN_RR_A
+        elif score >= B_MIN_SCORE and tr["rr"] >= MIN_RR_B and vol >= MIN_VOLUME_B:
+            grade = "B"
+            min_rr = MIN_RR_B
         else:
-            if not bq["valid_b"]: counters["weak_broken_support"] += 1
-            elif dist_broken > retest_max_dist: counters["entry_too_far_from_broken_support"] += 1
-            elif not retested: counters["broken_support_no_retest"] += 1
-            elif not failed: counters["broken_support_no_failed_retest"] += 1
-            elif not confirm: counters["broken_support_no_confirm"] += 1
+            blocks["score_rr_volume_block"] = blocks.get("score_rr_volume_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: score {score}, RR {tr['rr']:.2f}, vol x{vol:.2f}")
+            return
 
-    # 4) RESISTANCE BROKE -> RETEST -> LONG.
-    if broken_res_below:
-        broken_res, _ = broken_res_below[0]
-        rq = verify_level(c1h, c4h, broken_res, "resistance")
-        dist_broken = abs(pct(price, broken_res))
-        retested = min(x["low"] for x in c15[-8:]) <= broken_res * (1 + max(0.0025, atr_pct / 100 * 0.35))
-        held = close_confirmed_relative(c5, broken_res, "ABOVE", 2) and price > e5 and price > e15 * 0.997 and price > vw15 * 0.994
-        late_pump_ok = not (move2h > ANTI_CHASE_MOVE_PCT) or pullback <= -max(PULLBACK_FOR_LATE_LONG_PCT, 1.0)
-        confirm = decisive_confirmation(c5, c15, "LONG") and strong_rejection_candle(last15, "LONG")
-        room = next_level_room_ok(price, resistance, "LONG")
-        if rq["valid_b"] and btc_allows_long and t4 != "DOWN" and late_pump_ok and room and dist_broken <= retest_max_dist and retested and held and confirm:
-            sl = min(broken_res, min(x["low"] for x in c15[-8:])) - max(atr15 * 0.95, price * 0.006)
-            tp1 = min(resistance * 0.995, price * (1 + max(MIN_TP1_PRICE_MOVE / 100, 0.012))) if resistance > price else price * 1.012
-            if tp1 <= price:
-                tp1 = price * 1.012
-            tp2 = min(resistance * 1.002, price + (tp1 - price) * 1.8) if resistance > price else price + (tp1 - price) * 1.8
-            tp3 = price + (tp1 - price) * 2.8
-            risk = price - sl
-            reward = tp1 - price
-            rr = reward / risk if risk > 0 else 0
-            roi = abs(pct(tp1, price)) * LEVERAGE
-            score = 52 + min(24, rq["score"] * 2)
-            score += 10 if retested else 0
-            score += 8 if t1 == "UP" else 4 if t1 == "RANGE" else 0
-            score += 8 if volr >= MIN_VOLUME_RATIO_A else 4 if volr >= MIN_VOLUME_RATIO_B else 0
-            score += 10 if rr >= MIN_RR_A else 4 if rr >= MIN_RR_B else 0
-            score += 6 if btc.get("regime") in ["TREND_UP", "IMPULSE_UP", "RANGE", "UP"] else 0
-            grade = "A+" if score >= A_PLUS_MIN_SCORE and rr >= MIN_RR_A and volr >= MIN_VOLUME_RATIO_A and rq["valid_a"] else "B" if score >= B_MIN_SCORE and rr >= MIN_RR_B else "LOW"
-            if roi >= MIN_TP1_ROI_X10 and grade != "LOW":
-                reason = (
-                    f"Сопротивление {broken_res:.8g} было верифицировано (touches {rq['touches']}, reactions {rq['reactions']}), затем пробито. "
-                    f"Цена сделала retest сверху и удержала уровень как поддержку. "
-                    f"Это не long на вершине: вход рядом с retest ({dist_broken:.2f}%). 1H {t1}, 4H {t4}, volume x{volr:.2f}, RR {rr:.2f}."
-                )
-                candidates.append(build_signal(symbol, "LONG", "PRO_RESISTANCE_BREAK_RETEST_VERIFIED", "VERIFIED RESISTANCE BROKE / RETEST LONG", grade, int(score), price, sl, tp1, tp2, tp3, reason, btc, levels, 1.0 if grade == "A+" else 0.40))
-        else:
-            if not rq["valid_b"]: counters["weak_broken_resistance"] += 1
-            elif dist_broken > retest_max_dist: counters["entry_too_far_from_broken_resistance"] += 1
-            elif not retested: counters["broken_resistance_no_retest"] += 1
-            elif not held: counters["broken_resistance_not_held"] += 1
-            elif not confirm: counters["broken_resistance_no_confirm"] += 1
+        risk_mult = A_RISK_MULT if grade == "A+" else B_RISK_MULT
+        if tr["roi_sl"] > 20:
+            risk_mult = min(risk_mult, FAR_SL_RISK_MULT)
+        candidates.append({
+            "symbol": symbol, "side": side, "grade": grade, "score": score, "strategy": strategy,
+            "trade_type": trade_type, "entry": tr["entry"], "tp1": tr["tp1"], "tp2": tr["tp2"],
+            "tp3": tr["tp3"], "sl": tr["sl"], "rr": tr["rr"], "roi_tp1": tr["roi_tp1"],
+            "roi_sl": tr["roi_sl"], "risk_mult": risk_mult, "level": level["level"],
+            "level_touches": level.get("touches", 0), "level_reactions": level.get("reactions", 0),
+            "support": support["level"] if support else None, "resistance": resistance["level"] if resistance else None,
+            "btc_text": btc.get("text", ""), "t1h": t1h, "t4h": t4h, "volume_ratio": vol,
+            "reason": reason, "notes": notes, "created_at": now_ts(), "status": "active", "tp1_hit": False,
+        })
+
+    # 1. Support holds/reclaims -> LONG
+    if support:
+        s = support["level"]
+        recent_low = min(x["low"] for x in c15[-8:])
+        reclaimed = recent_low <= s * (1 + LEVEL_CLUSTER_TOL) and c15[-1]["close"] > s and price > s
+        strong = reclaimed and vol >= 0.85 and (t1h != "DOWN" or btc.get("direction") != "BEAR")
+        if reclaimed:
+            add_candidate(
+                "LONG", "PRO_VERIFIED_SUPPORT_RECLAIM", "SUPPORT RECLAIM LONG",
+                support, resistance,
+                f"Цена сделала touch/sweep поддержки {s:.8g} и закрылась обратно выше. Вход рядом с уровнем, не погоня.",
+                strong,
+            )
+
+    # 2. Resistance rejects -> SHORT
+    if resistance:
+        r = resistance["level"]
+        recent_high = max(x["high"] for x in c15[-8:])
+        rejected = recent_high >= r * (1 - LEVEL_CLUSTER_TOL) and c15[-1]["close"] < r and price < r
+        strong = rejected and vol >= 0.85 and (t1h != "UP" or btc.get("direction") != "BULL")
+        if rejected:
+            add_candidate(
+                "SHORT", "PRO_VERIFIED_RESISTANCE_REJECT", "RESISTANCE REJECT SHORT",
+                resistance, support,
+                f"Цена пришла к сопротивлению {r:.8g}, не закрепилась выше и вернулась ниже. Работа от уровня.",
+                strong,
+            )
+
+    # 3. Support broke and retested from below -> SHORT
+    if support:
+        s = support["level"]
+        was_below = any(x["close"] < s * (1 - LEVEL_CLUSTER_TOL) for x in c15[-10:-2])
+        retest = max(x["high"] for x in c15[-4:]) >= s * (1 - RETEST_TOL) and price < s
+        rejected = c5[-1]["close"] < min(e5, vw) and candle_body_ok(c5[-1], "SHORT")
+        if was_below and retest and rejected:
+            add_candidate(
+                "SHORT", "PRO_SUPPORT_BREAK_RETEST_VERIFIED", "SUPPORT FAILED / RETEST SHORT",
+                support, None,
+                f"Поддержка {s:.8g} была пробита, затем цена сделала retest снизу и снова отвернулась вниз.",
+                vol >= 0.85,
+            )
+
+    # 4. Resistance broke and retested from above -> LONG
+    if resistance:
+        r = resistance["level"]
+        was_above = any(x["close"] > r * (1 + LEVEL_CLUSTER_TOL) for x in c15[-10:-2])
+        retest = min(x["low"] for x in c15[-4:]) <= r * (1 + RETEST_TOL) and price > r
+        reclaimed = c5[-1]["close"] > max(e5, vw) and candle_body_ok(c5[-1], "LONG")
+        if was_above and retest and reclaimed:
+            add_candidate(
+                "LONG", "PRO_RESISTANCE_BREAK_RETEST_VERIFIED", "RESISTANCE BREAK / RETEST LONG",
+                resistance, None,
+                f"Сопротивление {r:.8g} было пробито, retest удержался сверху как поддержка.",
+                vol >= 0.85,
+            )
 
     if not candidates:
-        counters["no_candidate"] += 1
         return None
-    candidates.sort(key=lambda s: (s["grade"] == "A+", s["score"], s["tp1_roi_x10"]), reverse=True)
-    best = candidates[0]
-    ok, reason = adaptive_allows(best["strategy"], best["side"], best["grade"])
-    if not ok:
-        counters["adaptive_block"] += 1
-        counters[reason] += 1
-        return None
-    return best
+    candidates.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["rr"]), reverse=True)
+    return candidates[0]
 
-def can_send_signal(sig: Dict[str, Any], counters: Counter) -> Tuple[bool, str]:
-    reset_daily_counter_if_needed()
-    if MAX_SIGNALS_PER_DAY > 0 and STATE["signals_today"].get("count", 0) >= MAX_SIGNALS_PER_DAY:
-        counters["daily_limit_block"] += 1
-        return False, "daily signal limit"
-    if len(STATE.get("active_signals", {})) >= MAX_ACTIVE_SIGNALS:
-        counters["active_limit_block"] += 1
-        return False, "active signal limit"
-    cd = STATE.setdefault("cooldowns", {})
-    pair_key = f"pair:{sig['symbol']}"
-    strat_key = f"strategy:{sig['strategy']}:{sig['side']}"
-    t = now_ts()
-    if cd.get(pair_key, 0) > t:
-        counters["pair_cooldown_block"] += 1
-        return False, "pair cooldown"
-    if cd.get(strat_key, 0) > t:
-        counters["strategy_cooldown_block"] += 1
-        return False, "strategy cooldown"
-    return True, ""
+# ============================================================
+# Signal messages / scan / tracking
+# ============================================================
+
+def format_price(x: float) -> str:
+    if x >= 100:
+        return f"{x:.2f}"
+    if x >= 1:
+        return f"{x:.4f}".rstrip("0").rstrip(".")
+    return f"{x:.8f}".rstrip("0").rstrip(".")
 
 
-def save_new_signal(sig: Dict[str, Any]) -> None:
-    STATE.setdefault("active_signals", {})[sig["id"]] = sig
-    reset_daily_counter_if_needed()
-    STATE["signals_today"]["count"] = int(STATE["signals_today"].get("count", 0)) + 1
-    cd = STATE.setdefault("cooldowns", {})
-    cd[f"pair:{sig['symbol']}"] = now_ts() + PAIR_COOLDOWN_SECONDS
-    cd[f"strategy:{sig['strategy']}:{sig['side']}"] = now_ts() + STRATEGY_COOLDOWN_SECONDS
-    save_state()
-
-
-def scan_market(send_to_telegram: bool = True, force_diag: bool = False) -> Dict[str, Any]:
-    start = now_ts()
-    counters: Counter = Counter()
-    sent = []
-    candidates = []
-    btc = btc_context()
-    if not btc.get("ok"):
-        counters["btc_data_problem"] += 1
-    symbols = get_scan_universe()
-    counters["universe"] = len(symbols)
-    for sym in symbols:
-        if now_ts() - start > 70:
-            counters["scan_timeout"] += 1
-            break
-        counters["checked"] += 1
-        try:
-            sig = analyze_symbol(sym, btc, counters)
-            if sig:
-                candidates.append(sig)
-        except Exception as e:
-            counters["analyze_error"] += 1
-            STATE["auto"]["last_error"] = f"{sym}: {e}"
-    candidates.sort(key=lambda s: (s["grade"] == "A+", s["score"], s["tp1_roi_x10"]), reverse=True)
-    for sig in candidates[:MAX_SIGNALS_PER_SCAN]:
-        ok, reason = can_send_signal(sig, counters)
-        if not ok:
-            continue
-        save_new_signal(sig)
-        sent.append(sig)
-        if send_to_telegram:
-            send_telegram_message(signal_message(sig))
-        if len(sent) >= MAX_SIGNALS_PER_SCAN:
-            break
-    result = {
-        "checked": counters.get("checked", 0),
-        "candidates": len(candidates),
-        "sent": len(sent),
-        "btc": btc,
-        "blocks": dict(counters),
-        "duration": now_ts() - start,
-        "near_miss": [
-            {"symbol": display_symbol(s["symbol"]), "side": s["side"], "grade": s["grade"], "score": s["score"], "strategy": s["strategy"]}
-            for s in candidates[:5]
-        ],
-    }
-    STATE["auto"]["last_scan_result"] = result
-    STATE["auto"]["last_scan_time"] = now_ts()
-    save_state()
-    if force_diag or (not sent and now_ts() - int(STATE["auto"].get("last_diag_time", 0)) >= DIAG_SECONDS):
-        msg = build_diag_message(result)
-        send_telegram_message(msg)
-        STATE["auto"]["last_diag_time"] = now_ts()
-        save_state()
-    return result
-
-
-def build_diag_message(result: Dict[str, Any]) -> str:
-    blocks = result.get("blocks", {})
-    top_blocks = sorted([(k, v) for k, v in blocks.items() if isinstance(v, int) and v > 0 and k not in ["checked", "universe"]], key=lambda x: x[1], reverse=True)[:10]
-    st = STATE.get("stats", {})
-    p, sl = int(st.get("profit", 0)), int(st.get("sl", 0))
-    total = p + sl
-    wr = p / total * 100 if total else 0
-    lines = [
-        "🧪 <b>Диагностика V13.5 Balanced Verified Level Trader</b>",
-        f"Проверено: {result.get('checked', 0)} из universe {blocks.get('universe', 0)}",
-        f"Кандидатов: {result.get('candidates', 0)} · отправлено: {result.get('sent', 0)} · время: {result.get('duration', 0)}с",
-        f"BTC: {result.get('btc', {}).get('text', 'unknown')}",
-        f"Статистика: {p} профит / {sl} SL / WR {wr:.1f}%",
-    ]
-    if top_blocks:
-        lines.append("\n<b>Главные блокировки:</b>")
-        for k, v in top_blocks:
-            lines.append(f"{k}: {v}")
-    nm = result.get("near_miss") or []
-    if nm:
-        lines.append("\n<b>Ближайшие кандидаты:</b>")
-        for x in nm[:5]:
-            lines.append(f"{x['symbol']} {x['side']} {x['grade']} score {x['score']} · {x['strategy']}")
-    if STATE.get("auto", {}).get("last_error"):
-        lines.append(f"\nLast error: {STATE['auto']['last_error']}")
-    return "\n".join(lines)
-
-
-def track_active_signals() -> Dict[str, Any]:
-    active = list(STATE.get("active_signals", {}).items())
-    closed = []
-    for sid, sig in active:
-        try:
-            c = get_klines(sig["symbol"], "1m", 80, ttl=12)
-            if not c:
-                continue
-            price = c[-1]["close"]
-            side = sig["side"]
-            hit_tp1 = price >= sig["tp1"] if side == "LONG" else price <= sig["tp1"]
-            hit_tp2 = price >= sig["tp2"] if side == "LONG" else price <= sig["tp2"]
-            hit_tp3 = price >= sig["tp3"] if side == "LONG" else price <= sig["tp3"]
-            hit_sl = price <= sig["sl"] if side == "LONG" else price >= sig["sl"]
-            if hit_tp1 and not sig.get("tp1_hit"):
-                sig["tp1_hit"] = True
-                send_telegram_message(f"✅ <b>TP1</b> {display_symbol(sig['symbol'])} {sig['side']}\nЦена: {price:.8g}\nСделка уже считается позитивной по статистике, даже если остаток потом откатится.")
-            if hit_tp2 and not sig.get("tp2_hit"):
-                sig["tp2_hit"] = True
-                send_telegram_message(f"✅ <b>TP2</b> {display_symbol(sig['symbol'])} {sig['side']}\nЦена: {price:.8g}")
-            if hit_tp3:
-                sig["tp3_hit"] = True
-                sig["status"] = "closed"
-                sig["result"] = "profit"
-                closed.append((sid, sig, "TP3"))
-                continue
-            if hit_sl:
-                sig["status"] = "closed"
-                sig["result"] = "profit" if sig.get("tp1_hit") else "sl"
-                closed.append((sid, sig, "SL_AFTER_TP1" if sig.get("tp1_hit") else "SL"))
-                continue
-            STATE["active_signals"][sid] = sig
-        except Exception as e:
-            STATE["auto"]["last_error"] = f"track {sid}: {e}"
-    for sid, sig, event in closed:
-        STATE["active_signals"].pop(sid, None)
-        STATE.setdefault("closed_signals", []).append(sig)
-        update_stats(sig, sig["result"])
-        if event == "SL" and sig["result"] == "sl":
-            msg = f"❌ <b>Stop Loss</b>\n{sig['grade']} · {sig['side']} {display_symbol(sig['symbol'])}\nСтратегия: {sig['strategy']}\nВход: {sig['entry']:.8g}\nSL: {sig['sl']:.8g}\n\n{build_stats_text()}"
-        else:
-            msg = f"✅ <b>Профит / {event}</b>\n{sig['grade']} · {sig['side']} {display_symbol(sig['symbol'])}\nСтратегия: {sig['strategy']}\n\n{build_stats_text()}"
-        send_telegram_message(msg)
-    save_state()
-    return {"active": len(STATE.get("active_signals", {})), "closed": len(closed)}
-
-
-async def auto_worker() -> None:
-    await asyncio.sleep(2)
-    startup = (
-        f"✅ <b>{APP_NAME}</b> активирован и работает.\n"
-        f"Deploy marker: <code>{DEPLOY_MARKER}</code>\n\n"
-        "Режим: API STABILITY + PROFESSIONAL LEVEL VERIFICATION — стабильные свечи + подтверждённые 1H/4H уровни.\n"
-        "Логика: level touch/reaction → sweep/retest → 2 свечи 5m + 15m → вход рядом с уровнем.\n"
-        f"A+ score: {A_PLUS_MIN_SCORE} · B score: {B_MIN_SCORE}.\n"
-        f"Лимит: {MAX_SIGNALS_PER_DAY} сигнала/день · active max {MAX_ACTIVE_SIGNALS}.\n"
-        "Диагностика и статистика TP/SL: ON.\n"
-        f"Balanced Level Mode: verified 1H/4H levels, anti-chase, analyze {MAX_ANALYZE_SYMBOLS} symbols, max {MAX_SIGNALS_PER_SCAN}/scan."
+def build_signal_message(s: Dict[str, Any]) -> str:
+    arrow = "🟢" if s["side"] == "LONG" else "🔴"
+    return (
+        f"{arrow} {s['side']} {display_symbol(s['symbol'])}\n"
+        f"Класс: {s['grade']} · Score {s['score']} · {s['trade_type']}\n"
+        f"Стратегия: {s['strategy']}\n\n"
+        f"Вход: {format_price(s['entry'])}\n"
+        f"TP1: {format_price(s['tp1'])} · ≈ {s['roi_tp1']:.1f}% ROI при x{LEVERAGE}\n"
+        f"TP2: {format_price(s['tp2'])}\n"
+        f"TP3: {format_price(s['tp3'])}\n"
+        f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI при x{LEVERAGE}\n"
+        f"RR к TP1: {s['rr']:.2f}\n"
+        f"Риск: multiplier x{s['risk_mult']:.2f}\n\n"
+        f"📌 Профессиональная логика уровня:\n{s['reason']}\n"
+        f"Уровень: {format_price(s['level'])} · touches {s['level_touches']} · reactions {s['level_reactions']}\n"
+        f"1H {s['t1h']} · 4H {s['t4h']} · volume x{s['volume_ratio']:.2f}\n"
+        f"BTC: {s['btc_text']}\n"
+        f"Support: {format_price(s['support']) if s.get('support') else '-'} · Resistance: {format_price(s['resistance']) if s.get('resistance') else '-'}\n\n"
+        f"Сделка не является гарантией прибыли. SL возможен; размер позиции должен соответствовать риску."
     )
-    send_telegram_message(startup)
-    # Force first diagnostic, even if no signal.
+
+
+def build_diagnostic(scan: Dict[str, Any]) -> str:
+    blocks = scan.get("blocks", {})
+    block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:10]]
+    near = scan.get("near_miss", [])[:8]
+    return (
+        f"🧪 Диагностика V13.6 Level Trader\n"
+        f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
+        f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
+        f"BTC: {scan.get('btc', 'unknown')}\n"
+        f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
+        f"Главные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
+        ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
+        f"\n\nLast error: {STATE.get('last_error', '')}"
+    )
+
+
+def add_active_signal(s: Dict[str, Any]) -> None:
+    STATE.setdefault("active_signals", []).append(s)
+    STATE.setdefault("pair_cooldown", {})[s["symbol"]] = now_ts() + PAIR_COOLDOWN_SECONDS
+    STATE.setdefault("strategy_cooldown", {})[s["strategy"]] = now_ts() + STRATEGY_COOLDOWN_SECONDS
+    save_state()
+
+
+def run_scan(manual: bool = False) -> Dict[str, Any]:
+    start = time.time()
+    blocks: Dict[str, int] = {}
+    near_miss: List[str] = []
+    btc = btc_context()
+    symbols = get_symbols()
+    quality = [s for s in symbols if base_asset(s) in QUALITY_BASES]
+    rest = [s for s in symbols if base_asset(s) not in QUALITY_BASES]
+    selected = (quality + rest)[:MAX_ANALYZE_SYMBOLS]
+
+    scan = {
+        "checked": 0, "universe": len(symbols), "candidates": 0, "sent": 0,
+        "blocks": blocks, "near_miss": near_miss, "btc": btc.get("text", "BTC unknown"), "elapsed": 0,
+    }
+    if not btc.get("ok"):
+        blocks["btc_data_problem"] = 1
+        STATE["last_scan"] = scan
+        save_state()
+        return scan
+
+    found: List[Dict[str, Any]] = []
+    for sym in selected:
+        if len(STATE.get("active_signals", [])) >= MAX_ACTIVE_SIGNALS:
+            blocks["active_slots_full"] = blocks.get("active_slots_full", 0) + 1
+            break
+        try:
+            s = analyze_symbol(sym, btc, blocks, near_miss)
+            scan["checked"] += 1
+            if s:
+                found.append(s)
+        except Exception as e:
+            blocks["analyze_exception"] = blocks.get("analyze_exception", 0) + 1
+            STATE["last_error"] = f"analyze {sym}: {repr(e)}"
+
+    found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["rr"]), reverse=True)
+    scan["candidates"] = len(found)
+    sent = 0
+    for s in found[:MAX_SIGNALS_PER_SCAN]:
+        add_active_signal(s)
+        send_telegram(build_signal_message(s))
+        sent += 1
+    scan["sent"] = sent
+    scan["elapsed"] = time.time() - start
+    STATE["last_scan"] = scan
+    save_state()
+
+    # Send occasional diagnostics if no signal, or always on manual scan
+    if manual or sent == 0 and (now_ts() - STATE.get("last_diag_ts", 0) >= DIAG_SECONDS):
+        send_telegram(build_diagnostic(scan))
+        STATE["last_diag_ts"] = now_ts()
+        save_state()
+    return scan
+
+
+def current_price(symbol: str) -> Optional[float]:
+    c = get_klines(symbol, "1m", 80, cache_seconds=8)
+    if not c:
+        return None
+    return c[-1]["close"]
+
+
+def track_active_signals() -> None:
+    active = STATE.setdefault("active_signals", [])
+    if not active:
+        return
+    remaining = []
+    changed = False
+    for s in active:
+        p = current_price(s["symbol"])
+        if p is None:
+            remaining.append(s)
+            continue
+        side = s["side"]
+        hit_tp1 = p >= s["tp1"] if side == "LONG" else p <= s["tp1"]
+        hit_sl = p <= s["sl"] if side == "LONG" else p >= s["sl"]
+        if hit_tp1:
+            apply_result(s, "profit")
+            send_telegram(
+                f"✅ TAKE PROFIT\n{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\nTP1 достигнут: {format_price(p)}\n\n{build_stats_text()}"
+            )
+            changed = True
+            continue
+        if hit_sl:
+            apply_result(s, "sl")
+            send_telegram(
+                f"❌ Stop Loss\n{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\nВход: {format_price(s['entry'])}\nSL: {format_price(s['sl'])}\nТекущая цена: {format_price(p)}\n\n{build_stats_text()}"
+            )
+            changed = True
+            continue
+        remaining.append(s)
+    if changed:
+        STATE["active_signals"] = remaining
+        save_state()
+
+# ============================================================
+# Background tasks / HTTP endpoints
+# ============================================================
+
+async def scan_loop():
+    await asyncio.sleep(3)
+    send_telegram(
+        f"✅ {APP_NAME} активирован и работает.\n"
+        f"Deploy marker: {DEPLOY_MARKER}\n\n"
+        f"Level mode: verified support/resistance, reclaim/reject/break-retest.\n"
+        f"A+ {A_PLUS_MIN_SCORE}+ / B {B_MIN_SCORE}+ · TP1 min {MIN_TP1_ROI_X10:.0f}% ROI x{LEVERAGE}.\n"
+        f"API stability: retries {API_RETRIES}, analyze {MAX_ANALYZE_SYMBOLS} symbols."
+    )
+    # first diagnostic scan is always useful
     try:
-        scan_market(send_to_telegram=True, force_diag=True)
+        scan = run_scan(manual=True)
+        send_telegram(build_diagnostic(scan))
     except Exception as e:
-        STATE["auto"]["last_error"] = f"first_scan: {e}"
-        send_telegram_message(f"⚠️ Ошибка первого скана V13\n<code>{e}</code>")
+        STATE["last_error"] = f"first scan exception: {repr(e)}"
+        save_state()
+        send_telegram(f"⚠️ Ошибка первого скана: {repr(e)}")
     while True:
         try:
-            t = now_ts()
-            if AUTO_TRACK_ENABLED and t - int(STATE["auto"].get("last_track_time", 0)) >= AUTO_TRACK_SECONDS:
-                STATE["auto"]["last_track_time"] = t
-                track_active_signals()
-            if AUTO_SCAN_ENABLED and t - int(STATE["auto"].get("last_scan_time", 0)) >= AUTO_SCAN_SECONDS:
-                scan_market(send_to_telegram=True, force_diag=False)
+            if AUTO_SCAN_ENABLED:
+                run_scan(manual=False)
         except Exception as e:
-            STATE["auto"]["last_error"] = f"auto_worker: {e}"
-            send_telegram_message(f"⚠️ Ошибка auto-worker V13\n<code>{e}</code>")
-        await asyncio.sleep(5)
+            STATE["last_error"] = f"scan_loop: {repr(e)}"
+            save_state()
+            send_telegram(f"⚠️ Ошибка auto-scan: {repr(e)}")
+        await asyncio.sleep(AUTO_SCAN_SECONDS)
+
+
+async def track_loop():
+    await asyncio.sleep(8)
+    while True:
+        try:
+            if AUTO_TRACK_ENABLED:
+                track_active_signals()
+        except Exception as e:
+            STATE["last_error"] = f"track_loop: {repr(e)}"
+            save_state()
+        await asyncio.sleep(AUTO_TRACK_SECONDS)
 
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(auto_worker())
+    global STATE
+    STATE = load_state()
+    asyncio.create_task(scan_loop())
+    asyncio.create_task(track_loop())
+
+
+@app.get("/")
+def root():
+    return HTMLResponse(f"<h3>{APP_NAME}</h3><p>{DEPLOY_MARKER}</p><p>Use /health /version /scan /auto-status /stats</p>")
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "app": APP_NAME, "marker": DEPLOY_MARKER, "time": now_ts()}
+    return {"ok": True, "app": APP_NAME, "deploy": DEPLOY_MARKER, "active": len(STATE.get("active_signals", [])), "last_error": STATE.get("last_error", "")}
 
 
 @app.get("/version")
@@ -1281,55 +1105,35 @@ def version():
 def auto_status():
     return JSONResponse({
         "app": APP_NAME,
-        "marker": DEPLOY_MARKER,
-        "auto": STATE.get("auto", {}),
-        "active_signals": list(STATE.get("active_signals", {}).values()),
+        "deploy": DEPLOY_MARKER,
+        "active_signals": STATE.get("active_signals", []),
+        "last_scan": STATE.get("last_scan", {}),
+        "last_error": STATE.get("last_error", ""),
         "stats": STATE.get("stats", {}),
-        "signals_today": STATE.get("signals_today", {}),
     })
 
 
 @app.get("/scan")
 def manual_scan(send: bool = Query(True)):
-    return scan_market(send_to_telegram=send, force_diag=True)
+    scan = run_scan(manual=True)
+    if send:
+        send_telegram(build_diagnostic(scan))
+    return JSONResponse(scan)
 
 
 @app.get("/stats")
 def stats():
-    return HTMLResponse("<pre>" + build_stats_text().replace("<", "&lt;").replace(">", "&gt;") + "</pre>")
-
-
-@app.get("/send-stats")
-def send_stats():
-    return send_telegram_message(build_stats_text())
+    return HTMLResponse("<pre>" + build_stats_text() + "</pre>")
 
 
 @app.get("/test-telegram")
 def test_telegram():
-    return send_telegram_message(f"✅ Telegram test OK\n{APP_NAME}\n{DEPLOY_MARKER}")
-
-
-@app.get("/")
-def root():
-    return HTMLResponse(f"""
-    <h2>{APP_NAME}</h2>
-    <p><b>Deploy:</b> {DEPLOY_MARKER}</p>
-    <ul>
-      <li><a href='/health'>/health</a></li>
-      <li><a href='/version'>/version</a></li>
-      <li><a href='/auto-status'>/auto-status</a></li>
-      <li><a href='/scan'>/scan</a></li>
-      <li><a href='/stats'>/stats</a></li>
-      <li><a href='/send-stats'>/send-stats</a></li>
-      <li><a href='/test-telegram'>/test-telegram</a></li>
-    </ul>
-    """)
+    ok = send_telegram(f"✅ Test Telegram OK\n{APP_NAME}\n{DEPLOY_MARKER}")
+    return {"sent": ok, "last_error": STATE.get("last_error", "")}
 
 
 if __name__ == "__main__":
     # Background Worker mode for Render: python bot.py
-    async def main():
-        asyncio.create_task(auto_worker())
-        while True:
-            await asyncio.sleep(3600)
-    asyncio.run(main())
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
