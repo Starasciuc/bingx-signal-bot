@@ -11,14 +11,13 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.8 — Calm Level Momentum Trader
-# Goal: professional level trading plus calm breakout-pullback continuation. Capture moves like BEAT without chasing tops.
-# Core idea: verified HTF levels + scenario switch, no early shorts into breakout,
-# active secondary intraday levels to avoid silence, BTC context, diagnostics, TP/SL stats.
+# V13.10 — Professional Capital Protection Level Trader
+# Goal: fewer weak B trades, stronger confirmation, and real stat-based filtering.
+# Core idea: trade verified levels, but block strategies/classes that prove weak in live stats.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.8 CALM LEVEL MOMENTUM TRADER"
-DEPLOY_MARKER = "V13_8_CALM_LEVEL_MOMENTUM_TRADER_2026_06_20"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.10 PROFESSIONAL CAPITAL PROTECTION LEVEL TRADER"
+DEPLOY_MARKER = "V13_10_PRO_CAPITAL_PROTECTION_LEVEL_TRADER_2026_06_21"
 
 app = FastAPI(title=APP_NAME)
 
@@ -26,7 +25,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_8.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_9.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -43,12 +42,12 @@ MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 
 # --- Signal quality ---
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "82"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "86"))
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10.0"))
 MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1) / 100.0  # 10% ROI x10 ~= 1% price
-MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
-MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
+MIN_RR_A = float(os.getenv("MIN_RR_A", "1.05"))
+MIN_RR_B = float(os.getenv("MIN_RR_B", "0.95"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "6"))
 # V13.8: do not flood, but do not silence good momentum-pullback opportunities
@@ -67,11 +66,29 @@ MIN_REACTIONS_B = int(os.getenv("MIN_REACTIONS_B", "1"))
 MAX_TOUCHES_EFFECTIVE = int(os.getenv("MAX_TOUCHES_EFFECTIVE", "7"))
 
 # --- Volume / confirmation ---
-MIN_VOLUME_A = float(os.getenv("MIN_VOLUME_A", "0.95"))
-MIN_VOLUME_B = float(os.getenv("MIN_VOLUME_B", "0.70"))
-LOW_VOLUME_CAP = int(os.getenv("LOW_VOLUME_CAP", "78"))
+MIN_VOLUME_A = float(os.getenv("MIN_VOLUME_A", "1.10"))
+MIN_VOLUME_B = float(os.getenv("MIN_VOLUME_B", "0.95"))
+LOW_VOLUME_CAP = int(os.getenv("LOW_VOLUME_CAP", "76"))
 VERY_LOW_VOLUME = float(os.getenv("VERY_LOW_VOLUME", "0.60"))
 REQUIRE_15M_CONFIRM = os.getenv("REQUIRE_15M_CONFIRM", "true").lower() == "true"
+
+# --- V13.9 professional statistical quality gates ---
+ADAPTIVE_BLOCK_ENABLED = os.getenv("ADAPTIVE_BLOCK_ENABLED", "true").lower() == "true"
+ADAPTIVE_MIN_TRADES = int(os.getenv("ADAPTIVE_MIN_TRADES", "3"))
+ADAPTIVE_MIN_WR = float(os.getenv("ADAPTIVE_MIN_WR", "45"))
+BAD_STRATEGY_BLOCK_HOURS = int(os.getenv("BAD_STRATEGY_BLOCK_HOURS", "24"))
+LONG_NEEDS_HTF_NOT_DOWN = os.getenv("LONG_NEEDS_HTF_NOT_DOWN", "true").lower() == "true"
+LONG_MIN_VOLUME = float(os.getenv("LONG_MIN_VOLUME", "0.95"))
+LONG_MIN_RR = float(os.getenv("LONG_MIN_RR", "0.95"))
+CALM_BREAKOUT_LONG_A_ONLY = os.getenv("CALM_BREAKOUT_LONG_A_ONLY", "true").lower() == "true"
+CALM_BREAKDOWN_SHORT_A_ONLY = os.getenv("CALM_BREAKDOWN_SHORT_A_ONLY", "true").lower() == "true"
+CALM_LONG_MIN_VOLUME = float(os.getenv("CALM_LONG_MIN_VOLUME", "1.20"))
+CALM_LONG_MIN_RR = float(os.getenv("CALM_LONG_MIN_RR", "1.10"))
+CALM_SHORT_MIN_VOLUME = float(os.getenv("CALM_SHORT_MIN_VOLUME", "1.15"))
+CALM_SHORT_MIN_RR = float(os.getenv("CALM_SHORT_MIN_RR", "1.05"))
+GLOBAL_B_MIN_TRADES = int(os.getenv("GLOBAL_B_MIN_TRADES", "5"))
+GLOBAL_B_MIN_WR = float(os.getenv("GLOBAL_B_MIN_WR", "48"))
+WEAK_TYPE_MIN_WR = float(os.getenv("WEAK_TYPE_MIN_WR", "48"))
 
 # --- Anti-chase ---
 BIG_MOVE_6H = float(os.getenv("BIG_MOVE_6H", "0.060"))       # 6%
@@ -81,9 +98,9 @@ ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.060"))  # 6% c
 ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.090"))
 
 # --- Risk multipliers ---
-A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.70"))
-B_RISK_MULT = float(os.getenv("B_RISK_MULT", "0.25"))
-FAR_SL_RISK_MULT = float(os.getenv("FAR_SL_RISK_MULT", "0.15"))
+A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.50"))
+B_RISK_MULT = float(os.getenv("B_RISK_MULT", "0.08"))
+FAR_SL_RISK_MULT = float(os.getenv("FAR_SL_RISK_MULT", "0.08"))
 TP1_CLOSE_PERCENT = float(os.getenv("TP1_CLOSE_PERCENT", "70"))
 
 QUALITY_BASES = {
@@ -201,13 +218,15 @@ def apply_result(signal: Dict[str, Any], result: str) -> None:
     inc_stat("strategy_side_grade", f"{signal.get('strategy')}:{signal.get('side')}:{signal.get('grade')}", result)
     inc_stat("strategy_side", f"{signal.get('strategy')}:{signal.get('side')}", result)
 
-    # adaptive hard block: if a strategy+side has poor fresh stats, block for 12h
+    # V13.9 adaptive hard block: if a strategy/side keeps losing, block it for a day.
     ss = f"{signal.get('strategy')}:{signal.get('side')}"
     item = stats.get("strategy_side", {}).get(ss, {})
     closed = item.get("profit", 0) + item.get("sl", 0)
     wr = (item.get("profit", 0) / closed * 100.0) if closed else 0.0
-    if closed >= 4 and wr < 35:
-        STATE.setdefault("hard_block_until", {})[ss] = now_ts() + 12 * 3600
+    if closed >= ADAPTIVE_MIN_TRADES and wr < ADAPTIVE_MIN_WR:
+        until = now_ts() + BAD_STRATEGY_BLOCK_HOURS * 3600
+        STATE.setdefault("hard_block_until", {})[ss] = until
+        STATE.setdefault("hard_block_until", {})[signal.get("strategy")] = until
 
     save_state()
 
@@ -851,14 +870,122 @@ def score_signal(side: str, strategy: str, trade_type: str, level: Dict[str, Any
     return max(0, min(int(score), cap)), notes
 
 
-def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
+def item_wr(item: Dict[str, int]) -> Tuple[int, float]:
+    p = int(item.get("profit", 0))
+    sl = int(item.get("sl", 0))
+    total = p + sl
+    wr = (p / total * 100.0) if total else 0.0
+    return total, wr
+
+
+def adaptive_stats_gate(strategy: str, side: str, trade_type: str) -> Tuple[bool, str]:
+    if not ADAPTIVE_BLOCK_ENABLED:
+        return True, "ok"
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    checks = [
+        ("strategy", strategy),
+        ("strategy_side", f"{strategy}:{side}"),
+        ("type", trade_type),
+        ("side", side),
+    ]
+    for bucket, key in checks:
+        item = stats.get(bucket, {}).get(key, {})
+        closed, wr = item_wr(item)
+        # side is broader, so require more sample before blocking all LONG/SHORT
+        min_trades = max(6, ADAPTIVE_MIN_TRADES) if bucket == "side" else ADAPTIVE_MIN_TRADES
+        if closed >= min_trades and wr < ADAPTIVE_MIN_WR:
+            return False, f"adaptive block {bucket}:{key} WR {wr:.1f}% after {closed}"
+    return True, "ok"
+
+
+def grade_stats_gate(grade: str, strategy: str, side: str, trade_type: str) -> Tuple[bool, str]:
+    """Second-stage stat filter after grade is known.
+    In live stats B is losing, so B is blocked when global/strategy/type stats are weak.
+    This preserves quality instead of forcing more weak trades.
+    """
+    if not ADAPTIVE_BLOCK_ENABLED:
+        return True, "ok"
+    stats = STATE.setdefault("stats", default_state()["stats"])
+
+    if grade == "B":
+        b_item = stats.get("grade", {}).get("B", {})
+        closed, wr = item_wr(b_item)
+        if closed >= GLOBAL_B_MIN_TRADES and wr < GLOBAL_B_MIN_WR:
+            return False, f"B class blocked: WR {wr:.1f}% after {closed}"
+
+        # Momentum continuation B trades are disabled. They were the main source of recent SLs.
+        if strategy in ("PRO_CALM_BREAKOUT_PULLBACK_LONG", "PRO_CALM_BREAKDOWN_PULLBACK_SHORT"):
+            return False, f"{strategy} allowed only as A+"
+
+    # Block weak trade types/strategy-side once they have enough live evidence.
+    for bucket, key, threshold in [
+        ("type", trade_type, WEAK_TYPE_MIN_WR),
+        ("strategy_side", f"{strategy}:{side}", ADAPTIVE_MIN_WR),
+        ("strategy", strategy, ADAPTIVE_MIN_WR),
+    ]:
+        item = stats.get(bucket, {}).get(key, {})
+        closed, wr = item_wr(item)
+        if closed >= ADAPTIVE_MIN_TRADES and wr < threshold:
+            return False, f"stat block {bucket}:{key} WR {wr:.1f}% after {closed}"
+    return True, "ok"
+
+
+def micro_structure_ok(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str) -> bool:
+    """Final price-action check: avoid entering against the last micro impulse."""
+    if len(c5) < 5 or len(c15) < 3:
+        return False
+    a, b = c5[-2], c5[-1]
+    last15 = c15[-1]
+    if side == "LONG":
+        if b["close"] <= a["close"]:
+            return False
+        if b["low"] < min(x["low"] for x in c5[-4:-1]) and b["close"] < (b["high"] + b["low"]) / 2:
+            return False
+        if last15["close"] < last15["open"] and (last15["open"] - last15["close"]) > (last15["high"] - last15["low"]) * 0.45:
+            return False
+        return True
+    if b["close"] >= a["close"]:
+        return False
+    if b["high"] > max(x["high"] for x in c5[-4:-1]) and b["close"] > (b["high"] + b["low"]) / 2:
+        return False
+    if last15["close"] > last15["open"] and (last15["close"] - last15["open"]) > (last15["high"] - last15["low"]) * 0.45:
+        return False
+    return True
+
+
+def htf_professional_gate(strategy: str, side: str, btc: Dict[str, Any], t1h: str, t4h: str, vol: float, rr: float, strong: bool) -> Tuple[bool, str]:
+    """Professional context filter.
+    Counter-trend trades are allowed only as real level reversals with volume and RR, not as B momentum.
+    """
+    btc_dir = btc.get("direction")
+    if side == "LONG":
+        if btc_dir == "BEAR" and not strong:
+            return False, "BTC bearish vs LONG"
+        if t1h == "DOWN" and not (strong and vol >= 1.15 and rr >= 1.05):
+            return False, "1H DOWN: LONG needs strong reclaim + volume + RR"
+        if t4h == "DOWN" and not (strong and vol >= 1.20 and rr >= 1.10):
+            return False, "4H DOWN: LONG blocked unless very strong reclaim"
+    else:
+        if btc_dir == "BULL" and not strong:
+            return False, "BTC bullish vs SHORT"
+        if t1h == "UP" and not (strong and vol >= 1.15 and rr >= 1.05):
+            return False, "1H UP: SHORT needs strong reject + volume + RR"
+        if t4h == "UP" and not (strong and vol >= 1.20 and rr >= 1.10):
+            return False, "4H UP: SHORT blocked unless very strong reject"
+    return True, "ok"
+
+
+def cooldown_ok(symbol: str, strategy: str, side: str = "") -> Tuple[bool, str]:
     t = now_ts()
     if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
         return False, "pair cooldown"
     if t < STATE.setdefault("strategy_cooldown", {}).get(strategy, 0):
         return False, "strategy cooldown"
-    if t < STATE.setdefault("hard_block_until", {}).get(strategy, 0):
+    hb = STATE.setdefault("hard_block_until", {})
+    if t < hb.get(strategy, 0):
         return False, "strategy hard block"
+    if side and t < hb.get(f"{strategy}:{side}", 0):
+        return False, "strategy-side hard block"
     return True, "ok"
 
 
@@ -916,7 +1043,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
         if not ok:
             blocks["anti_chase_block"] = blocks.get("anti_chase_block", 0) + 1
             return
-        co, co_reason = cooldown_ok(symbol, strategy)
+        co, co_reason = cooldown_ok(symbol, strategy, side)
         if not co:
             blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
             return
@@ -925,6 +1052,49 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
         if tr["roi_tp1"] < MIN_TP1_ROI_X10:
             blocks["tp1_roi_block"] = blocks.get("tp1_roi_block", 0) + 1
             return
+
+        if not micro_structure_ok(c5, c15, side):
+            blocks["micro_structure_block"] = blocks.get("micro_structure_block", 0) + 1
+            return
+
+        htf_ok, htf_reason = htf_professional_gate(strategy, side, btc, t1h, t4h, vol, tr["rr"], strong)
+        if not htf_ok:
+            blocks["htf_professional_block"] = blocks.get("htf_professional_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: {htf_reason}")
+            return
+
+        # V13.10: professional gates before scoring. These prevent statistics-killing weak continuation entries.
+        gate_ok, gate_reason = adaptive_stats_gate(strategy, side, trade_type)
+        if not gate_ok:
+            blocks["adaptive_stats_block"] = blocks.get("adaptive_stats_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: {gate_reason}")
+            return
+
+        if side == "LONG":
+            if LONG_NEEDS_HTF_NOT_DOWN and t1h == "DOWN" and btc.get("direction") != "BULL":
+                blocks["long_1h_down_block"] = blocks.get("long_1h_down_block", 0) + 1
+                return
+            if vol < LONG_MIN_VOLUME:
+                blocks["long_volume_block"] = blocks.get("long_volume_block", 0) + 1
+                return
+            if tr["rr"] < LONG_MIN_RR:
+                blocks["long_rr_block"] = blocks.get("long_rr_block", 0) + 1
+                return
+
+        if strategy == "PRO_CALM_BREAKOUT_PULLBACK_LONG":
+            # This strategy currently has weak stats. It can pass only as a real high-quality A+ continuation.
+            if t1h != "UP" or btc.get("direction") == "BEAR" or vol < CALM_LONG_MIN_VOLUME or tr["rr"] < CALM_LONG_MIN_RR:
+                blocks["calm_long_quality_block"] = blocks.get("calm_long_quality_block", 0) + 1
+                return
+
+        if strategy == "PRO_CALM_BREAKDOWN_PULLBACK_SHORT":
+            # Recent short continuation failed too; allow only high-quality A+ breakdown continuation.
+            if t1h != "DOWN" or btc.get("direction") == "BULL" or vol < CALM_SHORT_MIN_VOLUME or tr["rr"] < CALM_SHORT_MIN_RR:
+                blocks["calm_short_quality_block"] = blocks.get("calm_short_quality_block", 0) + 1
+                return
+
         score, notes = score_signal(side, strategy, trade_type, level, btc, t1h, t4h, vol, tr["rr"], dist, strong)
         grade = None
         min_rr = None
@@ -932,12 +1102,25 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             grade = "A+"
             min_rr = MIN_RR_A
         elif score >= B_MIN_SCORE and tr["rr"] >= MIN_RR_B and vol >= MIN_VOLUME_B:
+            if CALM_BREAKOUT_LONG_A_ONLY and strategy == "PRO_CALM_BREAKOUT_PULLBACK_LONG":
+                blocks["calm_long_b_forbidden"] = blocks.get("calm_long_b_forbidden", 0) + 1
+                return
+            if CALM_BREAKDOWN_SHORT_A_ONLY and strategy == "PRO_CALM_BREAKDOWN_PULLBACK_SHORT":
+                blocks["calm_short_b_forbidden"] = blocks.get("calm_short_b_forbidden", 0) + 1
+                return
             grade = "B"
             min_rr = MIN_RR_B
         else:
             blocks["score_rr_volume_block"] = blocks.get("score_rr_volume_block", 0) + 1
             if len(near_miss) < 8:
                 near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: score {score}, RR {tr['rr']:.2f}, vol x{vol:.2f}")
+            return
+
+        g_ok, g_reason = grade_stats_gate(grade, strategy, side, trade_type)
+        if not g_ok:
+            blocks["grade_stats_block"] = blocks.get("grade_stats_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: {g_reason}")
             return
 
         risk_mult = A_RISK_MULT if grade == "A+" else B_RISK_MULT
@@ -1214,7 +1397,7 @@ async def scan_loop():
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
         f"Level mode: verified support/resistance, reclaim/reject/break-retest.\n"
         f"A+ {A_PLUS_MIN_SCORE}+ / B {B_MIN_SCORE}+ · TP1 min {MIN_TP1_ROI_X10:.0f}% ROI x{LEVERAGE}.\n"
-        f"API stability: retries {API_RETRIES}, analyze {MAX_ANALYZE_SYMBOLS} symbols."
+        f"Quality: micro-structure + HTF gate + grade-stat filter. API retries {API_RETRIES}, analyze {MAX_ANALYZE_SYMBOLS}."
     )
     # first diagnostic scan is always useful
     try:
