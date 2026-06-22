@@ -11,13 +11,13 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.10 — Professional Capital Protection Level Trader
-# Goal: fewer weak B trades, stronger confirmation, and real stat-based filtering.
-# Core idea: trade verified levels, but block strategies/classes that prove weak in live stats.
+# V13.11 — Professional Ladder Scalp + Level Trader
+# Goal: catch clean discretionary-style scalps like BLESS/BEAT:
+# active coin -> breakout/retest or pullback/reclaim -> ladder targets, while keeping verified level logic.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.10 PROFESSIONAL CAPITAL PROTECTION LEVEL TRADER"
-DEPLOY_MARKER = "V13_10_PRO_CAPITAL_PROTECTION_LEVEL_TRADER_2026_06_21"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.11 PROFESSIONAL LADDER SCALP LEVEL TRADER"
+DEPLOY_MARKER = "V13_11_PRO_LADDER_SCALP_LEVEL_TRADER_2026_06_21"
 
 app = FastAPI(title=APP_NAME)
 
@@ -25,7 +25,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_9.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_11.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -103,6 +103,26 @@ B_RISK_MULT = float(os.getenv("B_RISK_MULT", "0.08"))
 FAR_SL_RISK_MULT = float(os.getenv("FAR_SL_RISK_MULT", "0.08"))
 TP1_CLOSE_PERCENT = float(os.getenv("TP1_CLOSE_PERCENT", "70"))
 
+# --- V13.11 Professional ladder scalp mode ---
+# This mode is for trades like BLESS: active but not ultra-risk asset, micro pullback/reclaim,
+# tight technical invalidation and 5 ladder targets.
+LADDER_SCALP_ENABLED = os.getenv("LADDER_SCALP_ENABLED", "true").lower() == "true"
+LADDER_MIN_VOLUME = float(os.getenv("LADDER_MIN_VOLUME", "0.85"))
+LADDER_A_VOLUME = float(os.getenv("LADDER_A_VOLUME", "1.05"))
+LADDER_MIN_RR = float(os.getenv("LADDER_MIN_RR", "0.90"))
+LADDER_MIN_1H_MOVE = float(os.getenv("LADDER_MIN_1H_MOVE", "0.004"))      # 0.4% in ~1h
+LADDER_MAX_1H_MOVE = float(os.getenv("LADDER_MAX_1H_MOVE", "0.045"))      # avoid vertical chase
+LADDER_PULLBACK_MIN = float(os.getenv("LADDER_PULLBACK_MIN", "0.0025"))   # 0.25%
+LADDER_PULLBACK_MAX = float(os.getenv("LADDER_PULLBACK_MAX", "0.022"))    # 2.2%
+LADDER_SL_ATR_MULT = float(os.getenv("LADDER_SL_ATR_MULT", "0.55"))
+LADDER_TP1_MOVE = float(os.getenv("LADDER_TP1_MOVE", "0.010"))            # 10% ROI at x10
+LADDER_TP2_MOVE = float(os.getenv("LADDER_TP2_MOVE", "0.016"))
+LADDER_TP3_MOVE = float(os.getenv("LADDER_TP3_MOVE", "0.023"))
+LADDER_TP4_MOVE = float(os.getenv("LADDER_TP4_MOVE", "0.032"))
+LADDER_TP5_MOVE = float(os.getenv("LADDER_TP5_MOVE", "0.042"))
+LADDER_RISK_MULT = float(os.getenv("LADDER_RISK_MULT", "0.18"))
+SCALP_STRATEGIES = {"PRO_LADDER_SCALP_LONG", "PRO_LADDER_SCALP_SHORT"}
+
 QUALITY_BASES = {
     "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
     "OP", "ARB", "APT", "TIA", "ADA", "DOT", "MATIC", "TON", "LTC", "BCH", "ETC", "FIL", "ATOM",
@@ -117,7 +137,7 @@ ULTRA_RISK_KEYWORDS = {
 FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
     "BTC","ETH","SOL","BNB","XRP","LINK","AVAX","AAVE","SUI","TAO","NEAR","INJ","OP","ARB",
     "APT","TIA","ADA","DOT","LTC","BCH","ETC","FIL","ATOM","UNI","RUNE","SEI","FET","WLD",
-    "DOGE","TRX","ENA","JUP","ORDI"
+    "DOGE","TRX","ENA","JUP","ORDI","BEAT","BLESS","KAITO","XLM","WLFI","PUMP"
 ]]
 
 STATE: Dict[str, Any] = {}
@@ -753,6 +773,86 @@ def anti_chase_ok(side: str, c15: List[Dict[str, float]], current: float, near_l
     return True, "ok"
 
 
+
+def calculate_ladder_scalp_trade(symbol: str, side: str, entry: float, level: float, candles: List[Dict[str, float]]) -> Dict[str, Any]:
+    """V13.11: tight invalidation + ladder targets for active scalps.
+    TP1 is still about 10% ROI at x10, while TP5 can catch 30-40%+ ROI moves.
+    """
+    a = atr(candles, 14)
+    buffer = max(entry * 0.0018, a * LADDER_SL_ATR_MULT)
+    if side == "LONG":
+        recent_low = min(x["low"] for x in candles[-10:])
+        sl = min(level, recent_low) - buffer
+        # Avoid absurdly tight SL in noisy crypto, but keep it technical.
+        sl = min(sl, entry * 0.992)
+        tp1 = entry * (1 + LADDER_TP1_MOVE)
+        tp2 = entry * (1 + LADDER_TP2_MOVE)
+        tp3 = entry * (1 + LADDER_TP3_MOVE)
+        tp4 = entry * (1 + LADDER_TP4_MOVE)
+        tp5 = entry * (1 + LADDER_TP5_MOVE)
+    else:
+        recent_high = max(x["high"] for x in candles[-10:])
+        sl = max(level, recent_high) + buffer
+        sl = max(sl, entry * 1.008)
+        tp1 = entry * (1 - LADDER_TP1_MOVE)
+        tp2 = entry * (1 - LADDER_TP2_MOVE)
+        tp3 = entry * (1 - LADDER_TP3_MOVE)
+        tp4 = entry * (1 - LADDER_TP4_MOVE)
+        tp5 = entry * (1 - LADDER_TP5_MOVE)
+    risk = abs(entry - sl)
+    reward = abs(tp1 - entry)
+    rr = reward / risk if risk > 0 else 0.0
+    roi_tp1 = reward / entry * LEVERAGE * 100
+    roi_sl = risk / entry * LEVERAGE * 100
+    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "tp5": tp5, "rr": rr, "roi_tp1": roi_tp1, "roi_sl": roi_sl}
+
+
+def ladder_scalp_setup(c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], side: str, ema5: float, vw: float) -> Optional[Dict[str, Any]]:
+    """Discretionary-style active scalp detector.
+    It looks for: active move, controlled pullback, reclaim/reject, and no vertical chase.
+    """
+    if not LADDER_SCALP_ENABLED or len(c5) < 36 or len(c15) < 32 or len(c1h) < 40:
+        return None
+    price = c5[-1]["close"]
+    ch1h = (c15[-1]["close"] - c15[-5]["close"]) / max(c15[-5]["close"], 1e-12)
+    ch2h = (c15[-1]["close"] - c15[-9]["close"]) / max(c15[-9]["close"], 1e-12)
+    t1h = trend_state(c1h)
+
+    if side == "LONG":
+        if t1h == "DOWN" and ch1h < LADDER_MIN_1H_MOVE:
+            return None
+        if ch1h < LADDER_MIN_1H_MOVE or ch1h > LADDER_MAX_1H_MOVE or ch2h > 0.075:
+            return None
+        high = max(x["high"] for x in c5[-24:])
+        low = min(x["low"] for x in c5[-16:])
+        pullback = (high - low) / max(high, 1e-12)
+        if pullback < LADDER_PULLBACK_MIN or pullback > LADDER_PULLBACK_MAX:
+            return None
+        # Entry after reclaim, not at the top of the first impulse.
+        if not (c5[-1]["close"] > ema5 and c5[-1]["close"] > vw and c5[-1]["close"] > c5[-2]["high"] * 0.999):
+            return None
+        if c15[-1]["close"] < c15[-2]["close"] and c15[-1]["close"] < ema(closes(c15), 21):
+            return None
+        level = max(low, min(x["close"] for x in c5[-10:]))
+        return {"level": level, "score": 36, "touches": 2, "reactions": 1, "noise": False, "distance": abs(price-level)/price, "secondary": True, "scalp": True, "pullback": pullback, "ch1h": ch1h}
+
+    # SHORT ladder scalp: active down move -> controlled bounce -> reject.
+    if t1h == "UP" and ch1h > -LADDER_MIN_1H_MOVE:
+        return None
+    if ch1h > -LADDER_MIN_1H_MOVE or ch1h < -LADDER_MAX_1H_MOVE or ch2h < -0.075:
+        return None
+    high = max(x["high"] for x in c5[-16:])
+    low = min(x["low"] for x in c5[-24:])
+    bounce = (high - low) / max(low, 1e-12)
+    if bounce < LADDER_PULLBACK_MIN or bounce > LADDER_PULLBACK_MAX:
+        return None
+    if not (c5[-1]["close"] < ema5 and c5[-1]["close"] < vw and c5[-1]["close"] < c5[-2]["low"] * 1.001):
+        return None
+    if c15[-1]["close"] > c15[-2]["close"] and c15[-1]["close"] > ema(closes(c15), 21):
+        return None
+    level = min(high, max(x["close"] for x in c5[-10:]))
+    return {"level": level, "score": 36, "touches": 2, "reactions": 1, "noise": False, "distance": abs(price-level)/price, "secondary": True, "scalp": True, "pullback": bounce, "ch1h": ch1h}
+
 def calculate_trade(symbol: str, side: str, entry: float, level: float, opposite: Optional[Dict[str, Any]], candles: List[Dict[str, float]]) -> Dict[str, float]:
     a = atr(candles, 14)
     buffer = max(entry * 0.0025, a * 0.45)
@@ -1048,7 +1148,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
             return
 
-        tr = calculate_trade(symbol, side, price, level["level"], opposite, c15)
+        tr = calculate_ladder_scalp_trade(symbol, side, price, level["level"], c15) if strategy in SCALP_STRATEGIES else calculate_trade(symbol, side, price, level["level"], opposite, c15)
         if tr["roi_tp1"] < MIN_TP1_ROI_X10:
             blocks["tp1_roi_block"] = blocks.get("tp1_roi_block", 0) + 1
             return
@@ -1095,7 +1195,19 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 blocks["calm_short_quality_block"] = blocks.get("calm_short_quality_block", 0) + 1
                 return
 
+        if strategy in SCALP_STRATEGIES:
+            if vol < LADDER_MIN_VOLUME or tr["rr"] < LADDER_MIN_RR:
+                blocks["ladder_scalp_quality_block"] = blocks.get("ladder_scalp_quality_block", 0) + 1
+                return
+
         score, notes = score_signal(side, strategy, trade_type, level, btc, t1h, t4h, vol, tr["rr"], dist, strong)
+        if strategy in SCALP_STRATEGIES:
+            score += 8
+            notes.append("ladder scalp setup")
+            if vol < LADDER_A_VOLUME:
+                score = min(score, 86)
+            if tr["rr"] < 1.0:
+                score = min(score, 86)
         grade = None
         min_rr = None
         if score >= A_PLUS_MIN_SCORE and tr["rr"] >= MIN_RR_A and vol >= MIN_VOLUME_A:
@@ -1123,13 +1235,13 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: {g_reason}")
             return
 
-        risk_mult = A_RISK_MULT if grade == "A+" else B_RISK_MULT
+        risk_mult = LADDER_RISK_MULT if strategy in SCALP_STRATEGIES else (A_RISK_MULT if grade == "A+" else B_RISK_MULT)
         if tr["roi_sl"] > 20:
             risk_mult = min(risk_mult, FAR_SL_RISK_MULT)
         candidates.append({
             "symbol": symbol, "side": side, "grade": grade, "score": score, "strategy": strategy,
             "trade_type": trade_type, "entry": tr["entry"], "tp1": tr["tp1"], "tp2": tr["tp2"],
-            "tp3": tr["tp3"], "sl": tr["sl"], "rr": tr["rr"], "roi_tp1": tr["roi_tp1"],
+            "tp3": tr["tp3"], "tp4": tr.get("tp4"), "tp5": tr.get("tp5"), "sl": tr["sl"], "rr": tr["rr"], "roi_tp1": tr["roi_tp1"],
             "roi_sl": tr["roi_sl"], "risk_mult": risk_mult, "level": level["level"],
             "level_touches": level.get("touches", 0), "level_reactions": level.get("reactions", 0),
             "support": support["level"] if support else None, "resistance": resistance["level"] if resistance else None,
@@ -1206,7 +1318,30 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 vol >= 0.80,
             )
 
-    # 5. V13.8 calm continuation: trend move -> broken intraday level -> pullback -> hold/reject.
+
+    # 5. V13.11 professional ladder scalp: active coin, controlled pullback, reclaim/reject.
+    # This is designed for setups like BLESS: small but clean ladder targets, not averaging into a falling knife.
+    if LADDER_SCALP_ENABLED:
+        if btc.get("direction") != "BEAR":
+            sc = ladder_scalp_setup(c5, c15, c1h, "LONG", e5, vw)
+            if sc and vol >= LADDER_MIN_VOLUME:
+                add_candidate(
+                    "LONG", "PRO_LADDER_SCALP_LONG", "LADDER SCALP LONG",
+                    sc, resistance,
+                    f"Активный скальп от уровня: монета дала движение, затем контролируемый откат {sc.get('pullback',0)*100:.2f}% и reclaim EMA/VWAP. Вход не на вертикальной свече; цели идут лестницей.",
+                    vol >= LADDER_A_VOLUME and t1h != "DOWN",
+                )
+        if btc.get("direction") != "BULL":
+            sc = ladder_scalp_setup(c5, c15, c1h, "SHORT", e5, vw)
+            if sc and vol >= LADDER_MIN_VOLUME:
+                add_candidate(
+                    "SHORT", "PRO_LADDER_SCALP_SHORT", "LADDER SCALP SHORT",
+                    sc, support,
+                    f"Активный скальп от уровня: монета дала движение вниз, затем контролируемый отскок {sc.get('pullback',0)*100:.2f}% и reject EMA/VWAP. SHORT после отката, не на дне.",
+                    vol >= LADDER_A_VOLUME and t1h != "UP",
+                )
+
+    # 6. V13.8 calm continuation: trend move -> broken intraday level -> pullback -> hold/reject.
     # This is the mode that can catch moves like BEAT without buying a vertical top.
     if btc.get("direction") != "BEAR" and calm_momentum_context(c15, c1h, "LONG"):
         br = recent_broken_level(c15, price, "LONG")
@@ -1272,7 +1407,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:10]]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.7 Level Trader\n"
+        f"🧪 Диагностика V13.11 Ladder Scalp Level Trader\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -1395,8 +1530,9 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован и работает.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Level mode: verified support/resistance, reclaim/reject/break-retest.\n"
+        f"Level mode: verified levels + ladder scalp pullback/reclaim.\n"
         f"A+ {A_PLUS_MIN_SCORE}+ / B {B_MIN_SCORE}+ · TP1 min {MIN_TP1_ROI_X10:.0f}% ROI x{LEVERAGE}.\n"
+        f"V13.11: ловит BLESS-style setup: active move → controlled pullback → EMA/VWAP reclaim → ladder TP.\n"
         f"Quality: micro-structure + HTF gate + grade-stat filter. API retries {API_RETRIES}, analyze {MAX_ANALYZE_SYMBOLS}."
     )
     # first diagnostic scan is always useful
