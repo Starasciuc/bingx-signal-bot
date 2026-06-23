@@ -11,13 +11,13 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.11 — Professional Ladder Scalp + Level Trader
+# V13.12 — Verified Ladder Scalp Trader
 # Goal: catch clean discretionary-style scalps like BLESS/BEAT:
 # active coin -> breakout/retest or pullback/reclaim -> ladder targets, while keeping verified level logic.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.11 PROFESSIONAL LADDER SCALP LEVEL TRADER"
-DEPLOY_MARKER = "V13_11_PRO_LADDER_SCALP_LEVEL_TRADER_2026_06_21"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.12 VERIFIED LADDER SCALP TRADER"
+DEPLOY_MARKER = "V13_12_VERIFIED_LADDER_SCALP_TRADER_2026_06_21"
 
 app = FastAPI(title=APP_NAME)
 
@@ -25,7 +25,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_11.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_12.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -42,12 +42,12 @@ MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
 
 # --- Signal quality ---
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
 B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "86"))
 MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10.0"))
 MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1) / 100.0  # 10% ROI x10 ~= 1% price
-MIN_RR_A = float(os.getenv("MIN_RR_A", "1.05"))
-MIN_RR_B = float(os.getenv("MIN_RR_B", "0.95"))
+MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
+MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "6"))
 # V13.8: do not flood, but do not silence good momentum-pullback opportunities
@@ -107,9 +107,10 @@ TP1_CLOSE_PERCENT = float(os.getenv("TP1_CLOSE_PERCENT", "70"))
 # This mode is for trades like BLESS: active but not ultra-risk asset, micro pullback/reclaim,
 # tight technical invalidation and 5 ladder targets.
 LADDER_SCALP_ENABLED = os.getenv("LADDER_SCALP_ENABLED", "true").lower() == "true"
-LADDER_MIN_VOLUME = float(os.getenv("LADDER_MIN_VOLUME", "0.85"))
-LADDER_A_VOLUME = float(os.getenv("LADDER_A_VOLUME", "1.05"))
-LADDER_MIN_RR = float(os.getenv("LADDER_MIN_RR", "0.90"))
+LADDER_MIN_VOLUME = float(os.getenv("LADDER_MIN_VOLUME", "0.95"))
+LADDER_A_VOLUME = float(os.getenv("LADDER_A_VOLUME", "1.12"))
+LADDER_MIN_RR = float(os.getenv("LADDER_MIN_RR", "0.55"))  # for ladder we use weighted ladder RR, not only TP1/Risk
+LADDER_MIN_FINAL_RR = float(os.getenv("LADDER_MIN_FINAL_RR", "1.10"))
 LADDER_MIN_1H_MOVE = float(os.getenv("LADDER_MIN_1H_MOVE", "0.004"))      # 0.4% in ~1h
 LADDER_MAX_1H_MOVE = float(os.getenv("LADDER_MAX_1H_MOVE", "0.045"))      # avoid vertical chase
 LADDER_PULLBACK_MIN = float(os.getenv("LADDER_PULLBACK_MIN", "0.0025"))   # 0.25%
@@ -120,7 +121,7 @@ LADDER_TP2_MOVE = float(os.getenv("LADDER_TP2_MOVE", "0.016"))
 LADDER_TP3_MOVE = float(os.getenv("LADDER_TP3_MOVE", "0.023"))
 LADDER_TP4_MOVE = float(os.getenv("LADDER_TP4_MOVE", "0.032"))
 LADDER_TP5_MOVE = float(os.getenv("LADDER_TP5_MOVE", "0.042"))
-LADDER_RISK_MULT = float(os.getenv("LADDER_RISK_MULT", "0.18"))
+LADDER_RISK_MULT = float(os.getenv("LADDER_RISK_MULT", "0.12"))
 SCALP_STRATEGIES = {"PRO_LADDER_SCALP_LONG", "PRO_LADDER_SCALP_SHORT"}
 
 QUALITY_BASES = {
@@ -802,9 +803,13 @@ def calculate_ladder_scalp_trade(symbol: str, side: str, entry: float, level: fl
     risk = abs(entry - sl)
     reward = abs(tp1 - entry)
     rr = reward / risk if risk > 0 else 0.0
+    rewards = [abs(tp1-entry), abs(tp2-entry), abs(tp3-entry), abs(tp4-entry), abs(tp5-entry)]
+    weighted_reward = sum(rewards) / len(rewards) if rewards else reward
+    ladder_rr = weighted_reward / risk if risk > 0 else 0.0
+    final_rr = rewards[-1] / risk if risk > 0 and rewards else 0.0
     roi_tp1 = reward / entry * LEVERAGE * 100
     roi_sl = risk / entry * LEVERAGE * 100
-    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "tp5": tp5, "rr": rr, "roi_tp1": roi_tp1, "roi_sl": roi_sl}
+    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "tp5": tp5, "rr": rr, "ladder_rr": ladder_rr, "final_rr": final_rr, "roi_tp1": roi_tp1, "roi_sl": roi_sl}
 
 
 def ladder_scalp_setup(c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], side: str, ema5: float, vw: float) -> Optional[Dict[str, Any]]:
@@ -831,6 +836,12 @@ def ladder_scalp_setup(c5: List[Dict[str, float]], c15: List[Dict[str, float]], 
         # Entry after reclaim, not at the top of the first impulse.
         if not (c5[-1]["close"] > ema5 and c5[-1]["close"] > vw and c5[-1]["close"] > c5[-2]["high"] * 0.999):
             return None
+        # Professional scalp confirmation: not just a bounce, but a controlled reclaim.
+        # Last two 5m candles should not be heavy distribution candles.
+        if c5[-1]["close"] < c5[-1]["open"] and c5[-2]["close"] < c5[-2]["open"]:
+            return None
+        if upper_wick_ratio(c5[-1]) > 0.55 and c5[-1]["close"] < c5[-1]["high"] * 0.997:
+            return None
         if c15[-1]["close"] < c15[-2]["close"] and c15[-1]["close"] < ema(closes(c15), 21):
             return None
         level = max(low, min(x["close"] for x in c5[-10:]))
@@ -847,6 +858,11 @@ def ladder_scalp_setup(c5: List[Dict[str, float]], c15: List[Dict[str, float]], 
     if bounce < LADDER_PULLBACK_MIN or bounce > LADDER_PULLBACK_MAX:
         return None
     if not (c5[-1]["close"] < ema5 and c5[-1]["close"] < vw and c5[-1]["close"] < c5[-2]["low"] * 1.001):
+        return None
+    # Professional scalp confirmation: not just a dip, but a controlled reject.
+    if c5[-1]["close"] > c5[-1]["open"] and c5[-2]["close"] > c5[-2]["open"]:
+        return None
+    if lower_wick_ratio(c5[-1]) > 0.55 and c5[-1]["close"] > c5[-1]["low"] * 1.003:
         return None
     if c15[-1]["close"] > c15[-2]["close"] and c15[-1]["close"] > ema(closes(c15), 21):
         return None
@@ -1195,12 +1211,15 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 blocks["calm_short_quality_block"] = blocks.get("calm_short_quality_block", 0) + 1
                 return
 
+        rr_for_grade = tr.get("ladder_rr", tr["rr"]) if strategy in SCALP_STRATEGIES else tr["rr"]
         if strategy in SCALP_STRATEGIES:
-            if vol < LADDER_MIN_VOLUME or tr["rr"] < LADDER_MIN_RR:
+            # Ladder scalps have several partial targets. TP1/Risk alone is too strict;
+            # use weighted ladder RR + final target RR, but keep volume/context filters.
+            if vol < LADDER_MIN_VOLUME or rr_for_grade < LADDER_MIN_RR or tr.get("final_rr", rr_for_grade) < LADDER_MIN_FINAL_RR:
                 blocks["ladder_scalp_quality_block"] = blocks.get("ladder_scalp_quality_block", 0) + 1
                 return
 
-        score, notes = score_signal(side, strategy, trade_type, level, btc, t1h, t4h, vol, tr["rr"], dist, strong)
+        score, notes = score_signal(side, strategy, trade_type, level, btc, t1h, t4h, vol, rr_for_grade, dist, strong)
         if strategy in SCALP_STRATEGIES:
             score += 8
             notes.append("ladder scalp setup")
@@ -1210,10 +1229,10 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 score = min(score, 86)
         grade = None
         min_rr = None
-        if score >= A_PLUS_MIN_SCORE and tr["rr"] >= MIN_RR_A and vol >= MIN_VOLUME_A:
+        if score >= A_PLUS_MIN_SCORE and rr_for_grade >= MIN_RR_A and vol >= MIN_VOLUME_A:
             grade = "A+"
             min_rr = MIN_RR_A
-        elif score >= B_MIN_SCORE and tr["rr"] >= MIN_RR_B and vol >= MIN_VOLUME_B:
+        elif score >= B_MIN_SCORE and rr_for_grade >= MIN_RR_B and vol >= MIN_VOLUME_B:
             if CALM_BREAKOUT_LONG_A_ONLY and strategy == "PRO_CALM_BREAKOUT_PULLBACK_LONG":
                 blocks["calm_long_b_forbidden"] = blocks.get("calm_long_b_forbidden", 0) + 1
                 return
