@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import math
 import random
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,17 +10,20 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.13 — Trader Ladder Mode
-# Goal:
-# Verified levels + trader-style ladder continuation scalps.
+# V13.14 — FAST BURST LADDER TRADER
+# Professional goal:
+# Catch only fast momentum-burst ladder setups like the examples:
+# PORTAL/HOME/WLD/TAC SHORT and VELVET LONG.
 #
-# Designed to catch setups like:
-# PORTAL/HOME/WLD/TAC SHORT and VELVET LONG:
-# impulse -> controlled pullback -> EMA/VWAP reject/reclaim -> continuation -> 5 ladder TPs.
+# Core idea:
+# hot coin -> fresh impulse -> controlled pullback -> EMA/VWAP reject/reclaim
+# -> immediate continuation -> 5 compact ladder targets.
+#
+# Important: this bot sends signals/alerts. It does not guarantee profit.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.13 TRADER LADDER MODE"
-DEPLOY_MARKER = "V13_13_TRADER_LADDER_MODE_2026_06_23"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.14 FAST BURST LADDER TRADER"
+DEPLOY_MARKER = "V13_14_FAST_BURST_LADDER_TRADER_2026_06_23"
 
 app = FastAPI(title=APP_NAME)
 
@@ -29,142 +31,97 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_13.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_14_fast_burst.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
 # --- Scan stability ---
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
-AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "20"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "45"))
+AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "10"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 API_RETRIES = int(os.getenv("API_RETRIES", "3"))
-API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.10"))
+API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.08"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
-DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1800"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "160"))
+HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "90"))
+DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 
-# --- Signal quality ---
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
+# --- Signal limits ---
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
 B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "86"))
-MIN_TP1_ROI_X10 = float(os.getenv("MIN_TP1_ROI_X10", "10.0"))
-MIN_TP1_PRICE_MOVE = MIN_TP1_ROI_X10 / max(LEVERAGE, 1) / 100.0
-MIN_RR_A = float(os.getenv("MIN_RR_A", "0.95"))
-MIN_RR_B = float(os.getenv("MIN_RR_B", "0.75"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "8"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "6"))
-MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "0"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "900"))
-STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "600"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "4"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1800"))
+STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "480"))
 
-# --- Level parameters ---
-LEVEL_CLUSTER_TOL = float(os.getenv("LEVEL_CLUSTER_TOL", "0.0065"))
-LEVEL_NEAR_TOL = float(os.getenv("LEVEL_NEAR_TOL", "0.0125"))
-RETEST_TOL = float(os.getenv("RETEST_TOL", "0.016"))
-MIN_LEVEL_TOUCHES_A = int(os.getenv("MIN_LEVEL_TOUCHES_A", "3"))
-MIN_LEVEL_TOUCHES_B = int(os.getenv("MIN_LEVEL_TOUCHES_B", "2"))
-MIN_REACTIONS_A = int(os.getenv("MIN_REACTIONS_A", "2"))
-MIN_REACTIONS_B = int(os.getenv("MIN_REACTIONS_B", "1"))
-MAX_TOUCHES_EFFECTIVE = int(os.getenv("MAX_TOUCHES_EFFECTIVE", "7"))
+# --- Fast burst requirements ---
+FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
+FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.008"))        # 0.8% in 15m
+FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.012"))        # 1.2% in 30m
+FAST_MAX_30M_MOVE = float(os.getenv("FAST_MAX_30M_MOVE", "0.085"))        # avoid late vertical chase
+FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "1.15"))   # current 5m range expansion
+FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "1.12")) # current 15m volume expansion
+FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.0015"))   # 0.15% last 3m direction
+FAST_MAX_SPREAD_PROXY = float(os.getenv("FAST_MAX_SPREAD_PROXY", "0.022"))# current 5m candle too wide/chase block
 
-# --- Volume / confirmation ---
-MIN_VOLUME_A = float(os.getenv("MIN_VOLUME_A", "1.10"))
-MIN_VOLUME_B = float(os.getenv("MIN_VOLUME_B", "0.95"))
-LOW_VOLUME_CAP = int(os.getenv("LOW_VOLUME_CAP", "76"))
-VERY_LOW_VOLUME = float(os.getenv("VERY_LOW_VOLUME", "0.60"))
-REQUIRE_15M_CONFIRM = os.getenv("REQUIRE_15M_CONFIRM", "true").lower() == "true"
+# --- Pullback/retest requirements ---
+PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0025"))                 # 0.25%
+PULLBACK_MAX = float(os.getenv("PULLBACK_MAX", "0.0300"))                 # 3.0%
+RECLAIM_BUFFER = float(os.getenv("RECLAIM_BUFFER", "0.0005"))
+CLOSE_LOCATION_MIN_LONG = float(os.getenv("CLOSE_LOCATION_MIN_LONG", "0.58"))
+CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.42"))
 
-# --- V13.9 professional statistical quality gates ---
-ADAPTIVE_BLOCK_ENABLED = os.getenv("ADAPTIVE_BLOCK_ENABLED", "true").lower() == "true"
-ADAPTIVE_MIN_TRADES = int(os.getenv("ADAPTIVE_MIN_TRADES", "3"))
-ADAPTIVE_MIN_WR = float(os.getenv("ADAPTIVE_MIN_WR", "45"))
-BAD_STRATEGY_BLOCK_HOURS = int(os.getenv("BAD_STRATEGY_BLOCK_HOURS", "24"))
-LONG_NEEDS_HTF_NOT_DOWN = os.getenv("LONG_NEEDS_HTF_NOT_DOWN", "true").lower() == "true"
-LONG_MIN_VOLUME = float(os.getenv("LONG_MIN_VOLUME", "0.95"))
-LONG_MIN_RR = float(os.getenv("LONG_MIN_RR", "0.95"))
-CALM_BREAKOUT_LONG_A_ONLY = os.getenv("CALM_BREAKOUT_LONG_A_ONLY", "true").lower() == "true"
-CALM_BREAKDOWN_SHORT_A_ONLY = os.getenv("CALM_BREAKDOWN_SHORT_A_ONLY", "true").lower() == "true"
-CALM_LONG_MIN_VOLUME = float(os.getenv("CALM_LONG_MIN_VOLUME", "1.20"))
-CALM_LONG_MIN_RR = float(os.getenv("CALM_LONG_MIN_RR", "1.10"))
-CALM_SHORT_MIN_VOLUME = float(os.getenv("CALM_SHORT_MIN_VOLUME", "1.15"))
-CALM_SHORT_MIN_RR = float(os.getenv("CALM_SHORT_MIN_RR", "1.05"))
-GLOBAL_B_MIN_TRADES = int(os.getenv("GLOBAL_B_MIN_TRADES", "5"))
-GLOBAL_B_MIN_WR = float(os.getenv("GLOBAL_B_MIN_WR", "48"))
-WEAK_TYPE_MIN_WR = float(os.getenv("WEAK_TYPE_MIN_WR", "48"))
+# --- Compact ladder TPs for fast 10-minute realization style ---
+# These are intentionally more compact than slow ladder targets.
+TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0055"))
+TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0105"))
+TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0160"))
+TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0230"))
+TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0320"))
 
-# --- Anti-chase ---
-BIG_MOVE_6H = float(os.getenv("BIG_MOVE_6H", "0.060"))
-BIG_MOVE_24H = float(os.getenv("BIG_MOVE_24H", "0.120"))
-REQUIRED_PULLBACK_AFTER_BIG_MOVE = float(os.getenv("REQUIRED_PULLBACK_AFTER_BIG_MOVE", "0.012"))
-ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.060"))
-ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.090"))
+# --- Risk / stop ---
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
+MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0090"))                  # min 0.9% price risk
+MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0450"))                  # block if SL > 4.5%
+FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
+A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
-# --- Risk multipliers ---
-A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.50"))
-B_RISK_MULT = float(os.getenv("B_RISK_MULT", "0.08"))
-FAR_SL_RISK_MULT = float(os.getenv("FAR_SL_RISK_MULT", "0.08"))
-TP1_CLOSE_PERCENT = float(os.getenv("TP1_CLOSE_PERCENT", "70"))
+# --- Time stop / no-stall logic ---
+FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "12"))
+FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "18"))
+FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.35"))
+FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").lower() == "true"
 
-# --- V13.11 Professional ladder scalp mode ---
-LADDER_SCALP_ENABLED = os.getenv("LADDER_SCALP_ENABLED", "true").lower() == "true"
-LADDER_MIN_VOLUME = float(os.getenv("LADDER_MIN_VOLUME", "0.95"))
-LADDER_A_VOLUME = float(os.getenv("LADDER_A_VOLUME", "1.12"))
-LADDER_MIN_RR = float(os.getenv("LADDER_MIN_RR", "0.55"))
-LADDER_MIN_FINAL_RR = float(os.getenv("LADDER_MIN_FINAL_RR", "1.10"))
-LADDER_MIN_1H_MOVE = float(os.getenv("LADDER_MIN_1H_MOVE", "0.004"))
-LADDER_MAX_1H_MOVE = float(os.getenv("LADDER_MAX_1H_MOVE", "0.045"))
-LADDER_PULLBACK_MIN = float(os.getenv("LADDER_PULLBACK_MIN", "0.0025"))
-LADDER_PULLBACK_MAX = float(os.getenv("LADDER_PULLBACK_MAX", "0.022"))
-LADDER_SL_ATR_MULT = float(os.getenv("LADDER_SL_ATR_MULT", "0.55"))
-LADDER_TP1_MOVE = float(os.getenv("LADDER_TP1_MOVE", "0.010"))
-LADDER_TP2_MOVE = float(os.getenv("LADDER_TP2_MOVE", "0.016"))
-LADDER_TP3_MOVE = float(os.getenv("LADDER_TP3_MOVE", "0.023"))
-LADDER_TP4_MOVE = float(os.getenv("LADDER_TP4_MOVE", "0.032"))
-LADDER_TP5_MOVE = float(os.getenv("LADDER_TP5_MOVE", "0.042"))
-LADDER_RISK_MULT = float(os.getenv("LADDER_RISK_MULT", "0.12"))
+# --- BTC / market context ---
+ALLOW_COUNTER_BTC_A_ONLY = os.getenv("ALLOW_COUNTER_BTC_A_ONLY", "false").lower() == "true"
+BTC_STRONG_MOVE_BLOCK = float(os.getenv("BTC_STRONG_MOVE_BLOCK", "0.010")) # 1% BTC 1h move against trade blocks B
 
-# --- V13.13 Trader-style ladder mode ---
-TRADER_LADDER_ENABLED = os.getenv("TRADER_LADDER_ENABLED", "true").lower() == "true"
-TRADER_LADDER_MIN_VOLUME = float(os.getenv("TRADER_LADDER_MIN_VOLUME", "0.90"))
-TRADER_LADDER_A_VOLUME = float(os.getenv("TRADER_LADDER_A_VOLUME", "1.08"))
-TRADER_LADDER_MIN_1H_MOVE = float(os.getenv("TRADER_LADDER_MIN_1H_MOVE", "0.006"))
-TRADER_LADDER_MAX_1H_MOVE = float(os.getenv("TRADER_LADDER_MAX_1H_MOVE", "0.065"))
-TRADER_LADDER_PULLBACK_MIN = float(os.getenv("TRADER_LADDER_PULLBACK_MIN", "0.003"))
-TRADER_LADDER_PULLBACK_MAX = float(os.getenv("TRADER_LADDER_PULLBACK_MAX", "0.035"))
-TRADER_LADDER_SL_ATR_MULT = float(os.getenv("TRADER_LADDER_SL_ATR_MULT", "0.75"))
-TRADER_LADDER_RISK_MULT = float(os.getenv("TRADER_LADDER_RISK_MULT", "0.10"))
+# --- Ultra-risk blocks ---
+ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.075"))
+ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.110"))
 
-TRADER_TP1_MOVE = float(os.getenv("TRADER_TP1_MOVE", "0.0070"))
-TRADER_TP2_MOVE = float(os.getenv("TRADER_TP2_MOVE", "0.0140"))
-TRADER_TP3_MOVE = float(os.getenv("TRADER_TP3_MOVE", "0.0210"))
-TRADER_TP4_MOVE = float(os.getenv("TRADER_TP4_MOVE", "0.0300"))
-TRADER_TP5_MOVE = float(os.getenv("TRADER_TP5_MOVE", "0.0420"))
-
-SCALP_STRATEGIES = {
-    "PRO_LADDER_SCALP_LONG",
-    "PRO_LADDER_SCALP_SHORT",
-    "PRO_TRADER_LADDER_LONG",
-    "PRO_TRADER_LADDER_SHORT",
-}
+SCALP_STRATEGIES = {"PRO_FAST_BURST_LONG", "PRO_FAST_BURST_SHORT"}
 
 QUALITY_BASES = {
     "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
     "OP", "ARB", "APT", "TIA", "ADA", "DOT", "MATIC", "TON", "LTC", "BCH", "ETC", "FIL", "ATOM",
     "UNI", "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI",
-    "PORTAL", "HOME", "TAC", "VELVET"
+    "PORTAL", "HOME", "TAC", "VELVET", "BEAT", "BLESS"
 }
 
+# Do not include VELVET here; user gave a successful VELVET long example.
 ULTRA_RISK_KEYWORDS = {
     "1000", "PEPE", "BONK", "WIF", "MEME", "DOGS", "CATI", "HMSTR", "GOBLIN", "MOG", "TURBO",
     "BOME", "NEIRO", "PNUT", "MOODENG", "ACT", "GOAT", "FIGHT", "BLEND", "MAGMA"
 }
 
 FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
-    "BTC","ETH","SOL","BNB","XRP","LINK","AVAX","AAVE","SUI","TAO","NEAR","INJ","OP","ARB",
-    "APT","TIA","ADA","DOT","LTC","BCH","ETC","FIL","ATOM","UNI","RUNE","SEI","FET","WLD",
-    "DOGE","TRX","ENA","JUP","ORDI","BEAT","BLESS","KAITO","XLM","WLFI","PUMP",
-    "PORTAL","HOME","TAC","VELVET"
+    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
+    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "LTC", "BCH", "ETC", "FIL", "ATOM", "UNI",
+    "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI", "BEAT", "BLESS",
+    "KAITO", "XLM", "WLFI", "PUMP", "PORTAL", "HOME", "TAC", "VELVET"
 ]]
 
 STATE: Dict[str, Any] = {}
@@ -177,13 +134,6 @@ TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
 
 def now_ts() -> int:
     return int(time.time())
-
-
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -205,22 +155,18 @@ def default_state() -> Dict[str, Any]:
     return {
         "active_signals": [],
         "stats": {
-            "total": {"profit": 0, "sl": 0},
+            "total": {"profit": 0, "sl": 0, "expired": 0},
             "side": {},
             "grade": {},
             "strategy": {},
-            "type": {},
             "symbol": {},
-            "strategy_side_grade": {},
-            "strategy_side": {},
+            "type": {},
         },
         "pair_cooldown": {},
         "strategy_cooldown": {},
-        "hard_block_until": {},
-        "last_diag_ts": 0,
         "last_scan": {},
+        "last_diag_ts": 0,
         "last_error": "",
-        "startup_sent": False,
     }
 
 
@@ -231,7 +177,8 @@ def load_state() -> Dict[str, Any]:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         base = default_state()
-        base.update(data if isinstance(data, dict) else {})
+        if isinstance(data, dict):
+            base.update(data)
         return base
     except Exception:
         return default_state()
@@ -248,57 +195,41 @@ def save_state() -> None:
 def inc_stat(bucket: str, key: str, result: str) -> None:
     stats = STATE.setdefault("stats", default_state()["stats"])
     d = stats.setdefault(bucket, {})
-    item = d.setdefault(key, {"profit": 0, "sl": 0})
+    item = d.setdefault(key, {"profit": 0, "sl": 0, "expired": 0})
     item[result] = item.get(result, 0) + 1
 
 
 def apply_result(signal: Dict[str, Any], result: str) -> None:
-    if result not in ("profit", "sl"):
+    if result not in ("profit", "sl", "expired"):
         return
-
     stats = STATE.setdefault("stats", default_state()["stats"])
-    stats.setdefault("total", {"profit": 0, "sl": 0})[result] += 1
-
+    stats.setdefault("total", {"profit": 0, "sl": 0, "expired": 0})[result] += 1
     inc_stat("side", signal.get("side", "?"), result)
     inc_stat("grade", signal.get("grade", "?"), result)
     inc_stat("strategy", signal.get("strategy", "?"), result)
-    inc_stat("type", signal.get("trade_type", "?"), result)
     inc_stat("symbol", signal.get("symbol", "?"), result)
-    inc_stat("strategy_side_grade", f"{signal.get('strategy')}:{signal.get('side')}:{signal.get('grade')}", result)
-    inc_stat("strategy_side", f"{signal.get('strategy')}:{signal.get('side')}", result)
-
-    ss = f"{signal.get('strategy')}:{signal.get('side')}"
-    item = stats.get("strategy_side", {}).get(ss, {})
-    closed = item.get("profit", 0) + item.get("sl", 0)
-    wr = (item.get("profit", 0) / closed * 100.0) if closed else 0.0
-
-    if closed >= ADAPTIVE_MIN_TRADES and wr < ADAPTIVE_MIN_WR:
-        until = now_ts() + BAD_STRATEGY_BLOCK_HOURS * 3600
-        STATE.setdefault("hard_block_until", {})[ss] = until
-        STATE.setdefault("hard_block_until", {})[signal.get("strategy")] = until
-
+    inc_stat("type", signal.get("trade_type", "?"), result)
     save_state()
 
 
 def wr_text(item: Dict[str, int]) -> str:
-    p = item.get("profit", 0)
-    s = item.get("sl", 0)
-    t = p + s
-    wr = p / t * 100 if t else 0.0
-    return f"{p} профит / {s} SL / WR {wr:.1f}%"
+    p = int(item.get("profit", 0))
+    sl = int(item.get("sl", 0))
+    exp = int(item.get("expired", 0))
+    closed = p + sl + exp
+    wr = p / closed * 100 if closed else 0.0
+    return f"{p} профит / {sl} SL / {exp} expired / WR {wr:.1f}%"
 
 
 def build_stats_text() -> str:
     stats = STATE.setdefault("stats", default_state()["stats"])
     lines = ["📊 Статистика", f"Итого: {wr_text(stats.get('total', {}))}"]
-
     for title, key in [("Стороны", "side"), ("Классы", "grade"), ("Стратегии", "strategy"), ("Типы", "type")]:
         data = stats.get(key, {})
         if data:
             lines.append(f"\n{title}:")
-            for k, v in sorted(data.items(), key=lambda kv: -(kv[1].get("profit", 0) + kv[1].get("sl", 0)))[:10]:
+            for k, v in sorted(data.items(), key=lambda kv: -(kv[1].get("profit", 0) + kv[1].get("sl", 0) + kv[1].get("expired", 0)))[:12]:
                 lines.append(f"{k}: {wr_text(v)}")
-
     return "\n".join(lines)
 
 # ============================================================
@@ -310,13 +241,11 @@ def send_telegram(text: str) -> bool:
         STATE["last_error"] = "Telegram env missing: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
         save_state()
         return False
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
     try:
         r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]}, timeout=10)
         if not r.ok:
-            STATE["last_error"] = f"Telegram error {r.status_code}: {r.text[:200]}"
+            STATE["last_error"] = f"Telegram error {r.status_code}: {r.text[:250]}"
             save_state()
             return False
         return True
@@ -329,22 +258,18 @@ def send_telegram(text: str) -> bool:
 def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     url = BINGX_BASE_URL + path
     last_err = None
-
     for attempt in range(API_RETRIES):
         try:
             time.sleep(API_THROTTLE_SECONDS)
             r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code} {path}"
                 time.sleep(0.25 * (attempt + 1))
                 continue
-
             return r.json()
         except Exception as e:
             last_err = f"get_json {path}: {repr(e)}"
             time.sleep(0.35 * (attempt + 1))
-
     STATE["last_error"] = last_err or "unknown API error"
     save_state()
     return None
@@ -353,9 +278,7 @@ def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dic
 def parse_klines(raw: Any) -> Optional[List[Dict[str, float]]]:
     if not raw:
         return None
-
     candles: List[Dict[str, float]] = []
-
     for c in raw:
         try:
             if isinstance(c, dict):
@@ -378,53 +301,36 @@ def parse_klines(raw: Any) -> Optional[List[Dict[str, float]]]:
                 })
         except Exception:
             continue
-
     candles = [x for x in candles if x["open"] > 0 and x["high"] > 0 and x["low"] > 0 and x["close"] > 0]
     candles.sort(key=lambda x: x["time"])
+    return candles if len(candles) >= 30 else None
 
-    return candles if len(candles) >= 40 else None
 
-
-def get_klines(symbol: str, interval: str, limit: int = 180, cache_seconds: int = 30) -> Optional[List[Dict[str, float]]]:
+def get_klines(symbol: str, interval: str, limit: int = 180, cache_seconds: int = 20) -> Optional[List[Dict[str, float]]]:
     symbol = normalize_symbol(symbol)
     key = f"{symbol}:{interval}:{limit}"
-
     cached = KLINE_CACHE.get(key)
     if cached and time.time() - cached[0] < cache_seconds:
         return cached[1]
-
-    endpoints = [
-        "/openApi/swap/v3/quote/klines",
-        "/openApi/swap/v2/quote/klines",
-    ]
-
-    for ep in endpoints:
+    for ep in ["/openApi/swap/v3/quote/klines", "/openApi/swap/v2/quote/klines"]:
         data = get_json(ep, {"symbol": symbol, "interval": interval, "limit": limit})
         if not data:
             continue
-
-        raw = data.get("data")
-        candles = parse_klines(raw)
-
+        candles = parse_klines(data.get("data"))
         if candles:
             KLINE_CACHE[key] = (time.time(), candles)
             return candles
-
     KLINE_CACHE[key] = (time.time(), None)
     return None
 
 
 def is_good_contract_symbol(symbol: str) -> bool:
     s = normalize_symbol(symbol)
-
     if not s.endswith("-USDT"):
         return False
-
     b = base_asset(s)
-
     if any(x in b for x in ["USD", "USDC", "BULL", "BEAR"]):
         return False
-
     return True
 
 
@@ -432,288 +338,95 @@ def get_symbols() -> List[str]:
     cached = TICKER_CACHE.get("symbols")
     if cached and time.time() - cached[0] < 600:
         return cached[1] or FALLBACK_SYMBOLS
-
     data = get_json("/openApi/swap/v2/quote/contracts")
     out: List[str] = []
-
     if data and isinstance(data.get("data"), list):
         for item in data.get("data", []):
             s = item.get("symbol")
             if s and is_good_contract_symbol(s):
                 out.append(normalize_symbol(s))
-
     if not out:
         out = FALLBACK_SYMBOLS[:]
-
+    # Ensure important user examples are always included if contracts exist/fallback is needed.
+    for s in FALLBACK_SYMBOLS:
+        if s not in out:
+            out.append(s)
+    random.shuffle(out)
     quality = [s for s in out if base_asset(s) in QUALITY_BASES]
     rest = [s for s in out if base_asset(s) not in QUALITY_BASES]
-    random.shuffle(rest)
-
     result = (quality + rest)[:MAX_CONTRACTS]
     TICKER_CACHE["symbols"] = (time.time(), result)
-
     return result
 
 # ============================================================
-# Indicators / market context
+# Indicators
 # ============================================================
 
 def closes(c: List[Dict[str, float]]) -> List[float]:
     return [x["close"] for x in c]
 
 
-def highs(c: List[Dict[str, float]]) -> List[float]:
-    return [x["high"] for x in c]
-
-
-def lows(c: List[Dict[str, float]]) -> List[float]:
-    return [x["low"] for x in c]
-
-
 def ema(values: List[float], period: int) -> float:
     if not values:
         return 0.0
-
     if len(values) < period:
         return sum(values) / len(values)
-
     k = 2 / (period + 1)
     e = sum(values[:period]) / period
-
     for v in values[period:]:
         e = v * k + e * (1 - k)
-
     return e
 
 
 def vwap(candles: List[Dict[str, float]], n: int = 48) -> float:
     part = candles[-n:] if len(candles) >= n else candles
-
     pv = sum(((x["high"] + x["low"] + x["close"]) / 3) * max(x["volume"], 0) for x in part)
     vv = sum(max(x["volume"], 0) for x in part)
-
     return pv / vv if vv > 0 else (part[-1]["close"] if part else 0.0)
 
 
 def atr(candles: List[Dict[str, float]], n: int = 14) -> float:
     if len(candles) < 2:
         return 0.0
-
     trs = []
-
     for i in range(1, len(candles)):
         h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-
     part = trs[-n:] if len(trs) >= n else trs
-
     return sum(part) / len(part) if part else 0.0
 
 
 def percent_change(candles: List[Dict[str, float]], bars: int) -> float:
     if len(candles) <= bars:
         return 0.0
-
     a = candles[-bars]["close"]
     b = candles[-1]["close"]
-
     return (b - a) / a if a else 0.0
 
 
 def volume_ratio(candles: List[Dict[str, float]], n: int = 30) -> float:
     if len(candles) < n + 2:
         return 1.0
-
     cur = candles[-1]["volume"]
     avg = sum(x["volume"] for x in candles[-n - 1:-1]) / n
-
     return cur / avg if avg > 0 else 1.0
 
 
-def trend_state(candles: List[Dict[str, float]]) -> str:
-    cs = closes(candles)
-
-    if len(cs) < 60:
-        return "UNKNOWN"
-
-    e21 = ema(cs, 21)
-    e55 = ema(cs, 55)
-    price = cs[-1]
-    ch = percent_change(candles, min(20, len(candles) - 1))
-
-    if price > e21 > e55 and ch > 0.003:
-        return "UP"
-
-    if price < e21 < e55 and ch < -0.003:
-        return "DOWN"
-
-    return "RANGE"
+def candle_range(c: Dict[str, float]) -> float:
+    return max(c["high"] - c["low"], 0.0)
 
 
-def btc_context() -> Dict[str, Any]:
-    c15 = get_klines("BTC-USDT", "15m", 120, cache_seconds=45)
-    c1h = get_klines("BTC-USDT", "1h", 180, cache_seconds=120)
-    c4h = get_klines("BTC-USDT", "4h", 120, cache_seconds=240)
-
-    if not c15 or not c1h or not c4h:
-        return {"ok": False, "text": "BTC data unavailable", "direction": "UNKNOWN"}
-
-    ch15 = percent_change(c15, 4)
-    ch6h = percent_change(c15, 24)
-    t1h = trend_state(c1h)
-    t4h = trend_state(c4h)
-
-    direction = "RANGE"
-
-    if ch6h < -0.018 or (t1h == "DOWN" and ch15 < -0.002):
-        direction = "BEAR"
-    elif ch6h > 0.018 or (t1h == "UP" and ch15 > 0.002):
-        direction = "BULL"
-
-    return {
-        "ok": True,
-        "direction": direction,
-        "t1h": t1h,
-        "t4h": t4h,
-        "ch15": ch15,
-        "ch6h": ch6h,
-        "text": f"BTC {direction}: 15m {ch15*100:+.2f}%, 6h {ch6h*100:+.2f}%, 1H {t1h}, 4H {t4h}",
-    }
-
-# ============================================================
-# Professional level verification
-# ============================================================
-
-def pivot_levels(candles: List[Dict[str, float]], kind: str, left: int = 3, right: int = 3) -> List[float]:
-    vals = []
-
-    for i in range(left, len(candles) - right):
-        window = candles[i - left:i + right + 1]
-
-        if kind == "support":
-            if candles[i]["low"] == min(x["low"] for x in window):
-                vals.append(candles[i]["low"])
-        else:
-            if candles[i]["high"] == max(x["high"] for x in window):
-                vals.append(candles[i]["high"])
-
-    return vals
+def candle_range_ratio(candles: List[Dict[str, float]], n: int = 20) -> float:
+    if len(candles) < n + 2:
+        return 1.0
+    cur = candle_range(candles[-1])
+    avg = sum(candle_range(x) for x in candles[-n - 1:-1]) / n
+    return cur / avg if avg > 0 else 1.0
 
 
-def cluster_levels(levels: List[float], tol: float) -> List[float]:
-    levels = sorted([x for x in levels if x > 0])
-
-    if not levels:
-        return []
-
-    clusters: List[List[float]] = [[levels[0]]]
-
-    for lv in levels[1:]:
-        ref = sum(clusters[-1]) / len(clusters[-1])
-
-        if abs(lv - ref) / ref <= tol:
-            clusters[-1].append(lv)
-        else:
-            clusters.append([lv])
-
-    return [sum(c) / len(c) for c in clusters]
-
-
-def level_quality(candles: List[Dict[str, float]], level: float, kind: str, tf_weight: float = 1.0) -> Dict[str, Any]:
-    if not candles or level <= 0:
-        return {"score": 0, "touches": 0, "reactions": 0, "noise": True}
-
-    tol = LEVEL_CLUSTER_TOL
-    avg_atr = atr(candles, 14)
-    min_reaction = max(level * 0.004, avg_atr * 0.9)
-
-    touches = 0
-    reactions = 0
-    last_touch_i = -999
-
-    for i, c in enumerate(candles[-160:]):
-        idx = len(candles) - min(160, len(candles)) + i
-
-        if kind == "support":
-            touched = abs(c["low"] - level) / level <= tol or (c["low"] <= level <= c["high"])
-            reacted = touched and (c["high"] - level) >= min_reaction
-        else:
-            touched = abs(c["high"] - level) / level <= tol or (c["low"] <= level <= c["high"])
-            reacted = touched and (level - c["low"]) >= min_reaction
-
-        if touched and idx - last_touch_i >= 4:
-            touches += 1
-            last_touch_i = idx
-
-            if reacted:
-                reactions += 1
-
-    effective = min(touches, MAX_TOUCHES_EFFECTIVE)
-    noise_penalty = 8 if touches > 14 else 0
-
-    score = (effective * 8 + min(reactions, 6) * 9) * tf_weight - noise_penalty
-
-    return {
-        "score": max(0, score),
-        "touches": touches,
-        "reactions": reactions,
-        "noise": touches > 18,
-    }
-
-
-def verified_levels(c1h: List[Dict[str, float]], c4h: List[Dict[str, float]]) -> Dict[str, Any]:
-    price = c1h[-1]["close"]
-
-    raw_sup = pivot_levels(c1h[-140:], "support") + pivot_levels(c4h[-100:], "support")
-    raw_res = pivot_levels(c1h[-140:], "resistance") + pivot_levels(c4h[-100:], "resistance")
-
-    supports = [lv for lv in cluster_levels(raw_sup, LEVEL_CLUSTER_TOL) if lv < price]
-    resistances = [lv for lv in cluster_levels(raw_res, LEVEL_CLUSTER_TOL) if lv > price]
-
-    supports = sorted(supports, key=lambda x: abs(price - x))[:5]
-    resistances = sorted(resistances, key=lambda x: abs(price - x))[:5]
-
-    def best(levels: List[float], kind: str) -> Optional[Dict[str, Any]]:
-        out = []
-
-        for lv in levels:
-            q1 = level_quality(c1h, lv, kind, 1.0)
-            q4 = level_quality(c4h, lv, kind, 1.25)
-
-            q = {
-                "level": lv,
-                "score": q1["score"] + q4["score"],
-                "touches": q1["touches"] + q4["touches"],
-                "reactions": q1["reactions"] + q4["reactions"],
-                "noise": q1["noise"] or q4["noise"],
-                "distance": abs(price - lv) / price,
-            }
-
-            out.append(q)
-
-        return sorted(out, key=lambda z: (z["score"], -z["distance"]), reverse=True)[0] if out else None
-
-    return {
-        "support": best(supports, "support"),
-        "resistance": best(resistances, "resistance"),
-    }
-
-# ============================================================
-# Confirmation / signal construction
-# ============================================================
-
-def candle_body_ok(c: Dict[str, float], side: str) -> bool:
-    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
-    rng = max(h - l, 1e-12)
-
-    body = abs(cl - o) / rng
-    upper = (h - max(o, cl)) / rng
-    lower = (min(o, cl) - l) / rng
-
-    if side == "LONG":
-        return cl > o and body >= 0.22 and upper <= 0.55
-
-    return cl < o and body >= 0.22 and lower <= 0.55
+def close_location(c: Dict[str, float]) -> float:
+    rng = max(c["high"] - c["low"], 1e-12)
+    return (c["close"] - c["low"]) / rng
 
 
 def upper_wick_ratio(c: Dict[str, float]) -> float:
@@ -728,311 +441,293 @@ def lower_wick_ratio(c: Dict[str, float]) -> float:
     return (min(o, cl) - l) / rng
 
 
-def two_candle_confirmation(c5: List[Dict[str, float]], side: str, ema5: float, vw: float) -> bool:
-    if len(c5) < 4:
-        return False
-
-    a, b = c5[-2], c5[-1]
-
-    if side == "LONG":
-        return a["close"] > ema5 and b["close"] > ema5 and b["close"] > min(vw, ema5) and candle_body_ok(b, side)
-
-    return a["close"] < ema5 and b["close"] < ema5 and b["close"] < max(vw, ema5) and candle_body_ok(b, side)
-
-
-def htf_confirm(c15: List[Dict[str, float]], side: str, level: float) -> bool:
-    if len(c15) < 3:
-        return False
-
-    last = c15[-1]
-    prev = c15[-2]
-
-    if side == "LONG":
-        return last["close"] > level and (last["close"] >= prev["close"] or candle_body_ok(last, side))
-
-    return last["close"] < level and (last["close"] <= prev["close"] or candle_body_ok(last, side))
+def trend_state(candles: List[Dict[str, float]]) -> str:
+    cs = closes(candles)
+    if len(cs) < 60:
+        return "UNKNOWN"
+    e21 = ema(cs, 21)
+    e55 = ema(cs, 55)
+    price = cs[-1]
+    ch = percent_change(candles, min(20, len(candles) - 1))
+    if price > e21 > e55 and ch > 0.003:
+        return "UP"
+    if price < e21 < e55 and ch < -0.003:
+        return "DOWN"
+    return "RANGE"
 
 
-def closes_above(candles: List[Dict[str, float]], level: float, n: int = 2, buffer: float = 0.0010) -> bool:
-    if len(candles) < n:
-        return False
-
-    return all(c["close"] > level * (1 + buffer) for c in candles[-n:])
-
-
-def closes_below(candles: List[Dict[str, float]], level: float, n: int = 2, buffer: float = 0.0010) -> bool:
-    if len(candles) < n:
-        return False
-
-    return all(c["close"] < level * (1 - buffer) for c in candles[-n:])
-
-
-def professional_reject_confirm(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, level: float, ema5: float, vw: float) -> bool:
-    if len(c5) < 4 or len(c15) < 4:
-        return False
-
-    if side == "SHORT":
-        tested = max(x["high"] for x in c15[-6:]) >= level * (1 - LEVEL_CLUSTER_TOL)
-        failed_hold = not closes_above(c15, level, 2, 0.0008)
-        returned = closes_below(c5, level, 2, 0.0005) and c5[-1]["close"] < max(ema5, vw)
-        momentum_down = c5[-1]["close"] < c5[-2]["close"] and candle_body_ok(c5[-1], "SHORT")
-
-        return tested and failed_hold and returned and momentum_down
-
-    tested = min(x["low"] for x in c15[-6:]) <= level * (1 + LEVEL_CLUSTER_TOL)
-    failed_break = not closes_below(c15, level, 2, 0.0008)
-    reclaimed = closes_above(c5, level, 2, 0.0005) and c5[-1]["close"] > min(ema5, vw)
-    momentum_up = c5[-1]["close"] > c5[-2]["close"] and candle_body_ok(c5[-1], "LONG")
-
-    return tested and failed_break and reclaimed and momentum_up
-
-
-def breakout_hold_confirm(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, level: float, ema5: float, vw: float) -> bool:
-    if len(c5) < 4 or len(c15) < 6:
-        return False
-
-    if side == "LONG":
-        accepted = closes_above(c15, level, 2, 0.0010)
-        retest = min(x["low"] for x in c5[-8:]) <= level * (1 + RETEST_TOL)
-        held = c5[-1]["close"] > level and c5[-1]["close"] > min(ema5, vw)
-
-        return accepted and retest and held and two_candle_confirmation(c5, "LONG", ema5, vw)
-
-    accepted = closes_below(c15, level, 2, 0.0010)
-    retest = max(x["high"] for x in c5[-8:]) >= level * (1 - RETEST_TOL)
-    held = c5[-1]["close"] < level and c5[-1]["close"] < max(ema5, vw)
-
-    return accepted and retest and held and two_candle_confirmation(c5, "SHORT", ema5, vw)
-
-
-def build_secondary_intraday_level(c15: List[Dict[str, float]], price: float, kind: str) -> Optional[Dict[str, Any]]:
-    if len(c15) < 60:
-        return None
-
-    if kind == "support":
-        raw = pivot_levels(c15[-80:], "support", 2, 2)
-        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv < price]
-    else:
-        raw = pivot_levels(c15[-80:], "resistance", 2, 2)
-        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv > price]
-
-    if not levels:
-        return None
-
-    lv = sorted(levels, key=lambda x: abs(price - x))[0]
-    q = level_quality(c15, lv, kind, 0.70)
-
-    if q["touches"] < 2 or q["reactions"] < 1:
-        return None
-
-    return {
-        "level": lv,
-        "score": q["score"],
-        "touches": q["touches"],
-        "reactions": q["reactions"],
-        "noise": q["noise"],
-        "distance": abs(price - lv) / price,
-        "secondary": True,
-    }
-
-
-def recent_broken_level(c15: List[Dict[str, float]], price: float, side: str) -> Optional[Dict[str, Any]]:
-    if len(c15) < 70 or price <= 0:
-        return None
-
-    if side == "LONG":
-        raw = pivot_levels(c15[-100:-3], "resistance", 2, 2)
-        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv < price and abs(price - lv) / price <= RETEST_TOL]
-        kind = "resistance"
-    else:
-        raw = pivot_levels(c15[-100:-3], "support", 2, 2)
-        levels = [lv for lv in cluster_levels(raw, LEVEL_CLUSTER_TOL) if lv > price and abs(price - lv) / price <= RETEST_TOL]
-        kind = "support"
-
-    if not levels:
-        return None
-
-    lv = sorted(levels, key=lambda x: abs(price - x))[0]
-    q = level_quality(c15, lv, kind, 0.75)
-
-    if q["touches"] < 2 or q["reactions"] < 1:
-        return None
-
-    return {
-        "level": lv,
-        "score": min(q["score"], 42),
-        "touches": q["touches"],
-        "reactions": q["reactions"],
-        "noise": q["noise"],
-        "distance": abs(price - lv) / price,
-        "secondary": True,
-        "continuation": True,
-    }
-
-
-def calm_momentum_context(c15: List[Dict[str, float]], c1h: List[Dict[str, float]], side: str) -> bool:
-    if len(c15) < 40 or len(c1h) < 40:
-        return False
-
-    ch1h = (c15[-1]["close"] - c15[-4]["close"]) / max(c15[-4]["close"], 1e-12)
-    ch4h = (c15[-1]["close"] - c15[-16]["close"]) / max(c15[-16]["close"], 1e-12)
+def btc_context() -> Dict[str, Any]:
+    c15 = get_klines("BTC-USDT", "15m", 120, cache_seconds=45)
+    c1h = get_klines("BTC-USDT", "1h", 120, cache_seconds=120)
+    if not c15 or not c1h:
+        return {"ok": False, "direction": "UNKNOWN", "text": "BTC data unavailable", "ch1h": 0.0}
+    ch1h = percent_change(c15, 4)
+    ch6h = percent_change(c15, 24)
     t1h = trend_state(c1h)
+    direction = "RANGE"
+    if ch1h < -0.004 or ch6h < -0.018 or t1h == "DOWN":
+        direction = "BEAR"
+    elif ch1h > 0.004 or ch6h > 0.018 or t1h == "UP":
+        direction = "BULL"
+    return {
+        "ok": True,
+        "direction": direction,
+        "ch1h": ch1h,
+        "ch6h": ch6h,
+        "t1h": t1h,
+        "text": f"BTC {direction}: 1h {ch1h*100:+.2f}%, 6h {ch6h*100:+.2f}%, 1H {t1h}",
+    }
 
-    if side == "LONG":
-        return t1h != "DOWN" and ch1h > 0.0015 and ch4h > 0.003 and ch4h < 0.090
-
-    return t1h != "UP" and ch1h < -0.0015 and ch4h < -0.003 and ch4h > -0.090
-
-
-def calm_pullback_confirmation(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, level: float, ema5: float, vw: float) -> bool:
-    if len(c5) < 12 or len(c15) < 8:
-        return False
-
-    if side == "LONG":
-        had_pullback = min(x["low"] for x in c5[-10:]) <= level * (1 + RETEST_TOL)
-        held_level = c5[-1]["close"] > level and c5[-2]["close"] > level * 0.998
-        reclaimed_ma = c5[-1]["close"] > min(ema5, vw) and c5[-1]["close"] > c5[-2]["close"]
-        htf_ok = c15[-1]["close"] >= c15[-2]["close"] or c15[-1]["close"] > level
-
-        return had_pullback and held_level and reclaimed_ma and htf_ok and two_candle_confirmation(c5, "LONG", ema5, vw)
-
-    had_pullback = max(x["high"] for x in c5[-10:]) >= level * (1 - RETEST_TOL)
-    held_level = c5[-1]["close"] < level and c5[-2]["close"] < level * 1.002
-    rejected_ma = c5[-1]["close"] < max(ema5, vw) and c5[-1]["close"] < c5[-2]["close"]
-    htf_ok = c15[-1]["close"] <= c15[-2]["close"] or c15[-1]["close"] < level
-
-    return had_pullback and held_level and rejected_ma and htf_ok and two_candle_confirmation(c5, "SHORT", ema5, vw)
-
+# ============================================================
+# Hot symbol selection
+# ============================================================
 
 def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> bool:
     b = base_asset(symbol)
-
     if any(k in b for k in ULTRA_RISK_KEYWORDS):
         return True
-
-    for c in c5[-20:]:
+    for c in c5[-18:]:
         if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_5M_CANDLE:
             return True
-
-    for c in c15[-12:]:
+    for c in c15[-10:]:
         if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_15M_CANDLE:
             return True
-
     return False
 
 
-def anti_chase_ok(side: str, c15: List[Dict[str, float]], current: float, near_level: bool) -> Tuple[bool, str]:
-    ch6h = percent_change(c15, 24)
-    ch24h = percent_change(c15, min(96, len(c15) - 1))
-
-    recent_high = max(x["high"] for x in c15[-24:])
-    recent_low = min(x["low"] for x in c15[-24:])
-
-    pullback_from_high = (recent_high - current) / recent_high if recent_high else 0
-    bounce_from_low = (current - recent_low) / recent_low if recent_low else 0
-
-    if side == "SHORT" and (ch6h < -BIG_MOVE_6H or ch24h < -BIG_MOVE_24H):
-        if not near_level and bounce_from_low < REQUIRED_PULLBACK_AFTER_BIG_MOVE:
-            return False, f"late SHORT blocked: move6h {ch6h*100:.1f}%, bounce only {bounce_from_low*100:.1f}%"
-
-    if side == "LONG" and (ch6h > BIG_MOVE_6H or ch24h > BIG_MOVE_24H):
-        if not near_level and pullback_from_high < REQUIRED_PULLBACK_AFTER_BIG_MOVE:
-            return False, f"late LONG blocked: move6h {ch6h*100:.1f}%, pullback only {pullback_from_high*100:.1f}%"
-
-    return True, "ok"
+def hot_score(symbol: str) -> Tuple[float, str]:
+    c5 = get_klines(symbol, "5m", 80, cache_seconds=25)
+    c15 = get_klines(symbol, "15m", 80, cache_seconds=35)
+    if not c5 or not c15:
+        return 0.0, "no candles"
+    ch15m = abs(percent_change(c5, 3))
+    ch30m = abs(percent_change(c5, 6))
+    vr = volume_ratio(c15, 24)
+    rr = candle_range_ratio(c5, 20)
+    score = ch15m * 1000 + ch30m * 700 + min(vr, 4.0) * 8 + min(rr, 4.0) * 7
+    if base_asset(symbol) in QUALITY_BASES:
+        score += 8
+    return score, f"15m {ch15m*100:.2f}%, 30m {ch30m*100:.2f}%, vol x{vr:.2f}, range x{rr:.2f}"
 
 
-def calculate_ladder_scalp_trade(symbol: str, side: str, entry: float, level: float, candles: List[Dict[str, float]]) -> Dict[str, Any]:
-    a = atr(candles, 14)
-    buffer = max(entry * 0.0018, a * LADDER_SL_ATR_MULT)
+def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
+    scored: List[Tuple[float, str, str]] = []
+    notes: List[str] = []
+    for sym in symbols[:MAX_ANALYZE_SYMBOLS]:
+        try:
+            sc, note = hot_score(sym)
+            if sc > 0:
+                scored.append((sc, sym, note))
+        except Exception as e:
+            STATE["last_error"] = f"hot_score {sym}: {repr(e)}"
+    scored.sort(reverse=True, key=lambda x: x[0])
+    for sc, sym, note in scored[:8]:
+        notes.append(f"{display_symbol(sym)} hot {sc:.1f}: {note}")
+    selected = [sym for _, sym, _ in scored[:HOT_SYMBOLS_TO_ANALYZE]]
+    # Keep user examples in the rotation when available.
+    for sym in FALLBACK_SYMBOLS:
+        if sym not in selected and sym in symbols:
+            selected.append(sym)
+    return selected[:MAX_ANALYZE_SYMBOLS], notes
+
+# ============================================================
+# Setup logic
+# ============================================================
+
+def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, vol: float) -> Tuple[bool, str, Dict[str, float]]:
+    if len(c1) < 12 or len(c5) < 32 or len(c15) < 24:
+        return False, "not enough candles", {}
+
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    ch3m_1m = percent_change(c1, 3)
+    rr = candle_range_ratio(c5, 20)
+    last = c5[-1]
+    candle_move = (last["high"] - last["low"]) / max(last["open"], 1e-12)
+
+    metrics = {"ch15m": ch15m, "ch30m": ch30m, "ch3m_1m": ch3m_1m, "range_ratio": rr, "candle_move": candle_move, "vol": vol}
+
+    if candle_move > FAST_MAX_SPREAD_PROXY:
+        return False, f"last 5m candle too wide/chase risk {candle_move*100:.2f}%", metrics
 
     if side == "LONG":
-        recent_low = min(x["low"] for x in candles[-10:])
-        sl = min(level, recent_low) - buffer
-        sl = min(sl, entry * 0.992)
-
-        tp1 = entry * (1 + LADDER_TP1_MOVE)
-        tp2 = entry * (1 + LADDER_TP2_MOVE)
-        tp3 = entry * (1 + LADDER_TP3_MOVE)
-        tp4 = entry * (1 + LADDER_TP4_MOVE)
-        tp5 = entry * (1 + LADDER_TP5_MOVE)
+        if ch15m < FAST_MIN_15M_MOVE:
+            return False, f"slow LONG 15m {ch15m*100:.2f}%", metrics
+        if ch30m < FAST_MIN_30M_MOVE:
+            return False, f"slow LONG 30m {ch30m*100:.2f}%", metrics
+        if ch30m > FAST_MAX_30M_MOVE:
+            return False, f"late LONG chase 30m {ch30m*100:.2f}%", metrics
+        if ch3m_1m < FAST_MIN_1M_CONFIRM:
+            return False, f"no 1m acceleration LONG {ch3m_1m*100:.2f}%", metrics
+        if last["close"] <= last["open"]:
+            return False, "last 5m not bullish", metrics
+        if close_location(last) < CLOSE_LOCATION_MIN_LONG:
+            return False, f"LONG close location weak {close_location(last):.2f}", metrics
     else:
-        recent_high = max(x["high"] for x in candles[-10:])
-        sl = max(level, recent_high) + buffer
-        sl = max(sl, entry * 1.008)
+        if ch15m > -FAST_MIN_15M_MOVE:
+            return False, f"slow SHORT 15m {ch15m*100:.2f}%", metrics
+        if ch30m > -FAST_MIN_30M_MOVE:
+            return False, f"slow SHORT 30m {ch30m*100:.2f}%", metrics
+        if ch30m < -FAST_MAX_30M_MOVE:
+            return False, f"late SHORT chase 30m {ch30m*100:.2f}%", metrics
+        if ch3m_1m > -FAST_MIN_1M_CONFIRM:
+            return False, f"no 1m acceleration SHORT {ch3m_1m*100:.2f}%", metrics
+        if last["close"] >= last["open"]:
+            return False, "last 5m not bearish", metrics
+        if close_location(last) > CLOSE_LOCATION_MAX_SHORT:
+            return False, f"SHORT close location weak {close_location(last):.2f}", metrics
 
-        tp1 = entry * (1 - LADDER_TP1_MOVE)
-        tp2 = entry * (1 - LADDER_TP2_MOVE)
-        tp3 = entry * (1 - LADDER_TP3_MOVE)
-        tp4 = entry * (1 - LADDER_TP4_MOVE)
-        tp5 = entry * (1 - LADDER_TP5_MOVE)
+    if rr < FAST_MIN_RANGE_RATIO:
+        return False, f"range expansion weak x{rr:.2f}", metrics
+    if vol < FAST_MIN_VOLUME_RATIO:
+        return False, f"volume weak x{vol:.2f}", metrics
 
-    risk = abs(entry - sl)
-    reward = abs(tp1 - entry)
-    rr = reward / risk if risk > 0 else 0.0
+    return True, f"fast ok: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%, range x{rr:.2f}, vol x{vol:.2f}", metrics
 
-    rewards = [abs(tp1 - entry), abs(tp2 - entry), abs(tp3 - entry), abs(tp4 - entry), abs(tp5 - entry)]
-    weighted_reward = sum(rewards) / len(rewards) if rewards else reward
-    ladder_rr = weighted_reward / risk if risk > 0 else 0.0
-    final_rr = rewards[-1] / risk if risk > 0 and rewards else 0.0
 
-    roi_tp1 = reward / entry * LEVERAGE * 100
-    roi_sl = risk / entry * LEVERAGE * 100
+def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    if not FAST_BURST_ENABLED:
+        return None
+    if len(c1) < 30 or len(c5) < 48 or len(c15) < 40 or len(c1h) < 60:
+        return None
+
+    price = c1[-1]["close"]
+    e5 = ema(closes(c5), 21)
+    e1 = ema(closes(c1), 9)
+    vw5 = vwap(c5, 36)
+    vol = volume_ratio(c15, 24)
+    t1h = trend_state(c1h)
+
+    fast_ok, fast_reason, metrics = fast_context_ok(c1, c5, c15, side, vol)
+    if not fast_ok:
+        return None
+
+    btc_dir = btc.get("direction")
+    btc_ch1h = float(btc.get("ch1h", 0.0))
+    btc_against = (side == "LONG" and btc_dir == "BEAR") or (side == "SHORT" and btc_dir == "BULL")
+    if btc_against and abs(btc_ch1h) >= BTC_STRONG_MOVE_BLOCK:
+        return None
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+
+    if side == "LONG":
+        # Recent impulse high and controlled pullback.
+        recent_high = max(x["high"] for x in c5[-18:])
+        pullback_low = min(x["low"] for x in c5[-10:])
+        pullback = (recent_high - pullback_low) / max(recent_high, 1e-12)
+        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
+            return None
+        if price < e1 or price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER):
+            return None
+        if last5["close"] <= prev5["high"] * 0.998 and last5["close"] <= prev5["close"]:
+            return None
+        if upper_wick_ratio(last5) > 0.48 and close_location(last5) < 0.70:
+            return None
+        level = min(pullback_low, min(x["low"] for x in c1[-12:]))
+        strategy = "PRO_FAST_BURST_LONG"
+        trade_type = "FAST BURST LADDER LONG"
+        reason = (
+            f"FAST LONG: свежий импульс вверх, контролируемый откат {pullback*100:.2f}%, "
+            f"reclaim 1m/5m EMA и VWAP, последняя 5m свеча подтверждает продолжение. {fast_reason}."
+        )
+    else:
+        recent_low = min(x["low"] for x in c5[-18:])
+        bounce_high = max(x["high"] for x in c5[-10:])
+        pullback = (bounce_high - recent_low) / max(recent_low, 1e-12)
+        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
+            return None
+        if price > e1 or price > e5 * (1 - RECLAIM_BUFFER) or price > vw5 * (1 - RECLAIM_BUFFER):
+            return None
+        if last5["close"] >= prev5["low"] * 1.002 and last5["close"] >= prev5["close"]:
+            return None
+        if lower_wick_ratio(last5) > 0.48 and close_location(last5) > 0.30:
+            return None
+        level = max(bounce_high, max(x["high"] for x in c1[-12:]))
+        strategy = "PRO_FAST_BURST_SHORT"
+        trade_type = "FAST BURST LADDER SHORT"
+        reason = (
+            f"FAST SHORT: свежий импульс вниз, контролируемый отскок {pullback*100:.2f}%, "
+            f"reject 1m/5m EMA и VWAP, последняя 5m свеча подтверждает продолжение. {fast_reason}."
+        )
+
+    strong = vol >= 1.35 and metrics.get("range_ratio", 1.0) >= 1.35
+    score = 72
+    score += min(12, int(abs(metrics.get("ch15m", 0)) * 650))
+    score += min(10, int(abs(metrics.get("ch30m", 0)) * 430))
+    score += min(8, int((vol - 1.0) * 8))
+    score += min(8, int((metrics.get("range_ratio", 1.0) - 1.0) * 8))
+    if strong:
+        score += 6
+    if t1h == ("UP" if side == "LONG" else "DOWN"):
+        score += 5
+    if btc_against:
+        score -= 6
+    if base_asset(symbol) in QUALITY_BASES:
+        score += 2
+    score = max(0, min(100, score))
 
     return {
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "tp4": tp4,
-        "tp5": tp5,
-        "rr": rr,
-        "ladder_rr": ladder_rr,
-        "final_rr": final_rr,
-        "roi_tp1": roi_tp1,
-        "roi_sl": roi_sl,
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "trade_type": trade_type,
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol >= 1.25 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": pullback,
+        "volume_ratio": vol,
+        "range_ratio": metrics.get("range_ratio", 1.0),
+        "ch15m": metrics.get("ch15m", 0.0),
+        "ch30m": metrics.get("ch30m", 0.0),
+        "ch3m_1m": metrics.get("ch3m_1m", 0.0),
+        "t1h": t1h,
+        "btc_text": btc.get("text", ""),
     }
 
 
-def calculate_trader_ladder_trade(symbol: str, side: str, entry: float, level: float, candles: List[Dict[str, float]]) -> Dict[str, Any]:
-    a = atr(candles, 14)
-    buffer = max(entry * 0.0022, a * TRADER_LADDER_SL_ATR_MULT)
+def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
+    side = setup["side"]
+    entry = setup["entry"]
+    level = setup["level"]
+    a = atr(c5, 14)
+    buffer = max(entry * 0.0022, a * SL_ATR_MULT)
 
     if side == "LONG":
-        recent_low = min(x["low"] for x in candles[-14:])
+        recent_low = min(x["low"] for x in c1[-15:] + c5[-4:])
         sl = min(level, recent_low) - buffer
-        sl = min(sl, entry * 0.988)
-
-        tp1 = entry * (1 + TRADER_TP1_MOVE)
-        tp2 = entry * (1 + TRADER_TP2_MOVE)
-        tp3 = entry * (1 + TRADER_TP3_MOVE)
-        tp4 = entry * (1 + TRADER_TP4_MOVE)
-        tp5 = entry * (1 + TRADER_TP5_MOVE)
+        sl = min(sl, entry * (1 - MIN_SL_MOVE))
+        tp1 = entry * (1 + TP1_MOVE)
+        tp2 = entry * (1 + TP2_MOVE)
+        tp3 = entry * (1 + TP3_MOVE)
+        tp4 = entry * (1 + TP4_MOVE)
+        tp5 = entry * (1 + TP5_MOVE)
     else:
-        recent_high = max(x["high"] for x in candles[-14:])
+        recent_high = max(x["high"] for x in c1[-15:] + c5[-4:])
         sl = max(level, recent_high) + buffer
-        sl = max(sl, entry * 1.012)
-
-        tp1 = entry * (1 - TRADER_TP1_MOVE)
-        tp2 = entry * (1 - TRADER_TP2_MOVE)
-        tp3 = entry * (1 - TRADER_TP3_MOVE)
-        tp4 = entry * (1 - TRADER_TP4_MOVE)
-        tp5 = entry * (1 - TRADER_TP5_MOVE)
+        sl = max(sl, entry * (1 + MIN_SL_MOVE))
+        tp1 = entry * (1 - TP1_MOVE)
+        tp2 = entry * (1 - TP2_MOVE)
+        tp3 = entry * (1 - TP3_MOVE)
+        tp4 = entry * (1 - TP4_MOVE)
+        tp5 = entry * (1 - TP5_MOVE)
 
     risk = abs(entry - sl)
-    rewards = [abs(tp1 - entry), abs(tp2 - entry), abs(tp3 - entry), abs(tp4 - entry), abs(tp5 - entry)]
+    risk_move = risk / max(entry, 1e-12)
+    if risk_move > MAX_SL_MOVE:
+        return None
 
-    reward_tp1 = rewards[0]
-    rr = reward_tp1 / risk if risk > 0 else 0.0
+    rewards = [abs(tp1 - entry), abs(tp2 - entry), abs(tp3 - entry), abs(tp4 - entry), abs(tp5 - entry)]
+    rr = rewards[0] / risk if risk > 0 else 0.0
     ladder_rr = (sum(rewards) / len(rewards)) / risk if risk > 0 else 0.0
     final_rr = rewards[-1] / risk if risk > 0 else 0.0
-
-    roi_tp1 = reward_tp1 / entry * LEVERAGE * 100
+    roi_tp1 = rewards[0] / entry * LEVERAGE * 100
     roi_sl = risk / entry * LEVERAGE * 100
 
     return {
-        "entry": entry,
+        **setup,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -1044,1055 +739,131 @@ def calculate_trader_ladder_trade(symbol: str, side: str, entry: float, level: f
         "final_rr": final_rr,
         "roi_tp1": roi_tp1,
         "roi_sl": roi_sl,
+        "risk_mult": A_RISK_MULT if setup["grade"] == "A+" else FAST_RISK_MULT,
+        "created_at": now_ts(),
+        "status": "active",
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "tp4_hit": False,
+        "tp5_hit": False,
     }
 
 
-def ladder_scalp_setup(c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], side: str, ema5: float, vw: float) -> Optional[Dict[str, Any]]:
-    if not LADDER_SCALP_ENABLED or len(c5) < 36 or len(c15) < 32 or len(c1h) < 40:
-        return None
-
-    price = c5[-1]["close"]
-    ch1h = (c15[-1]["close"] - c15[-5]["close"]) / max(c15[-5]["close"], 1e-12)
-    ch2h = (c15[-1]["close"] - c15[-9]["close"]) / max(c15[-9]["close"], 1e-12)
-    t1h = trend_state(c1h)
-
-    if side == "LONG":
-        if t1h == "DOWN" and ch1h < LADDER_MIN_1H_MOVE:
-            return None
-
-        if ch1h < LADDER_MIN_1H_MOVE or ch1h > LADDER_MAX_1H_MOVE or ch2h > 0.075:
-            return None
-
-        high = max(x["high"] for x in c5[-24:])
-        low = min(x["low"] for x in c5[-16:])
-        pullback = (high - low) / max(high, 1e-12)
-
-        if pullback < LADDER_PULLBACK_MIN or pullback > LADDER_PULLBACK_MAX:
-            return None
-
-        if not (c5[-1]["close"] > ema5 and c5[-1]["close"] > vw and c5[-1]["close"] > c5[-2]["high"] * 0.999):
-            return None
-
-        if c5[-1]["close"] < c5[-1]["open"] and c5[-2]["close"] < c5[-2]["open"]:
-            return None
-
-        if upper_wick_ratio(c5[-1]) > 0.55 and c5[-1]["close"] < c5[-1]["high"] * 0.997:
-            return None
-
-        if c15[-1]["close"] < c15[-2]["close"] and c15[-1]["close"] < ema(closes(c15), 21):
-            return None
-
-        level = max(low, min(x["close"] for x in c5[-10:]))
-
-        return {
-            "level": level,
-            "score": 36,
-            "touches": 2,
-            "reactions": 1,
-            "noise": False,
-            "distance": abs(price - level) / price,
-            "secondary": True,
-            "scalp": True,
-            "pullback": pullback,
-            "ch1h": ch1h,
-        }
-
-    if t1h == "UP" and ch1h > -LADDER_MIN_1H_MOVE:
-        return None
-
-    if ch1h > -LADDER_MIN_1H_MOVE or ch1h < -LADDER_MAX_1H_MOVE or ch2h < -0.075:
-        return None
-
-    high = max(x["high"] for x in c5[-16:])
-    low = min(x["low"] for x in c5[-24:])
-    bounce = (high - low) / max(low, 1e-12)
-
-    if bounce < LADDER_PULLBACK_MIN or bounce > LADDER_PULLBACK_MAX:
-        return None
-
-    if not (c5[-1]["close"] < ema5 and c5[-1]["close"] < vw and c5[-1]["close"] < c5[-2]["low"] * 1.001):
-        return None
-
-    if c5[-1]["close"] > c5[-1]["open"] and c5[-2]["close"] > c5[-2]["open"]:
-        return None
-
-    if lower_wick_ratio(c5[-1]) > 0.55 and c5[-1]["close"] > c5[-1]["low"] * 1.003:
-        return None
-
-    if c15[-1]["close"] > c15[-2]["close"] and c15[-1]["close"] > ema(closes(c15), 21):
-        return None
-
-    level = min(high, max(x["close"] for x in c5[-10:]))
-
-    return {
-        "level": level,
-        "score": 36,
-        "touches": 2,
-        "reactions": 1,
-        "noise": False,
-        "distance": abs(price - level) / price,
-        "secondary": True,
-        "scalp": True,
-        "pullback": bounce,
-        "ch1h": ch1h,
-    }
-
-
-def trader_ladder_setup(
-    symbol: str,
-    c5: List[Dict[str, float]],
-    c15: List[Dict[str, float]],
-    c1h: List[Dict[str, float]],
-    side: str,
-    ema5: float,
-    vw: float
-) -> Optional[Dict[str, Any]]:
-    if not TRADER_LADDER_ENABLED:
-        return None
-
-    if len(c5) < 48 or len(c15) < 40 or len(c1h) < 40:
-        return None
-
-    price = c5[-1]["close"]
-    ch1h = (c15[-1]["close"] - c15[-5]["close"]) / max(c15[-5]["close"], 1e-12)
-    ch2h = (c15[-1]["close"] - c15[-9]["close"]) / max(c15[-9]["close"], 1e-12)
-    t1h = trend_state(c1h)
-
-    last = c5[-1]
-    prev = c5[-2]
-
-    if side == "SHORT":
-        if ch1h > -TRADER_LADDER_MIN_1H_MOVE:
-            return None
-
-        if ch1h < -TRADER_LADDER_MAX_1H_MOVE or ch2h < -0.10:
-            return None
-
-        if t1h == "UP" and ch1h > -0.018:
-            return None
-
-        recent_low = min(x["low"] for x in c5[-24:])
-        recent_high_after_low = max(x["high"] for x in c5[-14:])
-        bounce = (recent_high_after_low - recent_low) / max(recent_low, 1e-12)
-
-        if bounce < TRADER_LADDER_PULLBACK_MIN or bounce > TRADER_LADDER_PULLBACK_MAX:
-            return None
-
-        if not (price < ema5 and price < vw):
-            return None
-
-        if not (last["close"] < prev["low"] * 1.001 or last["close"] < prev["close"]):
-            return None
-
-        if last["close"] > last["open"] and prev["close"] > prev["open"]:
-            return None
-
-        if lower_wick_ratio(last) > 0.58 and last["close"] > last["low"] * 1.004:
-            return None
-
-        if c15[-1]["close"] > c15[-2]["close"] and c15[-1]["close"] > ema(closes(c15), 21):
-            return None
-
-        level = max(recent_high_after_low, max(x["close"] for x in c5[-10:]))
-
-        return {
-            "level": level,
-            "score": 42,
-            "touches": 2,
-            "reactions": 1,
-            "noise": False,
-            "distance": abs(price - level) / price,
-            "secondary": True,
-            "trader_ladder": True,
-            "pullback": bounce,
-            "ch1h": ch1h,
-        }
-
-    if side == "LONG":
-        if ch1h < TRADER_LADDER_MIN_1H_MOVE:
-            return None
-
-        if ch1h > TRADER_LADDER_MAX_1H_MOVE or ch2h > 0.10:
-            return None
-
-        if t1h == "DOWN" and ch1h < 0.018:
-            return None
-
-        recent_high = max(x["high"] for x in c5[-24:])
-        recent_low_after_high = min(x["low"] for x in c5[-14:])
-        pullback = (recent_high - recent_low_after_high) / max(recent_high, 1e-12)
-
-        if pullback < TRADER_LADDER_PULLBACK_MIN or pullback > TRADER_LADDER_PULLBACK_MAX:
-            return None
-
-        if not (price > ema5 and price > vw):
-            return None
-
-        if not (last["close"] > prev["high"] * 0.999 or last["close"] > prev["close"]):
-            return None
-
-        if last["close"] < last["open"] and prev["close"] < prev["open"]:
-            return None
-
-        if upper_wick_ratio(last) > 0.58 and last["close"] < last["high"] * 0.996:
-            return None
-
-        if c15[-1]["close"] < c15[-2]["close"] and c15[-1]["close"] < ema(closes(c15), 21):
-            return None
-
-        level = min(recent_low_after_high, min(x["close"] for x in c5[-10:]))
-
-        return {
-            "level": level,
-            "score": 42,
-            "touches": 2,
-            "reactions": 1,
-            "noise": False,
-            "distance": abs(price - level) / price,
-            "secondary": True,
-            "trader_ladder": True,
-            "pullback": pullback,
-            "ch1h": ch1h,
-        }
-
-    return None
-
-
-def calculate_trade(symbol: str, side: str, entry: float, level: float, opposite: Optional[Dict[str, Any]], candles: List[Dict[str, float]]) -> Dict[str, float]:
-    a = atr(candles, 14)
-    buffer = max(entry * 0.0025, a * 0.45)
-
-    if side == "LONG":
-        recent_low = min(x["low"] for x in candles[-12:])
-        sl = min(level, recent_low) - buffer
-        min_tp1 = entry * (1 + MIN_TP1_PRICE_MOVE * 1.05)
-        structural = opposite["level"] if opposite else entry * 1.025
-        tp1 = max(min_tp1, min(structural, entry * 1.032))
-
-        if tp1 <= entry:
-            tp1 = min_tp1
-
-        tp2 = entry + (tp1 - entry) * 1.8
-        tp3 = entry + (tp1 - entry) * 2.8
-    else:
-        recent_high = max(x["high"] for x in candles[-12:])
-        sl = max(level, recent_high) + buffer
-        min_tp1 = entry * (1 - MIN_TP1_PRICE_MOVE * 1.05)
-        structural = opposite["level"] if opposite else entry * 0.975
-        tp1 = min(min_tp1, max(structural, entry * 0.968))
-
-        if tp1 >= entry:
-            tp1 = min_tp1
-
-        tp2 = entry - (entry - tp1) * 1.8
-        tp3 = entry - (entry - tp1) * 2.8
-
-    risk = abs(entry - sl)
-    reward = abs(tp1 - entry)
-    rr = reward / risk if risk > 0 else 0.0
-    roi_tp1 = reward / entry * LEVERAGE * 100
-    roi_sl = risk / entry * LEVERAGE * 100
-
-    return {
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rr": rr,
-        "roi_tp1": roi_tp1,
-        "roi_sl": roi_sl,
-    }
-
-
-def score_signal(
-    side: str,
-    strategy: str,
-    trade_type: str,
-    level: Dict[str, Any],
-    btc: Dict[str, Any],
-    t1h: str,
-    t4h: str,
-    vol: float,
-    rr: float,
-    dist: float,
-    strong_reversal: bool
-) -> Tuple[int, List[str]]:
-    score = 45
-    notes = []
-
-    touches_eff = min(level.get("touches", 0), MAX_TOUCHES_EFFECTIVE)
-    reactions_eff = min(level.get("reactions", 0), 6)
-
-    score += touches_eff * 3 + reactions_eff * 5
-
-    if level.get("noise"):
-        score -= 8
-        notes.append("level noisy/excessive touches")
-
-    if dist <= 0.004:
-        score += 10
-    elif dist <= LEVEL_NEAR_TOL:
-        score += 6
-    else:
-        score -= 4
-
-    btc_dir = btc.get("direction")
-
-    if side == "LONG":
-        if btc_dir == "BULL":
-            score += 10
-        elif btc_dir == "RANGE":
-            score += 3
-        elif btc_dir == "BEAR":
-            score -= 14
-            notes.append("BTC bearish vs LONG")
-    else:
-        if btc_dir == "BEAR":
-            score += 10
-        elif btc_dir == "RANGE":
-            score += 3
-        elif btc_dir == "BULL":
-            score -= 14
-            notes.append("BTC bullish vs SHORT")
-
-    against_1h = (side == "LONG" and t1h == "DOWN") or (side == "SHORT" and t1h == "UP")
-    against_4h = (side == "LONG" and t4h == "DOWN") or (side == "SHORT" and t4h == "UP")
-    with_1h = (side == "LONG" and t1h == "UP") or (side == "SHORT" and t1h == "DOWN")
-    with_4h = (side == "LONG" and t4h == "UP") or (side == "SHORT" and t4h == "DOWN")
-
-    if with_1h:
-        score += 8
-
-    if with_4h:
-        score += 8
-
-    if against_1h:
-        score -= 10
-        notes.append("1H против")
-
-    if against_4h:
-        score -= 8
-        notes.append("4H против")
-
-    if strong_reversal:
-        score += 10
-        notes.append("strong reclaim/reject")
-
-    if vol >= 1.25:
-        score += 8
-    elif vol >= 0.95:
-        score += 4
-    elif vol < VERY_LOW_VOLUME:
-        score -= 12
-        notes.append(f"very low volume x{vol:.2f}")
-    elif vol < MIN_VOLUME_B:
-        score -= 6
-        notes.append(f"low volume x{vol:.2f}")
-
-    if rr >= 1.25:
-        score += 8
-    elif rr >= 1.0:
-        score += 5
-    elif rr >= 0.75:
-        score += 1
-    else:
-        score -= 8
-        notes.append(f"weak RR {rr:.2f}")
-
-    cap = 100
-
-    if vol < VERY_LOW_VOLUME:
-        cap = min(cap, LOW_VOLUME_CAP)
-
-    if rr < 0.85:
-        cap = min(cap, 82)
-
-    if against_1h and not strong_reversal:
-        cap = min(cap, 82)
-
-    if against_4h and not strong_reversal:
-        cap = min(cap, 80)
-
-    if level.get("touches", 0) > 16:
-        cap = min(cap, 84)
-
-    if level.get("secondary"):
-        if strategy in ("PRO_TRADER_LADDER_LONG", "PRO_TRADER_LADDER_SHORT"):
-            cap = min(cap, 92)
-        else:
-            cap = min(cap, 86)
-
-    if btc.get("direction") == "BEAR" and side == "LONG" and not strong_reversal:
-        cap = min(cap, 80)
-
-    if btc.get("direction") == "BULL" and side == "SHORT" and not strong_reversal:
-        cap = min(cap, 80)
-
-    return max(0, min(int(score), cap)), notes
-
-
-def item_wr(item: Dict[str, int]) -> Tuple[int, float]:
-    p = int(item.get("profit", 0))
-    sl = int(item.get("sl", 0))
-    total = p + sl
-    wr = (p / total * 100.0) if total else 0.0
-
-    return total, wr
-
-
-def adaptive_stats_gate(strategy: str, side: str, trade_type: str) -> Tuple[bool, str]:
-    if not ADAPTIVE_BLOCK_ENABLED:
-        return True, "ok"
-
-    stats = STATE.setdefault("stats", default_state()["stats"])
-
-    checks = [
-        ("strategy", strategy),
-        ("strategy_side", f"{strategy}:{side}"),
-        ("type", trade_type),
-        ("side", side),
-    ]
-
-    for bucket, key in checks:
-        item = stats.get(bucket, {}).get(key, {})
-        closed, wr = item_wr(item)
-
-        min_trades = max(6, ADAPTIVE_MIN_TRADES) if bucket == "side" else ADAPTIVE_MIN_TRADES
-
-        if strategy in ("PRO_TRADER_LADDER_LONG", "PRO_TRADER_LADDER_SHORT"):
-            min_trades = max(8, min_trades)
-
-        if closed >= min_trades and wr < ADAPTIVE_MIN_WR:
-            return False, f"adaptive block {bucket}:{key} WR {wr:.1f}% after {closed}"
-
-    return True, "ok"
-
-
-def grade_stats_gate(grade: str, strategy: str, side: str, trade_type: str) -> Tuple[bool, str]:
-    if not ADAPTIVE_BLOCK_ENABLED:
-        return True, "ok"
-
-    stats = STATE.setdefault("stats", default_state()["stats"])
-    is_trader_ladder = strategy in ("PRO_TRADER_LADDER_LONG", "PRO_TRADER_LADDER_SHORT")
-
-    if grade == "B" and not is_trader_ladder:
-        b_item = stats.get("grade", {}).get("B", {})
-        closed, wr = item_wr(b_item)
-
-        if closed >= GLOBAL_B_MIN_TRADES and wr < GLOBAL_B_MIN_WR:
-            return False, f"B class blocked: WR {wr:.1f}% after {closed}"
-
-        if strategy in ("PRO_CALM_BREAKOUT_PULLBACK_LONG", "PRO_CALM_BREAKDOWN_PULLBACK_SHORT"):
-            return False, f"{strategy} allowed only as A+"
-
-    checks = [
-        ("type", trade_type, WEAK_TYPE_MIN_WR),
-        ("strategy_side", f"{strategy}:{side}", ADAPTIVE_MIN_WR),
-        ("strategy", strategy, ADAPTIVE_MIN_WR),
-    ]
-
-    for bucket, key, threshold in checks:
-        item = stats.get(bucket, {}).get(key, {})
-        closed, wr = item_wr(item)
-
-        min_trades = max(8, ADAPTIVE_MIN_TRADES) if is_trader_ladder else ADAPTIVE_MIN_TRADES
-
-        if closed >= min_trades and wr < threshold:
-            return False, f"stat block {bucket}:{key} WR {wr:.1f}% after {closed}"
-
-    return True, "ok"
-
-
-def micro_structure_ok(c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str) -> bool:
-    if len(c5) < 5 or len(c15) < 3:
-        return False
-
-    a, b = c5[-2], c5[-1]
-    last15 = c15[-1]
-
-    if side == "LONG":
-        if b["close"] <= a["close"]:
-            return False
-
-        if b["low"] < min(x["low"] for x in c5[-4:-1]) and b["close"] < (b["high"] + b["low"]) / 2:
-            return False
-
-        if last15["close"] < last15["open"] and (last15["open"] - last15["close"]) > (last15["high"] - last15["low"]) * 0.45:
-            return False
-
-        return True
-
-    if b["close"] >= a["close"]:
-        return False
-
-    if b["high"] > max(x["high"] for x in c5[-4:-1]) and b["close"] > (b["high"] + b["low"]) / 2:
-        return False
-
-    if last15["close"] > last15["open"] and (last15["close"] - last15["open"]) > (last15["high"] - last15["low"]) * 0.45:
-        return False
-
-    return True
-
-
-def htf_professional_gate(strategy: str, side: str, btc: Dict[str, Any], t1h: str, t4h: str, vol: float, rr: float, strong: bool) -> Tuple[bool, str]:
-    btc_dir = btc.get("direction")
-
-    is_trader_ladder = strategy in ("PRO_TRADER_LADDER_LONG", "PRO_TRADER_LADDER_SHORT")
-
-    if is_trader_ladder:
-        if side == "LONG":
-            if btc_dir == "BEAR" and not strong:
-                return False, "BTC bearish vs trader ladder LONG"
-            if t1h == "DOWN" and not (strong and vol >= 1.00):
-                return False, "1H DOWN: trader ladder LONG needs strong reclaim"
-        else:
-            if btc_dir == "BULL" and not strong:
-                return False, "BTC bullish vs trader ladder SHORT"
-            if t1h == "UP" and not (strong and vol >= 1.00):
-                return False, "1H UP: trader ladder SHORT needs strong reject"
-
-        return True, "ok"
-
-    if side == "LONG":
-        if btc_dir == "BEAR" and not strong:
-            return False, "BTC bearish vs LONG"
-
-        if t1h == "DOWN" and not (strong and vol >= 1.15 and rr >= 1.05):
-            return False, "1H DOWN: LONG needs strong reclaim + volume + RR"
-
-        if t4h == "DOWN" and not (strong and vol >= 1.20 and rr >= 1.10):
-            return False, "4H DOWN: LONG blocked unless very strong reclaim"
-
-    else:
-        if btc_dir == "BULL" and not strong:
-            return False, "BTC bullish vs SHORT"
-
-        if t1h == "UP" and not (strong and vol >= 1.15 and rr >= 1.05):
-            return False, "1H UP: SHORT needs strong reject + volume + RR"
-
-        if t4h == "UP" and not (strong and vol >= 1.20 and rr >= 1.10):
-            return False, "4H UP: SHORT blocked unless very strong reject"
-
-    return True, "ok"
-
-
-def cooldown_ok(symbol: str, strategy: str, side: str = "") -> Tuple[bool, str]:
+def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
     t = now_ts()
-
     if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
         return False, "pair cooldown"
-
     if t < STATE.setdefault("strategy_cooldown", {}).get(strategy, 0):
         return False, "strategy cooldown"
-
-    hb = STATE.setdefault("hard_block_until", {})
-
-    if t < hb.get(strategy, 0):
-        return False, "strategy hard block"
-
-    if side and t < hb.get(f"{strategy}:{side}", 0):
-        return False, "strategy-side hard block"
-
     return True, "ok"
 
 
 def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], near_miss: List[str]) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
+    c1 = get_klines(symbol, "1m", 120, cache_seconds=6)
+    c5 = get_klines(symbol, "5m", 120, cache_seconds=15)
+    c15 = get_klines(symbol, "15m", 120, cache_seconds=30)
+    c1h = get_klines(symbol, "1h", 120, cache_seconds=90)
 
-    c15 = get_klines(symbol, "15m", 180)
-    if not c15:
-        blocks["no_klines_15m"] = blocks.get("no_klines_15m", 0) + 1
-        return None
-
-    c5 = get_klines(symbol, "5m", 160)
-    if not c5:
-        blocks["no_klines_5m"] = blocks.get("no_klines_5m", 0) + 1
-        return None
-
-    c1h = get_klines(symbol, "1h", 180)
-    c4h = get_klines(symbol, "4h", 120)
-
-    if not c1h or not c4h:
-        blocks["no_htf"] = blocks.get("no_htf", 0) + 1
+    if not c1 or not c5 or not c15 or not c1h:
+        blocks["no_candles"] = blocks.get("no_candles", 0) + 1
         return None
 
     if ultra_risk_symbol(symbol, c5, c15):
         blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
         return None
 
-    price = c5[-1]["close"]
-    e5 = ema(closes(c5), 21)
-    vw = vwap(c5, 48)
-    vol = volume_ratio(c15, 30)
-    t1h = trend_state(c1h)
-    t4h = trend_state(c4h)
-
-    lv = verified_levels(c1h, c4h)
-    support = lv.get("support")
-    resistance = lv.get("resistance")
-
     candidates: List[Dict[str, Any]] = []
+    for side in ("LONG", "SHORT"):
+        setup = fast_burst_setup(symbol, c1, c5, c15, c1h, btc, side)
+        if not setup:
+            blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
+            continue
 
-    def add_candidate(
-        side: str,
-        strategy: str,
-        trade_type: str,
-        level: Dict[str, Any],
-        opposite: Optional[Dict[str, Any]],
-        reason: str,
-        strong: bool
-    ) -> None:
-        if not level:
-            return
-
-        dist = abs(price - level["level"]) / price
-
-        is_trader_ladder = strategy in ("PRO_TRADER_LADDER_LONG", "PRO_TRADER_LADDER_SHORT")
-
-        if not is_trader_ladder and dist > max(LEVEL_NEAR_TOL, RETEST_TOL):
-            blocks["level_distance_block"] = blocks.get("level_distance_block", 0) + 1
-            return
-
-        if not is_trader_ladder:
-            min_touches = MIN_LEVEL_TOUCHES_A if strong else MIN_LEVEL_TOUCHES_B
-            min_reacts = MIN_REACTIONS_A if strong else MIN_REACTIONS_B
-
-            if level.get("touches", 0) < min_touches or level.get("reactions", 0) < min_reacts:
-                blocks["weak_level_block"] = blocks.get("weak_level_block", 0) + 1
-                return
-
-            if REQUIRE_15M_CONFIRM and not htf_confirm(c15, side, level["level"]):
-                blocks["confirm_15m_block"] = blocks.get("confirm_15m_block", 0) + 1
-                return
-
-            if not two_candle_confirmation(c5, side, e5, vw):
-                blocks["confirm_5m_block"] = blocks.get("confirm_5m_block", 0) + 1
-                return
-
-        ok, chase_reason = anti_chase_ok(side, c15, price, dist <= RETEST_TOL)
-        if not ok:
-            blocks["anti_chase_block"] = blocks.get("anti_chase_block", 0) + 1
-            return
-
-        co, co_reason = cooldown_ok(symbol, strategy, side)
+        co, reason = cooldown_ok(symbol, setup["strategy"])
         if not co:
             blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
-            return
+            continue
 
-        if is_trader_ladder:
-            tr = calculate_trader_ladder_trade(symbol, side, price, level["level"], c15)
-        elif strategy in SCALP_STRATEGIES:
-            tr = calculate_ladder_scalp_trade(symbol, side, price, level["level"], c15)
-        else:
-            tr = calculate_trade(symbol, side, price, level["level"], opposite, c15)
-
-        if is_trader_ladder:
-            if tr["roi_tp1"] < 6.0:
-                blocks["tp1_roi_block"] = blocks.get("tp1_roi_block", 0) + 1
-                return
-        else:
-            if tr["roi_tp1"] < MIN_TP1_ROI_X10:
-                blocks["tp1_roi_block"] = blocks.get("tp1_roi_block", 0) + 1
-                return
-
-        if not micro_structure_ok(c5, c15, side):
-            blocks["micro_structure_block"] = blocks.get("micro_structure_block", 0) + 1
-            return
-
-        rr_for_grade = tr.get("ladder_rr", tr["rr"]) if strategy in SCALP_STRATEGIES else tr["rr"]
-
-        htf_ok, htf_reason = htf_professional_gate(strategy, side, btc, t1h, t4h, vol, rr_for_grade, strong)
-        if not htf_ok:
-            blocks["htf_professional_block"] = blocks.get("htf_professional_block", 0) + 1
+        trade = calculate_fast_trade(setup, c1, c5)
+        if not trade:
+            blocks["sl_too_far_block"] = blocks.get("sl_too_far_block", 0) + 1
             if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: {htf_reason}")
-            return
+                near_miss.append(f"{display_symbol(symbol)} {side}: SL too far")
+            continue
 
-        gate_ok, gate_reason = adaptive_stats_gate(strategy, side, trade_type)
-        if not gate_ok:
-            blocks["adaptive_stats_block"] = blocks.get("adaptive_stats_block", 0) + 1
+        if trade["score"] < B_MIN_SCORE:
+            blocks["score_block"] = blocks.get("score_block", 0) + 1
             if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: {gate_reason}")
-            return
+                near_miss.append(f"{display_symbol(symbol)} {side}: score {trade['score']}, vol x{trade['volume_ratio']:.2f}, range x{trade['range_ratio']:.2f}")
+            continue
 
-        if side == "LONG" and not is_trader_ladder:
-            if LONG_NEEDS_HTF_NOT_DOWN and t1h == "DOWN" and btc.get("direction") != "BULL":
-                blocks["long_1h_down_block"] = blocks.get("long_1h_down_block", 0) + 1
-                return
-
-            if vol < LONG_MIN_VOLUME:
-                blocks["long_volume_block"] = blocks.get("long_volume_block", 0) + 1
-                return
-
-            if tr["rr"] < LONG_MIN_RR:
-                blocks["long_rr_block"] = blocks.get("long_rr_block", 0) + 1
-                return
-
-        if strategy == "PRO_CALM_BREAKOUT_PULLBACK_LONG":
-            if t1h != "UP" or btc.get("direction") == "BEAR" or vol < CALM_LONG_MIN_VOLUME or tr["rr"] < CALM_LONG_MIN_RR:
-                blocks["calm_long_quality_block"] = blocks.get("calm_long_quality_block", 0) + 1
-                return
-
-        if strategy == "PRO_CALM_BREAKDOWN_PULLBACK_SHORT":
-            if t1h != "DOWN" or btc.get("direction") == "BULL" or vol < CALM_SHORT_MIN_VOLUME or tr["rr"] < CALM_SHORT_MIN_RR:
-                blocks["calm_short_quality_block"] = blocks.get("calm_short_quality_block", 0) + 1
-                return
-
-        if is_trader_ladder:
-            if vol < TRADER_LADDER_MIN_VOLUME:
-                blocks["trader_ladder_volume_block"] = blocks.get("trader_ladder_volume_block", 0) + 1
-                return
-
-            if tr.get("final_rr", 0) < 0.90 or tr.get("ladder_rr", 0) < 0.45:
-                blocks["trader_ladder_rr_block"] = blocks.get("trader_ladder_rr_block", 0) + 1
-                return
-
-        elif strategy in SCALP_STRATEGIES:
-            if vol < LADDER_MIN_VOLUME or rr_for_grade < LADDER_MIN_RR or tr.get("final_rr", rr_for_grade) < LADDER_MIN_FINAL_RR:
-                blocks["ladder_scalp_quality_block"] = blocks.get("ladder_scalp_quality_block", 0) + 1
-                return
-
-        score, notes = score_signal(side, strategy, trade_type, level, btc, t1h, t4h, vol, rr_for_grade, dist, strong)
-
-        if is_trader_ladder:
-            score += 10
-            notes.append("trader-style ladder setup")
-
-            if vol < TRADER_LADDER_A_VOLUME:
-                score = min(score, 87)
-
-            if tr.get("ladder_rr", 0) < 0.65:
-                score = min(score, 86)
-
-        elif strategy in SCALP_STRATEGIES:
-            score += 8
-            notes.append("ladder scalp setup")
-
-            if vol < LADDER_A_VOLUME:
-                score = min(score, 86)
-
-            if tr["rr"] < 1.0:
-                score = min(score, 86)
-
-        grade = None
-
-        if score >= A_PLUS_MIN_SCORE and rr_for_grade >= MIN_RR_A and vol >= MIN_VOLUME_A:
-            grade = "A+"
-        elif score >= B_MIN_SCORE and rr_for_grade >= MIN_RR_B and vol >= MIN_VOLUME_B:
-            if CALM_BREAKOUT_LONG_A_ONLY and strategy == "PRO_CALM_BREAKOUT_PULLBACK_LONG":
-                blocks["calm_long_b_forbidden"] = blocks.get("calm_long_b_forbidden", 0) + 1
-                return
-
-            if CALM_BREAKDOWN_SHORT_A_ONLY and strategy == "PRO_CALM_BREAKDOWN_PULLBACK_SHORT":
-                blocks["calm_short_b_forbidden"] = blocks.get("calm_short_b_forbidden", 0) + 1
-                return
-
-            grade = "B"
-        else:
-            blocks["score_rr_volume_block"] = blocks.get("score_rr_volume_block", 0) + 1
-
+        # Professional gate: if TP5 cannot compensate structure risk, skip.
+        if trade["final_rr"] < 0.70 or trade["ladder_rr"] < 0.35:
+            blocks["weak_ladder_rr_block"] = blocks.get("weak_ladder_rr_block", 0) + 1
             if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: score {score}, RR {tr['rr']:.2f}, ladderRR {tr.get('ladder_rr', 0):.2f}, vol x{vol:.2f}")
+                near_miss.append(f"{display_symbol(symbol)} {side}: ladderRR {trade['ladder_rr']:.2f}, finalRR {trade['final_rr']:.2f}")
+            continue
 
-            return
-
-        g_ok, g_reason = grade_stats_gate(grade, strategy, side, trade_type)
-        if not g_ok:
-            blocks["grade_stats_block"] = blocks.get("grade_stats_block", 0) + 1
-
-            if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side} {strategy}: {g_reason}")
-
-            return
-
-        if is_trader_ladder:
-            risk_mult = TRADER_LADDER_RISK_MULT
-        elif strategy in SCALP_STRATEGIES:
-            risk_mult = LADDER_RISK_MULT
-        else:
-            risk_mult = A_RISK_MULT if grade == "A+" else B_RISK_MULT
-
-        if tr["roi_sl"] > 20:
-            risk_mult = min(risk_mult, FAR_SL_RISK_MULT)
-
-        candidates.append({
-            "symbol": symbol,
-            "side": side,
-            "grade": grade,
-            "score": score,
-            "strategy": strategy,
-            "trade_type": trade_type,
-            "entry": tr["entry"],
-            "tp1": tr["tp1"],
-            "tp2": tr["tp2"],
-            "tp3": tr["tp3"],
-            "tp4": tr.get("tp4"),
-            "tp5": tr.get("tp5"),
-            "sl": tr["sl"],
-            "rr": tr["rr"],
-            "ladder_rr": tr.get("ladder_rr"),
-            "final_rr": tr.get("final_rr"),
-            "roi_tp1": tr["roi_tp1"],
-            "roi_sl": tr["roi_sl"],
-            "risk_mult": risk_mult,
-            "level": level["level"],
-            "level_touches": level.get("touches", 0),
-            "level_reactions": level.get("reactions", 0),
-            "support": support["level"] if support else None,
-            "resistance": resistance["level"] if resistance else None,
-            "btc_text": btc.get("text", ""),
-            "t1h": t1h,
-            "t4h": t4h,
-            "volume_ratio": vol,
-            "reason": reason,
-            "notes": notes,
-            "created_at": now_ts(),
-            "status": "active",
-            "tp1_hit": False,
-            "tp2_hit": False,
-            "tp3_hit": False,
-            "tp4_hit": False,
-            "tp5_hit": False,
-        })
-
-    if not support:
-        support = build_secondary_intraday_level(c15, price, "support")
-        if support:
-            blocks["secondary_support_used"] = blocks.get("secondary_support_used", 0) + 1
-
-    if not resistance:
-        resistance = build_secondary_intraday_level(c15, price, "resistance")
-        if resistance:
-            blocks["secondary_resistance_used"] = blocks.get("secondary_resistance_used", 0) + 1
-
-    resistance_accepted_above = bool(resistance and closes_above(c15, resistance["level"], 2, 0.0010))
-    support_accepted_below = bool(support and closes_below(c15, support["level"], 2, 0.0010))
-
-    if support:
-        s = support["level"]
-
-        if support_accepted_below:
-            blocks["support_broken_no_long"] = blocks.get("support_broken_no_long", 0) + 1
-        elif professional_reject_confirm(c5, c15, "LONG", s, e5, vw):
-            strong = vol >= 0.90 and (t1h != "DOWN" or btc.get("direction") != "BEAR")
-
-            add_candidate(
-                "LONG",
-                "PRO_SUPPORT_RECLAIM_CONFIRMED",
-                "SUPPORT RECLAIM LONG",
-                support,
-                resistance,
-                f"Поддержка {s:.8g}: цена сделала тест/вынос и ДВЕ 5m свечи вернулись выше уровня. Это подтверждённый reclaim, не ранний вход.",
-                strong,
-            )
-
-    if resistance:
-        r = resistance["level"]
-
-        if resistance_accepted_above:
-            blocks["resistance_broken_no_short"] = blocks.get("resistance_broken_no_short", 0) + 1
-        elif professional_reject_confirm(c5, c15, "SHORT", r, e5, vw):
-            strong = vol >= 0.90 and (t1h != "UP" or btc.get("direction") != "BULL")
-
-            add_candidate(
-                "SHORT",
-                "PRO_RESISTANCE_REJECT_CONFIRMED",
-                "RESISTANCE REJECT SHORT",
-                resistance,
-                support,
-                f"Сопротивление {r:.8g}: цена не закрепилась выше, две 5m свечи вернулись ниже уровня и продавец подтвердил reject.",
-                strong,
-            )
-
-    if support:
-        s = support["level"]
-
-        if breakout_hold_confirm(c5, c15, "SHORT", s, e5, vw):
-            add_candidate(
-                "SHORT",
-                "PRO_SUPPORT_BREAK_RETEST_CONFIRMED",
-                "SUPPORT FAILED / RETEST SHORT",
-                support,
-                None,
-                f"Поддержка {s:.8g} принята ниже: цена закрепилась под уровнем, retest снизу не вернул уровень. SHORT по подтверждённому break-retest.",
-                vol >= 0.80,
-            )
-
-    if resistance:
-        r = resistance["level"]
-
-        if breakout_hold_confirm(c5, c15, "LONG", r, e5, vw):
-            add_candidate(
-                "LONG",
-                "PRO_RESISTANCE_BREAK_RETEST_CONFIRMED",
-                "RESISTANCE BREAK / RETEST LONG",
-                resistance,
-                None,
-                f"Сопротивление {r:.8g} принято выше: цена закрепилась над уровнем, retest сверху удержан. LONG по подтверждённому breakout-retest.",
-                vol >= 0.80,
-            )
-
-    if LADDER_SCALP_ENABLED:
-        if btc.get("direction") != "BEAR":
-            sc = ladder_scalp_setup(c5, c15, c1h, "LONG", e5, vw)
-
-            if sc and vol >= LADDER_MIN_VOLUME:
-                add_candidate(
-                    "LONG",
-                    "PRO_LADDER_SCALP_LONG",
-                    "LADDER SCALP LONG",
-                    sc,
-                    resistance,
-                    f"Активный скальп от уровня: монета дала движение, затем контролируемый откат {sc.get('pullback', 0)*100:.2f}% и reclaim EMA/VWAP. Вход не на вертикальной свече; цели идут лестницей.",
-                    vol >= LADDER_A_VOLUME and t1h != "DOWN",
-                )
-
-        if btc.get("direction") != "BULL":
-            sc = ladder_scalp_setup(c5, c15, c1h, "SHORT", e5, vw)
-
-            if sc and vol >= LADDER_MIN_VOLUME:
-                add_candidate(
-                    "SHORT",
-                    "PRO_LADDER_SCALP_SHORT",
-                    "LADDER SCALP SHORT",
-                    sc,
-                    support,
-                    f"Активный скальп от уровня: монета дала движение вниз, затем контролируемый отскок {sc.get('pullback', 0)*100:.2f}% и reject EMA/VWAP. SHORT после отката, не на дне.",
-                    vol >= LADDER_A_VOLUME and t1h != "UP",
-                )
-
-    if TRADER_LADDER_ENABLED:
-        if btc.get("direction") != "BULL":
-            sc = trader_ladder_setup(symbol, c5, c15, c1h, "SHORT", e5, vw)
-
-            if sc and vol >= TRADER_LADDER_MIN_VOLUME:
-                add_candidate(
-                    "SHORT",
-                    "PRO_TRADER_LADDER_SHORT",
-                    "TRADER LADDER SHORT",
-                    sc,
-                    support,
-                    f"Trader-style SHORT: активное движение вниз, затем контролируемый отскок {sc.get('pullback', 0)*100:.2f}% и reject EMA/VWAP. Вход после продолжения, не на первой красной свече.",
-                    vol >= TRADER_LADDER_A_VOLUME and t1h != "UP",
-                )
-
-        if btc.get("direction") != "BEAR":
-            sc = trader_ladder_setup(symbol, c5, c15, c1h, "LONG", e5, vw)
-
-            if sc and vol >= TRADER_LADDER_MIN_VOLUME:
-                add_candidate(
-                    "LONG",
-                    "PRO_TRADER_LADDER_LONG",
-                    "TRADER LADDER LONG",
-                    sc,
-                    resistance,
-                    f"Trader-style LONG: активное движение вверх, затем контролируемый откат {sc.get('pullback', 0)*100:.2f}% и reclaim EMA/VWAP. Вход после продолжения, не на первой зелёной свече.",
-                    vol >= TRADER_LADDER_A_VOLUME and t1h != "DOWN",
-                )
-
-    if btc.get("direction") != "BEAR" and calm_momentum_context(c15, c1h, "LONG"):
-        br = recent_broken_level(c15, price, "LONG")
-
-        if br and calm_pullback_confirmation(c5, c15, "LONG", br["level"], e5, vw):
-            add_candidate(
-                "LONG",
-                "PRO_CALM_BREAKOUT_PULLBACK_LONG",
-                "CALM BREAKOUT PULLBACK LONG",
-                br,
-                resistance,
-                f"Активное движение вверх: пробитый intraday-уровень {br['level']:.8g} удержан на откате. Это не погоня за свечой, а вход после retest/reclaim.",
-                vol >= 0.75 and t1h != "DOWN",
-            )
-
-    if btc.get("direction") != "BULL" and calm_momentum_context(c15, c1h, "SHORT"):
-        br = recent_broken_level(c15, price, "SHORT")
-
-        if br and calm_pullback_confirmation(c5, c15, "SHORT", br["level"], e5, vw):
-            add_candidate(
-                "SHORT",
-                "PRO_CALM_BREAKDOWN_PULLBACK_SHORT",
-                "CALM BREAKDOWN PULLBACK SHORT",
-                br,
-                support,
-                f"Активное движение вниз: пробитый intraday-уровень {br['level']:.8g} удержан снизу после отскока. SHORT после retest, не догоняющий вход на дне.",
-                vol >= 0.75 and t1h != "UP",
-            )
+        candidates.append(trade)
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda x: (x["grade"] == "A+", x["score"], x.get("ladder_rr") or x["rr"]), reverse=True)
-
+    candidates.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
     return candidates[0]
 
 # ============================================================
-# Signal messages / scan / tracking
+# Formatting / scanning / tracking
 # ============================================================
 
 def format_price(x: Optional[float]) -> str:
     if x is None:
         return "-"
-
     if x >= 100:
         return f"{x:.2f}"
-
     if x >= 1:
-        return f"{x:.4f}".rstrip("0").rstrip(".")
-
+        return f"{x:.5f}".rstrip("0").rstrip(".")
     return f"{x:.8f}".rstrip("0").rstrip(".")
 
 
 def build_signal_message(s: Dict[str, Any]) -> str:
     arrow = "🟢" if s["side"] == "LONG" else "🔴"
-
-    ladder_extra = ""
-
-    if s.get("tp4"):
-        ladder_extra += f"TP4: {format_price(s['tp4'])}\n"
-
-    if s.get("tp5"):
-        ladder_extra += f"TP5: {format_price(s['tp5'])}\n"
-
-    ladder_stats = ""
-
-    if s.get("ladder_rr") is not None:
-        ladder_stats += f"Ladder RR: {s.get('ladder_rr'):.2f} · Final RR: {s.get('final_rr'):.2f}\n"
-
     return (
         f"{arrow} {s['side']} {display_symbol(s['symbol'])}\n"
         f"Класс: {s['grade']} · Score {s['score']} · {s['trade_type']}\n"
         f"Стратегия: {s['strategy']}\n\n"
         f"Вход: {format_price(s['entry'])}\n"
-        f"TP1: {format_price(s['tp1'])} · ≈ {s['roi_tp1']:.1f}% ROI при x{LEVERAGE}\n"
+        f"TP1: {format_price(s['tp1'])} · ≈ {s['roi_tp1']:.1f}% ROI x{LEVERAGE}\n"
         f"TP2: {format_price(s['tp2'])}\n"
         f"TP3: {format_price(s['tp3'])}\n"
-        f"{ladder_extra}"
-        f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI при x{LEVERAGE}\n"
-        f"RR к TP1: {s['rr']:.2f}\n"
-        f"{ladder_stats}"
+        f"TP4: {format_price(s['tp4'])}\n"
+        f"TP5: {format_price(s['tp5'])}\n"
+        f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
+        f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
         f"Риск: multiplier x{s['risk_mult']:.2f}\n\n"
-        f"📌 Профессиональная логика:\n{s['reason']}\n"
-        f"Уровень/инвалидация: {format_price(s['level'])} · touches {s['level_touches']} · reactions {s['level_reactions']}\n"
-        f"1H {s['t1h']} · 4H {s['t4h']} · volume x{s['volume_ratio']:.2f}\n"
-        f"BTC: {s['btc_text']}\n"
-        f"Support: {format_price(s['support']) if s.get('support') else '-'} · Resistance: {format_price(s['resistance']) if s.get('resistance') else '-'}\n\n"
-        f"Сделка не является гарантией прибыли. SL возможен; размер позиции должен соответствовать риску."
+        f"📌 Логика:\n{s['reason']}\n"
+        f"15m: {s['ch15m']*100:+.2f}% · 30m: {s['ch30m']*100:+.2f}% · 1m3: {s['ch3m_1m']*100:+.2f}%\n"
+        f"Volume x{s['volume_ratio']:.2f} · Range x{s['range_ratio']:.2f} · 1H {s['t1h']}\n"
+        f"BTC: {s['btc_text']}\n\n"
+        f"⏱ Fast rule: если за {FAST_MAX_MINUTES_TO_TP1} минут нет движения к TP1 — сигнал будет expired."
     )
 
 
 def build_diagnostic(scan: Dict[str, Any]) -> str:
     blocks = scan.get("blocks", {})
-    block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:10]]
+    block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:12]]
+    hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
-
     return (
-        f"🧪 Диагностика V13.13 Trader Ladder Mode\n"
+        f"🧪 Диагностика V13.14 Fast Burst Ladder\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
-        f"Главные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
+        f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
+        f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
         ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
         f"\n\nLast error: {STATE.get('last_error', '')}"
     )
@@ -2109,13 +880,9 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
     start = time.time()
     blocks: Dict[str, int] = {}
     near_miss: List[str] = []
-
     btc = btc_context()
     symbols = get_symbols()
-
-    quality = [s for s in symbols if base_asset(s) in QUALITY_BASES]
-    rest = [s for s in symbols if base_asset(s) not in QUALITY_BASES]
-    selected = (quality + rest)[:MAX_ANALYZE_SYMBOLS]
+    selected, hot_notes = select_hot_symbols(symbols)
 
     scan = {
         "checked": 0,
@@ -2124,6 +891,7 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
         "sent": 0,
         "blocks": blocks,
         "near_miss": near_miss,
+        "hot_notes": hot_notes,
         "btc": btc.get("text", "BTC unknown"),
         "elapsed": 0,
     }
@@ -2135,28 +903,23 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
         return scan
 
     found: List[Dict[str, Any]] = []
-
     for sym in selected:
         if len(STATE.get("active_signals", [])) >= MAX_ACTIVE_SIGNALS:
             blocks["active_slots_full"] = blocks.get("active_slots_full", 0) + 1
             break
-
         try:
             s = analyze_symbol(sym, btc, blocks, near_miss)
             scan["checked"] += 1
-
             if s:
                 found.append(s)
         except Exception as e:
             blocks["analyze_exception"] = blocks.get("analyze_exception", 0) + 1
             STATE["last_error"] = f"analyze {sym}: {repr(e)}"
 
-    found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x.get("ladder_rr") or x["rr"]), reverse=True)
-
+    found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
     scan["candidates"] = len(found)
 
     sent = 0
-
     for s in found[:MAX_SIGNALS_PER_SCAN]:
         add_active_signal(s)
         send_telegram(build_signal_message(s))
@@ -2164,11 +927,10 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
 
     scan["sent"] = sent
     scan["elapsed"] = time.time() - start
-
     STATE["last_scan"] = scan
     save_state()
 
-    if manual or (sent == 0 and (now_ts() - STATE.get("last_diag_ts", 0) >= DIAG_SECONDS)):
+    if manual or (sent == 0 and now_ts() - STATE.get("last_diag_ts", 0) >= DIAG_SECONDS):
         send_telegram(build_diagnostic(scan))
         STATE["last_diag_ts"] = now_ts()
         save_state()
@@ -2177,31 +939,35 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
 
 
 def current_price(symbol: str) -> Optional[float]:
-    c = get_klines(symbol, "1m", 80, cache_seconds=8)
-
-    if not c:
-        return None
-
-    return c[-1]["close"]
+    c = get_klines(symbol, "1m", 80, cache_seconds=4)
+    return c[-1]["close"] if c else None
 
 
 def target_hit(side: str, price: float, target: float) -> bool:
-    if side == "LONG":
-        return price >= target
-
-    return price <= target
+    return price >= target if side == "LONG" else price <= target
 
 
 def sl_hit(side: str, price: float, sl: float) -> bool:
-    if side == "LONG":
-        return price <= sl
+    return price <= sl if side == "LONG" else price >= sl
 
-    return price >= sl
+
+def directional_progress_ratio(s: Dict[str, Any], p: float) -> Tuple[bool, float]:
+    entry = s["entry"]
+    tp1 = s["tp1"]
+    full = abs(tp1 - entry)
+    if full <= 0:
+        return False, 0.0
+    if s["side"] == "LONG":
+        directional = p > entry
+        progress = max(0.0, p - entry) / full
+    else:
+        directional = p < entry
+        progress = max(0.0, entry - p) / full
+    return directional, progress
 
 
 def track_active_signals() -> None:
     active = STATE.setdefault("active_signals", [])
-
     if not active:
         return
 
@@ -2210,18 +976,14 @@ def track_active_signals() -> None:
 
     for s in active:
         p = current_price(s["symbol"])
-
         if p is None:
             remaining.append(s)
             continue
 
         side = s["side"]
-        strategy = s.get("strategy", "")
-        is_ladder = strategy in SCALP_STRATEGIES and s.get("tp5")
+        age_minutes = (now_ts() - int(s.get("created_at", now_ts()))) / 60.0
 
-        hit_sl = sl_hit(side, p, s["sl"])
-
-        if hit_sl:
+        if sl_hit(side, p, s["sl"]):
             apply_result(s, "sl")
             send_telegram(
                 f"❌ Stop Loss\n"
@@ -2235,55 +997,66 @@ def track_active_signals() -> None:
             changed = True
             continue
 
-        if is_ladder:
-            hit_any = False
-
-            for key in ["tp1", "tp2", "tp3", "tp4"]:
-                if s.get(key) and not s.get(f"{key}_hit") and target_hit(side, p, s[key]):
-                    s[f"{key}_hit"] = True
-                    hit_any = True
-                    send_telegram(
-                        f"🎯 {key.upper()} HIT\n"
-                        f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
-                        f"Стратегия: {s['strategy']}\n"
-                        f"{key.upper()}: {format_price(s[key])}\n"
-                        f"Текущая цена: {format_price(p)}"
-                    )
-
-            if s.get("tp5") and target_hit(side, p, s["tp5"]):
-                s["tp5_hit"] = True
-                apply_result(s, "profit")
+        if FAST_CANCEL_IF_NO_PROGRESS and not s.get("tp1_hit") and age_minutes >= FAST_MAX_MINUTES_TO_TP1:
+            directional, progress = directional_progress_ratio(s, p)
+            if (not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP:
+                apply_result(s, "expired")
                 send_telegram(
-                    f"✅ FULL LADDER TAKE PROFIT\n"
+                    f"⏱ FAST TRADE EXPIRED\n"
                     f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
                     f"Стратегия: {s['strategy']}\n"
-                    f"TP5 достигнут: {format_price(p)}\n\n"
+                    f"Цена не реализовалась за {FAST_MAX_MINUTES_TO_TP1} минут.\n"
+                    f"Вход: {format_price(s['entry'])}\n"
+                    f"Текущая цена: {format_price(p)}\n"
+                    f"TP1: {format_price(s['tp1'])}\n"
+                    f"Прогресс к TP1: {progress*100:.1f}%\n\n"
                     f"{build_stats_text()}"
                 )
                 changed = True
                 continue
 
-            if hit_any:
-                changed = True
-                remaining.append(s)
-                continue
-
-            remaining.append(s)
-            continue
-
-        hit_tp1 = target_hit(side, p, s["tp1"])
-
-        if hit_tp1:
-            apply_result(s, "profit")
+        if age_minutes >= FAST_HARD_EXPIRE_MINUTES and not s.get("tp1_hit"):
+            apply_result(s, "expired")
             send_telegram(
-                f"✅ TAKE PROFIT\n"
+                f"⏱ HARD EXPIRE\n"
                 f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
                 f"Стратегия: {s['strategy']}\n"
-                f"TP1 достигнут: {format_price(p)}\n\n"
+                f"TP1 не достигнут за {FAST_HARD_EXPIRE_MINUTES} минут.\n"
+                f"Текущая цена: {format_price(p)}\n\n"
                 f"{build_stats_text()}"
             )
             changed = True
             continue
+
+        hit_any = False
+        for key in ["tp1", "tp2", "tp3", "tp4"]:
+            if s.get(key) and not s.get(f"{key}_hit") and target_hit(side, p, s[key]):
+                s[f"{key}_hit"] = True
+                hit_any = True
+                send_telegram(
+                    f"🎯 {key.upper()} HIT\n"
+                    f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                    f"Стратегия: {s['strategy']}\n"
+                    f"{key.upper()}: {format_price(s[key])}\n"
+                    f"Текущая цена: {format_price(p)}"
+                )
+
+        if s.get("tp5") and target_hit(side, p, s["tp5"]):
+            s["tp5_hit"] = True
+            apply_result(s, "profit")
+            send_telegram(
+                f"✅ FULL LADDER TAKE PROFIT\n"
+                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\n"
+                f"TP5 достигнут: {format_price(p)}\n"
+                f"Время в сделке: {age_minutes:.1f} мин\n\n"
+                f"{build_stats_text()}"
+            )
+            changed = True
+            continue
+
+        if hit_any:
+            changed = True
 
         remaining.append(s)
 
@@ -2297,17 +1070,15 @@ def track_active_signals() -> None:
 
 async def scan_loop():
     await asyncio.sleep(3)
-
     send_telegram(
-        f"✅ {APP_NAME} активирован и работает.\n"
+        f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Modes: verified levels + ladder scalp + trader-style ladder continuation.\n"
-        f"A+ {A_PLUS_MIN_SCORE}+ / B {B_MIN_SCORE}+.\n"
-        f"Trader ladder: impulse → pullback → EMA/VWAP reject/reclaim → 5 TP ladder.\n"
-        f"TP1 min normal {MIN_TP1_ROI_X10:.0f}% ROI x{LEVERAGE}; trader ladder TP1 min 6% ROI x{LEVERAGE}.\n"
-        f"Quality: micro-structure + HTF gate + separate trader ladder stats. API retries {API_RETRIES}, analyze {MAX_ANALYZE_SYMBOLS}."
+        f"Mode: FAST BURST LADDER.\n"
+        f"Логика: hot coin → быстрый импульс → контролируемый откат → EMA/VWAP reject/reclaim → 5 TP.\n"
+        f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
+        f"Targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
+        f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}."
     )
-
     try:
         scan = run_scan(manual=True)
         send_telegram(build_diagnostic(scan))
@@ -2324,13 +1095,11 @@ async def scan_loop():
             STATE["last_error"] = f"scan_loop: {repr(e)}"
             save_state()
             send_telegram(f"⚠️ Ошибка auto-scan: {repr(e)}")
-
         await asyncio.sleep(AUTO_SCAN_SECONDS)
 
 
 async def track_loop():
     await asyncio.sleep(8)
-
     while True:
         try:
             if AUTO_TRACK_ENABLED:
@@ -2338,7 +1107,6 @@ async def track_loop():
         except Exception as e:
             STATE["last_error"] = f"track_loop: {repr(e)}"
             save_state()
-
         await asyncio.sleep(AUTO_TRACK_SECONDS)
 
 
@@ -2372,10 +1140,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {
-        "app": APP_NAME,
-        "deploy_marker": DEPLOY_MARKER,
-    }
+    return {"app": APP_NAME, "deploy_marker": DEPLOY_MARKER}
 
 
 @app.get("/auto-status")
@@ -2393,10 +1158,8 @@ def auto_status():
 @app.get("/scan")
 def manual_scan(send: bool = Query(True)):
     scan = run_scan(manual=True)
-
     if send:
         send_telegram(build_diagnostic(scan))
-
     return JSONResponse(scan)
 
 
@@ -2408,15 +1171,10 @@ def stats():
 @app.get("/test-telegram")
 def test_telegram():
     ok = send_telegram(f"✅ Test Telegram OK\n{APP_NAME}\n{DEPLOY_MARKER}")
-
-    return {
-        "sent": ok,
-        "last_error": STATE.get("last_error", ""),
-    }
+    return {"sent": ok, "last_error": STATE.get("last_error", "")}
 
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
