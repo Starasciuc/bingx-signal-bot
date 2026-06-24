@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.20 — PROFESSIONAL LONG RECLAIM + REALTIME REVERSAL SCALPER
+# V13.21 — CONTEXT ADAPTIVE SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -23,8 +23,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # Important: this bot sends signals/alerts. It does not guarantee profit.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.20 PROFESSIONAL LONG RECLAIM SCALPER"
-DEPLOY_MARKER = "V13_20_PROFESSIONAL_LONG_RECLAIM_SCALPER_2026_06_24"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.21 CONTEXT ADAPTIVE SCALPER"
+DEPLOY_MARKER = "V13_21_CONTEXT_ADAPTIVE_SCALPER_2026_06_24"
 
 app = FastAPI(title=APP_NAME)
 
@@ -32,7 +32,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_20_professional_long_reclaim_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_21_context_adaptive_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -129,7 +129,7 @@ BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.020")) # avoid a
 # not a late buy at the end of a pump.
 ALLOW_LONG = os.getenv("ALLOW_LONG", "true").lower() == "true"
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "true").lower() == "true"
-LONG_BLOCK_BTC_BEAR = os.getenv("LONG_BLOCK_BTC_BEAR", "true").lower() == "true"
+LONG_BLOCK_BTC_BEAR = os.getenv("LONG_BLOCK_BTC_BEAR", "false").lower() == "true"
 LONG_MIN_1M_VOLUME_RATIO = float(os.getenv("LONG_MIN_1M_VOLUME_RATIO", "0.75"))
 LONG_MIN_1M_RANGE_RATIO = float(os.getenv("LONG_MIN_1M_RANGE_RATIO", "0.80"))
 LONG_MIN_3M_CONFIRM = float(os.getenv("LONG_MIN_3M_CONFIRM", "0.0012"))     # 0.12% in 3m
@@ -143,6 +143,27 @@ LONG_REQUIRE_HIGHER_LOW = os.getenv("LONG_REQUIRE_HIGHER_LOW", "true").lower() =
 LONG_STATS_PROTECTION = os.getenv("LONG_STATS_PROTECTION", "true").lower() == "true"
 LONG_STATS_MIN_CLOSED = int(os.getenv("LONG_STATS_MIN_CLOSED", "4"))
 LONG_STATS_MIN_WR = float(os.getenv("LONG_STATS_MIN_WR", "40"))
+
+# --- V13.21 context-adaptive rules ---
+# Professional idea: BTC direction is not a simple long/short switch.
+# LONG is allowed in a bearish market only if the coin is showing clear relative strength
+# and live reclaim pressure. SHORT is prioritized during BTC dump, but not chased without
+# a bounce/reject structure.
+CONTEXT_ADAPTIVE_ENABLED = os.getenv("CONTEXT_ADAPTIVE_ENABLED", "true").lower() == "true"
+BTC_DUMP_SHORT_BIAS_ENABLED = os.getenv("BTC_DUMP_SHORT_BIAS_ENABLED", "true").lower() == "true"
+BTC_DUMP_1H = float(os.getenv("BTC_DUMP_1H", "-0.012"))
+BTC_DUMP_6H = float(os.getenv("BTC_DUMP_6H", "-0.025"))
+LONG_ALLOW_BEAR_RELATIVE_STRENGTH = os.getenv("LONG_ALLOW_BEAR_RELATIVE_STRENGTH", "true").lower() == "true"
+LONG_BEAR_MIN_ALT_15M = float(os.getenv("LONG_BEAR_MIN_ALT_15M", "0.0065"))
+LONG_BEAR_MIN_ALT_30M = float(os.getenv("LONG_BEAR_MIN_ALT_30M", "0.0100"))
+LONG_BEAR_MIN_1M3 = float(os.getenv("LONG_BEAR_MIN_1M3", "0.0020"))
+LONG_BEAR_MIN_REL_STRENGTH_1H = float(os.getenv("LONG_BEAR_MIN_REL_STRENGTH_1H", "0.010"))
+LONG_BEAR_MIN_VOL1 = float(os.getenv("LONG_BEAR_MIN_VOL1", "0.90"))
+LONG_BEAR_MIN_RANGE1 = float(os.getenv("LONG_BEAR_MIN_RANGE1", "0.95"))
+LONG_BEAR_MIN_CLOSE_LOCATION = float(os.getenv("LONG_BEAR_MIN_CLOSE_LOCATION", "0.76"))
+SHORT_DUMP_ALLOW_EXTENDED_30M = float(os.getenv("SHORT_DUMP_ALLOW_EXTENDED_30M", "0.145"))
+SHORT_DUMP_MIN_LIVE_1M3 = float(os.getenv("SHORT_DUMP_MIN_LIVE_1M3", "-0.0014"))
+SHORT_DUMP_MIN_BOUNCE = float(os.getenv("SHORT_DUMP_MIN_BOUNCE", "0.0025"))
 
 
 # --- Ultra-risk blocks ---
@@ -812,12 +833,19 @@ def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15:
             return False, f"LONG close location weak {close_location(last):.2f}", metrics
         metrics["setup_mode"] = "REVERSAL_LONG" if reversal else "CONTINUATION_LONG"
     else:
-        continuation = ch15m <= -FAST_MIN_15M_MOVE and ch30m <= -FAST_MIN_30M_MOVE and ch3m_1m <= -FAST_MIN_1M_CONFIRM
+        btc_dump_context = BTC_DUMP_SHORT_BIAS_ENABLED and ch15m <= -FAST_MIN_15M_MOVE * 0.70 and ch3m_1m <= -FAST_MIN_1M_CONFIRM
+        continuation = (ch15m <= -FAST_MIN_15M_MOVE and ch30m <= -FAST_MIN_30M_MOVE and ch3m_1m <= -FAST_MIN_1M_CONFIRM) or btc_dump_context
         reversal = REVERSAL_ENABLED and ch30m >= REVERSAL_MIN_30M_MOVE and ch3m_1m <= -REVERSAL_MIN_LIVE_COUNTER_MOVE
         if not (continuation or reversal):
             return False, f"no SHORT edge: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%", metrics
         if ch30m < -FAST_MAX_30M_MOVE:
-            return False, f"late SHORT chase 30m {ch30m*100:.2f}%", metrics
+            # During market-wide dumps many examples realize quickly to the downside.
+            # Still avoid blind chasing: require a small bounce/reject structure before continuing.
+            recent_low = min(x["low"] for x in c5[-8:])
+            bounce = (max(x["high"] for x in c5[-5:]) - recent_low) / max(recent_low, 1e-12)
+            if not (BTC_DUMP_SHORT_BIAS_ENABLED and ch30m >= -SHORT_DUMP_ALLOW_EXTENDED_30M and ch3m_1m <= SHORT_DUMP_MIN_LIVE_1M3 and bounce >= SHORT_DUMP_MIN_BOUNCE):
+                return False, f"late SHORT chase 30m {ch30m*100:.2f}%", metrics
+            metrics["dump_bounce"] = bounce
         if last["close"] >= last["open"] and not reversal:
             return False, "last 5m not bearish for continuation", metrics
         if close_location(last) > CLOSE_LOCATION_MAX_SHORT and not reversal:
@@ -883,8 +911,8 @@ def professional_long_reclaim_gate(
         return False, "LONG gate: not enough candles"
 
     btc_dir = str(btc.get("direction", "UNKNOWN"))
-    if LONG_BLOCK_BTC_BEAR and btc_dir == "BEAR":
-        return False, "LONG gate: BTC BEAR, long disabled"
+    btc_ch1h = float(btc.get("ch1h", 0.0))
+    btc_ch6h = float(btc.get("ch6h", 0.0))
 
     last1 = c1[-1]
     prev1 = c1[-2]
@@ -896,8 +924,36 @@ def professional_long_reclaim_gate(
     range1 = metrics.get("range1", candle_range_ratio(c1, 20))
     loc1 = close_location(last1)
 
+    # BTC bearish does not automatically forbid LONG. But a LONG against a bearish BTC
+    # must be a leader/relative-strength coin, not a weak bounce. This is how coins like
+    # VELVET can still be traded LONG while the general market is heavy.
+    bear_rs_long = False
+    if btc_dir == "BEAR":
+        rel_strength_1h = ch15m - btc_ch1h
+        bear_rs_long = (
+            LONG_ALLOW_BEAR_RELATIVE_STRENGTH
+            and ch15m >= LONG_BEAR_MIN_ALT_15M
+            and ch30m >= LONG_BEAR_MIN_ALT_30M
+            and ch3m >= LONG_BEAR_MIN_1M3
+            and rel_strength_1h >= LONG_BEAR_MIN_REL_STRENGTH_1H
+            and vol1 >= LONG_BEAR_MIN_VOL1
+            and range1 >= LONG_BEAR_MIN_RANGE1
+            and loc1 >= LONG_BEAR_MIN_CLOSE_LOCATION
+        )
+        if LONG_BLOCK_BTC_BEAR and not bear_rs_long:
+            return False, (
+                f"LONG gate: BTC BEAR and coin has no relative strength: "
+                f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, "
+                f"1m3 {ch3m*100:+.2f}%, rel1h {rel_strength_1h*100:+.2f}%"
+            )
+
     if ch3m < LONG_MIN_3M_CONFIRM:
         return False, f"LONG gate: weak 3m confirm {ch3m*100:.2f}%"
+    if btc_dir == "BEAR" and LONG_ALLOW_BEAR_RELATIVE_STRENGTH and not bear_rs_long:
+        return False, (
+            f"LONG gate: BTC BEAR, only relative-strength longs allowed; "
+            f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, 1m3 {ch3m*100:+.2f}%"
+        )
     if vol1 < LONG_MIN_1M_VOLUME_RATIO:
         return False, f"LONG gate: weak 1m volume x{vol1:.2f}"
     if range1 < LONG_MIN_1M_RANGE_RATIO:
@@ -943,7 +999,7 @@ def professional_long_reclaim_gate(
     return True, (
         f"LONG professional gate ok: BTC {btc_dir}, 3m {ch3m*100:+.2f}%, "
         f"vol1 x{vol1:.2f}, range1 x{range1:.2f}, closeLoc {loc1:.2f}, "
-        f"sweep {swept_low}, reclaim {reclaimed}, higherLow {higher_low}"
+        f"bearRS {bear_rs_long}, sweep {swept_low}, reclaim {reclaimed}, higherLow {higher_low}"
     )
 
 def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
@@ -963,10 +1019,13 @@ def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str,
     vol = volume_ratio(c15, 24)
     t1h = trend_state(c1h)
 
-    # Market phase is not traded. BTC is only a shock filter; we avoid signals during violent BTC moves.
+    # Market phase is not traded as a prediction. BTC is a context filter:
+    # - during BTC shock down, avoid LONG unless the coin later passes relative-strength LONG gate;
+    # - allow SHORT during dump because that is exactly when many alts realize quickly.
     btc_ch1h = float(btc.get("ch1h", 0.0))
-    if abs(btc_ch1h) >= BTC_SHOCK_15M_BLOCK:
-        return None
+    if abs(btc_ch1h) >= BTC_SHOCK_15M_BLOCK and side == "LONG":
+        # Do not hard-block here; professional_long_reclaim_gate can still allow an exceptional RS long.
+        pass
 
     fast_ok, fast_reason, metrics = fast_context_ok(c1, c5, c15, side, vol)
     if not fast_ok:
@@ -1262,7 +1321,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.20 Professional Long Reclaim Scalper\n"
+        f"🧪 Диагностика V13.21 Context Adaptive Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
