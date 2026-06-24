@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.16 — BALANCED SCALPING EDGE
+# V13.17 — REALTIME VOLATILITY SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -23,8 +23,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # Important: this bot sends signals/alerts. It does not guarantee profit.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.16 BALANCED SCALPING EDGE"
-DEPLOY_MARKER = "V13_16_BALANCED_SCALPING_EDGE_2026_06_24"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.17 REALTIME VOLATILITY SCALPER"
+DEPLOY_MARKER = "V13_17_REALTIME_VOLATILITY_SCALPER_2026_06_24"
 
 app = FastAPI(title=APP_NAME)
 
@@ -32,44 +32,55 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_16_balanced_scalping_edge.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_17_realtime_volatility_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
 # --- Scan stability ---
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
 AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "30"))
-AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "5"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "15"))
+AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "3"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.08"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
 MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
-HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "70"))
+HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "35"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 
 # --- Signal limits ---
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "900"))
-STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "180"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "84"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "1"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "1"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1200"))
+STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "240"))
 
 # --- Fast burst requirements ---
 FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
-FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.0055"))        # 1.0% in 15m
-FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.0080"))        # 1.6% in 30m
+FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.0090"))        # 1.0% in 15m
+FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.0140"))        # 1.6% in 30m
 FAST_MAX_30M_MOVE = float(os.getenv("FAST_MAX_30M_MOVE", "0.090"))        # avoid late vertical chase
-FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "1.05"))   # current 5m range expansion
-FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "0.95")) # current 15m volume expansion
-FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.0006"))   # 0.15% last 3m direction
+FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "1.22"))   # current 5m range expansion
+FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "1.18")) # current 15m volume expansion
+FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.0012"))   # 0.15% last 3m direction
 FAST_MAX_SPREAD_PROXY = float(os.getenv("FAST_MAX_SPREAD_PROXY", "0.030"))# current 5m candle too wide/chase block
 EDGE_MIN_PRIOR_COMPRESSION = float(os.getenv("EDGE_MIN_PRIOR_COMPRESSION", "99.0")) # prior 5m range should be smaller before expansion
 EDGE_MIN_BREAKOUT_DISTANCE = float(os.getenv("EDGE_MIN_BREAKOUT_DISTANCE", "0.0003")) # 0.12% micro break beyond prior 1m structure
 EDGE_REQUIRE_MICRO_SWEEP = os.getenv("EDGE_REQUIRE_MICRO_SWEEP", "false").lower() == "true"
-EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.25")) # recent 15m move must cover 70% of TP5
+
+# --- Realtime pressure gate ---
+# Previous versions expired because they detected a pattern after the flow had already died.
+# These filters require live 1m pressure at the exact signal moment.
+HOT_MIN_SCORE = float(os.getenv("HOT_MIN_SCORE", "32"))
+REALTIME_MIN_1M_RANGE_RATIO = float(os.getenv("REALTIME_MIN_1M_RANGE_RATIO", "1.18"))
+REALTIME_MIN_1M_VOLUME_RATIO = float(os.getenv("REALTIME_MIN_1M_VOLUME_RATIO", "1.15"))
+REALTIME_MIN_2M_MOVE = float(os.getenv("REALTIME_MIN_2M_MOVE", "0.0014"))
+REALTIME_CLOSE_LOCATION_LONG = float(os.getenv("REALTIME_CLOSE_LOCATION_LONG", "0.66"))
+REALTIME_CLOSE_LOCATION_SHORT = float(os.getenv("REALTIME_CLOSE_LOCATION_SHORT", "0.34"))
+REALTIME_REQUIRE_TWO_1M_CANDLES = os.getenv("REALTIME_REQUIRE_TWO_1M_CANDLES", "true").lower() == "true"
+EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.45")) # recent 15m move must cover 70% of TP5
 
 # --- Pullback/retest requirements ---
 PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0015"))                 # 0.25%
@@ -80,11 +91,11 @@ CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.48"))
 
 # --- Compact ladder TPs for fast 10-minute realization style ---
 # These are intentionally more compact than slow ladder targets.
-TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0045"))
-TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0085"))
-TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0130"))
-TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0190"))
-TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0270"))
+TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0038"))
+TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0075"))
+TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0115"))
+TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0170"))
+TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0240"))
 
 # --- Risk / stop ---
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
@@ -94,9 +105,9 @@ FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
 # --- Time stop / no-stall logic ---
-FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "10"))
-FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "18"))
-FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.25"))
+FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
+FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "12"))
+FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.45"))
 FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").lower() == "true"
 
 # --- Market shock context ---
@@ -564,18 +575,37 @@ def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[st
 
 
 def hot_score(symbol: str) -> Tuple[float, str]:
-    c5 = get_klines(symbol, "5m", 80, cache_seconds=25)
-    c15 = get_klines(symbol, "15m", 80, cache_seconds=35)
-    if not c5 or not c15:
+    c1 = get_klines(symbol, "1m", 60, cache_seconds=8)
+    c5 = get_klines(symbol, "5m", 80, cache_seconds=18)
+    c15 = get_klines(symbol, "15m", 80, cache_seconds=30)
+    if not c1 or not c5 or not c15:
         return 0.0, "no candles"
+
+    ch3m = abs(percent_change(c1, 3))
     ch15m = abs(percent_change(c5, 3))
     ch30m = abs(percent_change(c5, 6))
-    vr = volume_ratio(c15, 24)
-    rr = candle_range_ratio(c5, 20)
-    score = ch15m * 1000 + ch30m * 700 + min(vr, 4.0) * 8 + min(rr, 4.0) * 7
+    vr1 = volume_ratio(c1, 20)
+    vr15 = volume_ratio(c15, 24)
+    rr1 = candle_range_ratio(c1, 20)
+    rr5 = candle_range_ratio(c5, 20)
+
+    # Realtime hotness is weighted more than old movement.
+    # We want coins that are moving NOW, not coins that moved 40 minutes ago.
+    score = (
+        ch3m * 4200 +
+        ch15m * 1150 +
+        ch30m * 700 +
+        min(vr1, 5.0) * 9 +
+        min(vr15, 5.0) * 7 +
+        min(rr1, 5.0) * 8 +
+        min(rr5, 5.0) * 6
+    )
     if base_asset(symbol) in QUALITY_BASES:
-        score += 8
-    return score, f"15m {ch15m*100:.2f}%, 30m {ch30m*100:.2f}%, vol x{vr:.2f}, range x{rr:.2f}"
+        score += 3
+    return score, (
+        f"1m3 {ch3m*100:.2f}%, 15m {ch15m*100:.2f}%, 30m {ch30m*100:.2f}%, "
+        f"vol1 x{vr1:.2f}, vol15 x{vr15:.2f}, range1 x{rr1:.2f}, range5 x{rr5:.2f}"
+    )
 
 
 def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
@@ -591,16 +621,60 @@ def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
     scored.sort(reverse=True, key=lambda x: x[0])
     for sc, sym, note in scored[:8]:
         notes.append(f"{display_symbol(sym)} hot {sc:.1f}: {note}")
-    selected = [sym for _, sym, _ in scored[:HOT_SYMBOLS_TO_ANALYZE]]
-    # Keep user examples in the rotation when available.
-    for sym in FALLBACK_SYMBOLS:
-        if sym not in selected and sym in symbols:
-            selected.append(sym)
+    # Only analyze actually hot symbols. Do not force old examples into rotation unless they are hot now.
+    selected = [sym for sc, sym, _ in scored if sc >= HOT_MIN_SCORE][:HOT_SYMBOLS_TO_ANALYZE]
     return selected[:MAX_ANALYZE_SYMBOLS], notes
 
 # ============================================================
 # Setup logic
 # ============================================================
+
+def realtime_pressure_ok(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str, Dict[str, float]]:
+    """Live 1m pressure gate.
+    This is the key V13.17 fix: a signal is allowed only if the coin is moving right now.
+    Expired signals usually came from patterns where the flow had already stopped.
+    """
+    if len(c1) < 30:
+        return False, "not enough 1m pressure data", {}
+
+    last = c1[-1]
+    prev = c1[-2]
+    ch2m = (last["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12)
+    ch3m = percent_change(c1, 3)
+    rr1 = candle_range_ratio(c1, 20)
+    vr1 = volume_ratio(c1, 20)
+    loc = close_location(last)
+    body = abs(last["close"] - last["open"]) / max(last["high"] - last["low"], 1e-12)
+
+    same_two_long = last["close"] > last["open"] and prev["close"] >= prev["open"]
+    same_two_short = last["close"] < last["open"] and prev["close"] <= prev["open"]
+
+    metrics = {"ch2m": ch2m, "ch3m": ch3m, "range1": rr1, "vol1": vr1, "loc": loc, "body": body}
+
+    if rr1 < REALTIME_MIN_1M_RANGE_RATIO:
+        return False, f"1m range not live x{rr1:.2f}", metrics
+    if vr1 < REALTIME_MIN_1M_VOLUME_RATIO:
+        return False, f"1m volume not live x{vr1:.2f}", metrics
+    if body < 0.35:
+        return False, f"1m body weak {body:.2f}", metrics
+
+    if side == "LONG":
+        if ch2m < REALTIME_MIN_2M_MOVE:
+            return False, f"LONG 2m pressure weak {ch2m*100:.2f}%", metrics
+        if loc < REALTIME_CLOSE_LOCATION_LONG:
+            return False, f"LONG 1m close not near high {loc:.2f}", metrics
+        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_long:
+            return False, "LONG lacks two 1m bullish candles", metrics
+    else:
+        if ch2m > -REALTIME_MIN_2M_MOVE:
+            return False, f"SHORT 2m pressure weak {ch2m*100:.2f}%", metrics
+        if loc > REALTIME_CLOSE_LOCATION_SHORT:
+            return False, f"SHORT 1m close not near low {loc:.2f}", metrics
+        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_short:
+            return False, "SHORT lacks two 1m bearish candles", metrics
+
+    return True, f"live pressure ok: 2m {ch2m*100:+.2f}%, 3m {ch3m*100:+.2f}%, range1 x{rr1:.2f}, vol1 x{vr1:.2f}", metrics
+
 
 def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, vol: float) -> Tuple[bool, str, Dict[str, float]]:
     if len(c1) < 20 or len(c5) < 36 or len(c15) < 24:
@@ -633,6 +707,11 @@ def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15:
     micro_ok, micro_reason = micro_structure_break(c1, side)
     if not micro_ok:
         return False, micro_reason, metrics
+
+    pressure_ok, pressure_reason, pressure_metrics = realtime_pressure_ok(c1, side)
+    metrics.update(pressure_metrics)
+    if not pressure_ok:
+        return False, pressure_reason, metrics
 
     sweep_ok, sweep_reason = micro_sweep_reclaim(c1, side)
     if not sweep_ok:
@@ -677,7 +756,7 @@ def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15:
     return True, (
         f"edge ok: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, "
         f"1m3 {ch3m_1m*100:+.2f}%, range x{rr:.2f}, vol x{vol:.2f}, "
-        f"compression x{compression:.2f}; {micro_reason}; {sweep_reason}; {feasible_reason}"
+        f"compression x{compression:.2f}; {micro_reason}; {pressure_reason}; {sweep_reason}; {feasible_reason}"
     ), metrics
 
 
@@ -758,6 +837,8 @@ def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str,
     score += min(10, int(abs(metrics.get("ch30m", 0)) * 430))
     score += min(8, int((vol - 1.0) * 7))
     score += min(8, int((metrics.get("range_ratio", 1.0) - 1.0) * 7))
+    score += min(8, int((metrics.get("vol1", 1.0) - 1.0) * 7))
+    score += min(8, int((metrics.get("range1", 1.0) - 1.0) * 7))
     # Market phase does not add or subtract. Only actual speed/liquidity edge matters.
     if strong:
         score += 7
@@ -782,6 +863,9 @@ def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str,
         "ch15m": metrics.get("ch15m", 0.0),
         "ch30m": metrics.get("ch30m", 0.0),
         "ch3m_1m": metrics.get("ch3m_1m", 0.0),
+        "vol1": metrics.get("vol1", 1.0),
+        "range1": metrics.get("range1", 1.0),
+        "ch2m": metrics.get("ch2m", 0.0),
         "t1h": t1h,
         "btc_text": btc.get("text", ""),
     }
@@ -944,7 +1028,7 @@ def build_signal_message(s: Dict[str, Any]) -> str:
         f"Риск: multiplier x{s['risk_mult']:.2f}\n\n"
         f"📌 Логика:\n{s['reason']}\n"
         f"15m: {s['ch15m']*100:+.2f}% · 30m: {s['ch30m']*100:+.2f}% · 1m3: {s['ch3m_1m']*100:+.2f}%\n"
-        f"Volume x{s['volume_ratio']:.2f} · Range x{s['range_ratio']:.2f} · Compression x{s.get('compression', 1.0):.2f}\n"
+        f"Volume15 x{s['volume_ratio']:.2f} · Range5 x{s['range_ratio']:.2f} · Vol1 x{s.get('vol1', 1.0):.2f} · Range1 x{s.get('range1', 1.0):.2f}\n"
         f"BTC: {s['btc_text']}\n\n"
         f"⏱ Scalping rule: если за {FAST_MAX_MINUTES_TO_TP1} минут нет движения к TP1 — сигнал expired. Фаза рынка не важна; важна быстрая реализация."
     )
@@ -956,7 +1040,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.16 Balanced Scalping Edge\n"
+        f"🧪 Диагностика V13.17 Realtime Volatility Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -1172,7 +1256,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: BALANCED SCALPING EDGE.\n"
+        f"Mode: REALTIME VOLATILITY SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
