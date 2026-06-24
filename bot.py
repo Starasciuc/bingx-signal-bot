@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.21 — CONTEXT ADAPTIVE SCALPER
+# V13.22 — PROFESSIONAL QUALITY SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -23,8 +23,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # Important: this bot sends signals/alerts. It does not guarantee profit.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.21 CONTEXT ADAPTIVE SCALPER"
-DEPLOY_MARKER = "V13_21_CONTEXT_ADAPTIVE_SCALPER_2026_06_24"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.22 PROFESSIONAL QUALITY SCALPER"
+DEPLOY_MARKER = "V13_22_PROFESSIONAL_QUALITY_SCALPER_2026_06_24"
 
 app = FastAPI(title=APP_NAME)
 
@@ -32,7 +32,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_21_context_adaptive_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_22_professional_quality_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -90,7 +90,7 @@ REALTIME_MIN_2M_MOVE = float(os.getenv("REALTIME_MIN_2M_MOVE", "0.00045"))
 REALTIME_CLOSE_LOCATION_LONG = float(os.getenv("REALTIME_CLOSE_LOCATION_LONG", "0.57"))
 REALTIME_CLOSE_LOCATION_SHORT = float(os.getenv("REALTIME_CLOSE_LOCATION_SHORT", "0.43"))
 REALTIME_REQUIRE_TWO_1M_CANDLES = os.getenv("REALTIME_REQUIRE_TWO_1M_CANDLES", "false").lower() == "true"
-EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.18")) # recent 15m move must cover 70% of TP5
+EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.70")) # recent 15m move should cover most of TP5 distance
 
 # --- Pullback/retest requirements ---
 PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0015"))                 # 0.25%
@@ -110,9 +110,27 @@ TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0185"))
 # --- Risk / stop ---
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
 MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0090"))                  # min 0.9% price risk
-MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0450"))                  # block if SL > 4.5%
+MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0240"))                  # hard technical max; tighter than old 4.5%
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
+
+# --- V13.22 professional quality gate ---
+# Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
+MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "14.0"))
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
+MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.65"))
+MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
+MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.75"))
+MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.50"))
+STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0090"))
+STRONG_RANGE1 = float(os.getenv("STRONG_RANGE1", "1.65"))
+HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.35"))
+HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "11.0"))
+HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.90"))
+HEAVY_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK", "AVAX",
+    "DOT", "LTC", "BCH", "XMR", "GMX", "AAVE", "UNI", "ATOM", "ETC", "FIL"
+}
 
 # --- Time stop / no-stall logic ---
 FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
@@ -1200,6 +1218,61 @@ def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: 
     }
 
 
+
+def professional_quality_gate(trade: Dict[str, Any], symbol: str) -> Tuple[bool, str, str]:
+    """Final professional quality filter.
+
+    This is intentionally hard. A fast scalp is not allowed when:
+    - stop risk is much larger than the reward ladder;
+    - TP5 does not at least compensate risk;
+    - live 1m volume is weak without a strong price/range exception;
+    - heavy/slow coins have wide SL and weak RR.
+    """
+    side = trade.get("side", "?")
+    base = base_asset(symbol)
+    rr = float(trade.get("rr", 0.0) or 0.0)
+    ladder_rr = float(trade.get("ladder_rr", 0.0) or 0.0)
+    final_rr = float(trade.get("final_rr", 0.0) or 0.0)
+    roi_sl = float(trade.get("roi_sl", 999.0) or 999.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    ch3m = abs(float(trade.get("ch3m_1m", 0.0) or 0.0))
+
+    if roi_sl > MAX_SCALP_SL_ROI:
+        return False, "sl_roi_too_high_block", f"{display_symbol(symbol)} {side}: SL risk too high {roi_sl:.1f}% ROI"
+
+    if rr < MIN_TP1_RR:
+        return False, "tp1_rr_hard_block", f"{display_symbol(symbol)} {side}: TP1 RR too weak {rr:.2f}"
+
+    if ladder_rr < MIN_LADDER_RR_HARD:
+        return False, "ladder_rr_hard_block", f"{display_symbol(symbol)} {side}: ladder RR too weak {ladder_rr:.2f}"
+
+    if final_rr < MIN_FINAL_RR_HARD:
+        return False, "final_rr_hard_block", f"{display_symbol(symbol)} {side}: final RR too weak {final_rr:.2f}"
+
+    if vol1 < MIN_LIVE_VOL_NORMAL:
+        strong_price_exception = (
+            vol1 >= MIN_LIVE_VOL_STRONG_PRICE
+            and ch3m >= STRONG_1M3_MOVE
+            and range1 >= STRONG_RANGE1
+        )
+        if not strong_price_exception:
+            return (
+                False,
+                "weak_live_volume_block",
+                f"{display_symbol(symbol)} {side}: weak live volume x{vol1:.2f}, 1m3 {ch3m*100:.2f}%, range1 x{range1:.2f}"
+            )
+
+    if base in HEAVY_BASES:
+        if roi_sl > HEAVY_MAX_SL_ROI:
+            return False, "heavy_coin_sl_block", f"{display_symbol(symbol)} {side}: heavy coin SL too wide {roi_sl:.1f}% ROI"
+        if final_rr < HEAVY_MIN_FINAL_RR:
+            return False, "heavy_coin_rr_block", f"{display_symbol(symbol)} {side}: heavy coin final RR too weak {final_rr:.2f}"
+        if vol1 < HEAVY_MIN_LIVE_VOL:
+            return False, "heavy_coin_volume_block", f"{display_symbol(symbol)} {side}: heavy coin live volume weak x{vol1:.2f}"
+
+    return True, "ok", "quality ok"
+
 def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
     t = now_ts()
     if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
@@ -1263,11 +1336,13 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 near_miss.append(f"{display_symbol(symbol)} {side}: score {trade['score']}, vol x{trade['volume_ratio']:.2f}, range x{trade['range_ratio']:.2f}")
             continue
 
-        # Professional gate: if TP5 cannot compensate structure risk, skip.
-        if trade["final_rr"] < 0.70 or trade["ladder_rr"] < 0.35:
-            blocks["weak_ladder_rr_block"] = blocks.get("weak_ladder_rr_block", 0) + 1
+        # V13.22 hard professional quality gate.
+        # Blocks low-quality scalps like XMR: tiny TP1, huge SL, weak live volume, poor final RR.
+        q_ok, q_block, q_reason = professional_quality_gate(trade, symbol)
+        if not q_ok:
+            blocks[q_block] = blocks.get(q_block, 0) + 1
             if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side}: ladderRR {trade['ladder_rr']:.2f}, finalRR {trade['final_rr']:.2f}")
+                near_miss.append(q_reason)
             continue
 
         candidates.append(trade)
