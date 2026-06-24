@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.15 — SCALPING EDGE ONLY
+# V13.16 — BALANCED SCALPING EDGE
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -23,8 +23,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # Important: this bot sends signals/alerts. It does not guarantee profit.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.15 SCALPING EDGE ONLY"
-DEPLOY_MARKER = "V13_15_SCALPING_EDGE_ONLY_2026_06_23"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.16 BALANCED SCALPING EDGE"
+DEPLOY_MARKER = "V13_16_BALANCED_SCALPING_EDGE_2026_06_24"
 
 app = FastAPI(title=APP_NAME)
 
@@ -32,7 +32,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_15_scalping_edge.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_16_balanced_scalping_edge.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -50,33 +50,33 @@ HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "70"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 
 # --- Signal limits ---
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "92"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "89"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "1"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "1800"))
-STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "480"))
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "900"))
+STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "180"))
 
 # --- Fast burst requirements ---
 FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
-FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.010"))        # 1.0% in 15m
-FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.016"))        # 1.6% in 30m
-FAST_MAX_30M_MOVE = float(os.getenv("FAST_MAX_30M_MOVE", "0.075"))        # avoid late vertical chase
-FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "1.35"))   # current 5m range expansion
-FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "1.25")) # current 15m volume expansion
-FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.0020"))   # 0.15% last 3m direction
-FAST_MAX_SPREAD_PROXY = float(os.getenv("FAST_MAX_SPREAD_PROXY", "0.022"))# current 5m candle too wide/chase block
-EDGE_MIN_PRIOR_COMPRESSION = float(os.getenv("EDGE_MIN_PRIOR_COMPRESSION", "0.65")) # prior 5m range should be smaller before expansion
-EDGE_MIN_BREAKOUT_DISTANCE = float(os.getenv("EDGE_MIN_BREAKOUT_DISTANCE", "0.0012")) # 0.12% micro break beyond prior 1m structure
-EDGE_REQUIRE_MICRO_SWEEP = os.getenv("EDGE_REQUIRE_MICRO_SWEEP", "true").lower() == "true"
-EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.70")) # recent 15m move must cover 70% of TP5
+FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.0055"))        # 1.0% in 15m
+FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.0080"))        # 1.6% in 30m
+FAST_MAX_30M_MOVE = float(os.getenv("FAST_MAX_30M_MOVE", "0.090"))        # avoid late vertical chase
+FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "1.05"))   # current 5m range expansion
+FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "0.95")) # current 15m volume expansion
+FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.0006"))   # 0.15% last 3m direction
+FAST_MAX_SPREAD_PROXY = float(os.getenv("FAST_MAX_SPREAD_PROXY", "0.030"))# current 5m candle too wide/chase block
+EDGE_MIN_PRIOR_COMPRESSION = float(os.getenv("EDGE_MIN_PRIOR_COMPRESSION", "99.0")) # prior 5m range should be smaller before expansion
+EDGE_MIN_BREAKOUT_DISTANCE = float(os.getenv("EDGE_MIN_BREAKOUT_DISTANCE", "0.0003")) # 0.12% micro break beyond prior 1m structure
+EDGE_REQUIRE_MICRO_SWEEP = os.getenv("EDGE_REQUIRE_MICRO_SWEEP", "false").lower() == "true"
+EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.25")) # recent 15m move must cover 70% of TP5
 
 # --- Pullback/retest requirements ---
-PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0025"))                 # 0.25%
-PULLBACK_MAX = float(os.getenv("PULLBACK_MAX", "0.0300"))                 # 3.0%
+PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0015"))                 # 0.25%
+PULLBACK_MAX = float(os.getenv("PULLBACK_MAX", "0.0400"))                 # 3.0%
 RECLAIM_BUFFER = float(os.getenv("RECLAIM_BUFFER", "0.0005"))
-CLOSE_LOCATION_MIN_LONG = float(os.getenv("CLOSE_LOCATION_MIN_LONG", "0.58"))
-CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.42"))
+CLOSE_LOCATION_MIN_LONG = float(os.getenv("CLOSE_LOCATION_MIN_LONG", "0.52"))
+CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.48"))
 
 # --- Compact ladder TPs for fast 10-minute realization style ---
 # These are intentionally more compact than slow ladder targets.
@@ -94,18 +94,18 @@ FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
 # --- Time stop / no-stall logic ---
-FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
-FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "12"))
-FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.50"))
+FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "10"))
+FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "18"))
+FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.25"))
 FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").lower() == "true"
 
 # --- Market shock context ---
 # We do not trade market phase/trend. BTC is used only as a shock filter.
-BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.014")) # avoid alt scalp during violent BTC shock
+BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.020")) # avoid alt scalp during violent BTC shock
 
 # --- Ultra-risk blocks ---
-ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.075"))
-ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.110"))
+ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.095"))
+ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.140"))
 
 SCALP_STRATEGIES = {"PRO_SCALPING_EDGE_LONG", "PRO_SCALPING_EDGE_SHORT"}
 
@@ -627,7 +627,7 @@ def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15:
     if candle_move > FAST_MAX_SPREAD_PROXY:
         return False, f"last 5m candle too wide/chase risk {candle_move*100:.2f}%", metrics
 
-    if compression > EDGE_MIN_PRIOR_COMPRESSION and rr < 1.75:
+    if compression > EDGE_MIN_PRIOR_COMPRESSION and rr < 1.75:  # disabled by default in V13.16 unless env lowers EDGE_MIN_PRIOR_COMPRESSION
         return False, f"no compression-to-expansion edge: compression x{compression:.2f}, range x{rr:.2f}", metrics
 
     micro_ok, micro_reason = micro_structure_break(c1, side)
@@ -956,7 +956,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.15 Scalping Edge Only\n"
+        f"🧪 Диагностика V13.16 Balanced Scalping Edge\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -1172,7 +1172,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: SCALPING EDGE ONLY.\n"
+        f"Mode: BALANCED SCALPING EDGE.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
