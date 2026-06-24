@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.19 — REALTIME REVERSAL + CONTINUATION SCALPER
+# V13.20 — PROFESSIONAL LONG RECLAIM + REALTIME REVERSAL SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -23,8 +23,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # Important: this bot sends signals/alerts. It does not guarantee profit.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.19 REALTIME REVERSAL SCALPER"
-DEPLOY_MARKER = "V13_19_REALTIME_REVERSAL_SCALPER_2026_06_24"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.20 PROFESSIONAL LONG RECLAIM SCALPER"
+DEPLOY_MARKER = "V13_20_PROFESSIONAL_LONG_RECLAIM_SCALPER_2026_06_24"
 
 app = FastAPI(title=APP_NAME)
 
@@ -32,7 +32,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_19_realtime_reversal_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_20_professional_long_reclaim_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -123,6 +123,27 @@ FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").low
 # --- Market shock context ---
 # We do not trade market phase/trend. BTC is used only as a shock filter.
 BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.020")) # avoid alt scalp during violent BTC shock
+
+# --- Side control / professional LONG repair ---
+# SHORT is already working in live stats. LONG is now stricter and must look like a real reclaim,
+# not a late buy at the end of a pump.
+ALLOW_LONG = os.getenv("ALLOW_LONG", "true").lower() == "true"
+ALLOW_SHORT = os.getenv("ALLOW_SHORT", "true").lower() == "true"
+LONG_BLOCK_BTC_BEAR = os.getenv("LONG_BLOCK_BTC_BEAR", "true").lower() == "true"
+LONG_MIN_1M_VOLUME_RATIO = float(os.getenv("LONG_MIN_1M_VOLUME_RATIO", "0.75"))
+LONG_MIN_1M_RANGE_RATIO = float(os.getenv("LONG_MIN_1M_RANGE_RATIO", "0.80"))
+LONG_MIN_3M_CONFIRM = float(os.getenv("LONG_MIN_3M_CONFIRM", "0.0012"))     # 0.12% in 3m
+LONG_MIN_CLOSE_LOCATION = float(os.getenv("LONG_MIN_CLOSE_LOCATION", "0.72"))
+LONG_MAX_15M_CHASE = float(os.getenv("LONG_MAX_15M_CHASE", "0.040"))        # above this needs pullback/sweep
+LONG_MAX_30M_CHASE = float(os.getenv("LONG_MAX_30M_CHASE", "0.070"))
+LONG_MIN_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MIN_PULLBACK_AFTER_PUMP", "0.0055"))
+LONG_MAX_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MAX_PULLBACK_AFTER_PUMP", "0.038"))
+LONG_REQUIRE_SWEEP_OR_RECLAIM = os.getenv("LONG_REQUIRE_SWEEP_OR_RECLAIM", "true").lower() == "true"
+LONG_REQUIRE_HIGHER_LOW = os.getenv("LONG_REQUIRE_HIGHER_LOW", "true").lower() == "true"
+LONG_STATS_PROTECTION = os.getenv("LONG_STATS_PROTECTION", "true").lower() == "true"
+LONG_STATS_MIN_CLOSED = int(os.getenv("LONG_STATS_MIN_CLOSED", "4"))
+LONG_STATS_MIN_WR = float(os.getenv("LONG_STATS_MIN_WR", "40"))
+
 
 # --- Ultra-risk blocks ---
 ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.095"))
@@ -818,6 +839,113 @@ def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15:
         f"{micro_reason}; {pressure_reason}; {sweep_reason}; {feasible_reason}"
     ), metrics
 
+
+def long_live_stats_ok() -> Tuple[bool, str]:
+    """Protect the bot from repeatedly taking bad LONGs while still allowing recovery later.
+    If live LONG stats are poor, allow only very high-quality LONGs by blocking B-class setups upstream.
+    """
+    if not LONG_STATS_PROTECTION:
+        return True, "long stats protection disabled"
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    item = stats.get("side", {}).get("LONG", {})
+    closed = int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0))
+    if closed < LONG_STATS_MIN_CLOSED:
+        return True, "not enough LONG stats"
+    wr = int(item.get("profit", 0)) / max(closed, 1) * 100.0
+    if wr < LONG_STATS_MIN_WR:
+        return False, f"LONG stats weak: WR {wr:.1f}% after {closed}"
+    return True, "LONG stats ok"
+
+
+def professional_long_reclaim_gate(
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    btc: Dict[str, Any],
+    metrics: Dict[str, float],
+    setup_mode: str,
+    e1: float,
+    e5: float,
+    vw5: float,
+) -> Tuple[bool, str]:
+    """Strict LONG-only repair.
+
+    Live results showed LONG was buying weak bounces / late pumps.
+    A valid LONG now needs a real reclaim pattern:
+    - BTC must not be BEAR by default;
+    - strong 1m pressure, close near high, volume/range alive;
+    - price must reclaim 1m EMA and be near/above 5m EMA/VWAP;
+    - no buying vertical 15m/30m extension unless there was a controlled pullback;
+    - prefer liquidity sweep / higher-low reclaim.
+    """
+    if len(c1) < 24 or len(c5) < 24 or len(c15) < 10:
+        return False, "LONG gate: not enough candles"
+
+    btc_dir = str(btc.get("direction", "UNKNOWN"))
+    if LONG_BLOCK_BTC_BEAR and btc_dir == "BEAR":
+        return False, "LONG gate: BTC BEAR, long disabled"
+
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    price = last1["close"]
+    ch3m = percent_change(c1, 3)
+    ch15m = metrics.get("ch15m", percent_change(c5, 3))
+    ch30m = metrics.get("ch30m", percent_change(c5, 6))
+    vol1 = metrics.get("vol1", volume_ratio(c1, 20))
+    range1 = metrics.get("range1", candle_range_ratio(c1, 20))
+    loc1 = close_location(last1)
+
+    if ch3m < LONG_MIN_3M_CONFIRM:
+        return False, f"LONG gate: weak 3m confirm {ch3m*100:.2f}%"
+    if vol1 < LONG_MIN_1M_VOLUME_RATIO:
+        return False, f"LONG gate: weak 1m volume x{vol1:.2f}"
+    if range1 < LONG_MIN_1M_RANGE_RATIO:
+        return False, f"LONG gate: weak 1m range x{range1:.2f}"
+    if loc1 < LONG_MIN_CLOSE_LOCATION:
+        return False, f"LONG gate: 1m close not strong {loc1:.2f}"
+    if last1["close"] <= last1["open"]:
+        return False, "LONG gate: last 1m not bullish"
+    if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
+        return False, "LONG gate: did not reclaim prior red candle"
+
+    # Must reclaim micro trend. For continuation LONG, also avoid being below 5m EMA/VWAP.
+    if price < e1 * (1 + RECLAIM_BUFFER):
+        return False, "LONG gate: no 1m EMA reclaim"
+    if setup_mode == "CONTINUATION_LONG" and (price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER)):
+        return False, "LONG gate: no 5m EMA/VWAP reclaim"
+
+    # Liquidity sweep / higher-low reclaim. This avoids buying a random bounce with no trap.
+    recent = c1[-16:-4]
+    last_zone = c1[-5:]
+    swept_low = min(x["low"] for x in last_zone[:-1]) <= min(x["low"] for x in recent) * 1.0015 if recent else False
+    reclaimed = last1["close"] > max(x["close"] for x in c1[-5:-1]) and loc1 >= LONG_MIN_CLOSE_LOCATION
+    higher_low = min(x["low"] for x in c1[-4:]) > min(x["low"] for x in c1[-10:-4]) * 0.998 if len(c1) >= 12 else False
+
+    if LONG_REQUIRE_SWEEP_OR_RECLAIM and not (swept_low or reclaimed):
+        return False, "LONG gate: no sweep/reclaim trigger"
+    if LONG_REQUIRE_HIGHER_LOW and not (higher_low or swept_low):
+        return False, "LONG gate: no higher-low/sweep structure"
+
+    # Anti-chase: after a big pump, only buy if there was a real controlled pullback first.
+    recent_high = max(x["high"] for x in c5[-18:])
+    recent_low = min(x["low"] for x in c5[-10:])
+    pullback = (recent_high - recent_low) / max(recent_high, 1e-12)
+    if ch15m > LONG_MAX_15M_CHASE or ch30m > LONG_MAX_30M_CHASE:
+        if not (LONG_MIN_PULLBACK_AFTER_PUMP <= pullback <= LONG_MAX_PULLBACK_AFTER_PUMP and (swept_low or reclaimed)):
+            return False, f"LONG gate: late pump chase blocked 15m {ch15m*100:.2f}%, 30m {ch30m*100:.2f}%, pullback {pullback*100:.2f}%"
+
+    # Avoid buying into a distribution wick.
+    last5 = c5[-1]
+    if upper_wick_ratio(last5) > 0.48 and close_location(last5) < 0.68:
+        return False, "LONG gate: 5m upper wick/distribution"
+
+    return True, (
+        f"LONG professional gate ok: BTC {btc_dir}, 3m {ch3m*100:+.2f}%, "
+        f"vol1 x{vol1:.2f}, range1 x{range1:.2f}, closeLoc {loc1:.2f}, "
+        f"sweep {swept_low}, reclaim {reclaimed}, higherLow {higher_low}"
+    )
+
 def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
     """Scalping Edge setup: no trend prediction.
     We only require a tradable micro-event: fresh imbalance + micro sweep/reclaim + immediate continuation.
@@ -845,6 +973,12 @@ def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str,
         return None
     setup_mode = str(metrics.get("setup_mode", ""))
     is_reversal = setup_mode.startswith("REVERSAL")
+
+    if side == "LONG":
+        long_gate_ok, long_gate_reason = professional_long_reclaim_gate(symbol, c1, c5, c15, btc, metrics, setup_mode, e1, e5, vw5)
+        if not long_gate_ok:
+            return None
+        metrics["long_gate_reason"] = long_gate_reason
 
     last5 = c5[-1]
     prev5 = c5[-2]
@@ -874,7 +1008,8 @@ def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str,
         reason = (
             f"SCALPING EDGE LONG: не прогноз рынка, а короткая ситуация. "
             f"Режим {setup_mode}: свежий дисбаланс вверх, микро-откат/перехват {pullback*100:.2f}%, "
-            f"live 1m pressure и немедленное продолжение. {fast_reason}."
+            f"live 1m pressure, sweep/reclaim и немедленное продолжение. {fast_reason}. "
+            f"{metrics.get('long_gate_reason', '')}."
         )
     else:
         recent_low = min(x["low"] for x in c5[-18:])
@@ -1032,10 +1167,24 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
 
     candidates: List[Dict[str, Any]] = []
     for side in ("LONG", "SHORT"):
+        if side == "LONG" and not ALLOW_LONG:
+            blocks["long_disabled"] = blocks.get("long_disabled", 0) + 1
+            continue
+        if side == "SHORT" and not ALLOW_SHORT:
+            blocks["short_disabled"] = blocks.get("short_disabled", 0) + 1
+            continue
         setup = fast_burst_setup(symbol, c1, c5, c15, c1h, btc, side)
         if not setup:
             blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
             continue
+
+        if side == "LONG":
+            long_stats_ok, long_stats_reason = long_live_stats_ok()
+            if not long_stats_ok and setup.get("grade") != "A+":
+                blocks["long_stats_protection_block"] = blocks.get("long_stats_protection_block", 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(f"{display_symbol(symbol)} LONG: {long_stats_reason}; B-class long skipped")
+                continue
 
         co, reason = cooldown_ok(symbol, setup["strategy"])
         if not co:
@@ -1113,7 +1262,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.18 Live Market Scalper\n"
+        f"🧪 Диагностика V13.20 Professional Long Reclaim Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -1158,11 +1307,15 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
         save_state()
         return scan
 
+    # Before scanning, refresh old active signals so expired/TP/SL positions do not block the market scan.
+    try:
+        track_active_signals()
+    except Exception as e:
+        STATE["last_error"] = f"pre-scan track_active_signals: {repr(e)}"
+        save_state()
+
     found: List[Dict[str, Any]] = []
     for sym in selected:
-        if len(STATE.get("active_signals", [])) >= MAX_ACTIVE_SIGNALS:
-            blocks["active_slots_full"] = blocks.get("active_slots_full", 0) + 1
-            break
         try:
             s = analyze_symbol(sym, btc, blocks, near_miss)
             scan["checked"] += 1
