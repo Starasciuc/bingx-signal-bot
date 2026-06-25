@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.22 — PROFESSIONAL QUALITY SCALPER
+# V13.23 — BALANCED PROFESSIONAL QUALITY SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -21,10 +21,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 #
 # If the trade does not start paying quickly, it is not the setup and gets expired.
 # Important: this bot sends signals/alerts. It does not guarantee profit.
+# V13.23 fix: V13.22 was too strict and could stay silent; this version keeps hard blocks
+# for bad RR/huge SL/weak live flow, but relaxes borderline thresholds so valid fast scalps can pass.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.22 PROFESSIONAL QUALITY SCALPER"
-DEPLOY_MARKER = "V13_22_PROFESSIONAL_QUALITY_SCALPER_2026_06_24"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.23 BALANCED QUALITY SCALPER"
+DEPLOY_MARKER = "V13_23_BALANCED_QUALITY_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
@@ -32,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_22_professional_quality_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_23_balanced_quality_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -46,12 +48,12 @@ API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.04"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
 MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
-HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "45"))
+HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "60"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 
 # --- Signal limits ---
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "82"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
@@ -90,7 +92,7 @@ REALTIME_MIN_2M_MOVE = float(os.getenv("REALTIME_MIN_2M_MOVE", "0.00045"))
 REALTIME_CLOSE_LOCATION_LONG = float(os.getenv("REALTIME_CLOSE_LOCATION_LONG", "0.57"))
 REALTIME_CLOSE_LOCATION_SHORT = float(os.getenv("REALTIME_CLOSE_LOCATION_SHORT", "0.43"))
 REALTIME_REQUIRE_TWO_1M_CANDLES = os.getenv("REALTIME_REQUIRE_TWO_1M_CANDLES", "false").lower() == "true"
-EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.70")) # recent 15m move should cover most of TP5 distance
+EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.50")) # recent 15m move should cover most of TP5 distance
 
 # --- Pullback/retest requirements ---
 PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0015"))                 # 0.25%
@@ -116,17 +118,17 @@ A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
 # --- V13.22 professional quality gate ---
 # Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
-MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "14.0"))
-MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
-MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.65"))
-MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
-MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.75"))
-MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.50"))
-STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0090"))
-STRONG_RANGE1 = float(os.getenv("STRONG_RANGE1", "1.65"))
-HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.35"))
-HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "11.0"))
-HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.90"))
+MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "16.0"))
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.17"))
+MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.52"))
+MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.00"))
+MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.55"))
+MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.30"))
+STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0050"))
+STRONG_RANGE1 = float(os.getenv("STRONG_RANGE1", "1.25"))
+HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.15"))
+HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "14.0"))
+HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.65"))
 HEAVY_BASES = {
     "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK", "AVAX",
     "DOT", "LTC", "BCH", "XMR", "GMX", "AAVE", "UNI", "ATOM", "ETC", "FIL"
@@ -1336,8 +1338,9 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 near_miss.append(f"{display_symbol(symbol)} {side}: score {trade['score']}, vol x{trade['volume_ratio']:.2f}, range x{trade['range_ratio']:.2f}")
             continue
 
-        # V13.22 hard professional quality gate.
-        # Blocks low-quality scalps like XMR: tiny TP1, huge SL, weak live volume, poor final RR.
+        # V13.23 balanced professional quality gate.
+        # Still blocks XMR-style bad scalps: huge SL, weak RR, weak live volume.
+        # But thresholds are not over-tight, so the bot can remain alive during the day.
         q_ok, q_block, q_reason = professional_quality_gate(trade, symbol)
         if not q_ok:
             blocks[q_block] = blocks.get(q_block, 0) + 1
