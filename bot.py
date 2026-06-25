@@ -25,8 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.28 MARKET DUMP AERO SCALPER"
-DEPLOY_MARKER = "V13_28_MARKET_DUMP_AERO_SCALPER_2026_06_25"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.29 LOCAL STOP DUMP SCALPER"
+DEPLOY_MARKER = "V13_29_LOCAL_STOP_DUMP_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_28_market_dump_aero_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_29_local_stop_dump_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -115,12 +115,19 @@ TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0350"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
 MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0100"))                  # min 1.0% price risk
 MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # technical invalidation cap for example-style ladder
+
+# V13.29: for fast scalps we use a LOCAL execution stop, not the distant invalidation/averaging zone.
+# This keeps AERO-style / dump scalps alive while still blocking XMR-style wide-risk trades.
+LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
+LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0145"))  # 1.45% price risk cap; x20 ≈ 29% ROI
+LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0065"))  # keep stop not too tight
+LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG", "AERO_STYLE_SHORT", "AERO_STYLE_LONG"}
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
 # --- V13.22 professional quality gate ---
 # Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
-MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "18.0"))
+MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "32.0"))
 MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
 MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.62"))
 MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
@@ -202,14 +209,14 @@ AERO_ALLOW_B_SCORE = os.getenv("AERO_ALLOW_B_SCORE", "true").lower() == "true"
 MARKET_DUMP_SHORT_ENABLED = os.getenv("MARKET_DUMP_SHORT_ENABLED", "true").lower() == "true"
 DUMP_MIN_1M3 = float(os.getenv("DUMP_MIN_1M3", "0.0048"))
 DUMP_MIN_15M = float(os.getenv("DUMP_MIN_15M", "0.0035"))
-DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.42"))
-DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.55"))
-DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.45"))
-DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.70"))
+DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.35"))
+DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.48"))
+DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.40"))
+DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.60"))
 DUMP_CLOSE_SHORT = float(os.getenv("DUMP_CLOSE_SHORT", "0.58"))
 DUMP_MIN_RECENT_RANGE = float(os.getenv("DUMP_MIN_RECENT_RANGE", "0.0100"))
 DUMP_MAX_LATE_30M = float(os.getenv("DUMP_MAX_LATE_30M", "0.095"))
-DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "true").lower() == "true"
+DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "false").lower() == "true"
 
 
 # --- Time stop / no-stall logic ---
@@ -1511,6 +1518,23 @@ def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: 
 
     risk = abs(entry - sl)
     risk_move = risk / max(entry, 1e-12)
+
+    # V13.29 professional scalp rule:
+    # The public trader examples use a far invalidation/averaging zone, but the signal itself
+    # must be managed by a local scalp stop. If the structural stop is too far, compress it
+    # to a local stop for fast execution instead of discarding every live dump candidate.
+    setup_mode = str(setup.get("setup_mode", ""))
+    if LOCAL_SCALP_STOP_ENABLED and risk_move > LOCAL_SCALP_MAX_SL_MOVE and setup_mode in LOCAL_STOP_MODES:
+        local_move = max(LOCAL_SCALP_MIN_SL_MOVE, min(LOCAL_SCALP_MAX_SL_MOVE, max(TP1_MOVE * 1.20, abs(float(setup.get("ch3m_1m", 0.0) or 0.0)) * 1.10)))
+        if side == "LONG":
+            sl = entry * (1 - local_move)
+        else:
+            sl = entry * (1 + local_move)
+        setup["local_stop_used"] = True
+        setup["original_sl_move"] = risk_move
+        risk = abs(entry - sl)
+        risk_move = risk / max(entry, 1e-12)
+
     if risk_move > MAX_SL_MOVE:
         return None
 
@@ -1535,6 +1559,8 @@ def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: 
         "roi_tp1": roi_tp1,
         "roi_sl": roi_sl,
         "risk_mult": A_RISK_MULT if setup["grade"] == "A+" else FAST_RISK_MULT,
+        "local_stop_used": bool(setup.get("local_stop_used", False)),
+        "original_sl_move": float(setup.get("original_sl_move", 0.0) or 0.0),
         "created_at": now_ts(),
         "status": "active",
         "tp1_hit": False,
@@ -1564,6 +1590,13 @@ def professional_quality_gate(trade: Dict[str, Any], symbol: str) -> Tuple[bool,
     vol1 = float(trade.get("vol1", 1.0) or 1.0)
     range1 = float(trade.get("range1", 1.0) or 1.0)
     ch3m = abs(float(trade.get("ch3m_1m", 0.0) or 0.0))
+
+    # Hard stop check is price-based first, because ROI depends on chosen leverage.
+    # At x20 a normal 1.1% local scalp stop looks like 22% ROI, which should not be blocked
+    # if final RR and ladder RR are healthy.
+    sl_price_move = roi_sl / max(LEVERAGE * 100.0, 1e-12)
+    if sl_price_move > LOCAL_SCALP_MAX_SL_MOVE * 1.10:
+        return False, "sl_price_too_high_block", f"{display_symbol(symbol)} {side}: SL price risk too high {sl_price_move*100:.2f}%"
 
     if roi_sl > MAX_SCALP_SL_ROI:
         return False, "sl_roi_too_high_block", f"{display_symbol(symbol)} {side}: SL risk too high {roi_sl:.1f}% ROI"
@@ -1938,7 +1971,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.28 Market Dump AERO Scalper\n"
+        f"🧪 Диагностика V13.29 Local Stop Dump Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -2164,7 +2197,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: MARKET DUMP + AERO STYLE TRADER SCALPER.\n"
+        f"Mode: MARKET DUMP + AERO STYLE + LOCAL STOP SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
