@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.24 — INSTANT EDGE QUALITY SCALPER
+# V13.25 — TRADER PATTERN QUALITY SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -21,12 +21,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 #
 # If the trade does not start paying quickly, it is not the setup and gets expired.
 # Important: this bot sends signals/alerts. It does not guarantee profit.
-# V13.24 fix: adds an INSTANT_EDGE fallback for live impulse/reclaim setups.
-# It keeps the professional quality gate, but no longer hides all rejects under no_fast.
+# V13.25 fix: adds a trader-pattern gate based on the user examples.
+# The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.24 INSTANT EDGE QUALITY SCALPER"
-DEPLOY_MARKER = "V13_24_INSTANT_EDGE_QUALITY_SCALPER_2026_06_25"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.26 BALANCED TRADER SCALPER"
+DEPLOY_MARKER = "V13_26_BALANCED_TRADER_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_24_instant_edge_quality_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_26_balanced_trader_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -103,32 +103,34 @@ CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.48"))
 
 # --- Compact ladder TPs for fast 10-minute realization style ---
 # These are intentionally more compact than slow ladder targets.
-TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0030"))
-TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0058"))
-TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0090"))
-TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0132"))
-TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0185"))
+# Trader-example ladder: AERO/PORTAL/HOME/VELVET style targets are not tiny 0.3% scalps.
+# TP1 should be reachable quickly, but TP5 should represent a real 3-4% move when volatility allows.
+TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0065"))
+TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0120"))
+TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0185"))
+TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0260"))
+TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0350"))
 
 # --- Risk / stop ---
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
-MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0090"))                  # min 0.9% price risk
-MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0240"))                  # hard technical max; tighter than old 4.5%
+MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0100"))                  # min 1.0% price risk
+MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # technical invalidation cap for example-style ladder
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
 # --- V13.22 professional quality gate ---
 # Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
-MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "16.0"))
-MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.17"))
-MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.52"))
-MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.00"))
-MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.55"))
+MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "18.0"))
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
+MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.62"))
+MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
+MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.50"))
 MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.30"))
 STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0050"))
 STRONG_RANGE1 = float(os.getenv("STRONG_RANGE1", "1.25"))
-HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.15"))
-HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "14.0"))
-HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.65"))
+HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.25"))
+HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "13.0"))
+HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.70"))
 HEAVY_BASES = {
     "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK", "AVAX",
     "DOT", "LTC", "BCH", "XMR", "GMX", "AAVE", "UNI", "ATOM", "ETC", "FIL"
@@ -150,6 +152,29 @@ INSTANT_CLOSE_SHORT = float(os.getenv("INSTANT_CLOSE_SHORT", "0.40"))
 INSTANT_MIN_BODY = float(os.getenv("INSTANT_MIN_BODY", "0.34"))
 INSTANT_MAX_30M_CHASE = float(os.getenv("INSTANT_MAX_30M_CHASE", "0.065"))
 INSTANT_ALLOW_STRONG_1M_EXCEPTION = os.getenv("INSTANT_ALLOW_STRONG_1M_EXCEPTION", "true").lower() == "true"
+
+# --- V13.25 trader-pattern quality gate ---
+# Built from the examples: AERO/PORTAL/HOME/WLD/VELVET are not random hot ticks.
+# They are either continuation after a controlled pullback/reject, or a leader/laggard relative-strength exception.
+TRADER_PATTERN_GATE_ENABLED = os.getenv("TRADER_PATTERN_GATE_ENABLED", "true").lower() == "true"
+TRADER_MIN_SCORE = int(os.getenv("TRADER_MIN_SCORE", "82"))
+TRADER_ALLOW_B_SCORE = os.getenv("TRADER_ALLOW_B_SCORE", "true").lower() == "true"
+TRADER_MIN_ABS_1M3 = float(os.getenv("TRADER_MIN_ABS_1M3", "0.0048"))
+TRADER_MIN_ABS_15M = float(os.getenv("TRADER_MIN_ABS_15M", "0.0055"))
+TRADER_MIN_ABS_30M = float(os.getenv("TRADER_MIN_ABS_30M", "0.0080"))
+TRADER_MIN_VOL1 = float(os.getenv("TRADER_MIN_VOL1", "0.52"))
+TRADER_MIN_VOL5 = float(os.getenv("TRADER_MIN_VOL5", "0.52"))
+TRADER_MIN_RANGE1 = float(os.getenv("TRADER_MIN_RANGE1", "0.85"))
+TRADER_MIN_RANGE5 = float(os.getenv("TRADER_MIN_RANGE5", "0.75"))
+TRADER_MIN_TP5_FEASIBILITY = float(os.getenv("TRADER_MIN_TP5_FEASIBILITY", "0.50"))
+TRADER_NEED_5M_DIRECTION = os.getenv("TRADER_NEED_5M_DIRECTION", "false").lower() == "true"
+TRADER_BLOCK_WEAK_CONTINUATION = os.getenv("TRADER_BLOCK_WEAK_CONTINUATION", "true").lower() == "true"
+TRADER_MAX_COUNTER_30M = float(os.getenv("TRADER_MAX_COUNTER_30M", "0.0100"))
+TRADER_REQUIRE_MICRO_BREAK = os.getenv("TRADER_REQUIRE_MICRO_BREAK", "true").lower() == "true"
+TRADER_CLOSE_LONG = float(os.getenv("TRADER_CLOSE_LONG", "0.57"))
+TRADER_CLOSE_SHORT = float(os.getenv("TRADER_CLOSE_SHORT", "0.43"))
+TRADER_HEAVY_ONLY_A_PLUS = os.getenv("TRADER_HEAVY_ONLY_A_PLUS", "true").lower() == "true"
+
 
 # --- Time stop / no-stall logic ---
 FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
@@ -1427,6 +1452,105 @@ def professional_quality_gate(trade: Dict[str, Any], symbol: str) -> Tuple[bool,
 
     return True, "ok", "quality ok"
 
+
+def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """Example-style final gate.
+
+    The goal is to block signals that are technically valid but not trader-quality:
+    - weak B-class entries with no live volume;
+    - tiny or stale continuation;
+    - counter-direction entries without true reversal strength;
+    - target ladders that require more movement than the recent market has shown;
+    - heavy coins unless the setup is genuinely A+.
+    """
+    if not TRADER_PATTERN_GATE_ENABLED:
+        return True, "ok", "trader pattern gate disabled"
+
+    side = str(trade.get("side", ""))
+    base = base_asset(symbol)
+    score = int(trade.get("score", 0) or 0)
+    grade = str(trade.get("grade", "B"))
+    setup_mode = str(trade.get("setup_mode", ""))
+    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
+    ch15m = float(trade.get("ch15m", 0.0) or 0.0)
+    ch30m = float(trade.get("ch30m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    tp5 = float(trade.get("tp5", 0.0) or 0.0)
+
+    if grade != "A+" and not TRADER_ALLOW_B_SCORE:
+        return False, "trader_grade_block", f"{display_symbol(symbol)} {side}: B-class skipped by env; set TRADER_ALLOW_B_SCORE=true to allow B+"
+
+    if score < TRADER_MIN_SCORE:
+        return False, "trader_score_block", f"{display_symbol(symbol)} {side}: trader score too low {score} < {TRADER_MIN_SCORE}"
+
+    # Balanced B+ mode: B setups are allowed, but only if the current tape is alive.
+    # This keeps the bot from going silent while still blocking random weak B entries.
+    if grade != "A+":
+        if abs(ch3m) < TRADER_MIN_ABS_1M3 * 1.20 and vol1 < TRADER_MIN_VOL1 * 1.20 and range1 < TRADER_MIN_RANGE1 * 1.15:
+            return False, "trader_bplus_quality_block", (
+                f"{display_symbol(symbol)} {side}: B+ not strong enough; 1m3 {ch3m*100:+.2f}%, "
+                f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+            )
+
+    if base in HEAVY_BASES and TRADER_HEAVY_ONLY_A_PLUS and grade != "A+":
+        return False, "trader_heavy_grade_block", f"{display_symbol(symbol)} {side}: heavy coin requires A+"
+
+    # Directional pressure must exist now. Examples are not slow predictions.
+    if side == "LONG":
+        if ch3m < TRADER_MIN_ABS_1M3:
+            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} LONG: weak live pressure 1m3 {ch3m*100:+.2f}%"
+        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] <= c5[-2]["close"]:
+            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} LONG: last 5m not confirming up"
+        if close_location(c1[-1]) < TRADER_CLOSE_LONG:
+            return False, "trader_close_location_block", f"{display_symbol(symbol)} LONG: 1m close not near high"
+        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] <= max(x["high"] for x in c1[-6:-1]):
+            return False, "trader_micro_break_block", f"{display_symbol(symbol)} LONG: no fresh 1m high break"
+        aligned = ch15m >= TRADER_MIN_ABS_15M and ch30m >= -TRADER_MAX_COUNTER_30M
+        reversal_exception = setup_mode.startswith("REVERSAL") and ch3m >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
+    else:
+        if ch3m > -TRADER_MIN_ABS_1M3:
+            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} SHORT: weak live pressure 1m3 {ch3m*100:+.2f}%"
+        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] >= c5[-2]["close"]:
+            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} SHORT: last 5m not confirming down"
+        if close_location(c1[-1]) > TRADER_CLOSE_SHORT:
+            return False, "trader_close_location_block", f"{display_symbol(symbol)} SHORT: 1m close not near low"
+        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] >= min(x["low"] for x in c1[-6:-1]):
+            return False, "trader_micro_break_block", f"{display_symbol(symbol)} SHORT: no fresh 1m low break"
+        aligned = ch15m <= -TRADER_MIN_ABS_15M and ch30m <= TRADER_MAX_COUNTER_30M
+        reversal_exception = setup_mode.startswith("REVERSAL") and abs(ch3m) >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
+
+    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception):
+        return False, "trader_structure_block", (
+            f"{display_symbol(symbol)} {side}: weak structure; 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, mode {setup_mode}"
+        )
+
+    if vol1 < TRADER_MIN_VOL1:
+        return False, "trader_vol1_block", f"{display_symbol(symbol)} {side}: live vol1 too weak x{vol1:.2f}"
+    if vol5 < TRADER_MIN_VOL5:
+        return False, "trader_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
+    if range1 < TRADER_MIN_RANGE1:
+        return False, "trader_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
+    if range5 < TRADER_MIN_RANGE5:
+        return False, "trader_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
+
+    # TP5 should be plausible from current market expansion, not a fantasy target.
+    if entry > 0 and tp5 > 0:
+        need = abs(entry - tp5) / entry
+        recent_move = max(abs(ch15m), abs(ch30m), abs(percent_change(c5, 6)))
+        if recent_move < need * TRADER_MIN_TP5_FEASIBILITY:
+            return False, "trader_tp5_feasibility_block", (
+                f"{display_symbol(symbol)} {side}: TP5 move {need*100:.2f}% not feasible vs recent {recent_move*100:.2f}%"
+            )
+
+    return True, "ok", (
+        f"trader-pattern ok: score {score}, grade {grade}, 1m3 {ch3m*100:+.2f}%, "
+        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+    )
+
 def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
     t = now_ts()
     if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
@@ -1503,6 +1627,14 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             if len(near_miss) < 8:
                 near_miss.append(q_reason)
             continue
+
+        t_ok, t_block, t_reason = trader_pattern_gate(trade, symbol, c1, c5, c15, btc)
+        if not t_ok:
+            blocks[t_block] = blocks.get(t_block, 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(t_reason)
+            continue
+        trade["trader_pattern_reason"] = t_reason
 
         candidates.append(trade)
 
@@ -1781,7 +1913,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: INSTANT EDGE QUALITY SCALPER.\n"
+        f"Mode: TRADER PATTERN QUALITY SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
