@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.27 — AERO STYLE TRADER SCALPER
+# V13.28 — MARKET DUMP + AERO STYLE SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -25,8 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.27 AERO STYLE SCALPER"
-DEPLOY_MARKER = "V13_27_AERO_STYLE_SCALPER_2026_06_25"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.28 MARKET DUMP AERO SCALPER"
+DEPLOY_MARKER = "V13_28_MARKET_DUMP_AERO_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_27_aero_style_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_28_market_dump_aero_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -194,6 +194,22 @@ AERO_CLOSE_SHORT = float(os.getenv("AERO_CLOSE_SHORT", "0.48"))
 AERO_CLOSE_LONG = float(os.getenv("AERO_CLOSE_LONG", "0.52"))
 AERO_REQUIRE_EMA_REJECT = os.getenv("AERO_REQUIRE_EMA_REJECT", "true").lower() == "true"
 AERO_ALLOW_B_SCORE = os.getenv("AERO_ALLOW_B_SCORE", "true").lower() == "true"
+
+# --- V13.28 Market Dump SHORT fallback ---
+# Used when BTC/ETH/alt market is actively selling off and old fast/aero gates are too
+# selective. This catches dump continuation, but still avoids shorting a dead bottom:
+# it needs live 1m pressure, 5m participation and fresh continuation/reject evidence.
+MARKET_DUMP_SHORT_ENABLED = os.getenv("MARKET_DUMP_SHORT_ENABLED", "true").lower() == "true"
+DUMP_MIN_1M3 = float(os.getenv("DUMP_MIN_1M3", "0.0048"))
+DUMP_MIN_15M = float(os.getenv("DUMP_MIN_15M", "0.0035"))
+DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.42"))
+DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.55"))
+DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.45"))
+DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.70"))
+DUMP_CLOSE_SHORT = float(os.getenv("DUMP_CLOSE_SHORT", "0.58"))
+DUMP_MIN_RECENT_RANGE = float(os.getenv("DUMP_MIN_RECENT_RANGE", "0.0100"))
+DUMP_MAX_LATE_30M = float(os.getenv("DUMP_MAX_LATE_30M", "0.095"))
+DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "true").lower() == "true"
 
 
 # --- Time stop / no-stall logic ---
@@ -1352,6 +1368,118 @@ def instant_edge_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[st
         "btc_text": btc.get("text", ""),
     }
 
+def market_dump_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """V13.28 fallback: market-dump continuation SHORT.
+
+    This is for active market selloff sessions when BTC/ETH and many alts are falling.
+    The old setup logic often waits for a perfect AERO pullback/reject and returns no_fast,
+    while the tape is already giving a clean dump continuation. We still pass the final
+    RR/SL/live-volume and trader-pattern gates after this setup is constructed.
+    """
+    if not MARKET_DUMP_SHORT_ENABLED or not ALLOW_SHORT:
+        return None
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
+        return None
+
+    side = "SHORT"
+    price = c1[-1]["close"]
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    ch3m = percent_change(c1, 3)
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol1 = volume_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range1 = candle_range_ratio(c1, 20)
+    range5 = candle_range_ratio(c5, 20)
+    loc = close_location(last1)
+    recent_range = (max(x["high"] for x in c5[-6:]) - min(x["low"] for x in c5[-6:])) / max(price, 1e-12)
+    btc_1h = float(btc.get("ch1h", 0.0) or 0.0)
+    btc_6h = float(btc.get("ch6h", 0.0) or 0.0)
+
+    # Must be real downside pressure now.
+    if ch3m > -DUMP_MIN_1M3:
+        return None
+
+    # Either the alt itself is already selling on 15m, or BTC has a clear dump context.
+    market_dump_context = btc_1h <= -0.0025 or btc_6h <= -0.0100 or str(btc.get("direction", "")) == "BEAR"
+    alt_dump_context = ch15m <= -DUMP_MIN_15M or ch30m <= -DUMP_MIN_15M * 1.25
+    if not (market_dump_context or alt_dump_context):
+        return None
+
+    # Avoid very late shorts after an extreme 30m collapse unless the live tape is still exceptional.
+    if ch30m < -DUMP_MAX_LATE_30M and not (abs(ch3m) >= DUMP_MIN_1M3 * 2.0 and range1 >= 1.35):
+        return None
+
+    if vol1 < DUMP_MIN_VOL1:
+        return None
+    if vol5 < DUMP_MIN_VOL5 and not (abs(ch3m) >= DUMP_MIN_1M3 * 1.65):
+        return None
+    if range1 < DUMP_MIN_RANGE1:
+        return None
+    if range5 < DUMP_MIN_RANGE5:
+        return None
+    if recent_range < DUMP_MIN_RECENT_RANGE:
+        return None
+
+    # Do not short a weak doji. In a dump, close below mid/low half is enough; exact low-close is too strict.
+    if loc > DUMP_CLOSE_SHORT or last1["close"] >= last1["open"]:
+        return None
+
+    fresh_low_break = last1["close"] < min(x["low"] for x in c1[-7:-1])
+    failed_bounce = any(x["close"] > x["open"] for x in c1[-8:-1]) and last1["close"] < prev1["close"]
+    lower_high_reject = max(x["high"] for x in c1[-4:]) < max(x["high"] for x in c1[-14:-4]) and last1["close"] < prev1["close"]
+    if DUMP_REQUIRE_REJECT_OR_BREAK and not (fresh_low_break or failed_bounce or lower_high_reject):
+        return None
+
+    level = max(x["high"] for x in c1[-10:])
+    score = 80
+    score += min(10, int(abs(ch3m) * 1100))
+    score += min(8, int(abs(min(ch15m, 0.0)) * 700))
+    score += min(6, int(max(0.0, vol1 - 0.60) * 6))
+    score += min(7, int(max(0.0, range1 - 0.80) * 5))
+    score += min(6, int(max(0.0, range5 - 1.00) * 4))
+    if market_dump_context:
+        score += 3
+    if fresh_low_break:
+        score += 3
+    score = max(0, min(100, score))
+
+    reason = (
+        f"MARKET DUMP SHORT: активный рыночный слив, не прогноз, а dump-continuation. "
+        f"BTC context {btc.get('text', '')}; alt pressure 1m3 {ch3m*100:+.2f}%, "
+        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, "
+        f"Vol5 x{vol5:.2f}, Range1 x{range1:.2f}, Range5 x{range5:.2f}. "
+        f"Break/reject: freshLow {fresh_low_break}, failedBounce {failed_bounce}, lowerHighReject {lower_high_reject}. "
+        f"Дальше сделка обязана пройти RR/SL/live-volume/trader quality gates."
+    )
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": "PRO_MARKET_DUMP_SHORT",
+        "trade_type": "MARKET DUMP SHORT",
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 0.85 and range1 >= 1.15 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": "MARKET_DUMP_SHORT",
+        "t1h": trend_state(c1h),
+        "btc_text": btc.get("text", ""),
+    }
+
+
 def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
     side = setup["side"]
     entry = setup["entry"]
@@ -1635,12 +1763,13 @@ def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, f
             return False, "trader_5m_direction_block", f"{display_symbol(symbol)} SHORT: last 5m not confirming down"
         if close_location(c1[-1]) > TRADER_CLOSE_SHORT:
             return False, "trader_close_location_block", f"{display_symbol(symbol)} SHORT: 1m close not near low"
-        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] >= min(x["low"] for x in c1[-6:-1]):
+        dump_exception = setup_mode.startswith("MARKET_DUMP") and ch3m <= -TRADER_MIN_ABS_1M3 * 1.10 and range1 >= max(0.45, TRADER_MIN_RANGE1 * 0.60)
+        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] >= min(x["low"] for x in c1[-6:-1]) and not dump_exception:
             return False, "trader_micro_break_block", f"{display_symbol(symbol)} SHORT: no fresh 1m low break"
         aligned = ch15m <= -TRADER_MIN_ABS_15M and ch30m <= TRADER_MAX_COUNTER_30M
         reversal_exception = setup_mode.startswith("REVERSAL") and abs(ch3m) >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
 
-    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok):
+    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok or setup_mode.startswith("MARKET_DUMP")):
         return False, "trader_structure_block", (
             f"{display_symbol(symbol)} {side}: weak structure; 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, mode {setup_mode}"
         )
@@ -1706,6 +1835,10 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
             if setup:
                 blocks[f"instant_edge_{side.lower()}"] = blocks.get(f"instant_edge_{side.lower()}", 0) + 1
+        if not setup and side == "SHORT":
+            setup = market_dump_short_setup(symbol, c1, c5, c15, c1h, btc)
+            if setup:
+                blocks["market_dump_short"] = blocks.get("market_dump_short", 0) + 1
         if not setup:
             blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
             continue
@@ -1805,7 +1938,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.24 Instant Edge Quality Scalper\n"
+        f"🧪 Диагностика V13.28 Market Dump AERO Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -2031,7 +2164,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: AERO STYLE TRADER SCALPER.\n"
+        f"Mode: MARKET DUMP + AERO STYLE TRADER SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
