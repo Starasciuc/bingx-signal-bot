@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.25 — TRADER PATTERN QUALITY SCALPER
+# V13.27 — AERO STYLE TRADER SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -25,8 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.26 BALANCED TRADER SCALPER"
-DEPLOY_MARKER = "V13_26_BALANCED_TRADER_SCALPER_2026_06_25"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.27 AERO STYLE SCALPER"
+DEPLOY_MARKER = "V13_27_AERO_STYLE_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_26_balanced_trader_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_27_aero_style_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -174,6 +174,26 @@ TRADER_REQUIRE_MICRO_BREAK = os.getenv("TRADER_REQUIRE_MICRO_BREAK", "true").low
 TRADER_CLOSE_LONG = float(os.getenv("TRADER_CLOSE_LONG", "0.57"))
 TRADER_CLOSE_SHORT = float(os.getenv("TRADER_CLOSE_SHORT", "0.43"))
 TRADER_HEAVY_ONLY_A_PLUS = os.getenv("TRADER_HEAVY_ONLY_A_PLUS", "true").lower() == "true"
+
+# --- V13.27 AERO-style trader gate ---
+# This is built from the user's AERO example: short after a controlled upper pullback/reject,
+# not a random late short at the bottom. It allows quality B+ trades if the tape shows a true
+# pullback -> rejection -> breakdown structure, while keeping RR/SL quality gate active.
+AERO_STYLE_GATE_ENABLED = os.getenv("AERO_STYLE_GATE_ENABLED", "true").lower() == "true"
+AERO_SHORT_ENABLED = os.getenv("AERO_SHORT_ENABLED", "true").lower() == "true"
+AERO_LONG_ENABLED = os.getenv("AERO_LONG_ENABLED", "true").lower() == "true"
+AERO_MIN_PULLBACK = float(os.getenv("AERO_MIN_PULLBACK", "0.0045"))       # recent high/low must be away from entry
+AERO_MAX_PULLBACK = float(os.getenv("AERO_MAX_PULLBACK", "0.0850"))       # avoid extreme manipulated spikes
+AERO_MIN_1M3 = float(os.getenv("AERO_MIN_1M3", "0.0038"))                 # current 3m pressure
+AERO_MIN_RECENT_RANGE = float(os.getenv("AERO_MIN_RECENT_RANGE", "0.0140")) # recent 30m range expansion
+AERO_MIN_VOL1 = float(os.getenv("AERO_MIN_VOL1", "0.35"))
+AERO_MIN_VOL5 = float(os.getenv("AERO_MIN_VOL5", "0.45"))
+AERO_MIN_RANGE1 = float(os.getenv("AERO_MIN_RANGE1", "0.60"))
+AERO_MIN_RANGE5 = float(os.getenv("AERO_MIN_RANGE5", "0.65"))
+AERO_CLOSE_SHORT = float(os.getenv("AERO_CLOSE_SHORT", "0.48"))
+AERO_CLOSE_LONG = float(os.getenv("AERO_CLOSE_LONG", "0.52"))
+AERO_REQUIRE_EMA_REJECT = os.getenv("AERO_REQUIRE_EMA_REJECT", "true").lower() == "true"
+AERO_ALLOW_B_SCORE = os.getenv("AERO_ALLOW_B_SCORE", "true").lower() == "true"
 
 
 # --- Time stop / no-stall logic ---
@@ -1453,6 +1473,99 @@ def professional_quality_gate(trade: Dict[str, Any], symbol: str) -> Tuple[bool,
     return True, "ok", "quality ok"
 
 
+
+def aero_style_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """V13.27 AERO/PORTAL-style gate.
+
+    Looks for the specific trader structure:
+    - SHORT: recent upper pullback/stop-hunt -> loss of momentum -> 1m breakdown.
+    - LONG: recent lower sweep -> reclaim -> 1m breakout.
+
+    This does not replace RR/SL filters. It is a structure-quality exception so the bot
+    can catch examples-style trades without accepting random weak B signals.
+    """
+    if not AERO_STYLE_GATE_ENABLED:
+        return False, "aero_disabled", "aero-style disabled"
+    if len(c1) < 35 or len(c5) < 20:
+        return False, "aero_no_candles", f"{display_symbol(symbol)}: not enough candles for AERO-style gate"
+
+    side = str(trade.get("side", ""))
+    if side == "SHORT" and not AERO_SHORT_ENABLED:
+        return False, "aero_short_disabled", f"{display_symbol(symbol)} SHORT: AERO short disabled"
+    if side == "LONG" and not AERO_LONG_ENABLED:
+        return False, "aero_long_disabled", f"{display_symbol(symbol)} LONG: AERO long disabled"
+
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    if entry <= 0:
+        return False, "aero_bad_entry", f"{display_symbol(symbol)} {side}: bad entry"
+
+    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
+    loc = close_location(c1[-1])
+    e1 = ema([x["close"] for x in c1[-25:]], 9)
+    e5 = ema([x["close"] for x in c5[-30:]], 9)
+    recent_1m = c1[-18:]
+    recent_5m = c5[-8:]
+    recent_high = max(x["high"] for x in recent_1m + recent_5m[-3:])
+    recent_low = min(x["low"] for x in recent_1m + recent_5m[-3:])
+    recent_range = (recent_high - recent_low) / max(entry, 1e-12)
+
+    if recent_range < AERO_MIN_RECENT_RANGE:
+        return False, "aero_recent_range_block", f"{display_symbol(symbol)} {side}: recent range too small {recent_range*100:.2f}%"
+    if vol1 < AERO_MIN_VOL1:
+        return False, "aero_vol1_block", f"{display_symbol(symbol)} {side}: vol1 too weak x{vol1:.2f}"
+    if vol5 < AERO_MIN_VOL5:
+        return False, "aero_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
+    if range1 < AERO_MIN_RANGE1:
+        return False, "aero_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
+    if range5 < AERO_MIN_RANGE5:
+        return False, "aero_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
+
+    if side == "SHORT":
+        pullback = (recent_high - entry) / max(entry, 1e-12)
+        if pullback < AERO_MIN_PULLBACK:
+            return False, "aero_pullback_block", f"{display_symbol(symbol)} SHORT: no upper pullback/reject; pullback {pullback*100:.2f}%"
+        if pullback > AERO_MAX_PULLBACK:
+            return False, "aero_spike_block", f"{display_symbol(symbol)} SHORT: spike too extreme {pullback*100:.2f}%"
+        if ch3m > -AERO_MIN_1M3:
+            return False, "aero_pressure_block", f"{display_symbol(symbol)} SHORT: no live breakdown 1m3 {ch3m*100:+.2f}%"
+        if loc > AERO_CLOSE_SHORT or c1[-1]["close"] >= c1[-1]["open"]:
+            return False, "aero_reject_close_block", f"{display_symbol(symbol)} SHORT: last 1m not rejected near low"
+        if c1[-1]["close"] >= min(x["low"] for x in c1[-7:-1]):
+            return False, "aero_breakdown_block", f"{display_symbol(symbol)} SHORT: no fresh local breakdown"
+        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] < e1 or c1[-1]["close"] < e5):
+            return False, "aero_ema_reject_block", f"{display_symbol(symbol)} SHORT: no EMA/VWAP-style rejection"
+        return True, "aero_style_short_ok", (
+            f"AERO-style SHORT ok: upper pullback/reject {pullback*100:.2f}%, "
+            f"live breakdown 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
+            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+        )
+
+    if side == "LONG":
+        sweep = (entry - recent_low) / max(entry, 1e-12)
+        if sweep < AERO_MIN_PULLBACK:
+            return False, "aero_sweep_block", f"{display_symbol(symbol)} LONG: no lower sweep/reclaim; sweep {sweep*100:.2f}%"
+        if sweep > AERO_MAX_PULLBACK:
+            return False, "aero_spike_block", f"{display_symbol(symbol)} LONG: spike too extreme {sweep*100:.2f}%"
+        if ch3m < AERO_MIN_1M3:
+            return False, "aero_pressure_block", f"{display_symbol(symbol)} LONG: no live reclaim 1m3 {ch3m*100:+.2f}%"
+        if loc < AERO_CLOSE_LONG or c1[-1]["close"] <= c1[-1]["open"]:
+            return False, "aero_reclaim_close_block", f"{display_symbol(symbol)} LONG: last 1m not reclaimed near high"
+        if c1[-1]["close"] <= max(x["high"] for x in c1[-7:-1]):
+            return False, "aero_breakout_block", f"{display_symbol(symbol)} LONG: no fresh local breakout"
+        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] > e1 or c1[-1]["close"] > e5):
+            return False, "aero_ema_reclaim_block", f"{display_symbol(symbol)} LONG: no EMA/VWAP-style reclaim"
+        return True, "aero_style_long_ok", (
+            f"AERO-style LONG ok: lower sweep/reclaim {sweep*100:.2f}%, "
+            f"live reclaim 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
+            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+        )
+
+    return False, "aero_side_block", f"{display_symbol(symbol)}: unknown side {side}"
+
 def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
     """Example-style final gate.
 
@@ -1481,20 +1594,24 @@ def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, f
     entry = float(trade.get("entry", 0.0) or 0.0)
     tp5 = float(trade.get("tp5", 0.0) or 0.0)
 
+    aero_ok, aero_block, aero_reason = aero_style_gate(trade, symbol, c1, c5, c15, btc)
+
     if grade != "A+" and not TRADER_ALLOW_B_SCORE:
         return False, "trader_grade_block", f"{display_symbol(symbol)} {side}: B-class skipped by env; set TRADER_ALLOW_B_SCORE=true to allow B+"
 
     if score < TRADER_MIN_SCORE:
-        return False, "trader_score_block", f"{display_symbol(symbol)} {side}: trader score too low {score} < {TRADER_MIN_SCORE}"
+        if not (aero_ok and AERO_ALLOW_B_SCORE and score >= max(72, TRADER_MIN_SCORE - 10)):
+            return False, "trader_score_block", f"{display_symbol(symbol)} {side}: trader score too low {score} < {TRADER_MIN_SCORE}"
 
     # Balanced B+ mode: B setups are allowed, but only if the current tape is alive.
     # This keeps the bot from going silent while still blocking random weak B entries.
     if grade != "A+":
         if abs(ch3m) < TRADER_MIN_ABS_1M3 * 1.20 and vol1 < TRADER_MIN_VOL1 * 1.20 and range1 < TRADER_MIN_RANGE1 * 1.15:
-            return False, "trader_bplus_quality_block", (
-                f"{display_symbol(symbol)} {side}: B+ not strong enough; 1m3 {ch3m*100:+.2f}%, "
-                f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
-            )
+            if not aero_ok:
+                return False, "trader_bplus_quality_block", (
+                    f"{display_symbol(symbol)} {side}: B+ not strong enough; 1m3 {ch3m*100:+.2f}%, "
+                    f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+                )
 
     if base in HEAVY_BASES and TRADER_HEAVY_ONLY_A_PLUS and grade != "A+":
         return False, "trader_heavy_grade_block", f"{display_symbol(symbol)} {side}: heavy coin requires A+"
@@ -1523,18 +1640,18 @@ def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, f
         aligned = ch15m <= -TRADER_MIN_ABS_15M and ch30m <= TRADER_MAX_COUNTER_30M
         reversal_exception = setup_mode.startswith("REVERSAL") and abs(ch3m) >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
 
-    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception):
+    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok):
         return False, "trader_structure_block", (
             f"{display_symbol(symbol)} {side}: weak structure; 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, mode {setup_mode}"
         )
 
-    if vol1 < TRADER_MIN_VOL1:
+    if vol1 < TRADER_MIN_VOL1 and not aero_ok:
         return False, "trader_vol1_block", f"{display_symbol(symbol)} {side}: live vol1 too weak x{vol1:.2f}"
-    if vol5 < TRADER_MIN_VOL5:
+    if vol5 < TRADER_MIN_VOL5 and not aero_ok:
         return False, "trader_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
-    if range1 < TRADER_MIN_RANGE1:
+    if range1 < TRADER_MIN_RANGE1 and not aero_ok:
         return False, "trader_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
-    if range5 < TRADER_MIN_RANGE5:
+    if range5 < TRADER_MIN_RANGE5 and not aero_ok:
         return False, "trader_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
 
     # TP5 should be plausible from current market expansion, not a fantasy target.
@@ -1546,8 +1663,9 @@ def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, f
                 f"{display_symbol(symbol)} {side}: TP5 move {need*100:.2f}% not feasible vs recent {recent_move*100:.2f}%"
             )
 
+    style_note = aero_reason if aero_ok else "standard trader-pattern ok"
     return True, "ok", (
-        f"trader-pattern ok: score {score}, grade {grade}, 1m3 {ch3m*100:+.2f}%, "
+        f"{style_note}; score {score}, grade {grade}, 1m3 {ch3m*100:+.2f}%, "
         f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, vol1 x{vol1:.2f}, range1 x{range1:.2f}"
     )
 
@@ -1913,7 +2031,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: TRADER PATTERN QUALITY SCALPER.\n"
+        f"Mode: AERO STYLE TRADER SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
