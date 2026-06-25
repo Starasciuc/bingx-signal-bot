@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# V13.23 — BALANCED PROFESSIONAL QUALITY SCALPER
+# V13.24 — INSTANT EDGE QUALITY SCALPER
 # Professional goal:
 # Trade only short-lived market situations with immediate edge.
 # No trend prediction, no market phase guessing.
@@ -21,12 +21,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 #
 # If the trade does not start paying quickly, it is not the setup and gets expired.
 # Important: this bot sends signals/alerts. It does not guarantee profit.
-# V13.23 fix: V13.22 was too strict and could stay silent; this version keeps hard blocks
-# for bad RR/huge SL/weak live flow, but relaxes borderline thresholds so valid fast scalps can pass.
+# V13.24 fix: adds an INSTANT_EDGE fallback for live impulse/reclaim setups.
+# It keeps the professional quality gate, but no longer hides all rejects under no_fast.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.23 BALANCED QUALITY SCALPER"
-DEPLOY_MARKER = "V13_23_BALANCED_QUALITY_SCALPER_2026_06_25"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.24 INSTANT EDGE QUALITY SCALPER"
+DEPLOY_MARKER = "V13_24_INSTANT_EDGE_QUALITY_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_23_balanced_quality_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_24_instant_edge_quality_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -133,6 +133,23 @@ HEAVY_BASES = {
     "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK", "AVAX",
     "DOT", "LTC", "BCH", "XMR", "GMX", "AAVE", "UNI", "ATOM", "ETC", "FIL"
 }
+
+# --- V13.24 Instant Edge fallback ---
+# This mode catches the examples-style micro-moment when the coin is moving NOW,
+# but the older pullback/EMA/VWAP setup is too slow and returns no_fast.
+# It is not a loose mode: final RR/SL/live-volume quality gate still applies after trade construction.
+INSTANT_EDGE_ENABLED = os.getenv("INSTANT_EDGE_ENABLED", "true").lower() == "true"
+INSTANT_MIN_1M3_MOVE = float(os.getenv("INSTANT_MIN_1M3_MOVE", "0.0055"))
+INSTANT_MIN_15M_MOVE = float(os.getenv("INSTANT_MIN_15M_MOVE", "0.0040"))
+INSTANT_MIN_VOL1 = float(os.getenv("INSTANT_MIN_VOL1", "0.45"))
+INSTANT_MIN_RANGE1 = float(os.getenv("INSTANT_MIN_RANGE1", "0.85"))
+INSTANT_MIN_VOL5 = float(os.getenv("INSTANT_MIN_VOL5", "0.55"))
+INSTANT_MIN_RANGE5 = float(os.getenv("INSTANT_MIN_RANGE5", "0.70"))
+INSTANT_CLOSE_LONG = float(os.getenv("INSTANT_CLOSE_LONG", "0.60"))
+INSTANT_CLOSE_SHORT = float(os.getenv("INSTANT_CLOSE_SHORT", "0.40"))
+INSTANT_MIN_BODY = float(os.getenv("INSTANT_MIN_BODY", "0.34"))
+INSTANT_MAX_30M_CHASE = float(os.getenv("INSTANT_MAX_30M_CHASE", "0.065"))
+INSTANT_ALLOW_STRONG_1M_EXCEPTION = os.getenv("INSTANT_ALLOW_STRONG_1M_EXCEPTION", "true").lower() == "true"
 
 # --- Time stop / no-stall logic ---
 FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
@@ -1158,15 +1175,149 @@ def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str,
     }
 
 
+
+def instant_edge_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    """V13.24 fallback: instant momentum/reclaim scalp.
+
+    This is for situations visible in diagnostics such as SYRUP/FOLKS:
+    live 1m impulse is present, but the older fast_burst setup rejects the trade because it
+    waits for a perfect 5m pullback/reclaim. We still keep strict quality filters after this.
+    """
+    if not INSTANT_EDGE_ENABLED:
+        return None
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
+        return None
+
+    price = c1[-1]["close"]
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    ch3m = percent_change(c1, 3)
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol1 = volume_ratio(c1, 20)
+    range1 = candle_range_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range5 = candle_range_ratio(c5, 20)
+    loc = close_location(last1)
+    body = abs(last1["close"] - last1["open"]) / max(last1["high"] - last1["low"], 1e-12)
+    t1h = trend_state(c1h)
+
+    # Live impulse must be real, not a dead hot-list artifact.
+    if side == "LONG":
+        if ch3m < INSTANT_MIN_1M3_MOVE:
+            return None
+        if ch15m < INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and ch3m >= INSTANT_MIN_1M3_MOVE * 1.45):
+            return None
+        if ch30m > INSTANT_MAX_30M_CHASE and ch3m < INSTANT_MIN_1M3_MOVE * 1.35:
+            return None
+        if loc < INSTANT_CLOSE_LONG or last1["close"] <= last1["open"]:
+            return None
+        if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
+            return None
+        # Avoid buying after multiple vertical green candles without any micro reset.
+        had_reset = any(x["close"] < x["open"] for x in c1[-7:-1]) or min(x["low"] for x in c1[-5:]) <= min(x["low"] for x in c1[-14:-5]) * 1.002
+        if not had_reset and ch30m > 0.025:
+            return None
+        level = min(x["low"] for x in c1[-10:])
+        strategy = "PRO_INSTANT_EDGE_LONG"
+        trade_type = "INSTANT EDGE LONG"
+        setup_mode = "INSTANT_MOMENTUM_LONG"
+        direction_text = "вверх"
+    else:
+        if ch3m > -INSTANT_MIN_1M3_MOVE:
+            return None
+        if ch15m > -INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.45):
+            return None
+        if ch30m < -INSTANT_MAX_30M_CHASE and abs(ch3m) < INSTANT_MIN_1M3_MOVE * 1.35:
+            return None
+        if loc > INSTANT_CLOSE_SHORT or last1["close"] >= last1["open"]:
+            return None
+        if prev1["close"] > prev1["open"] and last1["close"] >= prev1["open"]:
+            return None
+        had_reset = any(x["close"] > x["open"] for x in c1[-7:-1]) or max(x["high"] for x in c1[-5:]) >= max(x["high"] for x in c1[-14:-5]) * 0.998
+        if not had_reset and ch30m < -0.025:
+            return None
+        level = max(x["high"] for x in c1[-10:])
+        strategy = "PRO_INSTANT_EDGE_SHORT"
+        trade_type = "INSTANT EDGE SHORT"
+        setup_mode = "INSTANT_MOMENTUM_SHORT"
+        direction_text = "вниз"
+
+    if body < INSTANT_MIN_BODY:
+        return None
+    if range1 < INSTANT_MIN_RANGE1:
+        return None
+    if vol1 < INSTANT_MIN_VOL1 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and range1 >= 1.15):
+        return None
+    if range5 < INSTANT_MIN_RANGE5:
+        return None
+    if vol5 < INSTANT_MIN_VOL5 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.60):
+        return None
+
+    # Keep a micro structure break; this prevents entering the middle of a random candle.
+    micro_ok, micro_reason = micro_structure_break(c1, side)
+    if not micro_ok:
+        return None
+
+    # BTC is context, not a hard phase filter. Against BTC pressure, demand stronger live impulse.
+    btc_dir = str(btc.get("direction", "UNKNOWN"))
+    if side == "LONG" and btc_dir == "BEAR" and not (ch3m >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m >= INSTANT_MIN_15M_MOVE * 1.2):
+        return None
+    if side == "SHORT" and btc_dir == "BULL" and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m <= -INSTANT_MIN_15M_MOVE * 1.2):
+        return None
+
+    score = 78
+    score += min(10, int(abs(ch3m) * 1000))
+    score += min(8, int(abs(ch15m) * 700))
+    score += min(6, int(max(0.0, vol1 - 0.8) * 6))
+    score += min(6, int(max(0.0, range1 - 1.0) * 6))
+    score += min(5, int(max(0.0, range5 - 1.0) * 4))
+    score = max(0, min(100, score))
+
+    reason = (
+        f"INSTANT EDGE {side}: профессиональный fallback для живого импульса. "
+        f"Цена движется {direction_text} сейчас: 1m3 {ch3m*100:+.2f}%, 15m {ch15m*100:+.2f}%, "
+        f"30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
+        f"Vol5 x{vol5:.2f}, Range5 x{range5:.2f}, closeLoc {loc:.2f}. "
+        f"{micro_reason}. Сделка всё равно проходит RR/SL/live-volume quality gate."
+    )
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "trade_type": trade_type,
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 1.20 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": setup_mode,
+        "t1h": t1h,
+        "btc_text": btc.get("text", ""),
+    }
+
 def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
     side = setup["side"]
     entry = setup["entry"]
     level = setup["level"]
     a = atr(c5, 14)
-    buffer = max(entry * 0.0022, a * SL_ATR_MULT)
+    instant = str(setup.get("setup_mode", "")).startswith("INSTANT")
+    buffer = max(entry * (0.0016 if instant else 0.0022), a * (0.55 if instant else SL_ATR_MULT))
 
     if side == "LONG":
-        recent_low = min(x["low"] for x in c1[-15:] + c5[-4:])
+        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
+        recent_low = min(x["low"] for x in recent_source)
         sl = min(level, recent_low) - buffer
         sl = min(sl, entry * (1 - MIN_SL_MOVE))
         tp1 = entry * (1 + TP1_MOVE)
@@ -1175,7 +1326,8 @@ def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: 
         tp4 = entry * (1 + TP4_MOVE)
         tp5 = entry * (1 + TP5_MOVE)
     else:
-        recent_high = max(x["high"] for x in c1[-15:] + c5[-4:])
+        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
+        recent_high = max(x["high"] for x in recent_source)
         sl = max(level, recent_high) + buffer
         sl = max(sl, entry * (1 + MIN_SL_MOVE))
         tp1 = entry * (1 - TP1_MOVE)
@@ -1309,6 +1461,10 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             continue
         setup = fast_burst_setup(symbol, c1, c5, c15, c1h, btc, side)
         if not setup:
+            setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
+            if setup:
+                blocks[f"instant_edge_{side.lower()}"] = blocks.get(f"instant_edge_{side.lower()}", 0) + 1
+        if not setup:
             blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
             continue
 
@@ -1399,7 +1555,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.21 Context Adaptive Scalper\n"
+        f"🧪 Диагностика V13.24 Instant Edge Quality Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -1466,7 +1622,13 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
     scan["candidates"] = len(found)
 
     sent = 0
-    for s in found[:MAX_SIGNALS_PER_SCAN]:
+    free_slots = max(0, MAX_ACTIVE_SIGNALS - len(STATE.get("active_signals", [])))
+    send_limit = min(MAX_SIGNALS_PER_SCAN, free_slots)
+    if send_limit <= 0 and found:
+        blocks["active_slots_full_send_block"] = blocks.get("active_slots_full_send_block", 0) + 1
+        if len(near_miss) < 8:
+            near_miss.append(f"found {len(found)} candidate(s), but active slots are full")
+    for s in found[:send_limit]:
         add_active_signal(s)
         send_telegram(build_signal_message(s))
         sent += 1
@@ -1619,7 +1781,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: LIVE MARKET SCALPER.\n"
+        f"Mode: INSTANT EDGE QUALITY SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
