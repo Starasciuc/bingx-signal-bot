@@ -25,8 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.32 LOW STOP HIGH QUALITY SCALPER"
-DEPLOY_MARKER = "V13_32_LOW_STOP_HIGH_QUALITY_SCALPER_2026_06_26"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.29 LOCAL STOP DUMP SCALPER"
+DEPLOY_MARKER = "V13_29_LOCAL_STOP_DUMP_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_31_alive_kill_switch_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_29_local_stop_dump_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -119,18 +119,18 @@ MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # techn
 # V13.29: for fast scalps we use a LOCAL execution stop, not the distant invalidation/averaging zone.
 # This keeps AERO-style / dump scalps alive while still blocking XMR-style wide-risk trades.
 LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
-LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0095"))  # V13.32: max 0.95% price risk; x20 ≈ 19% ROI
-LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0048"))  # V13.32: tighter execution stop, but not random-noise tight
-LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "AERO_STYLE_SHORT", "AERO_STYLE_LONG"}
+LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0145"))  # 1.45% price risk cap; x20 ≈ 29% ROI
+LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0065"))  # keep stop not too tight
+LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG", "AERO_STYLE_SHORT", "AERO_STYLE_LONG"}
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
 # --- V13.22 professional quality gate ---
 # Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
-MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "22.0"))
-MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.45"))
-MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.95"))
-MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "2.20"))
+MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "32.0"))
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
+MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.62"))
+MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
 MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.50"))
 MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.30"))
 STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0050"))
@@ -147,20 +147,18 @@ HEAVY_BASES = {
 # This mode catches the examples-style micro-moment when the coin is moving NOW,
 # but the older pullback/EMA/VWAP setup is too slow and returns no_fast.
 # It is not a loose mode: final RR/SL/live-volume quality gate still applies after trade construction.
-INSTANT_EDGE_HARD_DISABLED = os.getenv("INSTANT_EDGE_HARD_DISABLED", "true").lower() == "true"
-INSTANT_EDGE_ENABLED = (not INSTANT_EDGE_HARD_DISABLED) and os.getenv("INSTANT_EDGE_ENABLED", "false").lower() == "true"
+INSTANT_EDGE_ENABLED = os.getenv("INSTANT_EDGE_ENABLED", "true").lower() == "true"
 INSTANT_MIN_1M3_MOVE = float(os.getenv("INSTANT_MIN_1M3_MOVE", "0.0055"))
 INSTANT_MIN_15M_MOVE = float(os.getenv("INSTANT_MIN_15M_MOVE", "0.0040"))
-INSTANT_MIN_VOL1 = float(os.getenv("INSTANT_MIN_VOL1", "0.65"))
-INSTANT_MIN_RANGE1 = float(os.getenv("INSTANT_MIN_RANGE1", "1.05"))
-INSTANT_MIN_VOL5 = float(os.getenv("INSTANT_MIN_VOL5", "0.70"))
-INSTANT_MIN_RANGE5 = float(os.getenv("INSTANT_MIN_RANGE5", "0.90"))
-INSTANT_CLOSE_LONG = float(os.getenv("INSTANT_CLOSE_LONG", "0.68"))
-INSTANT_CLOSE_SHORT = float(os.getenv("INSTANT_CLOSE_SHORT", "0.32"))
+INSTANT_MIN_VOL1 = float(os.getenv("INSTANT_MIN_VOL1", "0.45"))
+INSTANT_MIN_RANGE1 = float(os.getenv("INSTANT_MIN_RANGE1", "0.85"))
+INSTANT_MIN_VOL5 = float(os.getenv("INSTANT_MIN_VOL5", "0.55"))
+INSTANT_MIN_RANGE5 = float(os.getenv("INSTANT_MIN_RANGE5", "0.70"))
+INSTANT_CLOSE_LONG = float(os.getenv("INSTANT_CLOSE_LONG", "0.60"))
+INSTANT_CLOSE_SHORT = float(os.getenv("INSTANT_CLOSE_SHORT", "0.40"))
 INSTANT_MIN_BODY = float(os.getenv("INSTANT_MIN_BODY", "0.34"))
 INSTANT_MAX_30M_CHASE = float(os.getenv("INSTANT_MAX_30M_CHASE", "0.065"))
-INSTANT_ALLOW_STRONG_1M_EXCEPTION = os.getenv("INSTANT_ALLOW_STRONG_1M_EXCEPTION", "false").lower() == "true"
-INSTANT_REQUIRE_TWO_1M = os.getenv("INSTANT_REQUIRE_TWO_1M", "true").lower() == "true"
+INSTANT_ALLOW_STRONG_1M_EXCEPTION = os.getenv("INSTANT_ALLOW_STRONG_1M_EXCEPTION", "true").lower() == "true"
 
 # --- V13.25 trader-pattern quality gate ---
 # Built from the examples: AERO/PORTAL/HOME/WLD/VELVET are not random hot ticks.
@@ -211,38 +209,14 @@ AERO_ALLOW_B_SCORE = os.getenv("AERO_ALLOW_B_SCORE", "true").lower() == "true"
 MARKET_DUMP_SHORT_ENABLED = os.getenv("MARKET_DUMP_SHORT_ENABLED", "true").lower() == "true"
 DUMP_MIN_1M3 = float(os.getenv("DUMP_MIN_1M3", "0.0048"))
 DUMP_MIN_15M = float(os.getenv("DUMP_MIN_15M", "0.0035"))
-DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.62"))
-DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.60"))
-DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.85"))
-DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.75"))
-DUMP_CLOSE_SHORT = float(os.getenv("DUMP_CLOSE_SHORT", "0.34"))
+DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.35"))
+DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.48"))
+DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.40"))
+DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.60"))
+DUMP_CLOSE_SHORT = float(os.getenv("DUMP_CLOSE_SHORT", "0.58"))
 DUMP_MIN_RECENT_RANGE = float(os.getenv("DUMP_MIN_RECENT_RANGE", "0.0100"))
 DUMP_MAX_LATE_30M = float(os.getenv("DUMP_MAX_LATE_30M", "0.095"))
-DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "true").lower() == "true"
-DUMP_REQUIRE_TWO_RED = os.getenv("DUMP_REQUIRE_TWO_RED", "true").lower() == "true"
-
-
-
-# --- V13.31 strategy kill-switch defaults (fixed) ---
-# V13.30 used these names in the live stats protection function, but they must be defined
-# explicitly so the bot cannot throw a runtime NameError and silently skip candidates.
-STRATEGY_STATS_PROTECTION = os.getenv("STRATEGY_STATS_PROTECTION", "true").lower() == "true"
-INSTANT_STRATEGY_DISABLE_AFTER = int(os.getenv("INSTANT_STRATEGY_DISABLE_AFTER", "4"))
-INSTANT_STRATEGY_MIN_WR = float(os.getenv("INSTANT_STRATEGY_MIN_WR", "35.0"))
-# Default is false to avoid total silence. If true, weak Market Dump stats require A+/B+ tape.
-DUMP_ALLOW_ONLY_A_PLUS_WHEN_WEAK = os.getenv("DUMP_ALLOW_ONLY_A_PLUS_WHEN_WEAK", "false").lower() == "true"
-DUMP_STRATEGY_MIN_CLOSED = int(os.getenv("DUMP_STRATEGY_MIN_CLOSED", "12"))
-DUMP_STRATEGY_MIN_WR = float(os.getenv("DUMP_STRATEGY_MIN_WR", "35.0"))
-DUMP_WEAK_MIN_SCORE = int(os.getenv("DUMP_WEAK_MIN_SCORE", "88"))
-DUMP_WEAK_MIN_VOL1 = float(os.getenv("DUMP_WEAK_MIN_VOL1", "0.72"))
-DUMP_WEAK_MIN_RANGE1 = float(os.getenv("DUMP_WEAK_MIN_RANGE1", "0.95"))
-
-# --- V13.32 loss-control / smaller-stop protection ---
-# If a strategy proves it mostly creates SL/expired signals, do not keep trading it.
-STRATEGY_SL_RATE_PROTECTION = os.getenv("STRATEGY_SL_RATE_PROTECTION", "true").lower() == "true"
-STRATEGY_MIN_CLOSED_FOR_SL_BLOCK = int(os.getenv("STRATEGY_MIN_CLOSED_FOR_SL_BLOCK", "8"))
-STRATEGY_MAX_SL_RATE = float(os.getenv("STRATEGY_MAX_SL_RATE", "45.0"))
-STRATEGY_MIN_WR_FOR_SL_BLOCK = float(os.getenv("STRATEGY_MIN_WR_FOR_SL_BLOCK", "25.0"))
+DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "false").lower() == "true"
 
 
 # --- Time stop / no-stall logic ---
@@ -1016,50 +990,6 @@ def long_live_stats_ok() -> Tuple[bool, str]:
     return True, "LONG stats ok"
 
 
-
-def strategy_live_stats_ok(setup: Dict[str, Any]) -> Tuple[bool, str]:
-    """V13.30: automatic kill-switch for strategies that are losing in live stats.
-
-    The user's live stats showed INSTANT EDGE was strongly negative. The bot must stop
-    trusting a strategy after real losses instead of continuing to mark it A+.
-    """
-    if not STRATEGY_STATS_PROTECTION:
-        return True, "strategy stats protection disabled"
-    strategy = str(setup.get("strategy", ""))
-    stats = STATE.setdefault("stats", default_state()["stats"])
-    item = stats.get("strategy", {}).get(strategy, {})
-    closed = int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0))
-    if closed <= 0:
-        return True, "not enough strategy stats"
-    wr = int(item.get("profit", 0)) / max(closed, 1) * 100.0
-    sl_rate = int(item.get("sl", 0)) / max(closed, 1) * 100.0
-
-    if STRATEGY_SL_RATE_PROTECTION and closed >= STRATEGY_MIN_CLOSED_FOR_SL_BLOCK:
-        if wr < STRATEGY_MIN_WR_FOR_SL_BLOCK and sl_rate >= STRATEGY_MAX_SL_RATE:
-            return False, f"{strategy} disabled: WR {wr:.1f}%, SL-rate {sl_rate:.1f}% after {closed} signals"
-
-    # Instant Edge is disabled by default; if user enables it manually, stop it very quickly when stats are bad.
-    if strategy.startswith("PRO_INSTANT_EDGE"):
-        if closed >= INSTANT_STRATEGY_DISABLE_AFTER and wr < INSTANT_STRATEGY_MIN_WR:
-            return False, f"{strategy} disabled by live stats: WR {wr:.1f}% after {closed} signals"
-
-    # Market dump can work, but if the user enables weak-stats protection, do not make
-    # it all-or-nothing. Allow A+ OR a strong B+ tape, otherwise the bot can go silent.
-    if strategy == "PRO_MARKET_DUMP_SHORT" and DUMP_ALLOW_ONLY_A_PLUS_WHEN_WEAK:
-        if closed >= DUMP_STRATEGY_MIN_CLOSED and wr < DUMP_STRATEGY_MIN_WR:
-            score = int(setup.get("score", 0) or 0)
-            vol1 = float(setup.get("vol1", 0.0) or 0.0)
-            range1 = float(setup.get("range1", 0.0) or 0.0)
-            a_plus_ok = setup.get("grade") == "A+" and score >= 92
-            b_plus_ok = score >= DUMP_WEAK_MIN_SCORE and vol1 >= DUMP_WEAK_MIN_VOL1 and range1 >= DUMP_WEAK_MIN_RANGE1
-            if not (a_plus_ok or b_plus_ok):
-                return False, (
-                    f"{strategy} weak live stats: WR {wr:.1f}% after {closed}; "
-                    f"need A+ or B+ dump tape, got score {score}, vol1 x{vol1:.2f}, range1 x{range1:.2f}"
-                )
-
-    return True, "strategy stats ok"
-
 def professional_long_reclaim_gate(
     symbol: str,
     c1: List[Dict[str, float]],
@@ -1352,8 +1282,6 @@ def instant_edge_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[st
             return None
         if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
             return None
-        if INSTANT_REQUIRE_TWO_1M and not (prev1["close"] > prev1["open"] and last1["close"] > prev1["close"]):
-            return None
         # Avoid buying after multiple vertical green candles without any micro reset.
         had_reset = any(x["close"] < x["open"] for x in c1[-7:-1]) or min(x["low"] for x in c1[-5:]) <= min(x["low"] for x in c1[-14:-5]) * 1.002
         if not had_reset and ch30m > 0.025:
@@ -1373,8 +1301,6 @@ def instant_edge_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[st
         if loc > INSTANT_CLOSE_SHORT or last1["close"] >= last1["open"]:
             return None
         if prev1["close"] > prev1["open"] and last1["close"] >= prev1["open"]:
-            return None
-        if INSTANT_REQUIRE_TWO_1M and not (prev1["close"] < prev1["open"] and last1["close"] < prev1["close"]):
             return None
         had_reset = any(x["close"] > x["open"] for x in c1[-7:-1]) or max(x["high"] for x in c1[-5:]) >= max(x["high"] for x in c1[-14:-5]) * 0.998
         if not had_reset and ch30m < -0.025:
@@ -1511,9 +1437,6 @@ def market_dump_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Di
     failed_bounce = any(x["close"] > x["open"] for x in c1[-8:-1]) and last1["close"] < prev1["close"]
     lower_high_reject = max(x["high"] for x in c1[-4:]) < max(x["high"] for x in c1[-14:-4]) and last1["close"] < prev1["close"]
     if DUMP_REQUIRE_REJECT_OR_BREAK and not (fresh_low_break or failed_bounce or lower_high_reject):
-        return None
-    if DUMP_REQUIRE_TWO_RED and not (prev1["close"] < prev1["open"] and last1["close"] < prev1["close"]):
-        # Avoid shorting the first red candle after a bounce; this was a major stop-out source.
         return None
 
     level = max(x["high"] for x in c1[-10:])
@@ -1953,13 +1876,6 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
             continue
 
-        strategy_ok, strategy_reason = strategy_live_stats_ok(setup)
-        if not strategy_ok:
-            blocks["strategy_stats_block"] = blocks.get("strategy_stats_block", 0) + 1
-            if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side}: {strategy_reason}")
-            continue
-
         if side == "LONG":
             long_stats_ok, long_stats_reason = long_live_stats_ok()
             if not long_stats_ok and setup.get("grade") != "A+":
@@ -2055,7 +1971,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.31 Alive Kill-Switch Scalper\n"
+        f"🧪 Диагностика V13.29 Local Stop Dump Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
