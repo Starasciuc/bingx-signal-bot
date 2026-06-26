@@ -25,8 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.33 CONFIRMED TAPE SCALPER"
-DEPLOY_MARKER = "V13_33_CONFIRMED_TAPE_SCALPER_2026_06_26"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.34 BEAT STYLE LADDER SCALPER"
+DEPLOY_MARKER = "V13_34_BEAT_STYLE_LADDER_SCALPER_2026_06_26"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_33_confirmed_tape_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_34_beat_style_ladder_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -121,7 +121,7 @@ MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # techn
 LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
 LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0075"))  # V13.33: max 0.75% price risk; tighter professional execution stop
 LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0038"))  # V13.33: tighter but still above random 1m noise
-LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "AERO_STYLE_SHORT", "AERO_STYLE_LONG", "CONFIRMED_TAPE_SHORT", "CONFIRMED_TAPE_LONG"}
+LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "AERO_STYLE_SHORT", "AERO_STYLE_LONG", "CONFIRMED_TAPE_SHORT", "CONFIRMED_TAPE_LONG", "BEAT_STYLE_SHORT"}
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
@@ -240,6 +240,23 @@ TAPE_REQUIRE_2M_CONFIRM = os.getenv("TAPE_REQUIRE_2M_CONFIRM", "true").lower() =
 TAPE_DISABLE_AGAINST_BTC = os.getenv("TAPE_DISABLE_AGAINST_BTC", "false").lower() == "true"
 KILL_LEGACY_INSTANT_ACTIVE = os.getenv("KILL_LEGACY_INSTANT_ACTIVE", "true").lower() == "true"
 
+# --- V13.34 BEAT/AERO trader ladder setup ---
+# Built from the user's BEAT SHORT and AERO SHORT examples. This is not old Instant Edge:
+# it requires an entry after a retest/rejection zone, live downside tape and realistic ladder targets.
+BEAT_STYLE_SHORT_ENABLED = os.getenv("BEAT_STYLE_SHORT_ENABLED", "true").lower() == "true"
+BEAT_MIN_PULLBACK = float(os.getenv("BEAT_MIN_PULLBACK", "0.0055"))       # recent high above entry: reject/retest zone
+BEAT_MAX_PULLBACK = float(os.getenv("BEAT_MAX_PULLBACK", "0.0550"))       # avoid entering after an extreme dead-cat collapse
+BEAT_MIN_1M3 = float(os.getenv("BEAT_MIN_1M3", "0.0038"))                 # current downside tape
+BEAT_MIN_15M_ABS = float(os.getenv("BEAT_MIN_15M_ABS", "0.0025"))         # active but not necessarily already bearish
+BEAT_MIN_RECENT_RANGE = float(os.getenv("BEAT_MIN_RECENT_RANGE", "0.0160"))
+BEAT_MIN_VOL1 = float(os.getenv("BEAT_MIN_VOL1", "0.38"))
+BEAT_MIN_VOL5 = float(os.getenv("BEAT_MIN_VOL5", "0.42"))
+BEAT_MIN_RANGE1 = float(os.getenv("BEAT_MIN_RANGE1", "0.55"))
+BEAT_MIN_RANGE5 = float(os.getenv("BEAT_MIN_RANGE5", "0.62"))
+BEAT_CLOSE_SHORT = float(os.getenv("BEAT_CLOSE_SHORT", "0.46"))
+BEAT_REQUIRE_BREAK_OR_REJECT = os.getenv("BEAT_REQUIRE_BREAK_OR_REJECT", "true").lower() == "true"
+BEAT_ALLOW_ONE_RED = os.getenv("BEAT_ALLOW_ONE_RED", "true").lower() == "true"
+BEAT_MIN_SCORE = int(os.getenv("BEAT_MIN_SCORE", "84"))
 
 
 # --- V13.31 strategy kill-switch defaults (fixed) ---
@@ -1617,6 +1634,132 @@ def confirmed_tape_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[
     }
 
 
+
+def beat_style_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """V13.34 BEAT/AERO-style ladder SHORT.
+
+    The user's BEAT example: entry 2.411, TP1 ~0.99%, TP5 ~4.19%, invalidation/averaging far above.
+    The common structure is not random momentum. It is: retest/up-thrust -> rejection -> fresh downside tape.
+    This mode is intentionally more active than pure AERO gate, but far safer than the losing Instant Edge.
+    """
+    if not BEAT_STYLE_SHORT_ENABLED or not ALLOW_SHORT:
+        return None
+    if len(c1) < 45 or len(c5) < 40 or len(c15) < 16 or len(c1h) < 40:
+        return None
+
+    side = "SHORT"
+    price = float(c1[-1]["close"])
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    ch3m = percent_change(c1, 3)
+    ch2m = (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12)
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol1 = volume_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range1 = candle_range_ratio(c1, 20)
+    range5 = candle_range_ratio(c5, 20)
+    loc = close_location(last1)
+    t1h = trend_state(c1h)
+
+    recent_1m = c1[-18:]
+    recent_5m = c5[-8:]
+    recent_high = max(x["high"] for x in recent_1m + recent_5m[-3:])
+    recent_low = min(x["low"] for x in recent_1m + recent_5m[-3:])
+    pullback = (recent_high - price) / max(price, 1e-12)
+    recent_range = (recent_high - recent_low) / max(price, 1e-12)
+
+    # 1) The trade must come after a retest/up-thrust zone, not after a blind late dump.
+    if pullback < BEAT_MIN_PULLBACK or pullback > BEAT_MAX_PULLBACK:
+        return None
+    if recent_range < BEAT_MIN_RECENT_RANGE:
+        return None
+
+    # 2) Current tape must already be selling, but we allow this to be either continuation or reversal after a pump.
+    if ch3m > -BEAT_MIN_1M3:
+        return None
+    if abs(ch15m) < BEAT_MIN_15M_ABS and abs(ch30m) < BEAT_MIN_15M_ABS * 1.25:
+        # If 15/30m are quiet, require a stronger current breakdown.
+        if abs(ch3m) < BEAT_MIN_1M3 * 1.55 or range1 < BEAT_MIN_RANGE1 * 1.30:
+            return None
+
+    # 3) Tape quality: not dead volume/range.
+    if vol1 < BEAT_MIN_VOL1:
+        return None
+    if vol5 < BEAT_MIN_VOL5 and abs(ch3m) < BEAT_MIN_1M3 * 1.60:
+        return None
+    if range1 < BEAT_MIN_RANGE1:
+        return None
+    if range5 < BEAT_MIN_RANGE5 and recent_range < BEAT_MIN_RECENT_RANGE * 1.50:
+        return None
+
+    # 4) Rejection candle / micro breakdown. This keeps it away from losing Instant Edge.
+    if loc > BEAT_CLOSE_SHORT or last1["close"] >= last1["open"]:
+        return None
+    fresh_low_break = last1["close"] < min(x["low"] for x in c1[-7:-1])
+    failed_bounce = any(x["close"] > x["open"] for x in c1[-9:-1]) and last1["close"] < prev1["close"]
+    lower_high_reject = max(x["high"] for x in c1[-4:]) < max(x["high"] for x in c1[-16:-4]) and last1["close"] < prev1["close"]
+    two_red = prev1["close"] < prev1["open"] and last1["close"] < prev1["close"]
+    if BEAT_REQUIRE_BREAK_OR_REJECT and not (fresh_low_break or failed_bounce or lower_high_reject or (BEAT_ALLOW_ONE_RED and two_red)):
+        return None
+
+    # 5) Avoid buying-back wick: if the candle is heavily bought from the lows, wait for confirmation.
+    if lower_wick_ratio(last1) > 0.55 and not fresh_low_break:
+        return None
+
+    # Local invalidation just above recent rejection zone; calculate_fast_trade can compress to local scalp stop.
+    level = max(recent_high, max(x["high"] for x in c1[-10:]))
+
+    score = 84
+    score += min(8, int(abs(ch3m) * 1000))
+    score += min(6, int(pullback * 450))
+    score += min(6, int(recent_range * 250))
+    score += min(5, int(max(0.0, vol1 - 0.45) * 7))
+    score += min(5, int(max(0.0, range1 - 0.70) * 5))
+    if fresh_low_break:
+        score += 4
+    if failed_bounce or lower_high_reject:
+        score += 3
+    if ch15m < 0 and ch30m <= 0:
+        score += 3
+    score = max(0, min(100, score))
+    if score < BEAT_MIN_SCORE:
+        return None
+
+    reason = (
+        f"BEAT/AERO STYLE SHORT: retest/up-thrust -> rejection -> ladder breakdown. "
+        f"Pullback/reject zone {pullback*100:.2f}%, recent range {recent_range*100:.2f}%, "
+        f"1m3 {ch3m*100:+.2f}%, 2m {ch2m*100:+.2f}%, 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%. "
+        f"Vol1 x{vol1:.2f}, Vol5 x{vol5:.2f}, Range1 x{range1:.2f}, Range5 x{range5:.2f}, closeLoc {loc:.2f}. "
+        f"Break/reject: freshLow {fresh_low_break}, failedBounce {failed_bounce}, lowerHighReject {lower_high_reject}, twoRed {two_red}. "
+        f"Targets use trader ladder style: TP1 near 0.65-1%, TP5 around 3.5-4% when feasible."
+    )
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": "PRO_BEAT_STYLE_SHORT",
+        "trade_type": "BEAT/AERO STYLE SHORT",
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and (fresh_low_break or failed_bounce) and vol1 >= 0.55 and range1 >= 0.85 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": pullback,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": ch2m,
+        "setup_mode": "BEAT_STYLE_SHORT",
+        "t1h": t1h,
+        "btc_text": btc.get("text", ""),
+    }
+
 def market_dump_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """V13.28 fallback: market-dump continuation SHORT.
 
@@ -2001,19 +2144,20 @@ def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, f
     tp5 = float(trade.get("tp5", 0.0) or 0.0)
 
     aero_ok, aero_block, aero_reason = aero_style_gate(trade, symbol, c1, c5, c15, btc)
+    beat_ok = setup_mode.startswith("BEAT_STYLE")
 
     if grade != "A+" and not TRADER_ALLOW_B_SCORE:
         return False, "trader_grade_block", f"{display_symbol(symbol)} {side}: B-class skipped by env; set TRADER_ALLOW_B_SCORE=true to allow B+"
 
     if score < TRADER_MIN_SCORE:
-        if not (aero_ok and AERO_ALLOW_B_SCORE and score >= max(72, TRADER_MIN_SCORE - 10)):
+        if not ((aero_ok or beat_ok) and AERO_ALLOW_B_SCORE and score >= max(72, TRADER_MIN_SCORE - 10)):
             return False, "trader_score_block", f"{display_symbol(symbol)} {side}: trader score too low {score} < {TRADER_MIN_SCORE}"
 
     # Balanced B+ mode: B setups are allowed, but only if the current tape is alive.
     # This keeps the bot from going silent while still blocking random weak B entries.
     if grade != "A+":
         if abs(ch3m) < TRADER_MIN_ABS_1M3 * 1.20 and vol1 < TRADER_MIN_VOL1 * 1.20 and range1 < TRADER_MIN_RANGE1 * 1.15:
-            if not aero_ok:
+            if not (aero_ok or beat_ok):
                 return False, "trader_bplus_quality_block", (
                     f"{display_symbol(symbol)} {side}: B+ not strong enough; 1m3 {ch3m*100:+.2f}%, "
                     f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
@@ -2041,24 +2185,24 @@ def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, f
             return False, "trader_5m_direction_block", f"{display_symbol(symbol)} SHORT: last 5m not confirming down"
         if close_location(c1[-1]) > TRADER_CLOSE_SHORT:
             return False, "trader_close_location_block", f"{display_symbol(symbol)} SHORT: 1m close not near low"
-        dump_exception = setup_mode.startswith("MARKET_DUMP") and ch3m <= -TRADER_MIN_ABS_1M3 * 1.10 and range1 >= max(0.45, TRADER_MIN_RANGE1 * 0.60)
+        dump_exception = (setup_mode.startswith("MARKET_DUMP") or setup_mode.startswith("BEAT_STYLE")) and ch3m <= -TRADER_MIN_ABS_1M3 * 0.85 and range1 >= max(0.45, TRADER_MIN_RANGE1 * 0.55)
         if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] >= min(x["low"] for x in c1[-6:-1]) and not dump_exception:
             return False, "trader_micro_break_block", f"{display_symbol(symbol)} SHORT: no fresh 1m low break"
         aligned = ch15m <= -TRADER_MIN_ABS_15M and ch30m <= TRADER_MAX_COUNTER_30M
         reversal_exception = setup_mode.startswith("REVERSAL") and abs(ch3m) >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
 
-    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok or setup_mode.startswith("MARKET_DUMP")):
+    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok or beat_ok or setup_mode.startswith("MARKET_DUMP")):
         return False, "trader_structure_block", (
             f"{display_symbol(symbol)} {side}: weak structure; 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, mode {setup_mode}"
         )
 
-    if vol1 < TRADER_MIN_VOL1 and not aero_ok:
+    if vol1 < TRADER_MIN_VOL1 and not (aero_ok or beat_ok):
         return False, "trader_vol1_block", f"{display_symbol(symbol)} {side}: live vol1 too weak x{vol1:.2f}"
-    if vol5 < TRADER_MIN_VOL5 and not aero_ok:
+    if vol5 < TRADER_MIN_VOL5 and not (aero_ok or beat_ok):
         return False, "trader_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
-    if range1 < TRADER_MIN_RANGE1 and not aero_ok:
+    if range1 < TRADER_MIN_RANGE1 and not (aero_ok or beat_ok):
         return False, "trader_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
-    if range5 < TRADER_MIN_RANGE5 and not aero_ok:
+    if range5 < TRADER_MIN_RANGE5 and not (aero_ok or beat_ok):
         return False, "trader_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
 
     # TP5 should be plausible from current market expansion, not a fantasy target.
@@ -2070,7 +2214,7 @@ def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, f
                 f"{display_symbol(symbol)} {side}: TP5 move {need*100:.2f}% not feasible vs recent {recent_move*100:.2f}%"
             )
 
-    style_note = aero_reason if aero_ok else "standard trader-pattern ok"
+    style_note = aero_reason if aero_ok else ("BEAT-style trader ladder ok" if beat_ok else "standard trader-pattern ok")
     return True, "ok", (
         f"{style_note}; score {score}, grade {grade}, 1m3 {ch3m*100:+.2f}%, "
         f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, vol1 x{vol1:.2f}, range1 x{range1:.2f}"
@@ -2113,6 +2257,10 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
             if setup:
                 blocks[f"instant_edge_{side.lower()}"] = blocks.get(f"instant_edge_{side.lower()}", 0) + 1
+        if not setup and side == "SHORT":
+            setup = beat_style_short_setup(symbol, c1, c5, c15, c1h, btc)
+            if setup:
+                blocks["beat_style_short"] = blocks.get("beat_style_short", 0) + 1
         if not setup:
             setup = confirmed_tape_setup(symbol, c1, c5, c15, c1h, btc, side)
             if setup:
@@ -2227,7 +2375,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.33 Confirmed Tape Scalper\n"
+        f"🧪 Диагностика V13.34 BEAT Style Ladder Scalper\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
@@ -2453,7 +2601,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: MARKET DUMP + AERO STYLE + LOCAL STOP SCALPER.\n"
+        f"Mode: BEAT/AERO STYLE + CONFIRMED TAPE + MARKET DUMP + LOCAL STOP SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
