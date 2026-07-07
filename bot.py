@@ -1,3 +1,21 @@
+# -*- coding: utf-8 -*-
+"""
+V14 Professional Institutional Scalper
+-------------------------------------
+Новый движок без старого Instant Edge.
+
+Цель:
+- не ловить случайную свечу;
+- сначала найти trader-style setup;
+- затем дождаться подтверждения tape/price action;
+- отправлять только после подтверждения;
+- держать стоп локальным и коротким;
+- автоматически выключать слабые стратегии по статистике.
+
+Важно:
+Это не финансовая рекомендация и не гарантия прибыли. Бот только отправляет сигналы.
+"""
+
 import os
 import time
 import math
@@ -15,8 +33,8 @@ from fastapi import FastAPI
 # ============================================================
 
 APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Professional Institutional Scalper"
-APP_VERSION = "V14.00_PROFESSIONAL_INSTITUTIONAL_SCALPER"
-DEPLOY_MARKER = "V14_00_PROFESSIONAL_INSTITUTIONAL_SCALPER_2026"
+APP_VERSION = "V14.01_TELEGRAM_STATUS_SCALPER"
+DEPLOY_MARKER = "V14_01_TELEGRAM_STATUS_SCALPER_2026"
 
 app = FastAPI(title=APP_NAME)
 
@@ -55,6 +73,12 @@ def env_bool(name: str, default: bool) -> bool:
 BINGX_BASE = env_str("BINGX_BASE", "https://open-api.bingx.com")
 TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID", "")
+
+# Telegram service notifications
+SEND_STARTUP_TELEGRAM = env_bool("SEND_STARTUP_TELEGRAM", True)
+TELEGRAM_SCAN_REPORTS_ENABLED = env_bool("TELEGRAM_SCAN_REPORTS_ENABLED", True)
+TELEGRAM_SCAN_REPORT_EVERY_SECONDS = env_int("TELEGRAM_SCAN_REPORT_EVERY_SECONDS", 300)
+TELEGRAM_SCAN_REPORT_INCLUDE_HOT = env_bool("TELEGRAM_SCAN_REPORT_INCLUDE_HOT", True)
 
 STATE_FILE = env_str("STATE_FILE", "bot_state_v14_professional_scalper.json")
 
@@ -186,6 +210,7 @@ def default_state() -> Dict[str, Any]:
         "deploy_marker": DEPLOY_MARKER,
         "created_at": time.time(),
         "last_scan_at": 0,
+        "last_scan_report_at": 0,
         "last_track_at": 0,
         "last_error": "",
         "active_signals": [],
@@ -1335,11 +1360,56 @@ def format_diag(diag: Dict[str, Any]) -> str:
 _STOP = False
 
 
+
+def format_telegram_scan_report(diag: Dict[str, Any]) -> str:
+    """Compact Telegram status update: shows scan activity without spamming full diagnostics."""
+    if "error" in diag:
+        return f"⚠️ V14 scan error\n{diag.get('error')}\nLast error: {diag.get('last_error', '')}"
+
+    blocks = diag.get("blocks", {}) or {}
+    top_blocks = ", ".join([f"{k}:{v}" for k, v in list(blocks.items())[:5]]) or "нет"
+
+    lines = [
+        f"🧪 V14 scan update",
+        f"{APP_VERSION}",
+        f"Проверено: {diag.get('checked', 0)} из {diag.get('universe', 0)} · кандидатов: {diag.get('candidates', 0)} · отправлено: {diag.get('sent', 0)} · {diag.get('seconds', 0)}с",
+        f"BTC: {diag.get('btc', '')}",
+        f"Блокировки: {top_blocks}",
+    ]
+    if TELEGRAM_SCAN_REPORT_INCLUDE_HOT:
+        hot = diag.get("hot_symbols", [])[:5]
+        if hot:
+            lines.append("")
+            lines.append("Hot symbols:")
+            lines.extend(hot)
+    near = diag.get("near_miss", [])[:4]
+    if near:
+        lines.append("")
+        lines.append("Почти прошли:")
+        lines.extend(near)
+    return "\n".join(lines)
+
+
+def maybe_send_scan_report(diag: Dict[str, Any]) -> None:
+    if not TELEGRAM_SCAN_REPORTS_ENABLED:
+        return
+    now = now_ts()
+    with STATE_LOCK:
+        last = float(STATE.get("last_scan_report_at", 0) or 0)
+    if now - last < max(60, TELEGRAM_SCAN_REPORT_EVERY_SECONDS):
+        return
+    if send_telegram(format_telegram_scan_report(diag)):
+        with STATE_LOCK:
+            STATE["last_scan_report_at"] = now
+            save_state()
+
+
 def scan_loop() -> None:
     while not _STOP:
         try:
             if AUTO_SCAN_ENABLED:
-                run_scan()
+                diag = run_scan()
+                maybe_send_scan_report(diag)
         except Exception as e:
             STATE["last_error"] = f"scan_loop: {repr(e)}"
             save_state()
@@ -1357,6 +1427,16 @@ def track_loop() -> None:
 
 @app.on_event("startup")
 def startup_event() -> None:
+    if SEND_STARTUP_TELEGRAM:
+        send_telegram(
+            "✅ Bot activated\n"
+            f"{APP_VERSION}\n"
+            f"{DEPLOY_MARKER}\n"
+            f"Scan: every {AUTO_SCAN_SECONDS}s · Track: every {AUTO_TRACK_SECONDS}s\n"
+            f"Max active: {MAX_ACTIVE_SIGNALS} · Max per scan: {MAX_SIGNALS_PER_SCAN}\n"
+            f"Confirmation engine: {CONFIRMATION_ENGINE_ENABLED}\n"
+            f"Instant Edge disabled: {INSTANT_EDGE_HARD_DISABLED}"
+        )
     threading.Thread(target=scan_loop, daemon=True).start()
     threading.Thread(target=track_loop, daemon=True).start()
 
@@ -1378,6 +1458,9 @@ def version() -> Dict[str, Any]:
         "instant_edge_enabled": INSTANT_EDGE_ENABLED,
         "confirmation_engine": CONFIRMATION_ENGINE_ENABLED,
         "state_file": STATE_FILE,
+        "send_startup_telegram": SEND_STARTUP_TELEGRAM,
+        "telegram_scan_reports_enabled": TELEGRAM_SCAN_REPORTS_ENABLED,
+        "telegram_scan_report_every_seconds": TELEGRAM_SCAN_REPORT_EVERY_SECONDS,
     }
 
 
@@ -1389,6 +1472,9 @@ def health() -> Dict[str, Any]:
         "active_signals": len(STATE.get("active_signals", [])),
         "pending_setups": len(STATE.get("pending_setups", [])),
         "last_error": STATE.get("last_error", ""),
+        "telegram_scan_reports_enabled": TELEGRAM_SCAN_REPORTS_ENABLED,
+        "telegram_scan_report_every_seconds": TELEGRAM_SCAN_REPORT_EVERY_SECONDS,
+        "last_scan_report_at": STATE.get("last_scan_report_at", 0),
     }
 
 
