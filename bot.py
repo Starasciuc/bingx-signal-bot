@@ -32,9 +32,9 @@ from fastapi import FastAPI
 # APP / VERSION
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V14 MTF Structure Scalper"
-APP_VERSION = "V14.05_MTF_STRUCTURE_SCALPER"
-DEPLOY_MARKER = "V14_05_MTF_STRUCTURE_SCALPER_2026"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Level Reversal Scalper"
+APP_VERSION = "V14.07_LEVEL_REVERSAL_SCALPER"
+DEPLOY_MARKER = "V14_07_LEVEL_REVERSAL_SCALPER_2026"
 
 app = FastAPI(title=APP_NAME)
 
@@ -80,7 +80,7 @@ TELEGRAM_SCAN_REPORTS_ENABLED = env_bool("TELEGRAM_SCAN_REPORTS_ENABLED", True)
 TELEGRAM_SCAN_REPORT_EVERY_SECONDS = env_int("TELEGRAM_SCAN_REPORT_EVERY_SECONDS", 300)
 TELEGRAM_SCAN_REPORT_INCLUDE_HOT = env_bool("TELEGRAM_SCAN_REPORT_INCLUDE_HOT", True)
 
-STATE_FILE = env_str("STATE_FILE", "bot_state_v14_05_mtf_structure_scalper.json")
+STATE_FILE = env_str("STATE_FILE", "bot_state_v14_07_level_reversal_scalper.json")
 
 # Scanning
 AUTO_SCAN_ENABLED = env_bool("AUTO_SCAN_ENABLED", True)
@@ -89,7 +89,7 @@ AUTO_TRACK_SECONDS = env_int("AUTO_TRACK_SECONDS", 3)
 HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 7.0)
 HOT_WORKERS = env_int("HOT_WORKERS", 18)
 MAX_ANALYZE_SYMBOLS = env_int("MAX_ANALYZE_SYMBOLS", 320)
-HOT_SYMBOLS_TO_ANALYZE = env_int("HOT_SYMBOLS_TO_ANALYZE", 70)
+HOT_SYMBOLS_TO_ANALYZE = env_int("HOT_SYMBOLS_TO_ANALYZE", 90)
 MIN_HOT_SCORE = env_float("MIN_HOT_SCORE", 35.0)
 
 # Signal limits
@@ -122,11 +122,19 @@ BOUNCE_REJECT_SHORT_ENABLED = env_bool("BOUNCE_REJECT_SHORT_ENABLED", True)
 # This is NOT the old Instant Edge; it still waits for confirmation before sending.
 PUMP_TRAP_SHORT_ENABLED = env_bool("PUMP_TRAP_SHORT_ENABLED", True)
 
+# Extreme level reaction setups.
+# SHORT: price has grown many percent into a local resistance/high, then rejects and turns down.
+# LONG: price has fallen many percent into a local support/low, then reclaims and turns up.
+# This is the requested "catch the bounce from levels" mode, not a blind knife catch / top short.
+EXTREME_LEVEL_REACTION_ENABLED = env_bool("EXTREME_LEVEL_REACTION_ENABLED", True)
+LEVEL_REJECT_SHORT_ENABLED = env_bool("LEVEL_REJECT_SHORT_ENABLED", True)
+LEVEL_RECLAIM_LONG_ENABLED = env_bool("LEVEL_RECLAIM_LONG_ENABLED", True)
+
 # Confirmation engine: important difference from V13
 CONFIRMATION_ENGINE_ENABLED = env_bool("CONFIRMATION_ENGINE_ENABLED", True)
-CONFIRM_MIN_SECONDS = env_int("CONFIRM_MIN_SECONDS", 35)
-CONFIRM_MAX_SECONDS = env_int("CONFIRM_MAX_SECONDS", 150)
-CONFIRM_MIN_MOVE = env_float("CONFIRM_MIN_MOVE", 0.0014)       # price must move 0.14% in our direction before sending
+CONFIRM_MIN_SECONDS = env_int("CONFIRM_MIN_SECONDS", 20)
+CONFIRM_MAX_SECONDS = env_int("CONFIRM_MAX_SECONDS", 135)
+CONFIRM_MIN_MOVE = env_float("CONFIRM_MIN_MOVE", 0.0009)       # price must move 0.14% in our direction before sending
 CONFIRM_MAX_CHASE = env_float("CONFIRM_MAX_CHASE", 0.0048)     # do not send if it already moved too far
 IMMEDIATE_A_PLUS_SCORE = env_float("IMMEDIATE_A_PLUS_SCORE", 97.0)
 
@@ -135,10 +143,10 @@ IMMEDIATE_A_PLUS_SCORE = env_float("IMMEDIATE_A_PLUS_SCORE", 97.0)
 # It waits for real confirmation and blocks snapback/reversal candles before send.
 ALLOW_IMMEDIATE_SEND = env_bool("ALLOW_IMMEDIATE_SEND", False)
 PRE_SEND_TAPE_PROTECTION_ENABLED = env_bool("PRE_SEND_TAPE_PROTECTION_ENABLED", True)
-CONFIRM_MIN_TP1_PROGRESS = env_float("CONFIRM_MIN_TP1_PROGRESS", 0.22)
-CONFIRM_MAX_TP1_PROGRESS = env_float("CONFIRM_MAX_TP1_PROGRESS", 0.78)
-CONFIRM_MIN_VOL1 = env_float("CONFIRM_MIN_VOL1", 0.58)
-CONFIRM_MIN_RANGE1 = env_float("CONFIRM_MIN_RANGE1", 0.72)
+CONFIRM_MIN_TP1_PROGRESS = env_float("CONFIRM_MIN_TP1_PROGRESS", 0.14)
+CONFIRM_MAX_TP1_PROGRESS = env_float("CONFIRM_MAX_TP1_PROGRESS", 0.88)
+CONFIRM_MIN_VOL1 = env_float("CONFIRM_MIN_VOL1", 0.44)
+CONFIRM_MIN_RANGE1 = env_float("CONFIRM_MIN_RANGE1", 0.52)
 CONFIRM_SHORT_LOC_MAX = env_float("CONFIRM_SHORT_LOC_MAX", 0.42)
 CONFIRM_LONG_LOC_MIN = env_float("CONFIRM_LONG_LOC_MIN", 0.58)
 CONFIRM_MAX_OPPOSITE_1M = env_float("CONFIRM_MAX_OPPOSITE_1M", 0.0010)
@@ -214,30 +222,78 @@ BOUNCE_ALLOW_B_PLUS = env_bool("BOUNCE_ALLOW_B_PLUS", True)
 # strong upward expansion -> failed continuation -> rejection from recent high -> short.
 PUMP_MIN_15M_UP = env_float("PUMP_MIN_15M_UP", 0.0045)
 PUMP_MIN_30M_UP = env_float("PUMP_MIN_30M_UP", 0.0060)
-PUMP_MAX_30M_UP = env_float("PUMP_MAX_30M_UP", 0.0750)
-PUMP_MIN_REJECT_FROM_HIGH = env_float("PUMP_MIN_REJECT_FROM_HIGH", 0.0022)
-PUMP_MIN_1M3_DOWN = env_float("PUMP_MIN_1M3_DOWN", 0.0022)
-PUMP_MAX_1M3_CHASE = env_float("PUMP_MAX_1M3_CHASE", 0.0130)
-PUMP_MIN_RECENT_RANGE = env_float("PUMP_MIN_RECENT_RANGE", 0.0100)
-PUMP_MIN_VOL1 = env_float("PUMP_MIN_VOL1", 0.34)
-PUMP_MIN_VOL5 = env_float("PUMP_MIN_VOL5", 0.42)
-PUMP_MIN_RANGE1 = env_float("PUMP_MIN_RANGE1", 0.58)
-PUMP_MIN_RANGE5 = env_float("PUMP_MIN_RANGE5", 0.62)
+PUMP_MAX_30M_UP = env_float("PUMP_MAX_30M_UP", 0.1800)
+PUMP_MIN_REJECT_FROM_HIGH = env_float("PUMP_MIN_REJECT_FROM_HIGH", 0.0018)
+PUMP_MIN_1M3_DOWN = env_float("PUMP_MIN_1M3_DOWN", 0.0020)
+PUMP_MAX_1M3_CHASE = env_float("PUMP_MAX_1M3_CHASE", 0.0200)
+PUMP_MIN_RECENT_RANGE = env_float("PUMP_MIN_RECENT_RANGE", 0.0080)
+PUMP_MIN_VOL1 = env_float("PUMP_MIN_VOL1", 0.28)
+PUMP_MIN_VOL5 = env_float("PUMP_MIN_VOL5", 0.50)
+PUMP_MIN_RANGE1 = env_float("PUMP_MIN_RANGE1", 0.45)
+PUMP_MIN_RANGE5 = env_float("PUMP_MIN_RANGE5", 0.58)
 PUMP_SHORT_LOC_MAX = env_float("PUMP_SHORT_LOC_MAX", 0.52)
-PUMP_CONFIRM_MIN_TP1_PROGRESS = env_float("PUMP_CONFIRM_MIN_TP1_PROGRESS", 0.26)
-PUMP_CONFIRM_SHORT_LOC_MAX = env_float("PUMP_CONFIRM_SHORT_LOC_MAX", 0.40)
+PUMP_CONFIRM_MIN_TP1_PROGRESS = env_float("PUMP_CONFIRM_MIN_TP1_PROGRESS", 0.12)
+PUMP_CONFIRM_SHORT_LOC_MAX = env_float("PUMP_CONFIRM_SHORT_LOC_MAX", 0.48)
 PUMP_AVOID_NEAR_LOW = env_bool("PUMP_AVOID_NEAR_LOW", True)
 PUMP_ALLOW_B_PLUS = env_bool("PUMP_ALLOW_B_PLUS", True)
+
+# V14.06 adaptive confirmation. The previous V14.05 found pending setups but many expired
+# or were rejected by weak 1m volume even when 5m volume and price rejection were strong.
+# These settings keep quality, but allow trader-style traps like LAB/PUMP where vol1 may be low
+# exactly at the rejection candle while vol5 + range + 1m3 direction confirm the move.
+TRAP_FAST_CONFIRM_MIN_SECONDS = env_int("TRAP_FAST_CONFIRM_MIN_SECONDS", 12)
+TRAP_FAST_CONFIRM_MIN_TP1_PROGRESS = env_float("TRAP_FAST_CONFIRM_MIN_TP1_PROGRESS", 0.10)
+TRAP_FAST_CONFIRM_MIN_MOVE = env_float("TRAP_FAST_CONFIRM_MIN_MOVE", 0.00065)
+TRAP_FAST_CONFIRM_MIN_VOL1 = env_float("TRAP_FAST_CONFIRM_MIN_VOL1", 0.24)
+TRAP_FAST_CONFIRM_MIN_RANGE1 = env_float("TRAP_FAST_CONFIRM_MIN_RANGE1", 0.42)
+TRAP_FAST_CONFIRM_MIN_VOL5 = env_float("TRAP_FAST_CONFIRM_MIN_VOL5", 0.55)
+TRAP_FAST_CONFIRM_MIN_RANGE5 = env_float("TRAP_FAST_CONFIRM_MIN_RANGE5", 0.55)
+TRAP_FAST_CONFIRM_STRONG_1M3 = env_float("TRAP_FAST_CONFIRM_STRONG_1M3", 0.0085)
+PUMP_EXTREME_TRAP_ENABLED = env_bool("PUMP_EXTREME_TRAP_ENABLED", True)
+PUMP_EXTREME_MIN_1M3_DOWN = env_float("PUMP_EXTREME_MIN_1M3_DOWN", 0.0080)
+PUMP_EXTREME_MIN_VOL1 = env_float("PUMP_EXTREME_MIN_VOL1", 0.15)
+PUMP_EXTREME_MIN_VOL5 = env_float("PUMP_EXTREME_MIN_VOL5", 0.80)
+PUMP_EXTREME_MIN_RANGE1 = env_float("PUMP_EXTREME_MIN_RANGE1", 0.40)
+PUMP_EXTREME_MIN_RANGE5 = env_float("PUMP_EXTREME_MIN_RANGE5", 0.75)
+PUMP_CONFIRM_MIN_VOL1 = env_float("PUMP_CONFIRM_MIN_VOL1", 0.24)
+PUMP_CONFIRM_MIN_RANGE1 = env_float("PUMP_CONFIRM_MIN_RANGE1", 0.42)
+
+# V14.07 level-reaction requirements.
+# These catch: huge rise -> resistance rejection SHORT, huge fall -> support reclaim LONG.
+LEVEL_MIN_15M_EXTREME = env_float("LEVEL_MIN_15M_EXTREME", 0.0180)
+LEVEL_MIN_30M_EXTREME = env_float("LEVEL_MIN_30M_EXTREME", 0.0260)
+LEVEL_MIN_1H_EXTREME = env_float("LEVEL_MIN_1H_EXTREME", 0.0380)
+LEVEL_MIN_RECENT_RANGE = env_float("LEVEL_MIN_RECENT_RANGE", 0.0180)
+LEVEL_MAX_30M_EXTREME = env_float("LEVEL_MAX_30M_EXTREME", 0.2200)
+
+LEVEL_SHORT_MIN_REJECT = env_float("LEVEL_SHORT_MIN_REJECT", 0.0025)
+LEVEL_SHORT_MIN_1M3_DOWN = env_float("LEVEL_SHORT_MIN_1M3_DOWN", 0.0028)
+LEVEL_SHORT_MAX_CHASE_1M3 = env_float("LEVEL_SHORT_MAX_CHASE_1M3", 0.0200)
+LEVEL_SHORT_LOC_MAX = env_float("LEVEL_SHORT_LOC_MAX", 0.50)
+LEVEL_SHORT_MIN_VOL1 = env_float("LEVEL_SHORT_MIN_VOL1", 0.28)
+LEVEL_SHORT_MIN_VOL5 = env_float("LEVEL_SHORT_MIN_VOL5", 0.55)
+LEVEL_SHORT_MIN_RANGE1 = env_float("LEVEL_SHORT_MIN_RANGE1", 0.45)
+LEVEL_SHORT_MIN_RANGE5 = env_float("LEVEL_SHORT_MIN_RANGE5", 0.60)
+
+LEVEL_LONG_MIN_BOUNCE = env_float("LEVEL_LONG_MIN_BOUNCE", 0.0028)
+LEVEL_LONG_MIN_1M3_UP = env_float("LEVEL_LONG_MIN_1M3_UP", 0.0028)
+LEVEL_LONG_MAX_CHASE_1M3 = env_float("LEVEL_LONG_MAX_CHASE_1M3", 0.0200)
+LEVEL_LONG_LOC_MIN = env_float("LEVEL_LONG_LOC_MIN", 0.50)
+LEVEL_LONG_MIN_VOL1 = env_float("LEVEL_LONG_MIN_VOL1", 0.28)
+LEVEL_LONG_MIN_VOL5 = env_float("LEVEL_LONG_MIN_VOL5", 0.55)
+LEVEL_LONG_MIN_RANGE1 = env_float("LEVEL_LONG_MIN_RANGE1", 0.45)
+LEVEL_LONG_MIN_RANGE5 = env_float("LEVEL_LONG_MIN_RANGE5", 0.60)
+LEVEL_LONG_ALLOW_BTC_BEAR_EXCEPTION = env_bool("LEVEL_LONG_ALLOW_BTC_BEAR_EXCEPTION", True)
 
 # Professional multi-timeframe structure filter inspired by trader dashboards:
 # 4h/1h/15m context + MACD/OBV/volume-delta proxy + confirmed structure.
 # It is a final quality gate before a setup is allowed to wait for confirmation.
 PRO_MTF_FILTER_ENABLED = env_bool("PRO_MTF_FILTER_ENABLED", True)
-PRO_MTF_MIN_CONFIRMATIONS = env_float("PRO_MTF_MIN_CONFIRMATIONS", 3.0)
-PRO_MTF_A_PLUS_MIN_CONFIRMATIONS = env_float("PRO_MTF_A_PLUS_MIN_CONFIRMATIONS", 3.5)
+PRO_MTF_MIN_CONFIRMATIONS = env_float("PRO_MTF_MIN_CONFIRMATIONS", 2.5)
+PRO_MTF_A_PLUS_MIN_CONFIRMATIONS = env_float("PRO_MTF_A_PLUS_MIN_CONFIRMATIONS", 3.0)
 PRO_MTF_STRONG_SCORE_ESCAPE = env_float("PRO_MTF_STRONG_SCORE_ESCAPE", 93.0)
-PRO_MTF_BLOCK_BAD_DELTA = env_bool("PRO_MTF_BLOCK_BAD_DELTA", True)
-COINS_IN_ANALYSIS_TARGET = env_int("COINS_IN_ANALYSIS_TARGET", 12)
+PRO_MTF_BLOCK_BAD_DELTA = env_bool("PRO_MTF_BLOCK_BAD_DELTA", False)
+COINS_IN_ANALYSIS_TARGET = env_int("COINS_IN_ANALYSIS_TARGET", 20)
 
 # Market dump, but not old bad dump. Requires tape confirmation/pending unless A+.
 DUMP_MIN_1M3 = env_float("DUMP_MIN_1M3", 0.0048)
@@ -711,7 +767,7 @@ def pro_mtf_confirmation_score(tr: Dict[str, Any]) -> Tuple[float, str, List[str
 
     if side == "SHORT":
         # Context should not be violently against the short unless this is a trap/rejection setup.
-        trap = tr.get("strategy") in {"PRO_PUMP_TRAP_SHORT", "PRO_BOUNCE_REJECT_SHORT", "PRO_BEAT_STYLE_SHORT", "PRO_AERO_STYLE_SHORT"}
+        trap = tr.get("strategy") in {"PRO_PUMP_TRAP_SHORT", "PRO_BOUNCE_REJECT_SHORT", "PRO_BEAT_STYLE_SHORT", "PRO_AERO_STYLE_SHORT", "PRO_EXTREME_LEVEL_REJECT_SHORT", "PRO_EXTREME_LEVEL_RECLAIM_LONG"}
         if ch1h <= 0.006 or trap:
             score += 0.6; passed.append("1h/4h context ok")
         else:
@@ -911,6 +967,9 @@ def symbol_context(symbol: str) -> Optional[Dict[str, Any]]:
         ctx["bounce_from_low"] = max(0.0, safe_div(price - ctx["recent_low_20m"], price))
         ctx["bounce_from_low_10m"] = max(0.0, safe_div(price - ctx["recent_low_10m"], price))
         ctx["reject_from_high_10m"] = max(0.0, safe_div(ctx["recent_high_10m"] - price, price))
+        ctx["distance_from_high_20m"] = max(0.0, safe_div(ctx["recent_high_20m"] - price, price, 0.0))
+        ctx["distance_from_low_20m"] = max(0.0, safe_div(price - ctx["recent_low_20m"], price, 0.0))
+        ctx["level_range_20m"] = max(0.0, safe_div(ctx["recent_high_20m"] - ctx["recent_low_20m"], price, 0.0))
         ctx["selloff_15m"] = max(0.0, safe_div(max(highs(c1[-15:])) - min(lows(c1[-15:])), price, 0.0))
         # MTF / pro-dashboard style filters. 1h/4h are approximated from 15m candles to keep scanning fast.
         ctx["ch1h_mtf"] = percent_change(c15, 4) if len(c15) >= 5 else ctx["ch1h"]
@@ -987,6 +1046,9 @@ def build_trade(ctx: Dict[str, Any], side: str, strategy: str, setup_type: str, 
             "bounce_from_low": ctx.get("bounce_from_low", 0),
             "reject_from_high_10m": ctx.get("reject_from_high_10m", 0),
             "bounce_from_low_10m": ctx.get("bounce_from_low_10m", 0),
+            "distance_from_high_20m": ctx.get("distance_from_high_20m", 0),
+            "distance_from_low_20m": ctx.get("distance_from_low_20m", 0),
+            "level_range_20m": ctx.get("level_range_20m", 0),
             "break_short": ctx.get("break_short", False),
             "break_long": ctx.get("break_long", False),
             "two_red": ctx.get("two_red", False),
@@ -1154,6 +1216,133 @@ def score_common(ctx: Dict[str, Any], side: str, base: float = 70.0) -> float:
     return min(score, 99.0)
 
 
+def detect_extreme_level_reject_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """V14.07: resistance/level rejection SHORT after a large rise.
+
+    Pattern: price expanded hard upward into a local high/resistance zone, then failed to
+    hold the high and the 1m tape turns down. This is the "price grew many percent ->
+    catch the bounce/reject from level" setup.
+    """
+    if not (ALLOW_SHORT and EXTREME_LEVEL_REACTION_ENABLED and LEVEL_REJECT_SHORT_ENABLED):
+        return None
+
+    extreme_up = (
+        ctx["ch15m"] >= LEVEL_MIN_15M_EXTREME
+        or ctx["ch30m"] >= LEVEL_MIN_30M_EXTREME
+        or ctx.get("ch1h", 0.0) >= LEVEL_MIN_1H_EXTREME
+    )
+    if not extreme_up:
+        return None
+    if ctx["ch30m"] > LEVEL_MAX_30M_EXTREME and not (ctx["break_short"] and ctx["range1"] >= 1.10):
+        return None
+    if ctx["recent_range_30m"] < LEVEL_MIN_RECENT_RANGE and ctx.get("level_range_20m", 0.0) < LEVEL_MIN_RECENT_RANGE:
+        return None
+
+    reject = max(ctx.get("reject_from_high_10m", 0.0), ctx.get("pullback_from_high", 0.0), ctx.get("distance_from_high_20m", 0.0))
+    if reject < LEVEL_SHORT_MIN_REJECT:
+        return None
+    if ctx["ch1m3"] > -LEVEL_SHORT_MIN_1M3_DOWN:
+        return None
+    if abs(ctx["ch1m3"]) > LEVEL_SHORT_MAX_CHASE_1M3:
+        return None
+    if ctx["loc1"] > LEVEL_SHORT_LOC_MAX:
+        return None
+    if ctx["vol5"] < LEVEL_SHORT_MIN_VOL5 or ctx["range5"] < LEVEL_SHORT_MIN_RANGE5:
+        return None
+    # vol1 can be low right after a trap, but then range/5m participation must confirm.
+    if ctx["vol1"] < LEVEL_SHORT_MIN_VOL1 and not (ctx["range1"] >= 1.05 and ctx["vol5"] >= LEVEL_SHORT_MIN_VOL5 * 1.35):
+        return None
+    if ctx["range1"] < LEVEL_SHORT_MIN_RANGE1:
+        return None
+    if not (ctx["last_red"] or ctx["two_red"] or ctx["break_short"]):
+        return None
+    if not (ctx.get("under_ema_or_vwap") or ctx["break_short"] or ctx["two_red"]):
+        return None
+
+    score = score_common(ctx, "SHORT", 80.0)
+    score += min(max(ctx["ch15m"], ctx["ch30m"], 0.0) * 500, 10)
+    score += min(reject * 1500, 9)
+    if ctx["break_short"]:
+        score += 5
+    if ctx.get("vdelta1", 0.0) < -0.05 or ctx.get("vdelta5", 0.0) < -0.05:
+        score += 4
+
+    reason = (
+        "EXTREME LEVEL REJECT SHORT: цена сильно выросла в уровень/локальный high → не удержала зону → "
+        "появился reject и live tape вниз. "
+        f"15m {ctx['ch15m']*100:+.2f}%, 30m {ctx['ch30m']*100:+.2f}%, 1h {ctx.get('ch1h',0)*100:+.2f}%, "
+        f"reject {reject*100:.2f}%, 1m3 {ctx['ch1m3']*100:+.2f}%, "
+        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
+    )
+    return build_trade(ctx, "SHORT", "PRO_EXTREME_LEVEL_REJECT_SHORT", "EXTREME LEVEL REJECT SHORT", score, reason)
+
+
+def detect_extreme_level_reclaim_long(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """V14.07: support/level reclaim LONG after a large fall.
+
+    Pattern: price dumped hard into a local low/support zone, then reclaimed and 1m tape
+    turns up. This catches "price fell many percent -> bounce/reclaim from level" setups,
+    while avoiding blind falling-knife longs.
+    """
+    if not (ALLOW_LONG and EXTREME_LEVEL_REACTION_ENABLED and LEVEL_RECLAIM_LONG_ENABLED):
+        return None
+
+    extreme_down = (
+        ctx["ch15m"] <= -LEVEL_MIN_15M_EXTREME
+        or ctx["ch30m"] <= -LEVEL_MIN_30M_EXTREME
+        or ctx.get("ch1h", 0.0) <= -LEVEL_MIN_1H_EXTREME
+    )
+    if not extreme_down:
+        return None
+    if ctx["ch30m"] < -LEVEL_MAX_30M_EXTREME and not (ctx["break_long"] and ctx["range1"] >= 1.10):
+        return None
+    if ctx["recent_range_30m"] < LEVEL_MIN_RECENT_RANGE and ctx.get("level_range_20m", 0.0) < LEVEL_MIN_RECENT_RANGE:
+        return None
+
+    bounce = max(ctx.get("bounce_from_low", 0.0), ctx.get("bounce_from_low_10m", 0.0), ctx.get("distance_from_low_20m", 0.0))
+    if bounce < LEVEL_LONG_MIN_BOUNCE:
+        return None
+    if ctx["ch1m3"] < LEVEL_LONG_MIN_1M3_UP:
+        return None
+    if abs(ctx["ch1m3"]) > LEVEL_LONG_MAX_CHASE_1M3:
+        return None
+    if ctx["loc1"] < LEVEL_LONG_LOC_MIN:
+        return None
+    if ctx["vol5"] < LEVEL_LONG_MIN_VOL5 or ctx["range5"] < LEVEL_LONG_MIN_RANGE5:
+        return None
+    if ctx["vol1"] < LEVEL_LONG_MIN_VOL1 and not (ctx["range1"] >= 1.05 and ctx["vol5"] >= LEVEL_LONG_MIN_VOL5 * 1.35):
+        return None
+    if ctx["range1"] < LEVEL_LONG_MIN_RANGE1:
+        return None
+    if not (ctx["last_green"] or ctx["two_green"] or ctx["break_long"]):
+        return None
+    # Must reclaim at least one fast level. Otherwise it is just a weak bounce inside a dump.
+    if not (ctx["price"] > ctx["ema1_9"] or ctx["price"] > ctx["vwap1"] or ctx["break_long"] or ctx["two_green"]):
+        return None
+    # In BTC bear, allow only strong capitulation bounces / relative strength exceptions.
+    if market.get("regime") == "BTC BEAR" and not LEVEL_LONG_ALLOW_BTC_BEAR_EXCEPTION:
+        return None
+    if market.get("regime") == "BTC BEAR" and ctx["ch1m3"] < LEVEL_LONG_MIN_1M3_UP * 1.35 and ctx["range1"] < 1.0:
+        return None
+
+    score = score_common(ctx, "LONG", 80.0)
+    score += min(max(-ctx["ch15m"], -ctx["ch30m"], 0.0) * 500, 10)
+    score += min(bounce * 1500, 9)
+    if ctx["break_long"]:
+        score += 5
+    if ctx.get("vdelta1", 0.0) > 0.05 or ctx.get("vdelta5", 0.0) > 0.05:
+        score += 4
+
+    reason = (
+        "EXTREME LEVEL RECLAIM LONG: цена сильно упала в уровень/локальный low → продавец не продолжил → "
+        "появился reclaim и live tape вверх. "
+        f"15m {ctx['ch15m']*100:+.2f}%, 30m {ctx['ch30m']*100:+.2f}%, 1h {ctx.get('ch1h',0)*100:+.2f}%, "
+        f"bounce {bounce*100:.2f}%, 1m3 {ctx['ch1m3']*100:+.2f}%, "
+        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
+    )
+    return build_trade(ctx, "LONG", "PRO_EXTREME_LEVEL_RECLAIM_LONG", "EXTREME LEVEL RECLAIM LONG", score, reason)
+
+
 def detect_pump_trap_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     PUMP-style trap short.
@@ -1169,8 +1358,18 @@ def detect_pump_trap_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optio
     if not had_pump:
         return None
 
-    # Avoid extreme late-parabolic tops unless tape is very strong.
-    if ctx["ch30m"] > PUMP_MAX_30M_UP and not (ctx["break_short"] and ctx["vol1"] >= 0.80 and ctx["range1"] >= 1.20):
+    # Avoid extreme late-parabolic tops unless it is a true trap: strong rejection/downside tape
+    # with 5m participation. V14.05 was too strict here and skipped LAB-like traps
+    # where 30m was +10% but 1m3 flipped hard down.
+    extreme_trap_ok = (
+        PUMP_EXTREME_TRAP_ENABLED
+        and ctx["ch1m3"] <= -PUMP_EXTREME_MIN_1M3_DOWN
+        and ctx["vol1"] >= PUMP_EXTREME_MIN_VOL1
+        and ctx["vol5"] >= PUMP_EXTREME_MIN_VOL5
+        and ctx["range1"] >= PUMP_EXTREME_MIN_RANGE1
+        and ctx["range5"] >= PUMP_EXTREME_MIN_RANGE5
+    )
+    if ctx["ch30m"] > PUMP_MAX_30M_UP and not (ctx["break_short"] and ctx["vol1"] >= 0.80 and ctx["range1"] >= 1.20) and not extreme_trap_ok:
         return None
 
     # Must reject from recent high. This prevents shorting random weakness.
@@ -1188,10 +1387,18 @@ def detect_pump_trap_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optio
     if ctx["recent_range_30m"] < PUMP_MIN_RECENT_RANGE:
         return None
 
-    # Tape must be alive, but we keep it realistic so the bot does not go silent.
-    if ctx["vol1"] < PUMP_MIN_VOL1 or ctx["vol5"] < PUMP_MIN_VOL5:
+    # Tape must be alive. For strong trap flips, allow weaker vol1 if vol5/range confirm.
+    if ctx["vol5"] < PUMP_MIN_VOL5:
         return None
-    if ctx["range1"] < PUMP_MIN_RANGE1 or ctx["range5"] < PUMP_MIN_RANGE5:
+    if ctx["vol1"] < PUMP_MIN_VOL1 and not extreme_trap_ok:
+        return None
+    if ctx["vol1"] < PUMP_EXTREME_MIN_VOL1:
+        return None
+    if ctx["range5"] < PUMP_MIN_RANGE5:
+        return None
+    if ctx["range1"] < PUMP_MIN_RANGE1 and not extreme_trap_ok:
+        return None
+    if ctx["range1"] < PUMP_EXTREME_MIN_RANGE1:
         return None
 
     # Candle must close under control of sellers.
@@ -1446,6 +1653,8 @@ def analyze_symbol(symbol: str, market: Dict[str, Any], blocks: Dict[str, int], 
         return []
     candidates = []
     detectors = [
+        detect_extreme_level_reject_short,
+        detect_extreme_level_reclaim_long,
         detect_pump_trap_short,
         detect_bounce_reject_short,
         detect_beat_style_short,
@@ -1513,7 +1722,9 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
         if age > CONFIRM_MAX_SECONDS:
             blocks["pending_expired"] = blocks.get("pending_expired", 0) + 1
             continue
-        if age < CONFIRM_MIN_SECONDS:
+        trap_strategy = seed.get("strategy") in {"PRO_PUMP_TRAP_SHORT", "PRO_BOUNCE_REJECT_SHORT", "PRO_BEAT_STYLE_SHORT", "PRO_AERO_STYLE_SHORT", "PRO_EXTREME_LEVEL_REJECT_SHORT", "PRO_EXTREME_LEVEL_RECLAIM_LONG"}
+        min_confirm_age = TRAP_FAST_CONFIRM_MIN_SECONDS if trap_strategy else CONFIRM_MIN_SECONDS
+        if age < min_confirm_age:
             keep.append(item)
             continue
         sym = seed.get("symbol")
@@ -1541,11 +1752,26 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
         # This prevents sending a signal before the tape really starts moving.
         tp1_move = abs(float(seed.get("tp1", current)) - entry0) / entry0 if entry0 else 0.0
         tp1_progress = safe_div(progress, tp1_move, 0.0)
-        live_ok = ctx.get("vol1", 0.0) >= CONFIRM_MIN_VOL1 and ctx.get("range1", 0.0) >= CONFIRM_MIN_RANGE1
+        base_live_ok = ctx.get("vol1", 0.0) >= CONFIRM_MIN_VOL1 and ctx.get("range1", 0.0) >= CONFIRM_MIN_RANGE1
+        trap_live_ok = False
+        if trap_strategy:
+            trap_live_ok = (
+                ctx.get("vol1", 0.0) >= TRAP_FAST_CONFIRM_MIN_VOL1
+                and ctx.get("range1", 0.0) >= TRAP_FAST_CONFIRM_MIN_RANGE1
+                and ctx.get("vol5", 0.0) >= TRAP_FAST_CONFIRM_MIN_VOL5
+                and ctx.get("range5", 0.0) >= TRAP_FAST_CONFIRM_MIN_RANGE5
+            ) or (
+                abs(ctx.get("ch1m3", 0.0)) >= TRAP_FAST_CONFIRM_STRONG_1M3
+                and ctx.get("vol5", 0.0) >= TRAP_FAST_CONFIRM_MIN_VOL5
+                and ctx.get("range1", 0.0) >= TRAP_FAST_CONFIRM_MIN_RANGE1
+            )
+        live_ok = base_live_ok or trap_live_ok
+        min_move_needed = TRAP_FAST_CONFIRM_MIN_MOVE if trap_strategy else CONFIRM_MIN_MOVE
+        min_tp1_progress_needed = TRAP_FAST_CONFIRM_MIN_TP1_PROGRESS if trap_strategy else CONFIRM_MIN_TP1_PROGRESS
         chase_ok = progress <= CONFIRM_MAX_CHASE and tp1_progress <= CONFIRM_MAX_TP1_PROGRESS
         confirm_ok = (
-            progress >= CONFIRM_MIN_MOVE
-            and tp1_progress >= CONFIRM_MIN_TP1_PROGRESS
+            progress >= min_move_needed
+            and tp1_progress >= min_tp1_progress_needed
             and chase_ok
             and tape_ok
             and live_ok
@@ -1554,18 +1780,24 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
         )
 
         if seed.get("strategy") == "PRO_PUMP_TRAP_SHORT" and side == "SHORT":
+            pump_fast_exception = (
+                abs(ctx.get("ch1m3", 0.0)) >= PUMP_EXTREME_MIN_1M3_DOWN
+                and ctx.get("vol5", 0.0) >= PUMP_EXTREME_MIN_VOL5
+                and ctx.get("range1", 0.0) >= PUMP_EXTREME_MIN_RANGE1
+                and ctx.get("range5", 0.0) >= PUMP_EXTREME_MIN_RANGE5
+            )
             pump_tape_ok = (
                 tp1_progress >= PUMP_CONFIRM_MIN_TP1_PROGRESS
                 and ctx.get("loc1", 0.5) <= PUMP_CONFIRM_SHORT_LOC_MAX
                 and (ctx.get("last_red") or ctx.get("two_red") or ctx.get("break_short"))
-                and ctx.get("vol1", 0.0) >= max(CONFIRM_MIN_VOL1, PUMP_MIN_VOL1)
-                and ctx.get("range1", 0.0) >= max(CONFIRM_MIN_RANGE1, PUMP_MIN_RANGE1 * 0.90)
+                and (ctx.get("vol1", 0.0) >= PUMP_CONFIRM_MIN_VOL1 or pump_fast_exception)
+                and ctx.get("range1", 0.0) >= PUMP_CONFIRM_MIN_RANGE1
             )
             confirm_ok = confirm_ok and pump_tape_ok
 
         if confirm_ok:
             # rebuild at current price, not stale entry
-            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.05: цена прошла {tp1_progress*100:.0f}% пути к TP1 до отправки, tape не разворачивается против входа.")
+            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.06: цена прошла {tp1_progress*100:.0f}% пути к TP1 до отправки, tape не разворачивается против входа.")
             ok, why = strategy_allowed(rebuilt["strategy"])
             if ok and trade_quality_ok(rebuilt, blocks, near):
                 ready.append(rebuilt)
@@ -1817,7 +2049,7 @@ def run_scan() -> Dict[str, Any]:
                 sent += 1
 
         diag = {
-            "title": "Диагностика V14.05 MTF Structure Scalper",
+            "title": "Диагностика V14.06 Adaptive Confirmation Scalper",
             "checked": checked,
             "universe": len(symbols),
             "coins_in_analysis": min(COINS_IN_ANALYSIS_TARGET, len(selected)),
@@ -1963,6 +2195,7 @@ def startup_event() -> None:
             f"Instant Edge disabled: {INSTANT_EDGE_HARD_DISABLED}\n"
             f"Bounce Reject SHORT: {BOUNCE_REJECT_SHORT_ENABLED}\n"
             f"PUMP Trap SHORT: {PUMP_TRAP_SHORT_ENABLED}\n"
+            f"Extreme Level Reaction: {EXTREME_LEVEL_REACTION_ENABLED}\n"
             f"Immediate send: {ALLOW_IMMEDIATE_SEND} · Early invalidation: {EARLY_INVALIDATION_ENABLED}"
         )
     threading.Thread(target=scan_loop, daemon=True).start()
@@ -1993,6 +2226,7 @@ def version() -> Dict[str, Any]:
         "early_invalidation_enabled": EARLY_INVALIDATION_ENABLED,
         "confirm_min_tp1_progress": CONFIRM_MIN_TP1_PROGRESS,
         "pump_trap_short_enabled": PUMP_TRAP_SHORT_ENABLED,
+        "extreme_level_reaction_enabled": EXTREME_LEVEL_REACTION_ENABLED,
         "pro_mtf_filter_enabled": PRO_MTF_FILTER_ENABLED,
         "pro_mtf_min_confirmations": PRO_MTF_MIN_CONFIRMATIONS,
         "coins_in_analysis_target": COINS_IN_ANALYSIS_TARGET,
