@@ -32,9 +32,9 @@ from fastapi import FastAPI
 # APP / VERSION
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Professional Institutional Scalper"
-APP_VERSION = "V14.01_TELEGRAM_STATUS_SCALPER"
-DEPLOY_MARKER = "V14_01_TELEGRAM_STATUS_SCALPER_2026"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Protected Tape Scalper"
+APP_VERSION = "V14.02_PROTECTED_TAPE_SCALPER"
+DEPLOY_MARKER = "V14_02_PROTECTED_TAPE_SCALPER_2026"
 
 app = FastAPI(title=APP_NAME)
 
@@ -80,7 +80,7 @@ TELEGRAM_SCAN_REPORTS_ENABLED = env_bool("TELEGRAM_SCAN_REPORTS_ENABLED", True)
 TELEGRAM_SCAN_REPORT_EVERY_SECONDS = env_int("TELEGRAM_SCAN_REPORT_EVERY_SECONDS", 300)
 TELEGRAM_SCAN_REPORT_INCLUDE_HOT = env_bool("TELEGRAM_SCAN_REPORT_INCLUDE_HOT", True)
 
-STATE_FILE = env_str("STATE_FILE", "bot_state_v14_professional_scalper.json")
+STATE_FILE = env_str("STATE_FILE", "bot_state_v14_protected_tape_scalper.json")
 
 # Scanning
 AUTO_SCAN_ENABLED = env_bool("AUTO_SCAN_ENABLED", True)
@@ -119,7 +119,28 @@ CONFIRM_MIN_SECONDS = env_int("CONFIRM_MIN_SECONDS", 35)
 CONFIRM_MAX_SECONDS = env_int("CONFIRM_MAX_SECONDS", 150)
 CONFIRM_MIN_MOVE = env_float("CONFIRM_MIN_MOVE", 0.0014)       # price must move 0.14% in our direction before sending
 CONFIRM_MAX_CHASE = env_float("CONFIRM_MAX_CHASE", 0.0048)     # do not send if it already moved too far
-IMMEDIATE_A_PLUS_SCORE = env_float("IMMEDIATE_A_PLUS_SCORE", 94.0)
+IMMEDIATE_A_PLUS_SCORE = env_float("IMMEDIATE_A_PLUS_SCORE", 97.0)
+
+# Professional anti-SL protection.
+# V14.02 does not send a signal only because a setup exists.
+# It waits for real confirmation and blocks snapback/reversal candles before send.
+ALLOW_IMMEDIATE_SEND = env_bool("ALLOW_IMMEDIATE_SEND", False)
+PRE_SEND_TAPE_PROTECTION_ENABLED = env_bool("PRE_SEND_TAPE_PROTECTION_ENABLED", True)
+CONFIRM_MIN_TP1_PROGRESS = env_float("CONFIRM_MIN_TP1_PROGRESS", 0.22)
+CONFIRM_MAX_TP1_PROGRESS = env_float("CONFIRM_MAX_TP1_PROGRESS", 0.78)
+CONFIRM_MIN_VOL1 = env_float("CONFIRM_MIN_VOL1", 0.58)
+CONFIRM_MIN_RANGE1 = env_float("CONFIRM_MIN_RANGE1", 0.72)
+CONFIRM_SHORT_LOC_MAX = env_float("CONFIRM_SHORT_LOC_MAX", 0.42)
+CONFIRM_LONG_LOC_MIN = env_float("CONFIRM_LONG_LOC_MIN", 0.58)
+CONFIRM_MAX_OPPOSITE_1M = env_float("CONFIRM_MAX_OPPOSITE_1M", 0.0010)
+CONFIRM_REQUIRE_MICRO_BREAK = env_bool("CONFIRM_REQUIRE_MICRO_BREAK", False)
+
+# Early invalidation: this is not a Stop Loss.
+# If the signal starts moving against us and never showed progress, bot exits the idea before full SL.
+EARLY_INVALIDATION_ENABLED = env_bool("EARLY_INVALIDATION_ENABLED", True)
+EARLY_INVALIDATION_SECONDS = env_int("EARLY_INVALIDATION_SECONDS", 90)
+EARLY_INVALIDATION_ADVERSE_SL_FRACTION = env_float("EARLY_INVALIDATION_ADVERSE_SL_FRACTION", 0.55)
+EARLY_INVALIDATION_MAX_PROGRESS = env_float("EARLY_INVALIDATION_MAX_PROGRESS", 0.12)
 
 # TP ladder similar to BEAT/AERO examples, but not too silent
 TP1_MOVE = env_float("TP1_MOVE", 0.0065)
@@ -133,14 +154,14 @@ TP_MOVES = [TP1_MOVE, TP2_MOVE, TP3_MOVE, TP4_MOVE, TP5_MOVE]
 LEVERAGE_DISPLAY = env_int("LEVERAGE_DISPLAY", 10)
 LOCAL_SCALP_STOP_ENABLED = env_bool("LOCAL_SCALP_STOP_ENABLED", True)
 LOCAL_SCALP_MIN_SL_MOVE = env_float("LOCAL_SCALP_MIN_SL_MOVE", 0.0038)
-LOCAL_SCALP_MAX_SL_MOVE = env_float("LOCAL_SCALP_MAX_SL_MOVE", 0.0075)
+LOCAL_SCALP_MAX_SL_MOVE = env_float("LOCAL_SCALP_MAX_SL_MOVE", 0.0070)
 STRUCTURE_BUFFER = env_float("STRUCTURE_BUFFER", 0.0012)
 
 # Quality filters
 MIN_TP1_RR = env_float("MIN_TP1_RR", 0.65)
 MIN_LADDER_RR = env_float("MIN_LADDER_RR_HARD", 1.25)
 MIN_FINAL_RR = env_float("MIN_FINAL_RR_HARD", 3.00)
-MAX_SCALP_SL_ROI = env_float("MAX_SCALP_SL_ROI", 16.0)
+MAX_SCALP_SL_ROI = env_float("MAX_SCALP_SL_ROI", 14.5)
 MIN_SCORE_TO_SEND = env_float("MIN_SCORE_TO_SEND", 80.0)
 
 # Strategy statistic protection
@@ -201,7 +222,7 @@ STATE_LOCK = threading.RLock()
 
 
 def empty_stat() -> Dict[str, int]:
-    return {"profit": 0, "sl": 0, "expired": 0}
+    return {"profit": 0, "sl": 0, "expired": 0, "early_exit": 0}
 
 
 def default_state() -> Dict[str, Any]:
@@ -295,7 +316,7 @@ def safe_div(a: float, b: float, default: float = 0.0) -> float:
 
 
 def item_total(item: Dict[str, int]) -> int:
-    return int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0))
+    return int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0)) + int(item.get("early_exit", 0))
 
 
 def item_wr(item: Dict[str, int]) -> Tuple[int, float]:
@@ -310,6 +331,33 @@ def item_sl_rate(item: Dict[str, int]) -> float:
     if total <= 0:
         return 0.0
     return 100.0 * float(item.get("sl", 0)) / total
+
+
+def format_stat_line(name: str, item: Dict[str, int]) -> str:
+    total, wr = item_wr(item)
+    return (
+        f"{name}: {int(item.get('profit', 0))} profit / "
+        f"{int(item.get('sl', 0))} SL / "
+        f"{int(item.get('expired', 0))} expired / "
+        f"{int(item.get('early_exit', 0))} early-exit / "
+        f"WR {wr:.1f}%"
+    )
+
+
+def stats_summary_text(limit: int = 6) -> str:
+    st = STATE.get("stats", {})
+    lines = ["", "📊 <b>Статистика V14</b>"]
+    lines.append(format_stat_line("Итого", st.get("total", empty_stat())))
+    for title, key in [("Стороны", "side"), ("Стратегии", "strategy"), ("Типы", "type")]:
+        bucket = st.get(key, {}) or {}
+        if not bucket:
+            continue
+        lines.append("")
+        lines.append(f"<b>{title}:</b>")
+        items = sorted(bucket.items(), key=lambda kv: item_total(kv[1]), reverse=True)[:limit]
+        for name, item in items:
+            lines.append(format_stat_line(str(name), item))
+    return "\n".join(lines)
 
 # ============================================================
 # HTTP / BINGX
@@ -1084,21 +1132,46 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
         current = float(ctx["price"])
         if side == "SHORT":
             progress = safe_div(entry0 - current, entry0, 0.0)
-            chase = progress
-            tape_ok = ctx["loc1"] <= 0.48 and (ctx["last_red"] or ctx["break_short"] or ctx["two_red"])
+            tape_ok = ctx["loc1"] <= CONFIRM_SHORT_LOC_MAX and (ctx["last_red"] or ctx["break_short"] or ctx["two_red"])
+            not_snapback = ctx.get("ch1m1", 0.0) <= CONFIRM_MAX_OPPOSITE_1M
+            micro_ok = (ctx["break_short"] or ctx["two_red"]) if CONFIRM_REQUIRE_MICRO_BREAK else True
         else:
             progress = safe_div(current - entry0, entry0, 0.0)
-            chase = progress
-            tape_ok = ctx["loc1"] >= 0.52 and (ctx["last_green"] or ctx["break_long"] or ctx["two_green"])
-        if progress >= CONFIRM_MIN_MOVE and chase <= CONFIRM_MAX_CHASE and tape_ok:
+            tape_ok = ctx["loc1"] >= CONFIRM_LONG_LOC_MIN and (ctx["last_green"] or ctx["break_long"] or ctx["two_green"])
+            not_snapback = ctx.get("ch1m1", 0.0) >= -CONFIRM_MAX_OPPOSITE_1M
+            micro_ok = (ctx["break_long"] or ctx["two_green"]) if CONFIRM_REQUIRE_MICRO_BREAK else True
+
+        # Progress is measured both as raw price move and as share of TP1.
+        # This prevents sending a signal before the tape really starts moving.
+        tp1_move = abs(float(seed.get("tp1", current)) - entry0) / entry0 if entry0 else 0.0
+        tp1_progress = safe_div(progress, tp1_move, 0.0)
+        live_ok = ctx.get("vol1", 0.0) >= CONFIRM_MIN_VOL1 and ctx.get("range1", 0.0) >= CONFIRM_MIN_RANGE1
+        chase_ok = progress <= CONFIRM_MAX_CHASE and tp1_progress <= CONFIRM_MAX_TP1_PROGRESS
+        confirm_ok = (
+            progress >= CONFIRM_MIN_MOVE
+            and tp1_progress >= CONFIRM_MIN_TP1_PROGRESS
+            and chase_ok
+            and tape_ok
+            and live_ok
+            and not_snapback
+            and micro_ok
+        )
+
+        if confirm_ok:
             # rebuild at current price, not stale entry
-            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 84.0), seed.get("reason", "") + " Подтверждение: цена начала идти в сторону сетапа до отправки сигнала.")
+            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.02: цена прошла {tp1_progress*100:.0f}% пути к TP1 до отправки, tape не разворачивается против входа.")
             ok, why = strategy_allowed(rebuilt["strategy"])
             if ok and trade_quality_ok(rebuilt, blocks, near):
                 ready.append(rebuilt)
             else:
                 blocks["pending_quality_block"] = blocks.get("pending_quality_block", 0) + 1
         else:
+            if not live_ok:
+                blocks["pending_live_weak"] = blocks.get("pending_live_weak", 0) + 1
+            if not tape_ok or not not_snapback:
+                blocks["pending_tape_reject"] = blocks.get("pending_tape_reject", 0) + 1
+            if progress > CONFIRM_MAX_CHASE or tp1_progress > CONFIRM_MAX_TP1_PROGRESS:
+                blocks["pending_chase_block"] = blocks.get("pending_chase_block", 0) + 1
             keep.append(item)
     with STATE_LOCK:
         STATE["pending_setups"] = keep[-80:]
@@ -1107,13 +1180,16 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
 
 
 def should_send_immediately(tr: Dict[str, Any]) -> bool:
-    # Only near-perfect setups may skip pending confirmation.
+    # V14.02: by default every setup must pass pending confirmation.
+    # This reduces "entered and instantly stopped" trades.
+    if not ALLOW_IMMEDIATE_SEND:
+        return False
     if tr["score"] < IMMEDIATE_A_PLUS_SCORE:
         return False
     c = tr.get("ctx", {})
     if tr["side"] == "SHORT":
-        return c.get("loc1", 0.5) <= 0.30 and c.get("range1", 0) >= 1.25 and c.get("vol1", 0) >= 0.75
-    return c.get("loc1", 0.5) >= 0.70 and c.get("range1", 0) >= 1.25 and c.get("vol1", 0) >= 0.90
+        return c.get("loc1", 0.5) <= 0.25 and c.get("range1", 0) >= 1.45 and c.get("vol1", 0) >= 0.95
+    return c.get("loc1", 0.5) >= 0.75 and c.get("range1", 0) >= 1.45 and c.get("vol1", 0) >= 1.05
 
 # ============================================================
 # TELEGRAM / SIGNALS
@@ -1194,6 +1270,27 @@ def progress_to_tp1(tr: Dict[str, Any], price: float) -> float:
     return safe_div(price - entry, tp1 - entry, 0.0)
 
 
+def adverse_sl_fraction(tr: Dict[str, Any], price: float) -> float:
+    entry = float(tr["entry"])
+    sl = float(tr["sl"])
+    if tr["side"] == "SHORT":
+        return max(0.0, safe_div(price - entry, sl - entry, 0.0))
+    return max(0.0, safe_div(entry - price, entry - sl, 0.0))
+
+
+def early_invalidation_reason(tr: Dict[str, Any], price: float, age_min: float) -> Optional[str]:
+    if not EARLY_INVALIDATION_ENABLED:
+        return None
+    if age_min * 60.0 < EARLY_INVALIDATION_SECONDS:
+        return None
+    if float(tr.get("max_progress", 0.0)) > EARLY_INVALIDATION_MAX_PROGRESS:
+        return None
+    frac = adverse_sl_fraction(tr, price)
+    if frac >= EARLY_INVALIDATION_ADVERSE_SL_FRACTION and frac < 1.0:
+        return f"движение против входа {frac*100:.0f}% пути до SL, прогресс к TP1 слабый"
+    return None
+
+
 def track_active_signals() -> None:
     now = now_ts()
     with STATE_LOCK:
@@ -1216,6 +1313,7 @@ def track_active_signals() -> None:
             send_telegram(
                 f"✅ <b>TAKE PROFIT / TP1</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
                 f"Стратегия: {tr['strategy']}\nВход: {fmt_price(tr['entry'])}\nTP1: {fmt_price(tr['tp1'])}\nТекущая цена: {fmt_price(px)}"
+                + stats_summary_text()
             )
             continue
         if hit_sl:
@@ -1223,6 +1321,17 @@ def track_active_signals() -> None:
             send_telegram(
                 f"❌ <b>Stop Loss</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
                 f"Стратегия: {tr['strategy']}\nВход: {fmt_price(tr['entry'])}\nSL: {fmt_price(tr['sl'])}\nТекущая цена: {fmt_price(px)}"
+                + stats_summary_text()
+            )
+            continue
+        early_reason = early_invalidation_reason(tr, px, age_min)
+        if early_reason:
+            record_outcome(tr, "early_exit")
+            send_telegram(
+                f"🟠 <b>EARLY INVALIDATION / выйти раньше SL</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
+                f"Стратегия: {tr['strategy']}\nПричина: {early_reason}\n"
+                f"Вход: {fmt_price(tr['entry'])}\nТекущая цена: {fmt_price(px)}\nSL: {fmt_price(tr['sl'])}"
+                + stats_summary_text()
             )
             continue
         if age_min >= FAST_MAX_MINUTES_TO_TP1 and tr.get("max_progress", 0.0) < FAST_MIN_PROGRESS_TO_KEEP:
@@ -1232,6 +1341,7 @@ def track_active_signals() -> None:
                 f"Стратегия: {tr['strategy']}\nЦена не реализовалась за {FAST_MAX_MINUTES_TO_TP1} минут.\n"
                 f"Вход: {fmt_price(tr['entry'])}\nТекущая цена: {fmt_price(px)}\nTP1: {fmt_price(tr['tp1'])}\n"
                 f"Прогресс к TP1: {tr.get('max_progress', 0.0)*100:.1f}%"
+                + stats_summary_text()
             )
             continue
         if age_min >= FAST_HARD_EXPIRE_MINUTES:
@@ -1239,6 +1349,7 @@ def track_active_signals() -> None:
             send_telegram(
                 f"⏱ <b>HARD EXPIRED</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
                 f"Стратегия: {tr['strategy']}\nВход: {fmt_price(tr['entry'])}\nТекущая цена: {fmt_price(px)}"
+                + stats_summary_text()
             )
             continue
         keep.append(tr)
@@ -1369,11 +1480,14 @@ def format_telegram_scan_report(diag: Dict[str, Any]) -> str:
     blocks = diag.get("blocks", {}) or {}
     top_blocks = ", ".join([f"{k}:{v}" for k, v in list(blocks.items())[:5]]) or "нет"
 
+    total_item = STATE.get("stats", {}).get("total", empty_stat())
+    _, total_wr = item_wr(total_item)
     lines = [
         f"🧪 V14 scan update",
         f"{APP_VERSION}",
         f"Проверено: {diag.get('checked', 0)} из {diag.get('universe', 0)} · кандидатов: {diag.get('candidates', 0)} · отправлено: {diag.get('sent', 0)} · {diag.get('seconds', 0)}с",
         f"BTC: {diag.get('btc', '')}",
+        f"Stats: {int(total_item.get('profit',0))} profit / {int(total_item.get('sl',0))} SL / {int(total_item.get('expired',0))} expired / {int(total_item.get('early_exit',0))} early · WR {total_wr:.1f}%",
         f"Блокировки: {top_blocks}",
     ]
     if TELEGRAM_SCAN_REPORT_INCLUDE_HOT:
@@ -1435,7 +1549,8 @@ def startup_event() -> None:
             f"Scan: every {AUTO_SCAN_SECONDS}s · Track: every {AUTO_TRACK_SECONDS}s\n"
             f"Max active: {MAX_ACTIVE_SIGNALS} · Max per scan: {MAX_SIGNALS_PER_SCAN}\n"
             f"Confirmation engine: {CONFIRMATION_ENGINE_ENABLED}\n"
-            f"Instant Edge disabled: {INSTANT_EDGE_HARD_DISABLED}"
+            f"Instant Edge disabled: {INSTANT_EDGE_HARD_DISABLED}\n"
+            f"Immediate send: {ALLOW_IMMEDIATE_SEND} · Early invalidation: {EARLY_INVALIDATION_ENABLED}"
         )
     threading.Thread(target=scan_loop, daemon=True).start()
     threading.Thread(target=track_loop, daemon=True).start()
@@ -1461,6 +1576,9 @@ def version() -> Dict[str, Any]:
         "send_startup_telegram": SEND_STARTUP_TELEGRAM,
         "telegram_scan_reports_enabled": TELEGRAM_SCAN_REPORTS_ENABLED,
         "telegram_scan_report_every_seconds": TELEGRAM_SCAN_REPORT_EVERY_SECONDS,
+        "allow_immediate_send": ALLOW_IMMEDIATE_SEND,
+        "early_invalidation_enabled": EARLY_INVALIDATION_ENABLED,
+        "confirm_min_tp1_progress": CONFIRM_MIN_TP1_PROGRESS,
     }
 
 
@@ -1501,6 +1619,11 @@ def auto_status() -> Dict[str, Any]:
 @app.get("/stats")
 def stats_endpoint() -> Dict[str, Any]:
     return STATE.get("stats", {})
+
+
+@app.get("/stats-text")
+def stats_text_endpoint() -> str:
+    return stats_summary_text()
 
 
 @app.get("/test-telegram")
