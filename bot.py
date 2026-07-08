@@ -25,8 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.35 OLD ENGINE PRO REBOUND SCALPER"
-DEPLOY_MARKER = "V13_35_OLD_ENGINE_PRO_REBOUND_SCALPER_2026_07_08"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.36 OLD ENGINE PHOTO MTF SCALPER"
+DEPLOY_MARKER = "V13_36_OLD_ENGINE_PHOTO_MTF_SCALPER_2026_07_08"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_35_old_engine_pro_rebound_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_36_old_engine_photo_mtf_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -257,6 +257,25 @@ LEVEL_MIN_RANGE1 = float(os.getenv("LEVEL_MIN_RANGE1", "0.45"))
 LEVEL_MIN_RANGE5 = float(os.getenv("LEVEL_MIN_RANGE5", "0.60"))
 LEVEL_CLOSE_SHORT = float(os.getenv("LEVEL_CLOSE_SHORT", "0.46"))
 LEVEL_CLOSE_LONG = float(os.getenv("LEVEL_CLOSE_LONG", "0.54"))
+
+# --- V13.36: photo / 94%-style professional MTF structure filter ---
+# Based on the screenshots: multi-timeframe scan, confirmed structure, Vol Δ,
+# MACD, OBV and momentum shift. The 94% claim is not trusted as a promise;
+# only the filtering idea is used here.
+PHOTO_MTF_FILTER_ENABLED = os.getenv("PHOTO_MTF_FILTER_ENABLED", "true").lower() == "true"
+PHOTO_MTF_MIN_CONFIRMATIONS = float(os.getenv("PHOTO_MTF_MIN_CONFIRMATIONS", "2.7"))
+PHOTO_MTF_A_PLUS_MIN_CONFIRMATIONS = float(os.getenv("PHOTO_MTF_A_PLUS_MIN_CONFIRMATIONS", "3.2"))
+PHOTO_MTF_BLOCK_BAD_DELTA = os.getenv("PHOTO_MTF_BLOCK_BAD_DELTA", "true").lower() == "true"
+PHOTO_MTF_ALLOW_LEVEL_EXCEPTION = os.getenv("PHOTO_MTF_ALLOW_LEVEL_EXCEPTION", "true").lower() == "true"
+PHOTO_MTF_DELTA_MIN_1M = float(os.getenv("PHOTO_MTF_DELTA_MIN_1M", "0.045"))
+PHOTO_MTF_DELTA_MIN_5M = float(os.getenv("PHOTO_MTF_DELTA_MIN_5M", "0.035"))
+PHOTO_MTF_OBV_LOOKBACK = int(os.getenv("PHOTO_MTF_OBV_LOOKBACK", "18"))
+PHOTO_MTF_MOMENTUM_SHIFT_MIN = float(os.getenv("PHOTO_MTF_MOMENTUM_SHIFT_MIN", "0.0012"))
+PHOTO_MTF_MACD_WEIGHT = float(os.getenv("PHOTO_MTF_MACD_WEIGHT", "0.75"))
+PHOTO_MTF_OBV_WEIGHT = float(os.getenv("PHOTO_MTF_OBV_WEIGHT", "0.70"))
+PHOTO_MTF_DELTA_WEIGHT = float(os.getenv("PHOTO_MTF_DELTA_WEIGHT", "0.85"))
+PHOTO_MTF_MOMENTUM_WEIGHT = float(os.getenv("PHOTO_MTF_MOMENTUM_WEIGHT", "0.85"))
+PHOTO_MTF_STRUCTURE_WEIGHT = float(os.getenv("PHOTO_MTF_STRUCTURE_WEIGHT", "0.90"))
 
 
 # --- Time stop / no-stall logic ---
@@ -717,6 +736,174 @@ def lower_wick_ratio(c: Dict[str, float]) -> float:
     o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
     rng = max(h - l, 1e-12)
     return (min(o, cl) - l) / rng
+
+
+def macd_values(values: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float, float]:
+    """Return MACD line, signal line, histogram and previous histogram.
+    This is used as a soft MTF filter, not as a standalone entry trigger.
+    """
+    if len(values) < slow + signal + 5:
+        return 0.0, 0.0, 0.0, 0.0
+    macd_series: List[float] = []
+    for i in range(slow, len(values) + 1):
+        part = values[:i]
+        macd_series.append(ema(part, fast) - ema(part, slow))
+    sig = ema(macd_series, signal)
+    hist = macd_series[-1] - sig
+    prev_sig = ema(macd_series[:-1], signal) if len(macd_series) > signal + 1 else sig
+    prev_hist = macd_series[-2] - prev_sig if len(macd_series) >= 2 else hist
+    return macd_series[-1], sig, hist, prev_hist
+
+
+def obv_slope(candles: List[Dict[str, float]], lookback: int = 18) -> float:
+    """Normalized OBV slope: positive means accumulation, negative means distribution."""
+    if len(candles) < lookback + 2:
+        return 0.0
+    obv = [0.0]
+    for i in range(1, len(candles)):
+        if candles[i]["close"] > candles[i - 1]["close"]:
+            obv.append(obv[-1] + candles[i]["volume"])
+        elif candles[i]["close"] < candles[i - 1]["close"]:
+            obv.append(obv[-1] - candles[i]["volume"])
+        else:
+            obv.append(obv[-1])
+    recent = obv[-lookback:]
+    avg_vol = sum(max(x["volume"], 0.0) for x in candles[-lookback:]) / max(lookback, 1)
+    denom = max(avg_vol * lookback, 1e-12)
+    return (recent[-1] - recent[0]) / denom
+
+
+def volume_delta_proxy(candles: List[Dict[str, float]], lookback: int = 12) -> float:
+    """Candle based Vol Δ proxy.
+    Positive means buy pressure; negative means sell pressure.
+    """
+    if len(candles) < lookback + 1:
+        return 0.0
+    part = candles[-lookback:]
+    signed = 0.0
+    total = 0.0
+    for x in part:
+        rng = max(x["high"] - x["low"], 1e-12)
+        body_pressure = (x["close"] - x["open"]) / rng
+        signed += body_pressure * max(x["volume"], 0.0)
+        total += max(x["volume"], 0.0)
+    return signed / max(total, 1e-12)
+
+
+def momentum_shift_value(c1: List[Dict[str, float]]) -> float:
+    """Short-term momentum shift: last 3m move minus previous 3m move."""
+    if len(c1) < 8:
+        return 0.0
+    prev_base = c1[-7]["close"]
+    prev_end = c1[-4]["close"]
+    last_base = c1[-4]["close"]
+    last_end = c1[-1]["close"]
+    prev_move = (prev_end - prev_base) / max(prev_base, 1e-12)
+    last_move = (last_end - last_base) / max(last_base, 1e-12)
+    return last_move - prev_move
+
+
+def photo_mtf_structure_gate(
+    trade: Dict[str, Any],
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    c1h: List[Dict[str, float]],
+    btc: Dict[str, Any],
+) -> Tuple[bool, str, str]:
+    """Screenshot-inspired professional filter.
+
+    It uses the logic visible in the user's screenshots: multi-timeframe structure,
+    Vol Δ, MACD, OBV and momentum shift. This does not chase the claimed 94% win rate;
+    it only blocks setups that lack those confirmations.
+    """
+    if not PHOTO_MTF_FILTER_ENABLED:
+        return True, "ok", "photo MTF filter disabled"
+    if len(c1) < 40 or len(c5) < 45 or len(c15) < 60:
+        return False, "photo_mtf_no_data", f"{display_symbol(symbol)}: not enough MTF data"
+
+    side = str(trade.get("side", ""))
+    setup_mode = str(trade.get("setup_mode", ""))
+    grade = str(trade.get("grade", "B"))
+    last1 = c1[-1]
+    closes15 = closes(c15)
+    _, _, macd_hist, macd_prev = macd_values(closes15)
+    delta1 = volume_delta_proxy(c1, 10)
+    delta5 = volume_delta_proxy(c5, 8)
+    obv5 = obv_slope(c5, PHOTO_MTF_OBV_LOOKBACK)
+    obv15 = obv_slope(c15, PHOTO_MTF_OBV_LOOKBACK)
+    mom_shift = momentum_shift_value(c1)
+    loc = close_location(last1)
+
+    score = 0.0
+    parts: List[str] = []
+    bad_delta = False
+
+    if side == "SHORT":
+        if delta1 <= -PHOTO_MTF_DELTA_MIN_1M:
+            score += PHOTO_MTF_DELTA_WEIGHT
+            parts.append(f"VolΔ1 sell {delta1:+.2f}")
+        elif PHOTO_MTF_BLOCK_BAD_DELTA and delta1 > PHOTO_MTF_DELTA_MIN_1M:
+            bad_delta = True
+        if delta5 <= -PHOTO_MTF_DELTA_MIN_5M:
+            score += PHOTO_MTF_DELTA_WEIGHT * 0.70
+            parts.append(f"VolΔ5 sell {delta5:+.2f}")
+        if macd_hist < 0 or macd_hist < macd_prev:
+            score += PHOTO_MTF_MACD_WEIGHT
+            parts.append(f"MACD15 bear hist {macd_hist:+.5f}")
+        if obv5 < -0.03 or obv15 < -0.02:
+            score += PHOTO_MTF_OBV_WEIGHT
+            parts.append(f"OBV distribution 5m {obv5:+.2f}/15m {obv15:+.2f}")
+        if mom_shift <= -PHOTO_MTF_MOMENTUM_SHIFT_MIN:
+            score += PHOTO_MTF_MOMENTUM_WEIGHT
+            parts.append(f"momentum shift down {mom_shift*100:+.2f}%")
+        fresh_break = last1["close"] < min(x["low"] for x in c1[-7:-1]) or setup_mode.startswith(("LEVEL_", "AERO", "MARKET_DUMP"))
+        close_ok = last1["close"] < last1["open"] and loc <= 0.50
+        if fresh_break and close_ok:
+            score += PHOTO_MTF_STRUCTURE_WEIGHT
+            parts.append("confirmed short structure")
+    elif side == "LONG":
+        if delta1 >= PHOTO_MTF_DELTA_MIN_1M:
+            score += PHOTO_MTF_DELTA_WEIGHT
+            parts.append(f"VolΔ1 buy {delta1:+.2f}")
+        elif PHOTO_MTF_BLOCK_BAD_DELTA and delta1 < -PHOTO_MTF_DELTA_MIN_1M:
+            bad_delta = True
+        if delta5 >= PHOTO_MTF_DELTA_MIN_5M:
+            score += PHOTO_MTF_DELTA_WEIGHT * 0.70
+            parts.append(f"VolΔ5 buy {delta5:+.2f}")
+        if macd_hist > 0 or macd_hist > macd_prev:
+            score += PHOTO_MTF_MACD_WEIGHT
+            parts.append(f"MACD15 bull hist {macd_hist:+.5f}")
+        if obv5 > 0.03 or obv15 > 0.02:
+            score += PHOTO_MTF_OBV_WEIGHT
+            parts.append(f"OBV accumulation 5m {obv5:+.2f}/15m {obv15:+.2f}")
+        if mom_shift >= PHOTO_MTF_MOMENTUM_SHIFT_MIN:
+            score += PHOTO_MTF_MOMENTUM_WEIGHT
+            parts.append(f"momentum shift up {mom_shift*100:+.2f}%")
+        fresh_break = last1["close"] > max(x["high"] for x in c1[-7:-1]) or setup_mode.startswith(("LEVEL_", "AERO"))
+        close_ok = last1["close"] > last1["open"] and loc >= 0.50
+        if fresh_break and close_ok:
+            score += PHOTO_MTF_STRUCTURE_WEIGHT
+            parts.append("confirmed long structure")
+    else:
+        return False, "photo_mtf_side_block", f"{display_symbol(symbol)}: unknown side {side}"
+
+    required = PHOTO_MTF_A_PLUS_MIN_CONFIRMATIONS if grade == "A+" else PHOTO_MTF_MIN_CONFIRMATIONS
+    level_exception = PHOTO_MTF_ALLOW_LEVEL_EXCEPTION and setup_mode.startswith("LEVEL_") and score >= max(2.1, required - 0.45)
+    if bad_delta and not level_exception:
+        return False, "photo_mtf_bad_delta", f"{display_symbol(symbol)} {side}: VolΔ against trade; delta1 {delta1:+.2f}, delta5 {delta5:+.2f}"
+    if score < required and not level_exception:
+        return False, "photo_mtf_structure_block", (
+            f"{display_symbol(symbol)} {side}: photo MTF confirmations {score:.2f}/{required:.2f}; "
+            f"delta1 {delta1:+.2f}, delta5 {delta5:+.2f}, MACD {macd_hist:+.5f}, "
+            f"OBV5 {obv5:+.2f}, momShift {mom_shift*100:+.2f}%"
+        )
+
+    return True, "ok", (
+        f"Photo/94-style MTF filter ok: confirmations {score:.2f}/{required:.2f}; "
+        + ("; ".join(parts) if parts else "soft structure exception")
+    )
 
 
 def trend_state(candles: List[Dict[str, float]]) -> str:
@@ -2080,6 +2267,15 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             continue
         trade["trader_pattern_reason"] = t_reason
 
+        photo_ok, photo_block, photo_reason = photo_mtf_structure_gate(trade, symbol, c1, c5, c15, c1h, btc)
+        if not photo_ok:
+            blocks[photo_block] = blocks.get(photo_block, 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(photo_reason)
+            continue
+        trade["photo_mtf_reason"] = photo_reason
+        trade["reason"] = trade.get("reason", "") + f"\n🧠 Photo/94-style MTF filter: {photo_reason}"
+
         candidates.append(trade)
 
     if not candidates:
@@ -2313,6 +2509,21 @@ def confirm_pending_signals(blocks: Optional[Dict[str, int]] = None, near_miss: 
             if len(near_miss) < 8:
                 near_miss.append(q_reason + " after confirmation")
             continue
+        # Re-run the screenshot-inspired MTF filter at the actual alert moment.
+        c1_now = get_klines(confirmed["symbol"], "1m", 120, cache_seconds=3)
+        c5_now = get_klines(confirmed["symbol"], "5m", 120, cache_seconds=8)
+        c15_now = get_klines(confirmed["symbol"], "15m", 120, cache_seconds=15)
+        c1h_now = get_klines(confirmed["symbol"], "1h", 120, cache_seconds=60)
+        if c1_now and c5_now and c15_now and c1h_now:
+            p_ok, p_block, p_reason = photo_mtf_structure_gate(confirmed, confirmed["symbol"], c1_now, c5_now, c15_now, c1h_now, btc_context())
+            if not p_ok:
+                blocks[p_block] = blocks.get(p_block, 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(p_reason + " after confirmation")
+                continue
+            confirmed["photo_mtf_reason"] = p_reason
+            confirmed["reason"] = confirmed.get("reason", "") + f"\n🧠 Photo/94-style MTF recheck: {p_reason}"
+
         confirmed["reason"] = confirmed.get("reason", "") + f"\n✅ Pre-send confirmation: {reason}."
         add_active_signal(confirmed)
         send_telegram(build_signal_message(confirmed))
@@ -2563,7 +2774,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: OLD ENGINE + LEVEL REACTION + PENDING CONFIRMATION SCALPER.\n"
+        f"Mode: OLD ENGINE + LEVEL REACTION + PENDING CONFIRMATION + PHOTO/94 MTF FILTER SCALPER.\n"
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
@@ -2656,6 +2867,11 @@ def manual_scan(send: bool = Query(True)):
 
 @app.get("/stats")
 def stats():
+    return HTMLResponse("<pre>" + build_stats_text() + "</pre>")
+
+
+@app.get("/stats-text")
+def stats_text():
     return HTMLResponse("<pre>" + build_stats_text() + "</pre>")
 
 
