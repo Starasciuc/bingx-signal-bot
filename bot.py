@@ -32,9 +32,9 @@ from fastapi import FastAPI
 # APP / VERSION
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Bounce Reject Scalper"
-APP_VERSION = "V14.03_BOUNCE_REJECT_SCALPER"
-DEPLOY_MARKER = "V14_03_BOUNCE_REJECT_SCALPER_2026"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V14 PUMP Trap Bounce Scalper"
+APP_VERSION = "V14.04_PUMP_TRAP_BOUNCE_SCALPER"
+DEPLOY_MARKER = "V14_04_PUMP_TRAP_BOUNCE_SCALPER_2026"
 
 app = FastAPI(title=APP_NAME)
 
@@ -80,7 +80,7 @@ TELEGRAM_SCAN_REPORTS_ENABLED = env_bool("TELEGRAM_SCAN_REPORTS_ENABLED", True)
 TELEGRAM_SCAN_REPORT_EVERY_SECONDS = env_int("TELEGRAM_SCAN_REPORT_EVERY_SECONDS", 300)
 TELEGRAM_SCAN_REPORT_INCLUDE_HOT = env_bool("TELEGRAM_SCAN_REPORT_INCLUDE_HOT", True)
 
-STATE_FILE = env_str("STATE_FILE", "bot_state_v14_protected_tape_scalper.json")
+STATE_FILE = env_str("STATE_FILE", "bot_state_v14_04_pump_trap_scalper.json")
 
 # Scanning
 AUTO_SCAN_ENABLED = env_bool("AUTO_SCAN_ENABLED", True)
@@ -117,6 +117,11 @@ RECOVERY_RECLAIM_LONG_ENABLED = env_bool("RECOVERY_RECLAIM_LONG_ENABLED", True)
 # selloff -> bounce/retest upward -> rejection -> short continuation.
 BOUNCE_REJECT_SHORT_ENABLED = env_bool("BOUNCE_REJECT_SHORT_ENABLED", True)
 
+# PUMP trap setup. Designed for examples like PUMP SHORT:
+# fast upside expansion / micro-pump -> rejection from local high -> confirmed downside tape.
+# This is NOT the old Instant Edge; it still waits for confirmation before sending.
+PUMP_TRAP_SHORT_ENABLED = env_bool("PUMP_TRAP_SHORT_ENABLED", True)
+
 # Confirmation engine: important difference from V13
 CONFIRMATION_ENGINE_ENABLED = env_bool("CONFIRMATION_ENGINE_ENABLED", True)
 CONFIRM_MIN_SECONDS = env_int("CONFIRM_MIN_SECONDS", 35)
@@ -147,11 +152,11 @@ EARLY_INVALIDATION_ADVERSE_SL_FRACTION = env_float("EARLY_INVALIDATION_ADVERSE_S
 EARLY_INVALIDATION_MAX_PROGRESS = env_float("EARLY_INVALIDATION_MAX_PROGRESS", 0.12)
 
 # TP ladder similar to BEAT/AERO examples, but not too silent
-TP1_MOVE = env_float("TP1_MOVE", 0.0065)
-TP2_MOVE = env_float("TP2_MOVE", 0.0120)
-TP3_MOVE = env_float("TP3_MOVE", 0.0185)
-TP4_MOVE = env_float("TP4_MOVE", 0.0260)
-TP5_MOVE = env_float("TP5_MOVE", 0.0350)
+TP1_MOVE = env_float("TP1_MOVE", 0.0085)
+TP2_MOVE = env_float("TP2_MOVE", 0.0145)
+TP3_MOVE = env_float("TP3_MOVE", 0.0205)
+TP4_MOVE = env_float("TP4_MOVE", 0.0305)
+TP5_MOVE = env_float("TP5_MOVE", 0.0410)
 TP_MOVES = [TP1_MOVE, TP2_MOVE, TP3_MOVE, TP4_MOVE, TP5_MOVE]
 
 # Local scalp stop, tighter than previous versions
@@ -204,6 +209,25 @@ BOUNCE_SHORT_LOC_MAX = env_float("BOUNCE_SHORT_LOC_MAX", 0.48)
 BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP = env_bool("BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP", True)
 BOUNCE_NEAR_LOW_BLOCK = env_bool("BOUNCE_NEAR_LOW_BLOCK", True)
 BOUNCE_ALLOW_B_PLUS = env_bool("BOUNCE_ALLOW_B_PLUS", True)
+
+# PUMP / squeeze trap SHORT requirements. This catches setups like PUMP SHORT:
+# strong upward expansion -> failed continuation -> rejection from recent high -> short.
+PUMP_MIN_15M_UP = env_float("PUMP_MIN_15M_UP", 0.0045)
+PUMP_MIN_30M_UP = env_float("PUMP_MIN_30M_UP", 0.0060)
+PUMP_MAX_30M_UP = env_float("PUMP_MAX_30M_UP", 0.0750)
+PUMP_MIN_REJECT_FROM_HIGH = env_float("PUMP_MIN_REJECT_FROM_HIGH", 0.0022)
+PUMP_MIN_1M3_DOWN = env_float("PUMP_MIN_1M3_DOWN", 0.0022)
+PUMP_MAX_1M3_CHASE = env_float("PUMP_MAX_1M3_CHASE", 0.0130)
+PUMP_MIN_RECENT_RANGE = env_float("PUMP_MIN_RECENT_RANGE", 0.0100)
+PUMP_MIN_VOL1 = env_float("PUMP_MIN_VOL1", 0.34)
+PUMP_MIN_VOL5 = env_float("PUMP_MIN_VOL5", 0.42)
+PUMP_MIN_RANGE1 = env_float("PUMP_MIN_RANGE1", 0.58)
+PUMP_MIN_RANGE5 = env_float("PUMP_MIN_RANGE5", 0.62)
+PUMP_SHORT_LOC_MAX = env_float("PUMP_SHORT_LOC_MAX", 0.52)
+PUMP_CONFIRM_MIN_TP1_PROGRESS = env_float("PUMP_CONFIRM_MIN_TP1_PROGRESS", 0.26)
+PUMP_CONFIRM_SHORT_LOC_MAX = env_float("PUMP_CONFIRM_SHORT_LOC_MAX", 0.40)
+PUMP_AVOID_NEAR_LOW = env_bool("PUMP_AVOID_NEAR_LOW", True)
+PUMP_ALLOW_B_PLUS = env_bool("PUMP_ALLOW_B_PLUS", True)
 
 # Market dump, but not old bad dump. Requires tape confirmation/pending unless A+.
 DUMP_MIN_1M3 = env_float("DUMP_MIN_1M3", 0.0048)
@@ -940,6 +964,82 @@ def score_common(ctx: Dict[str, Any], side: str, base: float = 70.0) -> float:
     return min(score, 99.0)
 
 
+def detect_pump_trap_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    PUMP-style trap short.
+    Pattern: fast upside expansion / pump -> rejection from local high -> confirmed downside tape.
+    This is the type of trade from the PUMP example: entry after the pump fails,
+    close to the rejection zone, with TP1 around 0.8-1.0% and TP5 around 4%.
+    """
+    if not (ALLOW_SHORT and PUMP_TRAP_SHORT_ENABLED):
+        return None
+
+    # There must be a real upside expansion first; otherwise this is just a normal dump.
+    had_pump = ctx["ch15m"] >= PUMP_MIN_15M_UP or ctx["ch30m"] >= PUMP_MIN_30M_UP
+    if not had_pump:
+        return None
+
+    # Avoid extreme late-parabolic tops unless tape is very strong.
+    if ctx["ch30m"] > PUMP_MAX_30M_UP and not (ctx["break_short"] and ctx["vol1"] >= 0.80 and ctx["range1"] >= 1.20):
+        return None
+
+    # Must reject from recent high. This prevents shorting random weakness.
+    reject = max(ctx.get("reject_from_high_10m", 0.0), ctx.get("pullback_from_high", 0.0))
+    if reject < PUMP_MIN_REJECT_FROM_HIGH:
+        return None
+
+    # Fresh downside pressure, but not too late/chased.
+    if ctx["ch1m3"] > -PUMP_MIN_1M3_DOWN:
+        return None
+    if abs(ctx["ch1m3"]) > PUMP_MAX_1M3_CHASE:
+        return None
+
+    # Enough recent range for a 5-target ladder like the examples.
+    if ctx["recent_range_30m"] < PUMP_MIN_RECENT_RANGE:
+        return None
+
+    # Tape must be alive, but we keep it realistic so the bot does not go silent.
+    if ctx["vol1"] < PUMP_MIN_VOL1 or ctx["vol5"] < PUMP_MIN_VOL5:
+        return None
+    if ctx["range1"] < PUMP_MIN_RANGE1 or ctx["range5"] < PUMP_MIN_RANGE5:
+        return None
+
+    # Candle must close under control of sellers.
+    if ctx["loc1"] > PUMP_SHORT_LOC_MAX:
+        return None
+    if not (ctx["last_red"] or ctx["two_red"] or ctx["break_short"]):
+        return None
+
+    # Price should lose momentum area: EMA/VWAP or have a clean micro-break.
+    if not (ctx.get("under_ema_or_vwap") or ctx["break_short"] or ctx["two_red"]):
+        return None
+
+    # Do not send if already sitting on the local low; the example trades enter before the whole move is gone.
+    if PUMP_AVOID_NEAR_LOW and ctx["bounce_from_low"] < max(TP1_MOVE * 0.45, 0.0035):
+        return None
+
+    score = score_common(ctx, "SHORT", 78.0)
+    score += min(max(ctx["ch15m"], 0.0) * 850, 7)
+    score += min(max(ctx["ch30m"], 0.0) * 450, 7)
+    score += min(reject * 1400, 8)
+    if ctx.get("under_both_ema_vwap"):
+        score += 4
+    if ctx["break_short"]:
+        score += 5
+
+    if not PUMP_ALLOW_B_PLUS and score < 88:
+        return None
+
+    reason = (
+        "PUMP TRAP SHORT: быстрый памп/расширение вверх → failure/reject от локального high → tape развернулся вниз. "
+        f"pump15 {ctx['ch15m']*100:+.2f}%, pump30 {ctx['ch30m']*100:+.2f}%, "
+        f"reject {reject*100:.2f}%, 1m3 {ctx['ch1m3']*100:.2f}%, "
+        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, "
+        f"range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
+    )
+    return build_trade(ctx, "SHORT", "PRO_PUMP_TRAP_SHORT", "PUMP TRAP SHORT", score, reason)
+
+
 def detect_beat_style_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not (ALLOW_SHORT and BEAT_STYLE_SHORT_ENABLED):
         return None
@@ -1156,6 +1256,7 @@ def analyze_symbol(symbol: str, market: Dict[str, Any], blocks: Dict[str, int], 
         return []
     candidates = []
     detectors = [
+        detect_pump_trap_short,
         detect_bounce_reject_short,
         detect_beat_style_short,
         detect_aero_style_short,
@@ -1261,6 +1362,16 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
             and not_snapback
             and micro_ok
         )
+
+        if seed.get("strategy") == "PRO_PUMP_TRAP_SHORT" and side == "SHORT":
+            pump_tape_ok = (
+                tp1_progress >= PUMP_CONFIRM_MIN_TP1_PROGRESS
+                and ctx.get("loc1", 0.5) <= PUMP_CONFIRM_SHORT_LOC_MAX
+                and (ctx.get("last_red") or ctx.get("two_red") or ctx.get("break_short"))
+                and ctx.get("vol1", 0.0) >= max(CONFIRM_MIN_VOL1, PUMP_MIN_VOL1)
+                and ctx.get("range1", 0.0) >= max(CONFIRM_MIN_RANGE1, PUMP_MIN_RANGE1 * 0.90)
+            )
+            confirm_ok = confirm_ok and pump_tape_ok
 
         if confirm_ok:
             # rebuild at current price, not stale entry
@@ -1516,7 +1627,7 @@ def run_scan() -> Dict[str, Any]:
                 sent += 1
 
         diag = {
-            "title": "Диагностика V14 Professional Institutional Scalper",
+            "title": "Диагностика V14.04 PUMP Trap Bounce Scalper",
             "checked": checked,
             "universe": len(symbols),
             "candidates": len(candidates),
@@ -1656,6 +1767,7 @@ def startup_event() -> None:
             f"Confirmation engine: {CONFIRMATION_ENGINE_ENABLED}\n"
             f"Instant Edge disabled: {INSTANT_EDGE_HARD_DISABLED}\n"
             f"Bounce Reject SHORT: {BOUNCE_REJECT_SHORT_ENABLED}\n"
+            f"PUMP Trap SHORT: {PUMP_TRAP_SHORT_ENABLED}\n"
             f"Immediate send: {ALLOW_IMMEDIATE_SEND} · Early invalidation: {EARLY_INVALIDATION_ENABLED}"
         )
     threading.Thread(target=scan_loop, daemon=True).start()
@@ -1685,6 +1797,8 @@ def version() -> Dict[str, Any]:
         "allow_immediate_send": ALLOW_IMMEDIATE_SEND,
         "early_invalidation_enabled": EARLY_INVALIDATION_ENABLED,
         "confirm_min_tp1_progress": CONFIRM_MIN_TP1_PROGRESS,
+        "pump_trap_short_enabled": PUMP_TRAP_SHORT_ENABLED,
+        "tp_moves": TP_MOVES,
     }
 
 
