@@ -25,8 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.36 OLD ENGINE PHOTO MTF SCALPER"
-DEPLOY_MARKER = "V13_36_OLD_ENGINE_PHOTO_MTF_SCALPER_2026_07_08"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.37 BALANCED PHOTO REBOUND SCALPER"
+DEPLOY_MARKER = "V13_37_BALANCED_PHOTO_REBOUND_SCALPER_2026_07_08"
 
 app = FastAPI(title=APP_NAME)
 
@@ -34,7 +34,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_36_old_engine_photo_mtf_scalper.json")
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_37_balanced_photo_rebound_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
 
@@ -47,13 +47,13 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.04"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
-HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "60"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "260"))
+HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "90"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 
 # --- Signal limits ---
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "78"))
 MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
@@ -119,7 +119,7 @@ MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # techn
 # V13.29: for fast scalps we use a LOCAL execution stop, not the distant invalidation/averaging zone.
 # This keeps AERO-style / dump scalps alive while still blocking XMR-style wide-risk trades.
 LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
-LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0090"))  # 1.45% price risk cap; x20 ≈ 29% ROI
+LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0095"))  # 1.45% price risk cap; x20 ≈ 29% ROI
 LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0042"))  # keep stop not too tight
 LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "AERO_STYLE_SHORT", "AERO_STYLE_LONG", "LEVEL_REJECT_SHORT", "LEVEL_RECLAIM_LONG", "BOUNCE_REJECT_SHORT"}
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
@@ -128,9 +128,9 @@ A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 # --- V13.22 professional quality gate ---
 # Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
 MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "18.0"))
-MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.35"))
-MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.90"))
-MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.80"))
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.30"))
+MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.78"))
+MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.55"))
 MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.50"))
 MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.30"))
 STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0050"))
@@ -224,14 +224,14 @@ DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "false"
 # A setup must survive a short confirmation window. Weak setups expire before Telegram, so they
 # do not inflate SL/expired statistics.
 CONFIRM_BEFORE_SEND_ENABLED = os.getenv("CONFIRM_BEFORE_SEND_ENABLED", "true").lower() == "true"
-CONFIRM_MIN_SECONDS = int(os.getenv("CONFIRM_MIN_SECONDS", "18"))
-CONFIRM_MAX_SECONDS = int(os.getenv("CONFIRM_MAX_SECONDS", "120"))
-CONFIRM_MIN_TP1_PROGRESS = float(os.getenv("CONFIRM_MIN_TP1_PROGRESS", "0.14"))
-CONFIRM_MAX_TP1_PROGRESS = float(os.getenv("CONFIRM_MAX_TP1_PROGRESS", "0.85"))
-CONFIRM_MIN_VOL1 = float(os.getenv("CONFIRM_MIN_VOL1", "0.35"))
-CONFIRM_MIN_RANGE1 = float(os.getenv("CONFIRM_MIN_RANGE1", "0.45"))
-CONFIRM_MAX_ADVERSE_SL_FRACTION = float(os.getenv("CONFIRM_MAX_ADVERSE_SL_FRACTION", "0.22"))
-CONFIRM_REQUIRE_CANDLE_DIRECTION = os.getenv("CONFIRM_REQUIRE_CANDLE_DIRECTION", "true").lower() == "true"
+CONFIRM_MIN_SECONDS = int(os.getenv("CONFIRM_MIN_SECONDS", "12"))
+CONFIRM_MAX_SECONDS = int(os.getenv("CONFIRM_MAX_SECONDS", "150"))
+CONFIRM_MIN_TP1_PROGRESS = float(os.getenv("CONFIRM_MIN_TP1_PROGRESS", "0.08"))
+CONFIRM_MAX_TP1_PROGRESS = float(os.getenv("CONFIRM_MAX_TP1_PROGRESS", "0.92"))
+CONFIRM_MIN_VOL1 = float(os.getenv("CONFIRM_MIN_VOL1", "0.22"))
+CONFIRM_MIN_RANGE1 = float(os.getenv("CONFIRM_MIN_RANGE1", "0.28"))
+CONFIRM_MAX_ADVERSE_SL_FRACTION = float(os.getenv("CONFIRM_MAX_ADVERSE_SL_FRACTION", "0.35"))
+CONFIRM_REQUIRE_CANDLE_DIRECTION = os.getenv("CONFIRM_REQUIRE_CANDLE_DIRECTION", "false").lower() == "true"
 PENDING_MAX_PER_SYMBOL = int(os.getenv("PENDING_MAX_PER_SYMBOL", "1"))
 PENDING_MAX_TOTAL = int(os.getenv("PENDING_MAX_TOTAL", "25"))
 SEND_PENDING_NOTIFICATIONS = os.getenv("SEND_PENDING_NOTIFICATIONS", "false").lower() == "true"
@@ -258,30 +258,33 @@ LEVEL_MIN_RANGE5 = float(os.getenv("LEVEL_MIN_RANGE5", "0.60"))
 LEVEL_CLOSE_SHORT = float(os.getenv("LEVEL_CLOSE_SHORT", "0.46"))
 LEVEL_CLOSE_LONG = float(os.getenv("LEVEL_CLOSE_LONG", "0.54"))
 
-# --- V13.36: photo / 94%-style professional MTF structure filter ---
+# --- V13.37: photo / 94%-style professional MTF structure filter ---
 # Based on the screenshots: multi-timeframe scan, confirmed structure, Vol Δ,
 # MACD, OBV and momentum shift. The 94% claim is not trusted as a promise;
 # only the filtering idea is used here.
 PHOTO_MTF_FILTER_ENABLED = os.getenv("PHOTO_MTF_FILTER_ENABLED", "true").lower() == "true"
-PHOTO_MTF_MIN_CONFIRMATIONS = float(os.getenv("PHOTO_MTF_MIN_CONFIRMATIONS", "2.7"))
-PHOTO_MTF_A_PLUS_MIN_CONFIRMATIONS = float(os.getenv("PHOTO_MTF_A_PLUS_MIN_CONFIRMATIONS", "3.2"))
-PHOTO_MTF_BLOCK_BAD_DELTA = os.getenv("PHOTO_MTF_BLOCK_BAD_DELTA", "true").lower() == "true"
+PHOTO_MTF_MIN_CONFIRMATIONS = float(os.getenv("PHOTO_MTF_MIN_CONFIRMATIONS", "2.25"))
+PHOTO_MTF_A_PLUS_MIN_CONFIRMATIONS = float(os.getenv("PHOTO_MTF_A_PLUS_MIN_CONFIRMATIONS", "2.85"))
+PHOTO_MTF_BLOCK_BAD_DELTA = os.getenv("PHOTO_MTF_BLOCK_BAD_DELTA", "false").lower() == "true"
 PHOTO_MTF_ALLOW_LEVEL_EXCEPTION = os.getenv("PHOTO_MTF_ALLOW_LEVEL_EXCEPTION", "true").lower() == "true"
-PHOTO_MTF_DELTA_MIN_1M = float(os.getenv("PHOTO_MTF_DELTA_MIN_1M", "0.045"))
-PHOTO_MTF_DELTA_MIN_5M = float(os.getenv("PHOTO_MTF_DELTA_MIN_5M", "0.035"))
+PHOTO_MTF_DELTA_MIN_1M = float(os.getenv("PHOTO_MTF_DELTA_MIN_1M", "0.028"))
+PHOTO_MTF_DELTA_MIN_5M = float(os.getenv("PHOTO_MTF_DELTA_MIN_5M", "0.022"))
 PHOTO_MTF_OBV_LOOKBACK = int(os.getenv("PHOTO_MTF_OBV_LOOKBACK", "18"))
-PHOTO_MTF_MOMENTUM_SHIFT_MIN = float(os.getenv("PHOTO_MTF_MOMENTUM_SHIFT_MIN", "0.0012"))
+PHOTO_MTF_MOMENTUM_SHIFT_MIN = float(os.getenv("PHOTO_MTF_MOMENTUM_SHIFT_MIN", "0.0007"))
 PHOTO_MTF_MACD_WEIGHT = float(os.getenv("PHOTO_MTF_MACD_WEIGHT", "0.75"))
 PHOTO_MTF_OBV_WEIGHT = float(os.getenv("PHOTO_MTF_OBV_WEIGHT", "0.70"))
 PHOTO_MTF_DELTA_WEIGHT = float(os.getenv("PHOTO_MTF_DELTA_WEIGHT", "0.85"))
 PHOTO_MTF_MOMENTUM_WEIGHT = float(os.getenv("PHOTO_MTF_MOMENTUM_WEIGHT", "0.85"))
 PHOTO_MTF_STRUCTURE_WEIGHT = float(os.getenv("PHOTO_MTF_STRUCTURE_WEIGHT", "0.90"))
+PHOTO_MTF_HARD_BLOCK_ENABLED = os.getenv("PHOTO_MTF_HARD_BLOCK_ENABLED", "false").lower() == "true"
+PHOTO_MTF_SOFT_MIN_CONFIRMATIONS = float(os.getenv("PHOTO_MTF_SOFT_MIN_CONFIRMATIONS", "1.55"))
+PHOTO_MTF_RECHECK_BEFORE_SEND = os.getenv("PHOTO_MTF_RECHECK_BEFORE_SEND", "false").lower() == "true"
 
 
 # --- Time stop / no-stall logic ---
-FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
-FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "11"))
-FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.25"))
+FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "8"))
+FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "16"))
+FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.15"))
 FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").lower() == "true"
 
 # --- Market shock context ---
@@ -894,6 +897,14 @@ def photo_mtf_structure_gate(
     if bad_delta and not level_exception:
         return False, "photo_mtf_bad_delta", f"{display_symbol(symbol)} {side}: VolΔ against trade; delta1 {delta1:+.2f}, delta5 {delta5:+.2f}"
     if score < required and not level_exception:
+        # V13.37: balanced mode. The photo/94-style filter should improve quality, not make
+        # the bot completely silent. If the setup has at least a soft MTF score, let it pass
+        # to pending confirmation; hard blocking can be re-enabled with PHOTO_MTF_HARD_BLOCK_ENABLED=true.
+        if (not PHOTO_MTF_HARD_BLOCK_ENABLED) and score >= PHOTO_MTF_SOFT_MIN_CONFIRMATIONS:
+            return True, "soft_ok", (
+                f"Photo/94-style MTF SOFT pass: confirmations {score:.2f}/{required:.2f}; "
+                + ("; ".join(parts) if parts else "partial MTF structure")
+            )
         return False, "photo_mtf_structure_block", (
             f"{display_symbol(symbol)} {side}: photo MTF confirmations {score:.2f}/{required:.2f}; "
             f"delta1 {delta1:+.2f}, delta5 {delta5:+.2f}, MACD {macd_hist:+.5f}, "
@@ -2514,7 +2525,7 @@ def confirm_pending_signals(blocks: Optional[Dict[str, int]] = None, near_miss: 
         c5_now = get_klines(confirmed["symbol"], "5m", 120, cache_seconds=8)
         c15_now = get_klines(confirmed["symbol"], "15m", 120, cache_seconds=15)
         c1h_now = get_klines(confirmed["symbol"], "1h", 120, cache_seconds=60)
-        if c1_now and c5_now and c15_now and c1h_now:
+        if PHOTO_MTF_RECHECK_BEFORE_SEND and c1_now and c5_now and c15_now and c1h_now:
             p_ok, p_block, p_reason = photo_mtf_structure_gate(confirmed, confirmed["symbol"], c1_now, c5_now, c15_now, c1h_now, btc_context())
             if not p_ok:
                 blocks[p_block] = blocks.get(p_block, 0) + 1
