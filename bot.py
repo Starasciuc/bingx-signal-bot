@@ -32,9 +32,9 @@ from fastapi import FastAPI
 # APP / VERSION
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Protected Tape Scalper"
-APP_VERSION = "V14.02_PROTECTED_TAPE_SCALPER"
-DEPLOY_MARKER = "V14_02_PROTECTED_TAPE_SCALPER_2026"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Bounce Reject Scalper"
+APP_VERSION = "V14.03_BOUNCE_REJECT_SCALPER"
+DEPLOY_MARKER = "V14_03_BOUNCE_REJECT_SCALPER_2026"
 
 app = FastAPI(title=APP_NAME)
 
@@ -113,6 +113,10 @@ CONFIRMED_TAPE_ENABLED = env_bool("CONFIRMED_TAPE_ENABLED", True)
 MARKET_DUMP_SHORT_ENABLED = env_bool("MARKET_DUMP_SHORT_ENABLED", True)
 RECOVERY_RECLAIM_LONG_ENABLED = env_bool("RECOVERY_RECLAIM_LONG_ENABLED", True)
 
+# Bounce / retest rejection setup. This is designed for examples like GRASS/AERO/BEAT SHORT:
+# selloff -> bounce/retest upward -> rejection -> short continuation.
+BOUNCE_REJECT_SHORT_ENABLED = env_bool("BOUNCE_REJECT_SHORT_ENABLED", True)
+
 # Confirmation engine: important difference from V13
 CONFIRMATION_ENGINE_ENABLED = env_bool("CONFIRMATION_ENGINE_ENABLED", True)
 CONFIRM_MIN_SECONDS = env_int("CONFIRM_MIN_SECONDS", 35)
@@ -182,6 +186,24 @@ BEAT_MIN_RANGE5 = env_float("BEAT_MIN_RANGE5", 0.65)
 AERO_MIN_1M3 = env_float("AERO_MIN_1M3", 0.0036)
 AERO_MIN_PULLBACK = env_float("AERO_MIN_PULLBACK", 0.0040)
 AERO_MIN_RECENT_RANGE = env_float("AERO_MIN_RECENT_RANGE", 0.0110)
+
+# GRASS-style bounce reject SHORT requirements.
+# These are intentionally not too strict so the bot does not go silent, but they force a real bounce/rejection
+# instead of a random late market-order short.
+BOUNCE_MIN_FROM_LOW = env_float("BOUNCE_MIN_FROM_LOW", 0.0060)       # price bounced at least 0.60% from local low
+BOUNCE_MAX_FROM_LOW = env_float("BOUNCE_MAX_FROM_LOW", 0.0450)       # avoid shorting too high after full reversal
+BOUNCE_MIN_REJECT_FROM_HIGH = env_float("BOUNCE_MIN_REJECT_FROM_HIGH", 0.0028)
+BOUNCE_MIN_1M3 = env_float("BOUNCE_MIN_1M3", 0.0028)
+BOUNCE_MAX_1M3_CHASE = env_float("BOUNCE_MAX_1M3_CHASE", 0.0140)
+BOUNCE_MIN_RECENT_RANGE = env_float("BOUNCE_MIN_RECENT_RANGE", 0.0100)
+BOUNCE_MIN_VOL1 = env_float("BOUNCE_MIN_VOL1", 0.42)
+BOUNCE_MIN_VOL5 = env_float("BOUNCE_MIN_VOL5", 0.45)
+BOUNCE_MIN_RANGE1 = env_float("BOUNCE_MIN_RANGE1", 0.62)
+BOUNCE_MIN_RANGE5 = env_float("BOUNCE_MIN_RANGE5", 0.65)
+BOUNCE_SHORT_LOC_MAX = env_float("BOUNCE_SHORT_LOC_MAX", 0.48)
+BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP = env_bool("BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP", True)
+BOUNCE_NEAR_LOW_BLOCK = env_bool("BOUNCE_NEAR_LOW_BLOCK", True)
+BOUNCE_ALLOW_B_PLUS = env_bool("BOUNCE_ALLOW_B_PLUS", True)
 
 # Market dump, but not old bad dump. Requires tape confirmation/pending unless A+.
 DUMP_MIN_1M3 = env_float("DUMP_MIN_1M3", 0.0048)
@@ -727,6 +749,11 @@ def symbol_context(symbol: str) -> Optional[Dict[str, Any]]:
         }
         ctx["pullback_from_high"] = max(0.0, safe_div(ctx["recent_high_20m"] - price, price))
         ctx["bounce_from_low"] = max(0.0, safe_div(price - ctx["recent_low_20m"], price))
+        ctx["bounce_from_low_10m"] = max(0.0, safe_div(price - ctx["recent_low_10m"], price))
+        ctx["reject_from_high_10m"] = max(0.0, safe_div(ctx["recent_high_10m"] - price, price))
+        ctx["selloff_15m"] = max(0.0, safe_div(max(highs(c1[-15:])) - min(lows(c1[-15:])), price, 0.0))
+        ctx["under_ema_or_vwap"] = price < ctx["ema1_9"] or price < ctx["vwap1"]
+        ctx["under_both_ema_vwap"] = price < ctx["ema1_9"] and price < ctx["vwap1"]
         return ctx
     except Exception:
         return None
@@ -789,6 +816,9 @@ def build_trade(ctx: Dict[str, Any], side: str, strategy: str, setup_type: str, 
             "loc1": ctx.get("loc1", 0.5),
             "pullback_from_high": ctx.get("pullback_from_high", 0),
             "bounce_from_low": ctx.get("bounce_from_low", 0),
+            "reject_from_high_10m": ctx.get("reject_from_high_10m", 0),
+            "bounce_from_low_10m": ctx.get("bounce_from_low_10m", 0),
+            "under_ema_or_vwap": ctx.get("under_ema_or_vwap", False),
         },
         "risk": {
             "sl_move": sl_move,
@@ -962,6 +992,80 @@ def detect_aero_style_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Opti
     return build_trade(ctx, "SHORT", "PRO_AERO_STYLE_SHORT", "AERO STYLE SHORT", score, reason)
 
 
+def detect_bounce_reject_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    GRASS/AERO/BEAT-style bounce rejection short.
+    Pattern: prior weakness/selloff -> bounce upward/retest -> rejection -> short continuation.
+    This is not a late dump short: it requires the current price to be above the local low,
+    then to start rolling over from the local high/retest zone.
+    """
+    if not (ALLOW_SHORT and BOUNCE_REJECT_SHORT_ENABLED):
+        return None
+
+    # There must be a real bounce from a local low; otherwise we are shorting the bottom.
+    if ctx["bounce_from_low"] < BOUNCE_MIN_FROM_LOW:
+        return None
+    if ctx["bounce_from_low"] > BOUNCE_MAX_FROM_LOW:
+        return None
+
+    # There must also be rejection from the recent bounce high.
+    reject = max(ctx.get("reject_from_high_10m", 0.0), ctx.get("pullback_from_high", 0.0))
+    if reject < BOUNCE_MIN_REJECT_FROM_HIGH:
+        return None
+
+    # Fresh downside pressure, but not already too chased.
+    if ctx["ch1m3"] > -BOUNCE_MIN_1M3:
+        return None
+    if abs(ctx["ch1m3"]) > BOUNCE_MAX_1M3_CHASE:
+        return None
+
+    # Recent volatility must be enough for a 5-target ladder.
+    if ctx["recent_range_30m"] < BOUNCE_MIN_RECENT_RANGE:
+        return None
+
+    # Tape must be alive.
+    if ctx["vol1"] < BOUNCE_MIN_VOL1 or ctx["vol5"] < BOUNCE_MIN_VOL5:
+        return None
+    if ctx["range1"] < BOUNCE_MIN_RANGE1 or ctx["range5"] < BOUNCE_MIN_RANGE5:
+        return None
+
+    # The 1m candle must show rejection/downside control.
+    if ctx["loc1"] > BOUNCE_SHORT_LOC_MAX:
+        return None
+    if not (ctx["last_red"] or ctx["two_red"] or ctx["break_short"]):
+        return None
+
+    # After bounce/retest, price should lose 1m EMA or VWAP, unless we have a confirmed micro-break.
+    if BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP and not (ctx.get("under_ema_or_vwap") or ctx["break_short"] or ctx["two_red"]):
+        return None
+
+    # Do not short if price is already sitting on the recent low; there must be room for TP1/TP2.
+    if BOUNCE_NEAR_LOW_BLOCK and ctx["bounce_from_low"] < max(TP1_MOVE * 0.75, 0.0045):
+        return None
+
+    score = score_common(ctx, "SHORT", 76.0)
+    score += min(ctx["bounce_from_low"] * 800, 7)
+    score += min(reject * 1200, 8)
+    if ctx.get("under_both_ema_vwap"):
+        score += 4
+    if ctx["break_short"]:
+        score += 4
+    if market.get("regime") == "BTC BEAR" or market.get("panic"):
+        score += 2
+
+    # Allow good B+ setups, but weak B setups are filtered.
+    if not BOUNCE_ALLOW_B_PLUS and score < 88:
+        return None
+
+    reason = (
+        "BOUNCE REJECT SHORT: отскок вверх после слабости → retest/reject → перехват вниз. "
+        f"bounce from low {ctx['bounce_from_low']*100:.2f}%, reject {reject*100:.2f}%, "
+        f"1m3 {ctx['ch1m3']*100:.2f}%, 15m {ctx['ch15m']*100:.2f}%, "
+        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, "
+        f"range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
+    )
+    return build_trade(ctx, "SHORT", "PRO_BOUNCE_REJECT_SHORT", "BOUNCE REJECT SHORT", score, reason)
+
 def detect_market_dump_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not (ALLOW_SHORT and MARKET_DUMP_SHORT_ENABLED):
         return None
@@ -1052,6 +1156,7 @@ def analyze_symbol(symbol: str, market: Dict[str, Any], blocks: Dict[str, int], 
         return []
     candidates = []
     detectors = [
+        detect_bounce_reject_short,
         detect_beat_style_short,
         detect_aero_style_short,
         detect_market_dump_short,
@@ -1159,7 +1264,7 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
 
         if confirm_ok:
             # rebuild at current price, not stale entry
-            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.02: цена прошла {tp1_progress*100:.0f}% пути к TP1 до отправки, tape не разворачивается против входа.")
+            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.03: цена прошла {tp1_progress*100:.0f}% пути к TP1 до отправки, tape не разворачивается против входа.")
             ok, why = strategy_allowed(rebuilt["strategy"])
             if ok and trade_quality_ok(rebuilt, blocks, near):
                 ready.append(rebuilt)
@@ -1550,6 +1655,7 @@ def startup_event() -> None:
             f"Max active: {MAX_ACTIVE_SIGNALS} · Max per scan: {MAX_SIGNALS_PER_SCAN}\n"
             f"Confirmation engine: {CONFIRMATION_ENGINE_ENABLED}\n"
             f"Instant Edge disabled: {INSTANT_EDGE_HARD_DISABLED}\n"
+            f"Bounce Reject SHORT: {BOUNCE_REJECT_SHORT_ENABLED}\n"
             f"Immediate send: {ALLOW_IMMEDIATE_SEND} · Early invalidation: {EARLY_INVALIDATION_ENABLED}"
         )
     threading.Thread(target=scan_loop, daemon=True).start()
