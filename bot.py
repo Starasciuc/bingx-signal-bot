@@ -32,9 +32,9 @@ from fastapi import FastAPI
 # APP / VERSION
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V14 PUMP Trap Bounce Scalper"
-APP_VERSION = "V14.04_PUMP_TRAP_BOUNCE_SCALPER"
-DEPLOY_MARKER = "V14_04_PUMP_TRAP_BOUNCE_SCALPER_2026"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V14 MTF Structure Scalper"
+APP_VERSION = "V14.05_MTF_STRUCTURE_SCALPER"
+DEPLOY_MARKER = "V14_05_MTF_STRUCTURE_SCALPER_2026"
 
 app = FastAPI(title=APP_NAME)
 
@@ -80,7 +80,7 @@ TELEGRAM_SCAN_REPORTS_ENABLED = env_bool("TELEGRAM_SCAN_REPORTS_ENABLED", True)
 TELEGRAM_SCAN_REPORT_EVERY_SECONDS = env_int("TELEGRAM_SCAN_REPORT_EVERY_SECONDS", 300)
 TELEGRAM_SCAN_REPORT_INCLUDE_HOT = env_bool("TELEGRAM_SCAN_REPORT_INCLUDE_HOT", True)
 
-STATE_FILE = env_str("STATE_FILE", "bot_state_v14_04_pump_trap_scalper.json")
+STATE_FILE = env_str("STATE_FILE", "bot_state_v14_05_mtf_structure_scalper.json")
 
 # Scanning
 AUTO_SCAN_ENABLED = env_bool("AUTO_SCAN_ENABLED", True)
@@ -228,6 +228,16 @@ PUMP_CONFIRM_MIN_TP1_PROGRESS = env_float("PUMP_CONFIRM_MIN_TP1_PROGRESS", 0.26)
 PUMP_CONFIRM_SHORT_LOC_MAX = env_float("PUMP_CONFIRM_SHORT_LOC_MAX", 0.40)
 PUMP_AVOID_NEAR_LOW = env_bool("PUMP_AVOID_NEAR_LOW", True)
 PUMP_ALLOW_B_PLUS = env_bool("PUMP_ALLOW_B_PLUS", True)
+
+# Professional multi-timeframe structure filter inspired by trader dashboards:
+# 4h/1h/15m context + MACD/OBV/volume-delta proxy + confirmed structure.
+# It is a final quality gate before a setup is allowed to wait for confirmation.
+PRO_MTF_FILTER_ENABLED = env_bool("PRO_MTF_FILTER_ENABLED", True)
+PRO_MTF_MIN_CONFIRMATIONS = env_float("PRO_MTF_MIN_CONFIRMATIONS", 3.0)
+PRO_MTF_A_PLUS_MIN_CONFIRMATIONS = env_float("PRO_MTF_A_PLUS_MIN_CONFIRMATIONS", 3.5)
+PRO_MTF_STRONG_SCORE_ESCAPE = env_float("PRO_MTF_STRONG_SCORE_ESCAPE", 93.0)
+PRO_MTF_BLOCK_BAD_DELTA = env_bool("PRO_MTF_BLOCK_BAD_DELTA", True)
+COINS_IN_ANALYSIS_TARGET = env_int("COINS_IN_ANALYSIS_TARGET", 12)
 
 # Market dump, but not old bad dump. Requires tape confirmation/pending unless A+.
 DUMP_MIN_1M3 = env_float("DUMP_MIN_1M3", 0.0048)
@@ -629,6 +639,132 @@ def micro_break(c1: List[Dict[str, float]], side: str, bars: int = 4) -> bool:
         return last["c"] <= min(lows(prev)) or last["l"] <= min(lows(prev))
     return last["c"] >= max(highs(prev)) or last["h"] >= max(highs(prev))
 
+
+def macd_hist(c: List[Dict[str, float]], fast: int = 12, slow: int = 26, signal: int = 9) -> float:
+    """MACD histogram approximation from candle closes. Positive = bullish momentum, negative = bearish."""
+    cl = closes(c)
+    if len(cl) < slow + signal:
+        return 0.0
+    macd_line = []
+    # Use rolling EMA approximations over growing windows; enough for a filter, not for charting.
+    for i in range(slow, len(cl) + 1):
+        sub = cl[:i]
+        macd_line.append(ema(sub[-max(slow * 3, slow):], fast) - ema(sub[-max(slow * 3, slow):], slow))
+    if len(macd_line) < signal:
+        return macd_line[-1] if macd_line else 0.0
+    sig = ema(macd_line, signal)
+    return macd_line[-1] - sig
+
+
+def obv_slope(c: List[Dict[str, float]], length: int = 10) -> float:
+    """Normalized OBV slope. Positive = accumulation, negative = distribution."""
+    if len(c) < length + 2:
+        return 0.0
+    vals = [0.0]
+    for i in range(1, len(c)):
+        if c[i]["c"] > c[i - 1]["c"]:
+            vals.append(vals[-1] + c[i]["v"])
+        elif c[i]["c"] < c[i - 1]["c"]:
+            vals.append(vals[-1] - c[i]["v"])
+        else:
+            vals.append(vals[-1])
+    recent = vals[-length:]
+    denom = sum(abs(x) for x in recent) / max(len(recent), 1)
+    if denom <= 0:
+        denom = avg([x["v"] for x in c[-length:]], 1.0)
+    return safe_div(recent[-1] - recent[0], denom * max(length, 1), 0.0)
+
+
+def volume_delta_proxy(c: List[Dict[str, float]], length: int = 8) -> float:
+    """Candle-based volume delta proxy in [-1, 1]. Green volume positive, red volume negative."""
+    if len(c) < 2:
+        return 0.0
+    arr = c[-length:] if len(c) >= length else c
+    signed = 0.0
+    total = 0.0
+    for x in arr:
+        rng = candle_range(x)
+        body = x["c"] - x["o"]
+        # Weight by body dominance; wicks reduce confidence.
+        dominance = abs(body) / rng if rng > 0 else 0.0
+        signed += (1.0 if body > 0 else -1.0 if body < 0 else 0.0) * x["v"] * max(0.25, dominance)
+        total += x["v"]
+    return max(-1.0, min(1.0, safe_div(signed, total, 0.0)))
+
+
+def pro_mtf_confirmation_score(tr: Dict[str, Any]) -> Tuple[float, str, List[str]]:
+    """Return professional MTF confirmation score and explanation."""
+    ctx = tr.get("ctx", {}) or {}
+    side = tr.get("side", "")
+    score = 0.0
+    passed: List[str] = []
+    failed: List[str] = []
+
+    ch1h = float(ctx.get("ch1h_mtf", 0.0))
+    ch4h = float(ctx.get("ch4h_mtf", 0.0))
+    macd15 = float(ctx.get("macd15", 0.0))
+    macd15_prev = float(ctx.get("macd15_prev", 0.0))
+    obv5 = float(ctx.get("obv5_slope", 0.0))
+    obv15 = float(ctx.get("obv15_slope", 0.0))
+    vd1 = float(ctx.get("vdelta1", 0.0))
+    vd5 = float(ctx.get("vdelta5", 0.0))
+
+    if side == "SHORT":
+        # Context should not be violently against the short unless this is a trap/rejection setup.
+        trap = tr.get("strategy") in {"PRO_PUMP_TRAP_SHORT", "PRO_BOUNCE_REJECT_SHORT", "PRO_BEAT_STYLE_SHORT", "PRO_AERO_STYLE_SHORT"}
+        if ch1h <= 0.006 or trap:
+            score += 0.6; passed.append("1h/4h context ok")
+        else:
+            failed.append("1h контекст против SHORT")
+        if macd15 <= 0 or macd15 < macd15_prev:
+            score += 0.8; passed.append("15m MACD вниз/слабеет")
+        else:
+            failed.append("15m MACD не подтверждает")
+        if obv5 < -0.02 or obv15 < -0.02:
+            score += 0.8; passed.append("OBV distribution")
+        else:
+            failed.append("OBV без распределения")
+        if vd1 < -0.05 or vd5 < -0.05:
+            score += 0.8; passed.append("Vol Δ sell pressure")
+        else:
+            failed.append("Vol Δ слабый")
+        if ctx.get("break_short") or ctx.get("two_red") or ctx.get("under_ema_or_vwap") or float(ctx.get("reject_from_high_10m", 0.0)) >= 0.002:
+            score += 1.0; passed.append("структура SHORT подтверждена")
+        else:
+            failed.append("структура SHORT не подтверждена")
+        if float(ctx.get("loc1", 0.5)) <= 0.48:
+            score += 0.5; passed.append("1m close near low")
+        else:
+            failed.append("закрытие 1m не у low")
+    else:
+        if ch1h >= -0.006 or float(ctx.get("ch15m", 0.0)) >= 0.004:
+            score += 0.6; passed.append("1h/RS context ok")
+        else:
+            failed.append("1h контекст против LONG")
+        if macd15 >= 0 or macd15 > macd15_prev:
+            score += 0.8; passed.append("15m MACD вверх/усиливается")
+        else:
+            failed.append("15m MACD не подтверждает")
+        if obv5 > 0.02 or obv15 > 0.02:
+            score += 0.8; passed.append("OBV accumulation")
+        else:
+            failed.append("OBV без накопления")
+        if vd1 > 0.05 or vd5 > 0.05:
+            score += 0.8; passed.append("Vol Δ buy pressure")
+        else:
+            failed.append("Vol Δ слабый")
+        if ctx.get("break_long") or ctx.get("two_green") or float(ctx.get("bounce_from_low", 0.0)) >= 0.0035:
+            score += 1.0; passed.append("структура LONG подтверждена")
+        else:
+            failed.append("структура LONG не подтверждена")
+        if float(ctx.get("loc1", 0.5)) >= 0.52:
+            score += 0.5; passed.append("1m close near high")
+        else:
+            failed.append("закрытие 1m не у high")
+
+    note = "; ".join(passed[:4])
+    return score, note, failed
+
 # ============================================================
 # MARKET CONTEXT / HOT SCANNER
 # ============================================================
@@ -776,6 +912,15 @@ def symbol_context(symbol: str) -> Optional[Dict[str, Any]]:
         ctx["bounce_from_low_10m"] = max(0.0, safe_div(price - ctx["recent_low_10m"], price))
         ctx["reject_from_high_10m"] = max(0.0, safe_div(ctx["recent_high_10m"] - price, price))
         ctx["selloff_15m"] = max(0.0, safe_div(max(highs(c1[-15:])) - min(lows(c1[-15:])), price, 0.0))
+        # MTF / pro-dashboard style filters. 1h/4h are approximated from 15m candles to keep scanning fast.
+        ctx["ch1h_mtf"] = percent_change(c15, 4) if len(c15) >= 5 else ctx["ch1h"]
+        ctx["ch4h_mtf"] = percent_change(c15, 16) if len(c15) >= 17 else ctx["ch1h"]
+        ctx["macd15"] = macd_hist(c15) if len(c15) >= 35 else 0.0
+        ctx["macd15_prev"] = macd_hist(c15[:-1]) if len(c15) >= 36 else 0.0
+        ctx["obv5_slope"] = obv_slope(c5, 10)
+        ctx["obv15_slope"] = obv_slope(c15, 8) if len(c15) >= 10 else 0.0
+        ctx["vdelta1"] = volume_delta_proxy(c1, 8)
+        ctx["vdelta5"] = volume_delta_proxy(c5, 6)
         ctx["under_ema_or_vwap"] = price < ctx["ema1_9"] or price < ctx["vwap1"]
         ctx["under_both_ema_vwap"] = price < ctx["ema1_9"] and price < ctx["vwap1"]
         return ctx
@@ -842,7 +987,22 @@ def build_trade(ctx: Dict[str, Any], side: str, strategy: str, setup_type: str, 
             "bounce_from_low": ctx.get("bounce_from_low", 0),
             "reject_from_high_10m": ctx.get("reject_from_high_10m", 0),
             "bounce_from_low_10m": ctx.get("bounce_from_low_10m", 0),
+            "break_short": ctx.get("break_short", False),
+            "break_long": ctx.get("break_long", False),
+            "two_red": ctx.get("two_red", False),
+            "two_green": ctx.get("two_green", False),
+            "last_red": ctx.get("last_red", False),
+            "last_green": ctx.get("last_green", False),
             "under_ema_or_vwap": ctx.get("under_ema_or_vwap", False),
+            "under_both_ema_vwap": ctx.get("under_both_ema_vwap", False),
+            "ch1h_mtf": ctx.get("ch1h_mtf", 0),
+            "ch4h_mtf": ctx.get("ch4h_mtf", 0),
+            "macd15": ctx.get("macd15", 0),
+            "macd15_prev": ctx.get("macd15_prev", 0),
+            "obv5_slope": ctx.get("obv5_slope", 0),
+            "obv15_slope": ctx.get("obv15_slope", 0),
+            "vdelta1": ctx.get("vdelta1", 0),
+            "vdelta5": ctx.get("vdelta5", 0),
         },
         "risk": {
             "sl_move": sl_move,
@@ -858,6 +1018,34 @@ def build_trade(ctx: Dict[str, Any], side: str, strategy: str, setup_type: str, 
 
 def symbol_key(symbol: str) -> str:
     return symbol.replace("-", "_").replace("/", "_")
+
+
+def pro_mtf_filter_ok(tr: Dict[str, Any], blocks: Dict[str, int], near: List[str]) -> bool:
+    if not PRO_MTF_FILTER_ENABLED:
+        return True
+    score, note, failed = pro_mtf_confirmation_score(tr)
+    required = PRO_MTF_A_PLUS_MIN_CONFIRMATIONS if tr.get("class") == "A+" else PRO_MTF_MIN_CONFIRMATIONS
+    # Very strong setups may pass with a small deficit, but only if delta is not directly against the trade.
+    ctx = tr.get("ctx", {}) or {}
+    side = tr.get("side", "")
+    bad_delta = False
+    if side == "SHORT":
+        bad_delta = float(ctx.get("vdelta1", 0.0)) > 0.25 and float(ctx.get("vdelta5", 0.0)) > 0.15
+    elif side == "LONG":
+        bad_delta = float(ctx.get("vdelta1", 0.0)) < -0.25 and float(ctx.get("vdelta5", 0.0)) < -0.15
+
+    escape = tr.get("score", 0) >= PRO_MTF_STRONG_SCORE_ESCAPE and score >= required - 0.7 and not bad_delta
+    if (score >= required and not (PRO_MTF_BLOCK_BAD_DELTA and bad_delta)) or escape:
+        tr["reason"] = tr.get("reason", "") + f" MTF-фильтр: {score:.1f}/{required:.1f}; {note}."
+        tr.setdefault("ctx", {})["mtf_score"] = score
+        return True
+
+    blocks["mtf_structure_block"] = blocks.get("mtf_structure_block", 0) + 1
+    if bad_delta:
+        blocks["mtf_bad_delta_block"] = blocks.get("mtf_bad_delta_block", 0) + 1
+    if len(near) < 10:
+        near.append(f"{display_symbol(tr['symbol'])} {side}: MTF {score:.1f}/{required:.1f} блок · " + "; ".join(failed[:3]))
+    return False
 
 
 def trade_quality_ok(tr: Dict[str, Any], blocks: Dict[str, int], near: List[str]) -> bool:
@@ -883,6 +1071,8 @@ def trade_quality_ok(tr: Dict[str, Any], blocks: Dict[str, int], near: List[str]
     # Heavy coins require A+ only, because their fast ladder is often less clean.
     if base_asset(sym) in HEAVY_BASES and tr["score"] < 90:
         blocks["heavy_coin_score_block"] = blocks.get("heavy_coin_score_block", 0) + 1
+        return False
+    if not pro_mtf_filter_ok(tr, blocks, near):
         return False
     return True
 
@@ -1375,7 +1565,7 @@ def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near:
 
         if confirm_ok:
             # rebuild at current price, not stale entry
-            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.03: цена прошла {tp1_progress*100:.0f}% пути к TP1 до отправки, tape не разворачивается против входа.")
+            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.05: цена прошла {tp1_progress*100:.0f}% пути к TP1 до отправки, tape не разворачивается против входа.")
             ok, why = strategy_allowed(rebuilt["strategy"])
             if ok and trade_quality_ok(rebuilt, blocks, near):
                 ready.append(rebuilt)
@@ -1627,9 +1817,12 @@ def run_scan() -> Dict[str, Any]:
                 sent += 1
 
         diag = {
-            "title": "Диагностика V14.04 PUMP Trap Bounce Scalper",
+            "title": "Диагностика V14.05 MTF Structure Scalper",
             "checked": checked,
             "universe": len(symbols),
+            "coins_in_analysis": min(COINS_IN_ANALYSIS_TARGET, len(selected)),
+            "pending_setups": len(STATE.get("pending_setups", [])),
+            "active_signals": len(STATE.get("active_signals", [])),
             "candidates": len(candidates),
             "sent": sent,
             "seconds": round(now_ts() - start, 1),
@@ -1656,6 +1849,7 @@ def format_diag(diag: Dict[str, Any]) -> str:
     lines = []
     lines.append(f"🧪 {diag.get('title', 'Диагностика')}" )
     lines.append(f"Проверено: {diag.get('checked', 0)} из universe {diag.get('universe', 0)}")
+    lines.append(f"Монет в анализе: {diag.get('coins_in_analysis', 0)} · pending: {diag.get('pending_setups', 0)} · active: {diag.get('active_signals', 0)}")
     lines.append(f"Кандидатов: {diag.get('candidates', 0)} · отправлено: {diag.get('sent', 0)} · время: {diag.get('seconds', 0)}с")
     lines.append(f"BTC: {diag.get('btc', '')}")
     lines.append("")
@@ -1701,7 +1895,8 @@ def format_telegram_scan_report(diag: Dict[str, Any]) -> str:
     lines = [
         f"🧪 V14 scan update",
         f"{APP_VERSION}",
-        f"Проверено: {diag.get('checked', 0)} из {diag.get('universe', 0)} · кандидатов: {diag.get('candidates', 0)} · отправлено: {diag.get('sent', 0)} · {diag.get('seconds', 0)}с",
+        f"Проверено: {diag.get('checked', 0)} из {diag.get('universe', 0)} · монет в анализе: {diag.get('coins_in_analysis', 0)} · кандидатов: {diag.get('candidates', 0)} · отправлено: {diag.get('sent', 0)} · {diag.get('seconds', 0)}с",
+        f"Active: {diag.get('active_signals', 0)} · Pending confirmation: {diag.get('pending_setups', 0)}",
         f"BTC: {diag.get('btc', '')}",
         f"Stats: {int(total_item.get('profit',0))} profit / {int(total_item.get('sl',0))} SL / {int(total_item.get('expired',0))} expired / {int(total_item.get('early_exit',0))} early · WR {total_wr:.1f}%",
         f"Блокировки: {top_blocks}",
@@ -1798,6 +1993,9 @@ def version() -> Dict[str, Any]:
         "early_invalidation_enabled": EARLY_INVALIDATION_ENABLED,
         "confirm_min_tp1_progress": CONFIRM_MIN_TP1_PROGRESS,
         "pump_trap_short_enabled": PUMP_TRAP_SHORT_ENABLED,
+        "pro_mtf_filter_enabled": PRO_MTF_FILTER_ENABLED,
+        "pro_mtf_min_confirmations": PRO_MTF_MIN_CONFIRMATIONS,
+        "coins_in_analysis_target": COINS_IN_ANALYSIS_TARGET,
         "tp_moves": TP_MOVES,
     }
 
