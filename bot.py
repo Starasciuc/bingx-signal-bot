@@ -1,3 +1,16 @@
+"""
+BingX Signal Bot for existing Render Background Worker
+Start command supported: uvicorn bot:app --host 0.0.0.0 --port $PORT
+
+What it does:
+- Sends Telegram startup notification.
+- Scans BingX USDT-M swap/futures public markets.
+- Sends scalp setups in the style: ENTRY, 5 TPs, averaging order, protective stop.
+- Tracks TP/averaging/stop and keeps win/loss statistics.
+
+This is a signal bot only. It never opens trades.
+"""
+
 import asyncio
 import json
 import logging
@@ -11,23 +24,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import ccxt.async_support as ccxt
-import numpy as np
-import pandas as pd
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ============================================================
-# BingX Scalp Signal Bot
-# ------------------------------------------------------------
-# - Сканирует публичные USDT-M futures/swap рынки BingX через CCXT.
-# - НЕ открывает сделки. Только Telegram-сигналы.
-# - Ищет сетапы в стиле: сильный импульс/перегрев -> отскок/отбой,
-#   либо пробой/пролом уровня с объемом.
-# - Формат сигнала похож на примеры: entry, 5 take-profit, averaging order.
-# ============================================================
-
 APP_NAME = "BingX Scalp Signal Bot"
 STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+
+# -------------------------
+# ENV helpers
+# -------------------------
+
+def first_env(names: List[str], default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return default
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -49,10 +61,10 @@ def env_float(name: str, default: float) -> float:
 
 
 def env_bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
+    value = os.getenv(name)
+    if value is None:
         return default
-    return val.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def env_list(name: str, default: str) -> List[str]:
@@ -60,30 +72,44 @@ def env_list(name: str, default: str) -> List[str]:
     return [x.strip().upper() for x in raw.split(",") if x.strip()]
 
 
-TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = first_env([
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN", "TG_BOT_TOKEN"
+])
+TELEGRAM_CHAT_ID = first_env([
+    "TELEGRAM_CHAT_ID", "TELEGRAM_CHANNEL_ID", "TG_CHAT_ID", "CHAT_ID"
+])
 
+# Scan settings. If the bot is too quiet, lower MIN_SCORE/FALLBACK_SCORE.
 SCAN_INTERVAL_SECONDS = max(45, env_int("SCAN_INTERVAL_SECONDS", 180))
-TOP_SYMBOLS_LIMIT = max(20, env_int("TOP_SYMBOLS_LIMIT", 100))
-MIN_24H_QUOTE_VOLUME_USDT = env_float("MIN_24H_QUOTE_VOLUME_USDT", 1_000_000)
+TOP_SYMBOLS_LIMIT = max(20, env_int("TOP_SYMBOLS_LIMIT", 120))
+MIN_24H_QUOTE_VOLUME_USDT = env_float("MIN_24H_QUOTE_VOLUME_USDT", 700_000)
 
-MIN_SCORE = env_int("MIN_SCORE", 76)
-FALLBACK_SCORE = env_int("FALLBACK_SCORE", 70)
-DAILY_MIN_SIGNALS = env_int("DAILY_MIN_SIGNALS", 1)
-MAX_SIGNALS_PER_DAY = env_int("MAX_SIGNALS_PER_DAY", 6)
-COOLDOWN_MINUTES = env_int("COOLDOWN_MINUTES", 180)
+MIN_SCORE = env_int("MIN_SCORE", 74)
+FALLBACK_SCORE = env_int("FALLBACK_SCORE", 68)
+DAILY_MIN_SIGNALS = max(0, env_int("DAILY_MIN_SIGNALS", 1))
+MAX_SIGNALS_PER_DAY = max(1, env_int("MAX_SIGNALS_PER_DAY", 6))
+COOLDOWN_MINUTES = max(15, env_int("COOLDOWN_MINUTES", 180))
 
 LEVERAGE = max(1, env_int("LEVERAGE", 20))
-TAKE_PCTS = [float(x.strip()) / 100 for x in env_str("TAKE_PCTS", "0.77,1.37,1.97,2.98,3.98").split(",") if x.strip()]
-AVERAGE_PCT = env_float("AVERAGE_PCT", 7.7) / 100
-STOP_AFTER_AVERAGE_PCT = env_float("STOP_AFTER_AVERAGE_PCT", 10.5) / 100
+TAKE_PCTS = [
+    float(x.strip()) / 100.0
+    for x in env_str("TAKE_PCTS", "0.80,1.40,2.00,3.00,4.00").split(",")
+    if x.strip()
+]
+if len(TAKE_PCTS) < 5:
+    TAKE_PCTS = [0.008, 0.014, 0.020, 0.030, 0.040]
+AVERAGE_PCT = env_float("AVERAGE_PCT", 7.7) / 100.0
+STOP_AFTER_AVERAGE_PCT = env_float("STOP_AFTER_AVERAGE_PCT", 10.5) / 100.0
 
 SEND_STARTUP_MESSAGE = env_bool("SEND_STARTUP_MESSAGE", True)
+SEND_STATS_AFTER_CLOSE = env_bool("SEND_STATS_AFTER_CLOSE", True)
+SEND_SCAN_ERRORS_TO_TELEGRAM = env_bool("SEND_SCAN_ERRORS_TO_TELEGRAM", False)
 SEND_EMPTY_SCAN = env_bool("SEND_EMPTY_SCAN", False)
-EXCLUDED_BASES = set(env_list("EXCLUDED_BASES", "BTC,ETH,USDC,FDUSD,TUSD,DAI,USDE,USDP,USTC"))
 
-# Если сигналы слишком частые — увеличь MIN_SCORE до 80-84.
-# Если бот слишком молчит — снизь MIN_SCORE до 72-74 или TOP_SYMBOLS_LIMIT увеличь до 150.
+EXCLUDED_BASES = set(env_list(
+    "EXCLUDED_BASES",
+    "BTC,ETH,USDC,FDUSD,TUSD,DAI,USDE,USDP,USTC,BUSD"
+))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,11 +122,22 @@ exchange = None
 scanner_task: Optional[asyncio.Task] = None
 started_at = time.time()
 last_scan_summary: Dict[str, Any] = {}
+last_telegram_status: Dict[str, Any] = {
+    "ok": None,
+    "time_utc": None,
+    "http_status": None,
+    "error": None,
+    "response": None,
+}
 
+# -------------------------
+# State / stats
+# -------------------------
 
 @dataclass
 class Signal:
     symbol: str
+    display_symbol: str
     base: str
     side: str  # LONG / SHORT
     setup: str
@@ -118,6 +155,23 @@ class Signal:
     closed: bool = False
 
 
+def default_stats() -> Dict[str, Any]:
+    return {
+        "total_signals_sent": 0,
+        "closed_total": 0,
+        "closed_profit": 0,
+        "closed_loss": 0,
+        "tp1_hits": 0,
+        "all_targets": 0,
+        "stop_losses": 0,
+        "average_hits": 0,
+        "total_closed_roi": 0.0,
+        "best_roi": None,
+        "worst_roi": None,
+        "last_results": [],
+    }
+
+
 @dataclass
 class BotState:
     day: str = ""
@@ -125,6 +179,7 @@ class BotState:
     last_signal_ts: float = 0.0
     cooldowns: Dict[str, float] = field(default_factory=dict)
     active: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    stats: Dict[str, Any] = field(default_factory=default_stats)
 
 
 state = BotState()
@@ -134,8 +189,18 @@ def today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def ensure_stats() -> None:
+    base = default_stats()
+    if not isinstance(state.stats, dict):
+        state.stats = base
+    for key, value in base.items():
+        state.stats.setdefault(key, value)
+    if not isinstance(state.stats.get("last_results"), list):
+        state.stats["last_results"] = []
+    state.stats["last_results"] = state.stats["last_results"][-30:]
+
+
 def reset_daily_if_needed() -> None:
-    global state
     today = today_key()
     if state.day != today:
         state.day = today
@@ -148,12 +213,24 @@ def load_state() -> None:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            state = BotState(**raw)
+            state = BotState(
+                day=raw.get("day", ""),
+                signals_today=int(raw.get("signals_today", 0) or 0),
+                last_signal_ts=float(raw.get("last_signal_ts", 0.0) or 0.0),
+                cooldowns=raw.get("cooldowns", {}) if isinstance(raw.get("cooldowns", {}), dict) else {},
+                active=raw.get("active", {}) if isinstance(raw.get("active", {}), dict) else {},
+                stats=raw.get("stats", default_stats()) if isinstance(raw.get("stats", {}), dict) else default_stats(),
+            )
+            ensure_stats()
             reset_daily_if_needed()
             logger.info("State loaded")
+        else:
+            state = BotState(day=today_key())
+            ensure_stats()
     except Exception as e:
         logger.warning("Could not load state: %s", e)
         state = BotState(day=today_key())
+        ensure_stats()
 
 
 def save_state() -> None:
@@ -164,20 +241,30 @@ def save_state() -> None:
         logger.warning("Could not save state: %s", e)
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def stat_inc(key: str, amount: int = 1) -> None:
+    ensure_stats()
+    state.stats[key] = int(state.stats.get(key, 0) or 0) + amount
+
+# -------------------------
+# Formatting helpers
+# -------------------------
 
 
 def safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
+        if x is None:
             return default
-        return float(x)
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
     except Exception:
         return default
 
 
 def pct_change(new: float, old: float) -> float:
+    old = safe_float(old)
+    new = safe_float(new)
     if old == 0:
         return 0.0
     return (new / old - 1.0) * 100.0
@@ -188,7 +275,6 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 def fmt_price(price: float) -> str:
-    """Dynamic price formatting for crypto scalps."""
     price = safe_float(price)
     if price >= 1000:
         return f"{price:.2f}"
@@ -197,835 +283,930 @@ def fmt_price(price: float) -> str:
     if price >= 10:
         return f"{price:.4f}"
     if price >= 1:
-        return f"{price:.5f}"
+        return f"{price:.5f}".rstrip("0").rstrip(".")
     if price >= 0.1:
-        return f"{price:.5f}"
+        return f"{price:.5f}".rstrip("0").rstrip(".")
     if price >= 0.01:
-        return f"{price:.6f}"
+        return f"{price:.6f}".rstrip("0").rstrip(".")
     if price >= 0.001:
-        return f"{price:.7f}"
-    return f"{price:.9f}"
+        return f"{price:.7f}".rstrip("0").rstrip(".")
+    return f"{price:.9f}".rstrip("0").rstrip(".")
 
 
-def base_from_symbol(symbol: str) -> str:
-    # CCXT swap symbol usually looks like GRASS/USDT:USDT
-    return symbol.split("/")[0].replace("1000", "1000")
+def fmt_pct(value: float) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}%"
 
 
-def display_pair(symbol: str) -> str:
-    return f"{base_from_symbol(symbol)}USDT"
+def display_symbol_from_market(market: Dict[str, Any]) -> str:
+    base = str(market.get("base") or "").upper()
+    quote = str(market.get("quote") or "USDT").upper()
+    if base:
+        return f"{base}/{quote}"
+    symbol = str(market.get("symbol") or "")
+    return symbol.replace(":USDT", "")
 
 
-def make_levels(entry: float, side: str) -> Tuple[List[float], float, float]:
-    if side == "LONG":
-        targets = [entry * (1 + p) for p in TAKE_PCTS]
-        average = entry * (1 - AVERAGE_PCT)
-        stop = entry * (1 - STOP_AFTER_AVERAGE_PCT)
-    else:
-        targets = [entry * (1 - p) for p in TAKE_PCTS]
-        average = entry * (1 + AVERAGE_PCT)
-        stop = entry * (1 + STOP_AFTER_AVERAGE_PCT)
-    return targets, average, stop
+def compact_symbol(display_symbol: str) -> str:
+    return display_symbol.replace("/", "").replace(":", "")
 
+# -------------------------
+# Telegram
+# -------------------------
 
-def roi_pct(entry: float, price: float, side: str, leverage: int = LEVERAGE) -> float:
-    if entry <= 0:
-        return 0.0
-    if side == "LONG":
-        return ((price - entry) / entry) * 100.0 * leverage
-    return ((entry - price) / entry) * 100.0 * leverage
+async def send_telegram(text: str, silent: bool = False) -> bool:
+    global last_telegram_status
+    last_telegram_status = {
+        "ok": None,
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+        "http_status": None,
+        "error": None,
+        "response": None,
+    }
 
-
-async def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram variables are missing. Message not sent: %s", text[:80])
+        msg = "Telegram env missing: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID"
+        last_telegram_status.update({"ok": False, "error": msg})
+        logger.warning(msg)
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status >= 400:
+    chunks = []
+    text = str(text)
+    while len(text) > 3900:
+        chunks.append(text[:3900])
+        text = text[3900:]
+    chunks.append(text)
+
+    ok_all = True
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        for chunk in chunks:
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "disable_notification": silent,
+            }
+            try:
+                async with session.post(url, json=payload) as resp:
                     body = await resp.text()
-                    logger.error("Telegram error %s: %s", resp.status, body[:300])
-                    return False
-                return True
-    except Exception as e:
-        logger.error("Telegram send failed: %s", e)
-        return False
+                    last_telegram_status.update({
+                        "ok": 200 <= resp.status < 300,
+                        "http_status": resp.status,
+                        "response": body[:500],
+                        "error": None if 200 <= resp.status < 300 else body[:500],
+                    })
+                    if not (200 <= resp.status < 300):
+                        ok_all = False
+                        logger.error("Telegram error %s: %s", resp.status, body[:300])
+            except Exception as e:
+                ok_all = False
+                last_telegram_status.update({"ok": False, "error": repr(e)})
+                logger.exception("Telegram send failed")
+    return ok_all
 
 
-def ohlcv_to_df(ohlcv: List[List[float]]) -> pd.DataFrame:
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna().reset_index(drop=True)
-    return df
-
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    vol = df["volume"].replace(0, np.nan)
-
-    df["ema9"] = close.ewm(span=9, adjust=False).mean()
-    df["ema20"] = close.ewm(span=20, adjust=False).mean()
-    df["ema50"] = close.ewm(span=50, adjust=False).mean()
-    df["ema200"] = close.ewm(span=200, adjust=False).mean()
-
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    df["rsi"] = df["rsi"].fillna(50)
-
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    df["atr"] = tr.ewm(span=14, adjust=False).mean()
-    df["atr_pct"] = (df["atr"] / close.replace(0, np.nan)) * 100
-
-    typical = (high + low + close) / 3
-    vwap_vol = vol.rolling(50, min_periods=10).sum()
-    df["vwap50"] = (typical * vol).rolling(50, min_periods=10).sum() / vwap_vol
-    df["vwap50"] = df["vwap50"].fillna(df["ema20"])
-
-    basis = close.rolling(20, min_periods=20).mean()
-    sd = close.rolling(20, min_periods=20).std()
-    df["bb_mid"] = basis
-    df["bb_up"] = basis + 2 * sd
-    df["bb_low"] = basis - 2 * sd
-
-    df["vol_avg20"] = df["volume"].rolling(20, min_periods=5).mean()
-    df["vol_ratio"] = df["volume"] / df["vol_avg20"].replace(0, np.nan)
-    df["vol_ratio"] = df["vol_ratio"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
-    return df
-
-
-def candle_parts(row: pd.Series) -> Dict[str, float]:
-    o, h, l, c = map(safe_float, [row["open"], row["high"], row["low"], row["close"]])
-    rng = max(h - l, 1e-12)
-    body = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-    return {
-        "range_pct": (rng / c) * 100 if c else 0,
-        "body_pct_of_range": body / rng,
-        "upper_wick": upper / rng,
-        "lower_wick": lower / rng,
-        "is_bull": 1.0 if c > o else 0.0,
-        "is_bear": 1.0 if c < o else 0.0,
-        "candle_change_pct": pct_change(c, o),
-    }
-
-
-def add_reason(reasons: List[str], text: str) -> None:
-    if len(reasons) < 7:
-        reasons.append(text)
-
-
-def score_long_bounce(df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Tuple[int, List[str], Dict[str, Any]]:
-    c5, p5 = df5.iloc[-1], df5.iloc[-2]
-    c15 = df15.iloc[-1]
-    c1h = df1h.iloc[-1]
-    c4h = df4h.iloc[-1]
-    parts = candle_parts(c15)
-    price = safe_float(c15["close"])
-
-    change_1h = pct_change(price, safe_float(df15.iloc[-5]["close"])) if len(df15) >= 6 else 0
-    change_4h = pct_change(price, safe_float(df15.iloc[-17]["close"])) if len(df15) >= 18 else 0
-    change_24h = pct_change(safe_float(c1h["close"]), safe_float(df1h.iloc[-25]["close"])) if len(df1h) >= 26 else 0
-    vol_ratio = safe_float(c15["vol_ratio"], 1.0)
-    rsi15 = safe_float(c15["rsi"], 50)
-    rsi5 = safe_float(c5["rsi"], 50)
-    rsi5_prev = safe_float(p5["rsi"], 50)
-    atr_pct = safe_float(c15["atr_pct"], 0)
-
-    score = 0
-    reasons: List[str] = []
-
-    if change_1h <= -3.0:
-        score += 14
-        add_reason(reasons, f"1h сильное падение {change_1h:.2f}%")
-    if change_4h <= -6.0:
-        score += 14
-        add_reason(reasons, f"4h перепроданность {change_4h:.2f}%")
-    if change_24h <= -10.0:
-        score += 6
-        add_reason(reasons, f"24h давление {change_24h:.2f}%")
-
-    if parts["is_bull"]:
-        score += 8
-        add_reason(reasons, "15m свеча закрывается бычьей")
-    if parts["lower_wick"] >= 0.30:
-        score += 10
-        add_reason(reasons, "нижняя тень показывает выкуп")
-    if price > safe_float(c15["ema9"]):
-        score += 8
-        add_reason(reasons, "возврат выше EMA9")
-    if price > safe_float(c5["vwap50"]):
-        score += 7
-        add_reason(reasons, "5m выше VWAP")
-    if vol_ratio >= 1.35:
-        score += min(16, int(8 + (vol_ratio - 1.35) * 6))
-        add_reason(reasons, f"объем x{vol_ratio:.2f}")
-    if 24 <= rsi15 <= 54:
-        score += 8
-        add_reason(reasons, f"RSI15 {rsi15:.1f}, зона отскока")
-    if rsi5 - rsi5_prev >= 2.0:
-        score += 7
-        add_reason(reasons, "RSI5 разворачивается вверх")
-    if 0.45 <= atr_pct <= 7.0:
-        score += 7
-        add_reason(reasons, f"ATR15 {atr_pct:.2f}% подходит для скальпа")
-
-    # Anti-chase: if already huge green candle, reduce score.
-    if parts["candle_change_pct"] > 5.5:
-        score -= 12
-        add_reason(reasons, "анти-чейз: свеча уже слишком большая")
-    elif parts["candle_change_pct"] >= 0.25:
-        score += 5
-
-    # Bigger market structure: avoid catching a knife under all EMAs unless bounce is strong.
-    if safe_float(c1h["close"]) > safe_float(c1h["ema20"]):
-        score += 4
-    if safe_float(c4h["close"]) > safe_float(c4h["ema50"]):
-        score += 3
-
-    metrics = {
-        "change_1h": round(change_1h, 2),
-        "change_4h": round(change_4h, 2),
-        "change_24h": round(change_24h, 2),
-        "vol_ratio": round(vol_ratio, 2),
-        "rsi15": round(rsi15, 1),
-        "rsi5": round(rsi5, 1),
-        "atr_pct": round(atr_pct, 2),
-        "lower_wick": round(parts["lower_wick"], 2),
-    }
-    return int(clamp(score, 0, 99)), reasons, metrics
-
-
-def score_short_rejection(df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Tuple[int, List[str], Dict[str, Any]]:
-    c5, p5 = df5.iloc[-1], df5.iloc[-2]
-    c15 = df15.iloc[-1]
-    c1h = df1h.iloc[-1]
-    c4h = df4h.iloc[-1]
-    parts = candle_parts(c15)
-    price = safe_float(c15["close"])
-
-    change_1h = pct_change(price, safe_float(df15.iloc[-5]["close"])) if len(df15) >= 6 else 0
-    change_4h = pct_change(price, safe_float(df15.iloc[-17]["close"])) if len(df15) >= 18 else 0
-    change_24h = pct_change(safe_float(c1h["close"]), safe_float(df1h.iloc[-25]["close"])) if len(df1h) >= 26 else 0
-    vol_ratio = safe_float(c15["vol_ratio"], 1.0)
-    rsi15 = safe_float(c15["rsi"], 50)
-    rsi5 = safe_float(c5["rsi"], 50)
-    rsi5_prev = safe_float(p5["rsi"], 50)
-    atr_pct = safe_float(c15["atr_pct"], 0)
-
-    score = 0
-    reasons: List[str] = []
-
-    if change_1h >= 3.0:
-        score += 14
-        add_reason(reasons, f"1h сильный рост {change_1h:.2f}%")
-    if change_4h >= 6.0:
-        score += 14
-        add_reason(reasons, f"4h перегрев {change_4h:.2f}%")
-    if change_24h >= 10.0:
-        score += 6
-        add_reason(reasons, f"24h перегрев {change_24h:.2f}%")
-
-    if parts["is_bear"]:
-        score += 8
-        add_reason(reasons, "15m свеча закрывается медвежьей")
-    if parts["upper_wick"] >= 0.30:
-        score += 10
-        add_reason(reasons, "верхняя тень показывает продавца")
-    if price < safe_float(c15["ema9"]):
-        score += 8
-        add_reason(reasons, "возврат ниже EMA9")
-    if price < safe_float(c5["vwap50"]):
-        score += 7
-        add_reason(reasons, "5m ниже VWAP")
-    if vol_ratio >= 1.35:
-        score += min(16, int(8 + (vol_ratio - 1.35) * 6))
-        add_reason(reasons, f"объем x{vol_ratio:.2f}")
-    if 46 <= rsi15 <= 82:
-        score += 8
-        add_reason(reasons, f"RSI15 {rsi15:.1f}, зона отбоя")
-    if rsi5_prev - rsi5 >= 2.0:
-        score += 7
-        add_reason(reasons, "RSI5 разворачивается вниз")
-    if 0.45 <= atr_pct <= 7.0:
-        score += 7
-        add_reason(reasons, f"ATR15 {atr_pct:.2f}% подходит для скальпа")
-
-    if parts["candle_change_pct"] < -5.5:
-        score -= 12
-        add_reason(reasons, "анти-чейз: свеча уже слишком большая")
-    elif parts["candle_change_pct"] <= -0.25:
-        score += 5
-
-    if safe_float(c1h["close"]) < safe_float(c1h["ema20"]):
-        score += 4
-    if safe_float(c4h["close"]) < safe_float(c4h["ema50"]):
-        score += 3
-
-    metrics = {
-        "change_1h": round(change_1h, 2),
-        "change_4h": round(change_4h, 2),
-        "change_24h": round(change_24h, 2),
-        "vol_ratio": round(vol_ratio, 2),
-        "rsi15": round(rsi15, 1),
-        "rsi5": round(rsi5, 1),
-        "atr_pct": round(atr_pct, 2),
-        "upper_wick": round(parts["upper_wick"], 2),
-    }
-    return int(clamp(score, 0, 99)), reasons, metrics
-
-
-def score_breakout_long(df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Tuple[int, List[str], Dict[str, Any]]:
-    c15 = df15.iloc[-1]
-    c5 = df5.iloc[-1]
-    c1h = df1h.iloc[-1]
-    parts = candle_parts(c15)
-    price = safe_float(c15["close"])
-    prev_high = safe_float(df15.iloc[-36:-1]["high"].max()) if len(df15) >= 40 else safe_float(df15.iloc[:-1]["high"].max())
-    change_1h = pct_change(price, safe_float(df15.iloc[-5]["close"])) if len(df15) >= 6 else 0
-    vol_ratio = safe_float(c15["vol_ratio"], 1.0)
-    rsi15 = safe_float(c15["rsi"], 50)
-    atr_pct = safe_float(c15["atr_pct"], 0)
-
-    score = 0
-    reasons: List[str] = []
-    breakout = price > prev_high * 1.001
-
-    if breakout:
-        score += 24
-        add_reason(reasons, "пробой 15m сопротивления")
-    if vol_ratio >= 1.5:
-        score += min(18, int(10 + (vol_ratio - 1.5) * 6))
-        add_reason(reasons, f"пробой на объеме x{vol_ratio:.2f}")
-    if price > safe_float(c15["vwap50"]):
-        score += 8
-        add_reason(reasons, "цена выше VWAP15")
-    if price > safe_float(c15["ema20"]):
-        score += 7
-        add_reason(reasons, "цена выше EMA20")
-    if safe_float(c1h["close"]) > safe_float(c1h["ema50"]):
-        score += 8
-        add_reason(reasons, "1h тренд поддерживает LONG")
-    if safe_float(df4h.iloc[-1]["close"]) > safe_float(df4h.iloc[-1]["ema20"]):
-        score += 5
-    if parts["is_bull"] and parts["body_pct_of_range"] >= 0.45:
-        score += 8
-        add_reason(reasons, "тело свечи подтверждает импульс")
-    if 52 <= rsi15 <= 76:
-        score += 7
-        add_reason(reasons, f"RSI15 {rsi15:.1f}, импульс без экстремума")
-    if 0.45 <= atr_pct <= 6.5:
-        score += 6
-    if change_1h > 12:
-        score -= 12
-        add_reason(reasons, "анти-чейз: 1h уже слишком разогналась")
-
-    metrics = {
-        "prev_resistance": fmt_price(prev_high),
-        "change_1h": round(change_1h, 2),
-        "vol_ratio": round(vol_ratio, 2),
-        "rsi15": round(rsi15, 1),
-        "atr_pct": round(atr_pct, 2),
-    }
-    return int(clamp(score, 0, 99)), reasons, metrics
-
-
-def score_breakdown_short(df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Tuple[int, List[str], Dict[str, Any]]:
-    c15 = df15.iloc[-1]
-    c1h = df1h.iloc[-1]
-    parts = candle_parts(c15)
-    price = safe_float(c15["close"])
-    prev_low = safe_float(df15.iloc[-36:-1]["low"].min()) if len(df15) >= 40 else safe_float(df15.iloc[:-1]["low"].min())
-    change_1h = pct_change(price, safe_float(df15.iloc[-5]["close"])) if len(df15) >= 6 else 0
-    vol_ratio = safe_float(c15["vol_ratio"], 1.0)
-    rsi15 = safe_float(c15["rsi"], 50)
-    atr_pct = safe_float(c15["atr_pct"], 0)
-
-    score = 0
-    reasons: List[str] = []
-    breakdown = price < prev_low * 0.999
-
-    if breakdown:
-        score += 24
-        add_reason(reasons, "пробой 15m поддержки вниз")
-    if vol_ratio >= 1.5:
-        score += min(18, int(10 + (vol_ratio - 1.5) * 6))
-        add_reason(reasons, f"пролом на объеме x{vol_ratio:.2f}")
-    if price < safe_float(c15["vwap50"]):
-        score += 8
-        add_reason(reasons, "цена ниже VWAP15")
-    if price < safe_float(c15["ema20"]):
-        score += 7
-        add_reason(reasons, "цена ниже EMA20")
-    if safe_float(c1h["close"]) < safe_float(c1h["ema50"]):
-        score += 8
-        add_reason(reasons, "1h тренд поддерживает SHORT")
-    if safe_float(df4h.iloc[-1]["close"]) < safe_float(df4h.iloc[-1]["ema20"]):
-        score += 5
-    if parts["is_bear"] and parts["body_pct_of_range"] >= 0.45:
-        score += 8
-        add_reason(reasons, "тело свечи подтверждает импульс вниз")
-    if 24 <= rsi15 <= 48:
-        score += 7
-        add_reason(reasons, f"RSI15 {rsi15:.1f}, продавец активен")
-    if 0.45 <= atr_pct <= 6.5:
-        score += 6
-    if change_1h < -12:
-        score -= 12
-        add_reason(reasons, "анти-чейз: 1h уже слишком упала")
-
-    metrics = {
-        "prev_support": fmt_price(prev_low),
-        "change_1h": round(change_1h, 2),
-        "vol_ratio": round(vol_ratio, 2),
-        "rsi15": round(rsi15, 1),
-        "atr_pct": round(atr_pct, 2),
-    }
-    return int(clamp(score, 0, 99)), reasons, metrics
-
-
-def is_hot_enough(df15: pd.DataFrame) -> bool:
-    if len(df15) < 60:
-        return False
-    df15 = add_indicators(df15)
-    last = df15.iloc[-1]
-    price = safe_float(last["close"])
-    change_1h = abs(pct_change(price, safe_float(df15.iloc[-5]["close"]))) if len(df15) >= 6 else 0
-    change_4h = abs(pct_change(price, safe_float(df15.iloc[-17]["close"]))) if len(df15) >= 18 else 0
-    vol_ratio = safe_float(last["vol_ratio"], 1.0)
-    atr_pct = safe_float(last["atr_pct"], 0)
-
-    # Нужно движение. Иначе бот будет ловить мертвый флэт.
+def startup_message() -> str:
+    token_ok = "✅" if TELEGRAM_BOT_TOKEN else "❌"
+    chat_ok = "✅" if TELEGRAM_CHAT_ID else "❌"
     return (
-        change_1h >= 1.4
-        or change_4h >= 3.0
-        or vol_ratio >= 1.45
-        or atr_pct >= 0.75
+        "🚀 <b>BingX scalp bot запущен</b>\n\n"
+        f"Режим: Background Worker / uvicorn bot:app\n"
+        f"Скан: каждые {SCAN_INTERVAL_SECONDS} сек\n"
+        f"Монет в топе: {TOP_SYMBOLS_LIMIT}\n"
+        f"MIN_SCORE: {MIN_SCORE} / fallback: {FALLBACK_SCORE}\n"
+        f"Лимит сигналов/день: {MAX_SIGNALS_PER_DAY}\n"
+        f"Плечо в сообщении: x{LEVERAGE}\n\n"
+        f"Telegram token: {token_ok}\n"
+        f"Telegram chat_id: {chat_ok}\n\n"
+        "Бот только отправляет сигналы, сделки не открывает."
     )
 
+# -------------------------
+# Indicator functions without pandas/numpy
+# -------------------------
 
-def choose_best_signal(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Optional[Signal]:
-    if min(len(df5), len(df15), len(df1h), len(df4h)) < 50:
+
+def closes(ohlcv: List[List[float]]) -> List[float]:
+    return [safe_float(x[4]) for x in ohlcv if len(x) >= 5]
+
+
+def highs(ohlcv: List[List[float]]) -> List[float]:
+    return [safe_float(x[2]) for x in ohlcv if len(x) >= 3]
+
+
+def lows(ohlcv: List[List[float]]) -> List[float]:
+    return [safe_float(x[3]) for x in ohlcv if len(x) >= 4]
+
+
+def volumes(ohlcv: List[List[float]]) -> List[float]:
+    return [safe_float(x[5]) for x in ohlcv if len(x) >= 6]
+
+
+def ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period or period <= 0:
+        return None
+    k = 2 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def rsi(values: List[float], period: int = 14) -> Optional[float]:
+    if len(values) <= period:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for g, l in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def atr(ohlcv: List[List[float]], period: int = 14) -> Optional[float]:
+    if len(ohlcv) <= period:
+        return None
+    trs = []
+    for i in range(1, len(ohlcv)):
+        h = safe_float(ohlcv[i][2])
+        l = safe_float(ohlcv[i][3])
+        pc = safe_float(ohlcv[i - 1][4])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
+
+def volume_ratio(ohlcv: List[List[float]], lookback: int = 20) -> float:
+    vols = volumes(ohlcv)
+    if len(vols) < lookback + 1:
+        return 1.0
+    avg = sum(vols[-lookback - 1:-1]) / lookback
+    if avg <= 0:
+        return 1.0
+    return vols[-1] / avg
+
+
+def vwap(ohlcv: List[List[float]], lookback: int = 48) -> Optional[float]:
+    chunk = ohlcv[-lookback:]
+    pv = 0.0
+    vv = 0.0
+    for c in chunk:
+        if len(c) < 6:
+            continue
+        high = safe_float(c[2])
+        low = safe_float(c[3])
+        close = safe_float(c[4])
+        vol = safe_float(c[5])
+        typical = (high + low + close) / 3
+        pv += typical * vol
+        vv += vol
+    if vv <= 0:
+        return None
+    return pv / vv
+
+
+def last_candle_direction(ohlcv: List[List[float]]) -> str:
+    if not ohlcv:
+        return "flat"
+    o = safe_float(ohlcv[-1][1])
+    c = safe_float(ohlcv[-1][4])
+    if c > o:
+        return "bull"
+    if c < o:
+        return "bear"
+    return "flat"
+
+# -------------------------
+# Exchange / scanning
+# -------------------------
+
+async def init_exchange() -> None:
+    global exchange
+    if exchange is not None:
+        return
+    exchange_class = getattr(ccxt, "bingx", None)
+    if exchange_class is None:
+        raise RuntimeError("Your ccxt version does not support bingx. Update requirements.txt ccxt.")
+    exchange = exchange_class({
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+            "defaultSubType": "linear",
+        },
+        "timeout": 20000,
+    })
+    await exchange.load_markets()
+    logger.info("BingX markets loaded: %s", len(exchange.markets))
+
+
+def market_is_candidate(market: Dict[str, Any]) -> bool:
+    if not market:
+        return False
+    base = str(market.get("base") or "").upper()
+    quote = str(market.get("quote") or "").upper()
+    active = market.get("active", True)
+    is_swap = bool(market.get("swap") or market.get("type") == "swap")
+    linear = market.get("linear", True)
+    if not active or not is_swap or linear is False:
+        return False
+    if quote != "USDT":
+        return False
+    if base in EXCLUDED_BASES:
+        return False
+    return True
+
+
+def ticker_quote_volume(ticker: Dict[str, Any]) -> float:
+    for key in ("quoteVolume", "quoteVolume24h"):
+        v = safe_float(ticker.get(key), 0.0)
+        if v > 0:
+            return v
+    info = ticker.get("info", {}) if isinstance(ticker.get("info"), dict) else {}
+    for key in ("quoteVolume", "quoteVolume24h", "turnover", "turnover24h", "amount"):
+        v = safe_float(info.get(key), 0.0)
+        if v > 0:
+            return v
+    last = safe_float(ticker.get("last"), 0.0)
+    base_vol = safe_float(ticker.get("baseVolume"), 0.0)
+    return last * base_vol
+
+
+async def get_top_symbols() -> List[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    await init_exchange()
+    assert exchange is not None
+    tickers = await exchange.fetch_tickers()
+    rows: List[Tuple[str, Dict[str, Any], Dict[str, Any], float]] = []
+    for symbol, ticker in tickers.items():
+        market = exchange.markets.get(symbol)
+        if not market_is_candidate(market):
+            continue
+        qv = ticker_quote_volume(ticker)
+        if qv < MIN_24H_QUOTE_VOLUME_USDT:
+            continue
+        last = safe_float(ticker.get("last"), 0.0)
+        if last <= 0:
+            continue
+        rows.append((symbol, market, ticker, qv))
+    rows.sort(key=lambda x: x[3], reverse=True)
+    return [(s, m, t) for s, m, t, _ in rows[:TOP_SYMBOLS_LIMIT]]
+
+
+async def fetch_ohlcv_safe(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
+    try:
+        assert exchange is not None
+        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception as e:
+        logger.debug("fetch_ohlcv failed %s %s: %s", symbol, timeframe, e)
+        return []
+
+
+def calc_metrics(ohlcv_5m: List[List[float]], ohlcv_15m: List[List[float]], ohlcv_1h: List[List[float]]) -> Optional[Dict[str, Any]]:
+    if len(ohlcv_5m) < 40 or len(ohlcv_15m) < 60:
         return None
 
-    df5 = add_indicators(df5)
-    df15 = add_indicators(df15)
-    df1h = add_indicators(df1h)
-    df4h = add_indicators(df4h)
-    entry = safe_float(df15.iloc[-1]["close"])
-    base = base_from_symbol(symbol)
+    c5 = closes(ohlcv_5m)
+    c15 = closes(ohlcv_15m)
+    c1h = closes(ohlcv_1h) if ohlcv_1h else []
+    h15 = highs(ohlcv_15m)
+    l15 = lows(ohlcv_15m)
 
-    scored = []
-    s, r, m = score_long_bounce(df5, df15, df1h, df4h)
-    scored.append((s, "LONG", "ОТСКОК ПОСЛЕ ПРОЛИВА", r, m))
-    s, r, m = score_short_rejection(df5, df15, df1h, df4h)
-    scored.append((s, "SHORT", "ОТБОЙ ПОСЛЕ ПАМПА", r, m))
-    s, r, m = score_breakout_long(df5, df15, df1h, df4h)
-    scored.append((s, "LONG", "ПРОБОЙ СОПРОТИВЛЕНИЯ", r, m))
-    s, r, m = score_breakdown_short(df5, df15, df1h, df4h)
-    scored.append((s, "SHORT", "ПРОБОЙ ПОДДЕРЖКИ", r, m))
-
-    best_score, side, setup, reasons, metrics = max(scored, key=lambda x: x[0])
-    if best_score <= 0:
+    last = c15[-1]
+    if last <= 0:
         return None
 
-    targets, average, stop = make_levels(entry, side)
+    recent_high_20 = max(h15[-21:-1]) if len(h15) >= 21 else max(h15[:-1])
+    recent_low_20 = min(l15[-21:-1]) if len(l15) >= 21 else min(l15[:-1])
+    recent_high_48 = max(h15[-49:-1]) if len(h15) >= 49 else max(h15[:-1])
+    recent_low_48 = min(l15[-49:-1]) if len(l15) >= 49 else min(l15[:-1])
+
+    rsi15 = rsi(c15, 14) or 50.0
+    rsi5 = rsi(c5, 14) or 50.0
+    ema20_15 = ema(c15, 20) or last
+    ema50_15 = ema(c15, 50) or last
+    ema50_1h = ema(c1h, 50) or (c1h[-1] if c1h else last)
+    ema100_1h = ema(c1h, 100) or ema50_1h
+    atr15 = atr(ohlcv_15m, 14) or 0.0
+    vwap15 = vwap(ohlcv_15m, 48) or last
+    volr15 = volume_ratio(ohlcv_15m, 20)
+    volr5 = volume_ratio(ohlcv_5m, 20)
+
+    return {
+        "last": last,
+        "move_5m_3": pct_change(c5[-1], c5[-4]) if len(c5) >= 4 else 0.0,
+        "move_5m_6": pct_change(c5[-1], c5[-7]) if len(c5) >= 7 else 0.0,
+        "move_15m_4": pct_change(c15[-1], c15[-5]) if len(c15) >= 5 else 0.0,
+        "move_15m_12": pct_change(c15[-1], c15[-13]) if len(c15) >= 13 else 0.0,
+        "move_15m_24": pct_change(c15[-1], c15[-25]) if len(c15) >= 25 else 0.0,
+        "rsi15": rsi15,
+        "rsi5": rsi5,
+        "ema20_15": ema20_15,
+        "ema50_15": ema50_15,
+        "ema50_1h": ema50_1h,
+        "ema100_1h": ema100_1h,
+        "vwap15": vwap15,
+        "atr15": atr15,
+        "atr_pct": (atr15 / last * 100.0) if last else 0.0,
+        "volr15": volr15,
+        "volr5": volr5,
+        "recent_high_20": recent_high_20,
+        "recent_low_20": recent_low_20,
+        "recent_high_48": recent_high_48,
+        "recent_low_48": recent_low_48,
+        "dist_to_high_20": pct_change(last, recent_high_20),
+        "dist_from_low_20": pct_change(last, recent_low_20),
+        "break_high_pct": pct_change(last, recent_high_20),
+        "break_low_pct": pct_change(last, recent_low_20),
+        "candle15": last_candle_direction(ohlcv_15m),
+        "candle5": last_candle_direction(ohlcv_5m),
+    }
+
+
+def score_candidate(metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    last = metrics["last"]
+    if last <= 0:
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+
+    # LONG: strong dump -> first confirmed bounce.
+    score = 0
+    reasons = []
+    if metrics["move_15m_24"] <= -7.0:
+        score += 24; reasons.append("сильный пролив 6ч")
+    elif metrics["move_15m_12"] <= -4.5:
+        score += 18; reasons.append("быстрый пролив 3ч")
+    if metrics["rsi15"] <= 39:
+        score += 14; reasons.append("RSI15 перепродан")
+    if metrics["candle15"] == "bull" and metrics["candle5"] == "bull":
+        score += 14; reasons.append("бычья 15m/5m свеча")
+    if metrics["move_5m_3"] >= 0.25:
+        score += 14; reasons.append("отскок уже начался")
+    if metrics["volr15"] >= 1.25 or metrics["volr5"] >= 1.35:
+        score += 16; reasons.append("объем выше среднего")
+    if metrics["dist_from_low_20"] <= 3.2:
+        score += 10; reasons.append("цена рядом с локальной поддержкой")
+    if last >= metrics["vwap15"] or last >= metrics["ema20_15"]:
+        score += 8; reasons.append("reclaim VWAP/EMA20")
+    # anti-chase
+    if metrics["move_5m_6"] > 5.5:
+        score -= 12; reasons.append("анти-чейз: слишком резкий отскок")
+    candidates.append({"side": "LONG", "setup": "SUPPORT BOUNCE / RECLAIM", "score": score, "reasons": reasons})
+
+    # SHORT: strong pump -> rejection.
+    score = 0
+    reasons = []
+    if metrics["move_15m_24"] >= 8.0:
+        score += 24; reasons.append("сильный памп 6ч")
+    elif metrics["move_15m_12"] >= 5.0:
+        score += 18; reasons.append("быстрый памп 3ч")
+    if metrics["rsi15"] >= 61:
+        score += 14; reasons.append("RSI15 перегрет")
+    if metrics["candle15"] == "bear" and metrics["candle5"] == "bear":
+        score += 14; reasons.append("медвежья 15m/5m свеча")
+    if metrics["move_5m_3"] <= -0.25:
+        score += 14; reasons.append("отбой уже начался")
+    if metrics["volr15"] >= 1.25 or metrics["volr5"] >= 1.35:
+        score += 16; reasons.append("объем выше среднего")
+    if abs(metrics["dist_to_high_20"]) <= 3.2:
+        score += 10; reasons.append("цена рядом с сопротивлением")
+    if last <= metrics["vwap15"] or last <= metrics["ema20_15"]:
+        score += 8; reasons.append("потеря VWAP/EMA20")
+    if metrics["move_5m_6"] < -5.5:
+        score -= 12; reasons.append("анти-чейз: падение уже большое")
+    candidates.append({"side": "SHORT", "setup": "RESISTANCE REJECTION", "score": score, "reasons": reasons})
+
+    # LONG breakout.
+    score = 0
+    reasons = []
+    if metrics["break_high_pct"] >= 0.15:
+        score += 23; reasons.append("пробой сопротивления 15m")
+    if metrics["volr15"] >= 1.45:
+        score += 18; reasons.append("пробой на объеме")
+    if metrics["move_5m_3"] >= 0.25:
+        score += 12; reasons.append("импульс после пробоя")
+    if last > metrics["ema20_15"] > 0 and last > metrics["vwap15"]:
+        score += 13; reasons.append("цена выше EMA20/VWAP")
+    if metrics["ema50_1h"] >= metrics["ema100_1h"] * 0.985:
+        score += 10; reasons.append("1h тренд не против")
+    if metrics["move_15m_12"] > 12.0:
+        score -= 16; reasons.append("анти-чейз после вертикали")
+    candidates.append({"side": "LONG", "setup": "RESISTANCE BREAKOUT", "score": score, "reasons": reasons})
+
+    # SHORT breakdown.
+    score = 0
+    reasons = []
+    if metrics["break_low_pct"] <= -0.15:
+        score += 23; reasons.append("пробой поддержки 15m")
+    if metrics["volr15"] >= 1.45:
+        score += 18; reasons.append("пролом на объеме")
+    if metrics["move_5m_3"] <= -0.25:
+        score += 12; reasons.append("импульс после пролома")
+    if last < metrics["ema20_15"] and last < metrics["vwap15"]:
+        score += 13; reasons.append("цена ниже EMA20/VWAP")
+    if metrics["ema50_1h"] <= metrics["ema100_1h"] * 1.015:
+        score += 10; reasons.append("1h тренд не против")
+    if metrics["move_15m_12"] < -12.0:
+        score -= 16; reasons.append("анти-чейз после вертикали")
+    candidates.append({"side": "SHORT", "setup": "SUPPORT BREAKDOWN", "score": score, "reasons": reasons})
+
+    best = max(candidates, key=lambda x: x["score"])
+    quality = int(clamp(best["score"], 0, 99))
+    if quality <= 0:
+        return None
+    best["quality"] = quality
+    return best
+
+
+def build_signal(symbol: str, market: Dict[str, Any], metrics: Dict[str, Any], scored: Dict[str, Any]) -> Signal:
+    entry = safe_float(metrics["last"])
+    side = scored["side"]
+    display_symbol = display_symbol_from_market(market)
+    base = str(market.get("base") or display_symbol.split("/")[0]).upper()
+
+    if side == "LONG":
+        targets = [entry * (1 + p) for p in TAKE_PCTS[:5]]
+        average = entry * (1 - AVERAGE_PCT)
+        stop = entry * (1 - STOP_AFTER_AVERAGE_PCT)
+    else:
+        targets = [entry * (1 - p) for p in TAKE_PCTS[:5]]
+        average = entry * (1 + AVERAGE_PCT)
+        stop = entry * (1 + STOP_AFTER_AVERAGE_PCT)
+
     return Signal(
         symbol=symbol,
+        display_symbol=display_symbol,
         base=base,
         side=side,
-        setup=setup,
-        quality=best_score,
+        setup=scored["setup"],
+        quality=int(scored["quality"]),
         entry=entry,
         targets=targets,
         average=average,
         stop=stop,
         leverage=LEVERAGE,
-        score_reasons=reasons,
+        score_reasons=list(scored.get("reasons", []))[:7],
         metrics=metrics,
     )
 
 
-def signal_to_text(sig: Signal) -> str:
-    q = "A" if sig.quality >= 85 else "B" if sig.quality >= MIN_SCORE else "B-"
-    lines = []
-    lines.append(f"Скальп-позиция - {sig.base} {sig.side}")
-    lines.append(f"Сетап: {sig.setup} · качество {q} {sig.quality}%")
-    lines.append(f"Плечо: x{sig.leverage} · биржа: BingX USDT-M")
-    lines.append("")
-    lines.append(f"Моя точка входа - {fmt_price(sig.entry)}")
-    lines.append("")
-    lines.append("Лимитные ордера на фиксацию выставить на значениях:")
-    lines.append("")
-    for i, target in enumerate(sig.targets, start=1):
-        roi = roi_pct(sig.entry, target, sig.side, sig.leverage)
-        lines.append(f"TP{i}: {fmt_price(target)}  (+{roi:.1f}% ROI x{sig.leverage})")
-    lines.append("")
-    lines.append(f"Лимитный ордер на усреднение: {fmt_price(sig.average)}")
-    lines.append(f"Защитный стоп после усреднения: {fmt_price(sig.stop)}")
-    lines.append("")
-    if sig.score_reasons:
-        lines.append("Почему бот дал сетап:")
-        for reason in sig.score_reasons[:6]:
-            lines.append(f"• {reason}")
+def signal_message(sig: Signal) -> str:
+    compact = compact_symbol(sig.display_symbol)
+    lines = [
+        f"🔥 <b>Скальп-позиция - {sig.base} {sig.side}</b>",
+        "",
+        f"Биржа: BingX USDT-M Futures",
+        f"Сетап: {sig.setup}",
+        f"Качество: <b>{sig.quality}/100</b>",
+        "",
+        f"Моя точка входа - <b>{fmt_price(sig.entry)}</b>",
+        "",
+        "Пока заходите, следующим блоком параметры сделки!",
+        "",
+        "Лимитные ордера на фиксацию выставить на значениях:",
+        "",
+    ]
+    for target in sig.targets:
+        lines.append(fmt_price(target))
+    lines += [
+        "",
+        f"Лимитный ордер на усреднение: <b>{fmt_price(sig.average)}</b>",
+        f"Защитный стоп: <b>{fmt_price(sig.stop)}</b>",
+        "",
+        f"Плечо: до x{sig.leverage}",
+        "Риск-менеджмент: RM ≤ 0.5% депозита",
+        "",
+        "Подтверждения: " + ", ".join(sig.score_reasons),
+        "",
+        f"Монета: {compact}",
+        "О любых действиях по открытой сделке буду сообщать в канале.",
+        "",
+        "⚠️ Это сигнал, а не гарантия прибыли. Соблюдай риск."
+    ]
+    return "\n".join(lines)
+
+
+def stats_text() -> str:
+    ensure_stats()
+    st = state.stats
+    closed = int(st.get("closed_total", 0) or 0)
+    profit = int(st.get("closed_profit", 0) or 0)
+    loss = int(st.get("closed_loss", 0) or 0)
+    wr = (profit / closed * 100.0) if closed else 0.0
+    avg_roi = (float(st.get("total_closed_roi", 0.0) or 0.0) / closed) if closed else 0.0
+    best = st.get("best_roi")
+    worst = st.get("worst_roi")
+
+    lines = [
+        "📊 <b>Статистика бота</b>",
+        "",
+        f"Всего сигналов: <b>{int(st.get('total_signals_sent', 0) or 0)}</b>",
+        f"Активные сделки: <b>{len(state.active)}</b>",
+        f"Закрытые сделки: <b>{closed}</b>",
+        f"✅ Прибыльные: <b>{profit}</b>",
+        f"🛑 Убыточные: <b>{loss}</b>",
+        f"Win rate: <b>{wr:.1f}%</b>",
+        "",
+        f"TP1 достигнут: {int(st.get('tp1_hits', 0) or 0)}",
+        f"Все 5 целей: {int(st.get('all_targets', 0) or 0)}",
+        f"Усреднений: {int(st.get('average_hits', 0) or 0)}",
+        f"Стопов: {int(st.get('stop_losses', 0) or 0)}",
+        "",
+        f"Средний ROI по закрытым: {fmt_pct(avg_roi)}",
+        f"Лучший ROI: {fmt_pct(best) if best is not None else '—'}",
+        f"Худший ROI: {fmt_pct(worst) if worst is not None else '—'}",
+    ]
+    recent = st.get("last_results", [])[-5:]
+    if recent:
         lines.append("")
-    lines.append("Риск: бот не открывает сделку сам. Не заходи всем депозитом; стоп обязателен.")
-    lines.append("О любых действиях по открытой сделке бот будет сообщать в канале.")
+        lines.append("Последние закрытые:")
+        for r in reversed(recent):
+            icon = "✅" if r.get("result") == "profit" else "🛑"
+            lines.append(f"{icon} {r.get('symbol')} {r.get('side')} · {r.get('reason')} · {fmt_pct(safe_float(r.get('roi')))}")
     return "\n".join(lines)
 
 
-def update_to_text(sig: Signal, event: str, price: float, extra: str = "") -> str:
-    roi = roi_pct(sig.entry, price, sig.side, sig.leverage)
-    lines = [f"{event} — {sig.base} {sig.side}"]
-    lines.append(f"Цена: {fmt_price(price)} · результат: {roi:+.2f}% ROI x{sig.leverage}")
-    if extra:
-        lines.append(extra)
-    return "\n".join(lines)
+def is_on_cooldown(symbol: str) -> bool:
+    until = safe_float(state.cooldowns.get(symbol), 0.0)
+    return until > time.time()
 
 
-def is_excluded_symbol(symbol: str, market: Dict[str, Any]) -> bool:
-    base = str(market.get("base") or base_from_symbol(symbol)).upper()
-    if base in EXCLUDED_BASES:
-        return True
-    bad_parts = ["UP/", "DOWN/", "BULL/", "BEAR/", "3L/", "3S/", "5L/", "5S/"]
-    up = symbol.upper()
-    if any(part in up for part in bad_parts):
-        return True
-    return False
+def put_cooldown(symbol: str) -> None:
+    state.cooldowns[symbol] = time.time() + COOLDOWN_MINUTES * 60
 
 
-def ticker_quote_volume(ticker: Dict[str, Any]) -> float:
-    qv = safe_float(ticker.get("quoteVolume"), 0)
-    if qv > 0:
-        return qv
-    last = safe_float(ticker.get("last"), 0)
-    bv = safe_float(ticker.get("baseVolume"), 0)
-    return last * bv
+def cleanup_cooldowns() -> None:
+    now = time.time()
+    state.cooldowns = {s: ts for s, ts in state.cooldowns.items() if safe_float(ts) > now}
 
 
-async def make_exchange():
-    ex = ccxt.bingx({
-        "enableRateLimit": True,
-        "timeout": 20_000,
-        "options": {
-            "defaultType": "swap",
-        },
-    })
-    return ex
-
-
-async def fetch_ohlcv_safe(symbol: str, timeframe: str, limit: int = 120) -> Optional[pd.DataFrame]:
-    try:
-        raw = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not raw or len(raw) < 40:
-            return None
-        return ohlcv_to_df(raw)
-    except Exception as e:
-        logger.debug("OHLCV failed %s %s: %s", symbol, timeframe, e)
-        return None
-
-
-async def get_tradeable_symbols() -> List[Tuple[str, Dict[str, Any], float]]:
-    try:
-        markets = await exchange.load_markets()
-        tickers = await exchange.fetch_tickers()
-    except Exception as e:
-        logger.error("Could not load markets/tickers: %s", e)
-        return []
-
-    result: List[Tuple[str, Dict[str, Any], float]] = []
-    for symbol, market in markets.items():
-        try:
-            if not market.get("active", True):
-                continue
-            if not market.get("swap"):
-                continue
-            if str(market.get("quote", "")).upper() != "USDT":
-                continue
-            if is_excluded_symbol(symbol, market):
-                continue
-            ticker = tickers.get(symbol) or {}
-            qv = ticker_quote_volume(ticker)
-            if qv < MIN_24H_QUOTE_VOLUME_USDT:
-                continue
-            result.append((symbol, market, qv))
-        except Exception:
-            continue
-
-    result.sort(key=lambda x: x[2], reverse=True)
-    return result[:TOP_SYMBOLS_LIMIT]
-
-
-def can_send_symbol(symbol: str) -> bool:
-    reset_daily_if_needed()
-    if state.signals_today >= MAX_SIGNALS_PER_DAY:
-        return False
-    cooldown_until = state.cooldowns.get(symbol, 0)
-    return time.time() >= cooldown_until
-
-
-def current_threshold() -> int:
-    """Adaptive mode: if bot is completely silent, allow one weaker B- setup."""
-    reset_daily_if_needed()
-    if state.signals_today >= DAILY_MIN_SIGNALS:
-        return MIN_SCORE
-    hours_since_signal = (time.time() - state.last_signal_ts) / 3600 if state.last_signal_ts else 999
-    if hours_since_signal >= 10:
-        return min(MIN_SCORE, FALLBACK_SCORE)
-    return MIN_SCORE
-
-
-async def analyze_symbol(symbol: str) -> Optional[Signal]:
-    df15 = await fetch_ohlcv_safe(symbol, "15m", 140)
-    if df15 is None or not is_hot_enough(df15):
-        return None
-
-    # Загружаем тяжелые таймфреймы только если монета уже горячая.
-    df5, df1h, df4h = await asyncio.gather(
-        fetch_ohlcv_safe(symbol, "5m", 140),
-        fetch_ohlcv_safe(symbol, "1h", 120),
-        fetch_ohlcv_safe(symbol, "4h", 120),
+async def analyze_symbol(symbol: str, market: Dict[str, Any]) -> Optional[Signal]:
+    ohlcv_5m, ohlcv_15m, ohlcv_1h = await asyncio.gather(
+        fetch_ohlcv_safe(symbol, "5m", 90),
+        fetch_ohlcv_safe(symbol, "15m", 120),
+        fetch_ohlcv_safe(symbol, "1h", 140),
     )
-    if df5 is None or df1h is None or df4h is None:
+    metrics = calc_metrics(ohlcv_5m, ohlcv_15m, ohlcv_1h)
+    if not metrics:
         return None
-    return choose_best_signal(symbol, df5, df15, df1h, df4h)
+    scored = score_candidate(metrics)
+    if not scored:
+        return None
+    return build_signal(symbol, market, metrics, scored)
 
 
-async def send_new_signal(sig: Signal) -> None:
-    text = signal_to_text(sig)
-    ok = await send_telegram(text)
-    if ok:
-        state.signals_today += 1
-        state.last_signal_ts = time.time()
-        state.cooldowns[sig.symbol] = time.time() + COOLDOWN_MINUTES * 60
-        state.active[sig.symbol] = asdict(sig)
-        save_state()
-        logger.info("Signal sent: %s %s quality=%s", sig.symbol, sig.side, sig.quality)
+async def scan_once() -> Dict[str, Any]:
+    global last_scan_summary
+    reset_daily_if_needed()
+    cleanup_cooldowns()
+
+    await init_exchange()
+    assert exchange is not None
+
+    # First update active positions.
+    await update_active_signals()
+
+    top = await get_top_symbols()
+    candidates: List[Signal] = []
+    checked = 0
+
+    # Scan sequentially with a little delay to respect rate limits.
+    for symbol, market, _ticker in top:
+        checked += 1
+        if state.signals_today >= MAX_SIGNALS_PER_DAY:
+            break
+        if symbol in state.active or is_on_cooldown(symbol):
+            continue
+        try:
+            sig = await analyze_symbol(symbol, market)
+            if sig:
+                candidates.append(sig)
+        except Exception as e:
+            logger.debug("Analyze failed %s: %s", symbol, e)
+        await asyncio.sleep(0.05)
+
+    candidates.sort(key=lambda s: s.quality, reverse=True)
+    threshold = MIN_SCORE
+    if state.signals_today < DAILY_MIN_SIGNALS:
+        threshold = min(MIN_SCORE, FALLBACK_SCORE)
+
+    sent = 0
+    for sig in candidates:
+        if sig.quality < threshold:
+            continue
+        if state.signals_today >= MAX_SIGNALS_PER_DAY:
+            break
+        if sig.symbol in state.active or is_on_cooldown(sig.symbol):
+            continue
+        ok = await send_telegram(signal_message(sig))
+        if ok:
+            state.active[sig.symbol] = asdict(sig)
+            state.signals_today += 1
+            state.last_signal_ts = time.time()
+            stat_inc("total_signals_sent")
+            put_cooldown(sig.symbol)
+            save_state()
+            sent += 1
+            logger.info("Signal sent: %s %s quality=%s", sig.display_symbol, sig.side, sig.quality)
+        await asyncio.sleep(1.0)
+
+    last_scan_summary = {
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+        "checked": checked,
+        "candidates": len(candidates),
+        "sent": sent,
+        "signals_today": state.signals_today,
+        "active": len(state.active),
+        "threshold_used": threshold,
+        "best_candidates": [
+            {
+                "symbol": s.display_symbol,
+                "side": s.side,
+                "setup": s.setup,
+                "quality": s.quality,
+                "entry": s.entry,
+            }
+            for s in candidates[:10]
+        ],
+    }
+    logger.info("Scan: checked=%s candidates=%s sent=%s active=%s", checked, len(candidates), sent, len(state.active))
+
+    if SEND_EMPTY_SCAN and sent == 0:
+        best = candidates[0] if candidates else None
+        msg = (
+            "🧪 <b>Scan update</b>\n"
+            f"Проверено: {checked}\n"
+            f"Кандидатов: {len(candidates)}\n"
+            f"Отправлено: {sent}\n"
+            f"Active: {len(state.active)}\n"
+            f"Best: {best.display_symbol + ' ' + best.side + ' ' + str(best.quality) if best else 'нет'}"
+        )
+        await send_telegram(msg, silent=True)
+    return last_scan_summary
 
 
-async def track_active_signals() -> None:
+async def current_price(symbol: str) -> Optional[float]:
+    try:
+        assert exchange is not None
+        ticker = await exchange.fetch_ticker(symbol)
+        price = safe_float(ticker.get("last"), 0.0)
+        return price if price > 0 else None
+    except Exception as e:
+        logger.debug("fetch_ticker active failed %s: %s", symbol, e)
+        return None
+
+
+def signal_from_dict(data: Dict[str, Any]) -> Signal:
+    return Signal(
+        symbol=data.get("symbol", ""),
+        display_symbol=data.get("display_symbol") or data.get("symbol", ""),
+        base=data.get("base", ""),
+        side=data.get("side", "LONG"),
+        setup=data.get("setup", ""),
+        quality=int(data.get("quality", 0) or 0),
+        entry=safe_float(data.get("entry")),
+        targets=[safe_float(x) for x in data.get("targets", [])],
+        average=safe_float(data.get("average")),
+        stop=safe_float(data.get("stop")),
+        leverage=int(data.get("leverage", LEVERAGE) or LEVERAGE),
+        score_reasons=list(data.get("score_reasons", [])),
+        metrics=dict(data.get("metrics", {})),
+        created_ts=safe_float(data.get("created_ts"), time.time()),
+        hit_targets=[int(x) for x in data.get("hit_targets", [])],
+        average_hit=bool(data.get("average_hit", False)),
+        closed=bool(data.get("closed", False)),
+    )
+
+
+def trade_roi(sig: Signal, exit_price: float) -> float:
+    if sig.entry <= 0:
+        return 0.0
+    if sig.side == "LONG":
+        return pct_change(exit_price, sig.entry) * sig.leverage
+    return pct_change(sig.entry, exit_price) * sig.leverage
+
+
+def close_signal(symbol: str, sig: Signal, reason: str, result: str, exit_price: float) -> None:
+    roi = trade_roi(sig, exit_price)
+    ensure_stats()
+    stat_inc("closed_total")
+    if result == "profit":
+        stat_inc("closed_profit")
+    else:
+        stat_inc("closed_loss")
+    if "STOP" in reason.upper():
+        stat_inc("stop_losses")
+    if len(sig.hit_targets) >= 5:
+        stat_inc("all_targets")
+    state.stats["total_closed_roi"] = float(state.stats.get("total_closed_roi", 0.0) or 0.0) + roi
+    best = state.stats.get("best_roi")
+    worst = state.stats.get("worst_roi")
+    state.stats["best_roi"] = roi if best is None else max(float(best), roi)
+    state.stats["worst_roi"] = roi if worst is None else min(float(worst), roi)
+    state.stats["last_results"].append({
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+        "symbol": sig.display_symbol,
+        "side": sig.side,
+        "reason": reason,
+        "result": result,
+        "roi": roi,
+        "entry": sig.entry,
+        "exit": exit_price,
+    })
+    state.stats["last_results"] = state.stats["last_results"][-30:]
+    state.active.pop(symbol, None)
+    save_state()
+
+
+async def update_active_signals() -> None:
     if not state.active:
         return
-    try:
-        tickers = await exchange.fetch_tickers(list(state.active.keys()))
-    except Exception:
-        tickers = {}
-
     changed = False
-    to_remove: List[str] = []
-    for symbol, raw_sig in list(state.active.items()):
-        try:
-            sig = Signal(**raw_sig)
-            ticker = tickers.get(symbol) or {}
-            price = safe_float(ticker.get("last"), 0)
-            if price <= 0:
-                continue
+    for symbol, raw in list(state.active.items()):
+        sig = signal_from_dict(raw)
+        if sig.closed:
+            continue
+        price = await current_price(symbol)
+        if price is None:
+            continue
 
-            # Average order hit
-            if not sig.average_hit:
-                avg_hit = (price <= sig.average) if sig.side == "LONG" else (price >= sig.average)
-                if avg_hit:
-                    sig.average_hit = True
-                    changed = True
-                    await send_telegram(update_to_text(sig, "⚠️ Усреднение достигнуто", price, f"Уровень усреднения: {fmt_price(sig.average)}"))
-
-            # Stop hit
-            stop_hit = (price <= sig.stop) if sig.side == "LONG" else (price >= sig.stop)
-            if stop_hit:
-                sig.closed = True
+        # Average hit.
+        if not sig.average_hit:
+            if (sig.side == "LONG" and price <= sig.average) or (sig.side == "SHORT" and price >= sig.average):
+                sig.average_hit = True
+                stat_inc("average_hits")
                 changed = True
-                await send_telegram(update_to_text(sig, "🛑 Защитный стоп", price, "Сетап закрыт ботом в мониторинге."))
-                to_remove.append(symbol)
+                await send_telegram(
+                    f"⚠️ <b>Усреднение активировано</b>\n"
+                    f"{sig.display_symbol} {sig.side}\n"
+                    f"Цена дошла до: <b>{fmt_price(sig.average)}</b>\n"
+                    f"Текущая цена: {fmt_price(price)}\n"
+                    "Риск держи строго по плану."
+                )
+
+        # Target hits.
+        for i, target in enumerate(sig.targets, start=1):
+            if i in sig.hit_targets:
                 continue
+            hit = (sig.side == "LONG" and price >= target) or (sig.side == "SHORT" and price <= target)
+            if hit:
+                sig.hit_targets.append(i)
+                changed = True
+                if i == 1:
+                    stat_inc("tp1_hits")
+                roi = trade_roi(sig, target)
+                await send_telegram(
+                    f"✅ <b>TP{i} достигнут</b>\n"
+                    f"{sig.display_symbol} {sig.side}\n"
+                    f"Цель: <b>{fmt_price(target)}</b>\n"
+                    f"ROI по плечу x{sig.leverage}: <b>{fmt_pct(roi)}</b>"
+                )
 
-            # Targets hit
-            for idx, target in enumerate(sig.targets, start=1):
-                if idx in sig.hit_targets:
-                    continue
-                hit = (price >= target) if sig.side == "LONG" else (price <= target)
-                if hit:
-                    sig.hit_targets.append(idx)
-                    changed = True
-                    await send_telegram(update_to_text(sig, f"✅ TP{idx} взят", price, f"Цель: {fmt_price(target)}"))
+        # Full close on TP5.
+        if len(sig.hit_targets) >= 5:
+            close_signal(symbol, sig, "TP5", "profit", sig.targets[-1])
+            await send_telegram(
+                f"🏆 <b>Все 5 целей взяты</b>\n"
+                f"{sig.display_symbol} {sig.side}\n"
+                f"Entry: {fmt_price(sig.entry)}\n"
+                f"TP5: {fmt_price(sig.targets[-1])}\n"
+                f"Итог ROI x{sig.leverage}: <b>{fmt_pct(trade_roi(sig, sig.targets[-1]))}</b>"
+            )
+            if SEND_STATS_AFTER_CLOSE:
+                await send_telegram(stats_text(), silent=True)
+            continue
 
-            if len(sig.hit_targets) >= len(sig.targets):
-                sig.closed = True
-                await send_telegram(f"🏁 {sig.base} {sig.side}: все 5 целей достигнуты. Сделка закрыта в мониторинге.")
-                to_remove.append(symbol)
-            else:
-                state.active[symbol] = asdict(sig)
-        except Exception as e:
-            logger.warning("Track active failed for %s: %s", symbol, e)
+        # Stop.
+        stop_hit = (sig.side == "LONG" and price <= sig.stop) or (sig.side == "SHORT" and price >= sig.stop)
+        if stop_hit:
+            result = "profit" if 1 in sig.hit_targets else "loss"
+            reason = "STOP after TP" if result == "profit" else "STOP before TP1"
+            close_signal(symbol, sig, reason, result, price)
+            icon = "✅" if result == "profit" else "🛑"
+            await send_telegram(
+                f"{icon} <b>{'Сделка закрыта в плюс' if result == 'profit' else 'Stop Loss'}</b>\n"
+                f"{sig.display_symbol} {sig.side}\n"
+                f"Entry: {fmt_price(sig.entry)}\n"
+                f"Exit: {fmt_price(price)}\n"
+                f"ROI x{sig.leverage}: <b>{fmt_pct(trade_roi(sig, price))}</b>"
+            )
+            if SEND_STATS_AFTER_CLOSE:
+                await send_telegram(stats_text(), silent=True)
+            continue
 
-    for symbol in to_remove:
-        state.active.pop(symbol, None)
-    if changed or to_remove:
+        state.active[symbol] = asdict(sig)
+    if changed:
         save_state()
 
 
 async def scanner_loop() -> None:
-    global last_scan_summary
-    await asyncio.sleep(3)
+    # Never let the worker die on one scan error.
     while True:
-        reset_daily_if_needed()
-        scan_started = time.time()
-        checked = 0
-        hot = 0
-        best_seen: List[Tuple[int, str, str, str]] = []
-        sent = 0
-        err = None
-
         try:
-            await track_active_signals()
-            symbols = await get_tradeable_symbols()
-            threshold = current_threshold()
-            candidates: List[Signal] = []
-
-            for symbol, market, qv in symbols:
-                checked += 1
-                if not can_send_symbol(symbol):
-                    continue
-                sig = await analyze_symbol(symbol)
-                if sig is None:
-                    continue
-                hot += 1
-                best_seen.append((sig.quality, display_pair(sig.symbol), sig.side, sig.setup))
-                if sig.quality >= threshold:
-                    candidates.append(sig)
-
-                # Do not scan forever when daily limit is already nearly reached.
-                await asyncio.sleep(0.05)
-
-            candidates.sort(key=lambda s: s.quality, reverse=True)
-            for sig in candidates:
-                if state.signals_today >= MAX_SIGNALS_PER_DAY:
-                    break
-                if not can_send_symbol(sig.symbol):
-                    continue
-                await send_new_signal(sig)
-                sent += 1
-                # чтобы не закинуть 5 сигналов сразу одной пачкой
-                await asyncio.sleep(2)
-
-            best_seen.sort(reverse=True, key=lambda x: x[0])
-            last_scan_summary = {
-                "time_utc": datetime.now(timezone.utc).isoformat(),
-                "checked": checked,
-                "analyzed_hot": hot,
-                "sent": sent,
-                "threshold": threshold,
-                "signals_today": state.signals_today,
-                "active_signals": len(state.active),
-                "best_seen": best_seen[:10],
-                "duration_sec": round(time.time() - scan_started, 1),
-            }
-            logger.info("Scan: %s", last_scan_summary)
-
-            if SEND_EMPTY_SCAN and sent == 0:
-                top = best_seen[:3]
-                txt = f"Скан завершен: сигналов нет. Проверено {checked}, threshold {threshold}."
-                if top:
-                    txt += "\nЛучшие кандидаты:\n" + "\n".join([f"{p} {side} {score}% — {setup}" for score, p, side, setup in top])
-                await send_telegram(txt)
-
+            await scan_once()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            err = str(e)
-            logger.error("Scanner loop error: %s\n%s", e, traceback.format_exc())
-            await send_telegram(f"⚠️ {APP_NAME}: ошибка сканера\n{e}")
-
-        if err:
-            await asyncio.sleep(max(60, SCAN_INTERVAL_SECONDS))
-        else:
-            elapsed = time.time() - scan_started
-            await asyncio.sleep(max(15, SCAN_INTERVAL_SECONDS - elapsed))
+            err = "".join(traceback.format_exception_only(type(e), e)).strip()
+            logger.error("Scanner loop error: %s\n%s", err, traceback.format_exc())
+            if SEND_SCAN_ERRORS_TO_TELEGRAM:
+                await send_telegram(f"⚠️ Ошибка сканера:\n<code>{err}</code>", silent=True)
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
 @app.on_event("startup")
-async def on_startup():
-    global exchange, scanner_task
+async def on_startup() -> None:
+    global scanner_task
     load_state()
-    reset_daily_if_needed()
-    exchange = await make_exchange()
+    logger.info("Starting %s", APP_NAME)
     if SEND_STARTUP_MESSAGE:
-        await send_telegram(
-            "✅ BingX scalp bot запущен\n"
-            f"Сканер активен: каждые {SCAN_INTERVAL_SECONDS} сек.\n"
-            f"Рынок: BingX USDT-M futures/swap\n"
-            f"Формат: entry + 5 TP + усреднение + стоп\n"
-            f"Плечо в расчетах ROI: x{LEVERAGE}\n"
-            "Бот НЕ открывает сделки, только отправляет сигналы."
-        )
+        await send_telegram(startup_message())
+    # Start scanner after startup; do not crash Render if first exchange connection fails.
     scanner_task = asyncio.create_task(scanner_loop())
-    logger.info("Startup complete")
 
 
 @app.on_event("shutdown")
-async def on_shutdown():
+async def on_shutdown() -> None:
     global exchange, scanner_task
+    save_state()
     if scanner_task:
         scanner_task.cancel()
-    save_state()
-    if exchange:
-        await exchange.close()
+    if exchange is not None:
+        try:
+            await exchange.close()
+        except Exception:
+            pass
+        exchange = None
 
 
-@app.get("/", response_class=PlainTextResponse)
-async def root():
-    return f"{APP_NAME} is running. Open /status for scanner state."
+@app.get("/")
+async def root() -> JSONResponse:
+    return JSONResponse({
+        "ok": True,
+        "app": APP_NAME,
+        "mode": "uvicorn bot:app",
+        "uptime_sec": int(time.time() - started_at),
+        "active": len(state.active),
+        "signals_today": state.signals_today,
+        "last_scan": last_scan_summary,
+    })
 
 
 @app.get("/health")
-async def health():
-    return {"ok": True, "uptime_sec": int(time.time() - started_at)}
+async def health() -> JSONResponse:
+    return JSONResponse({"ok": True, "active": len(state.active), "telegram": last_telegram_status})
 
 
-@app.get("/status")
-async def status():
-    reset_daily_if_needed()
-    return JSONResponse(
-        {
-            "app": APP_NAME,
-            "uptime_sec": int(time.time() - started_at),
-            "config": {
-                "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
-                "top_symbols_limit": TOP_SYMBOLS_LIMIT,
-                "min_24h_quote_volume_usdt": MIN_24H_QUOTE_VOLUME_USDT,
-                "min_score": MIN_SCORE,
-                "fallback_score": FALLBACK_SCORE,
-                "daily_min_signals": DAILY_MIN_SIGNALS,
-                "max_signals_per_day": MAX_SIGNALS_PER_DAY,
-                "cooldown_minutes": COOLDOWN_MINUTES,
-                "leverage": LEVERAGE,
-                "take_pcts": TAKE_PCTS,
-                "average_pct": AVERAGE_PCT,
-                "stop_after_average_pct": STOP_AFTER_AVERAGE_PCT,
-            },
-            "state": asdict(state),
-            "last_scan_summary": last_scan_summary,
-        }
-    )
+@app.get("/stats")
+async def stats() -> JSONResponse:
+    ensure_stats()
+    return JSONResponse({"ok": True, "stats": state.stats, "active": state.active})
+
+
+@app.get("/stats/send")
+async def send_stats() -> JSONResponse:
+    ok = await send_telegram(stats_text())
+    return JSONResponse({"ok": ok, "telegram": last_telegram_status})
+
+
+@app.get("/telegram/test")
+async def telegram_test() -> JSONResponse:
+    ok = await send_telegram("✅ Telegram test: бот может отправлять сообщения.")
+    return JSONResponse({"ok": ok, "telegram": last_telegram_status})
+
+
+@app.get("/debug")
+async def debug() -> JSONResponse:
+    return JSONResponse({
+        "ok": True,
+        "env": {
+            "TELEGRAM_BOT_TOKEN_present": bool(TELEGRAM_BOT_TOKEN),
+            "TELEGRAM_CHAT_ID_present": bool(TELEGRAM_CHAT_ID),
+            "SCAN_INTERVAL_SECONDS": SCAN_INTERVAL_SECONDS,
+            "TOP_SYMBOLS_LIMIT": TOP_SYMBOLS_LIMIT,
+            "MIN_SCORE": MIN_SCORE,
+            "FALLBACK_SCORE": FALLBACK_SCORE,
+            "DAILY_MIN_SIGNALS": DAILY_MIN_SIGNALS,
+            "MAX_SIGNALS_PER_DAY": MAX_SIGNALS_PER_DAY,
+            "LEVERAGE": LEVERAGE,
+        },
+        "last_telegram_status": last_telegram_status,
+        "last_scan_summary": last_scan_summary,
+    })
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000") or "8000")
+    uvicorn.run("bot:app", host="0.0.0.0", port=port, reload=False)
