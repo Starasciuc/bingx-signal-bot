@@ -1,56 +1,60 @@
-# -*- coding: utf-8 -*-
-"""
-V14 Professional Institutional Scalper
--------------------------------------
-Новый движок без старого Instant Edge.
-
-Цель:
-- не ловить случайную свечу;
-- сначала найти trader-style setup;
-- затем дождаться подтверждения tape/price action;
-- отправлять только после подтверждения;
-- держать стоп локальным и коротким;
-- автоматически выключать слабые стратегии по статистике.
-
-Важно:
-Это не финансовая рекомендация и не гарантия прибыли. Бот только отправляет сигналы.
-"""
-
 import os
 import time
-import math
 import json
-import statistics
+import math
+import html
+import asyncio
+import logging
+import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 # ============================================================
-# APP / VERSION
+# V14.11 — ANTI-SILENCE LEVEL SCALPER
+# Telegram signal bot only. It NEVER opens trades.
+#
+# Что изменено против V14.10:
+# - TP3 больше НЕ блокирует сделку: цели адаптируются под реальную волатильность.
+# - Anti-silence режим: после паузы бот разрешает B+ / B компактные скальпы.
+# - Pending confirmation имеет таймаут и не висит бесконечно.
+# - Scan updates ограничены, чтобы бот не спамил вместо сигналов.
+# - Входы остаются через уровень + VWAP/EMA + импульс + объём + BTC-фильтр.
+#
+# ENV на Render:
+# TELEGRAM_BOT_TOKEN=...
+# TELEGRAM_CHAT_ID=...
+# ADMIN_KEY=любой_секрет_для_/scan_и_/status_если_хочешь
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V14 Final Hardened Level Scalper"
-APP_VERSION = "V14.10_FINAL_HARDENED_LEVEL_SCALPER"
-DEPLOY_MARKER = "V14_10_FINAL_HARDENED_LEVEL_SCALPER_2026_07_08"
+VERSION = "V14.11_ANTI_SILENCE_LEVEL_SCALPER"
 
-app = FastAPI(title=APP_NAME)
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger(VERSION)
 
-# ============================================================
-# ENV HELPERS
-# ============================================================
-
-def env_str(name: str, default: str) -> str:
-    return os.getenv(name, default)
+# ----------------------------
+# Helpers / ENV
+# ----------------------------
+def env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
 
 def env_int(name: str, default: int) -> int:
     try:
-        return int(os.getenv(name, str(default)))
+        return int(float(os.getenv(name, str(default))))
     except Exception:
         return default
 
@@ -66,594 +70,11 @@ def env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
 
-# ============================================================
-# CONFIG
-# ============================================================
 
-BINGX_BASE = env_str("BINGX_BASE", "https://open-api.bingx.com")
-TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID", "")
-
-# Telegram service notifications
-SEND_STARTUP_TELEGRAM = env_bool("SEND_STARTUP_TELEGRAM", True)
-TELEGRAM_SCAN_REPORTS_ENABLED = env_bool("TELEGRAM_SCAN_REPORTS_ENABLED", True)
-TELEGRAM_SCAN_REPORT_EVERY_SECONDS = env_int("TELEGRAM_SCAN_REPORT_EVERY_SECONDS", 300)
-TELEGRAM_SCAN_REPORT_INCLUDE_HOT = env_bool("TELEGRAM_SCAN_REPORT_INCLUDE_HOT", True)
-
-STATE_FILE = env_str("STATE_FILE", "bot_state_v14_10_final_hardened_level_scalper.json")
-
-# Scanning
-AUTO_SCAN_ENABLED = env_bool("AUTO_SCAN_ENABLED", True)
-AUTO_SCAN_SECONDS = env_int("AUTO_SCAN_SECONDS", 15)
-AUTO_TRACK_SECONDS = env_int("AUTO_TRACK_SECONDS", 3)
-HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 7.0)
-HOT_WORKERS = env_int("HOT_WORKERS", 18)
-MAX_ANALYZE_SYMBOLS = env_int("MAX_ANALYZE_SYMBOLS", 320)
-HOT_SYMBOLS_TO_ANALYZE = env_int("HOT_SYMBOLS_TO_ANALYZE", 90)
-MIN_HOT_SCORE = env_float("MIN_HOT_SCORE", 35.0)
-
-# Signal limits
-MAX_ACTIVE_SIGNALS = env_int("MAX_ACTIVE_SIGNALS", 1)
-MAX_SIGNALS_PER_SCAN = env_int("MAX_SIGNALS_PER_SCAN", 1)
-PAIR_COOLDOWN_SECONDS = env_int("PAIR_COOLDOWN_SECONDS", 900)
-STRATEGY_COOLDOWN_SECONDS = env_int("STRATEGY_COOLDOWN_SECONDS", 180)
-
-# Professional safety controls from the hardened V14 base
-CIRCUIT_BREAKER_ENABLED = env_bool("CIRCUIT_BREAKER_ENABLED", True)
-MAX_CONSECUTIVE_SL = env_int("MAX_CONSECUTIVE_SL", 2)
-MAX_DAILY_SL = env_int("MAX_DAILY_SL", 4)
-CIRCUIT_BREAKER_PAUSE_MINUTES = env_int("CIRCUIT_BREAKER_PAUSE_MINUTES", 120)
-WATCHDOG_ENABLED = env_bool("WATCHDOG_ENABLED", True)
-WATCHDOG_STALE_MINUTES = env_int("WATCHDOG_STALE_MINUTES", 10)
-API_RETRY_TOTAL = env_int("API_RETRY_TOTAL", 3)
-
-# Sides
-ALLOW_LONG = env_bool("ALLOW_LONG", True)
-ALLOW_SHORT = env_bool("ALLOW_SHORT", True)
-
-# Old bad mode hard disabled
-INSTANT_EDGE_ENABLED = False
-INSTANT_EDGE_HARD_DISABLED = True
-
-# New strategies
-BEAT_STYLE_SHORT_ENABLED = env_bool("BEAT_STYLE_SHORT_ENABLED", True)
-AERO_STYLE_ENABLED = env_bool("AERO_STYLE_ENABLED", True)
-CONFIRMED_TAPE_ENABLED = env_bool("CONFIRMED_TAPE_ENABLED", True)
-MARKET_DUMP_SHORT_ENABLED = env_bool("MARKET_DUMP_SHORT_ENABLED", True)
-RECOVERY_RECLAIM_LONG_ENABLED = env_bool("RECOVERY_RECLAIM_LONG_ENABLED", True)
-
-# Bounce / retest rejection setup. This is designed for examples like GRASS/AERO/BEAT SHORT:
-# selloff -> bounce/retest upward -> rejection -> short continuation.
-BOUNCE_REJECT_SHORT_ENABLED = env_bool("BOUNCE_REJECT_SHORT_ENABLED", True)
-
-# PUMP trap setup. Designed for examples like PUMP SHORT:
-# fast upside expansion / micro-pump -> rejection from local high -> confirmed downside tape.
-# This is NOT the old Instant Edge; it still waits for confirmation before sending.
-PUMP_TRAP_SHORT_ENABLED = env_bool("PUMP_TRAP_SHORT_ENABLED", True)
-
-# Extreme level reaction setups.
-# SHORT: price has grown many percent into a local resistance/high, then rejects and turns down.
-# LONG: price has fallen many percent into a local support/low, then reclaims and turns up.
-# This is the requested "catch the bounce from levels" mode, not a blind knife catch / top short.
-EXTREME_LEVEL_REACTION_ENABLED = env_bool("EXTREME_LEVEL_REACTION_ENABLED", True)
-LEVEL_REJECT_SHORT_ENABLED = env_bool("LEVEL_REJECT_SHORT_ENABLED", True)
-LEVEL_RECLAIM_LONG_ENABLED = env_bool("LEVEL_RECLAIM_LONG_ENABLED", True)
-
-# Confirmation engine: important difference from V13
-CONFIRMATION_ENGINE_ENABLED = env_bool("CONFIRMATION_ENGINE_ENABLED", True)
-CONFIRM_MIN_SECONDS = env_int("CONFIRM_MIN_SECONDS", 20)
-CONFIRM_MAX_SECONDS = env_int("CONFIRM_MAX_SECONDS", 135)
-CONFIRM_MIN_MOVE = env_float("CONFIRM_MIN_MOVE", 0.0009)       # price must move 0.14% in our direction before sending
-CONFIRM_MAX_CHASE = env_float("CONFIRM_MAX_CHASE", 0.0048)     # do not send if it already moved too far
-IMMEDIATE_A_PLUS_SCORE = env_float("IMMEDIATE_A_PLUS_SCORE", 97.0)
-
-# Professional anti-SL protection.
-# V14.02 does not send a signal only because a setup exists.
-# It waits for real confirmation and blocks snapback/reversal candles before send.
-ALLOW_IMMEDIATE_SEND = env_bool("ALLOW_IMMEDIATE_SEND", False)
-PRE_SEND_TAPE_PROTECTION_ENABLED = env_bool("PRE_SEND_TAPE_PROTECTION_ENABLED", True)
-CONFIRM_MIN_TP1_PROGRESS = env_float("CONFIRM_MIN_TP1_PROGRESS", 0.14)
-CONFIRM_MAX_TP1_PROGRESS = env_float("CONFIRM_MAX_TP1_PROGRESS", 0.88)
-CONFIRM_MIN_VOL1 = env_float("CONFIRM_MIN_VOL1", 0.44)
-CONFIRM_MIN_RANGE1 = env_float("CONFIRM_MIN_RANGE1", 0.52)
-CONFIRM_SHORT_LOC_MAX = env_float("CONFIRM_SHORT_LOC_MAX", 0.42)
-CONFIRM_LONG_LOC_MIN = env_float("CONFIRM_LONG_LOC_MIN", 0.58)
-CONFIRM_MAX_OPPOSITE_1M = env_float("CONFIRM_MAX_OPPOSITE_1M", 0.0010)
-CONFIRM_REQUIRE_MICRO_BREAK = env_bool("CONFIRM_REQUIRE_MICRO_BREAK", False)
-
-# V14.10: two-step confirmation against 10-second stop-outs.
-# A setup can look valid on one live candle, then instantly snap back.
-# Now the bot requires the first confirmation, waits a short hold period,
-# then revalidates that price has NOT snapped back before sending Telegram signal.
-POST_CONFIRM_HOLD_ENABLED = env_bool("POST_CONFIRM_HOLD_ENABLED", True)
-POST_CONFIRM_HOLD_SECONDS = env_int("POST_CONFIRM_HOLD_SECONDS", 25)
-POST_CONFIRM_MIN_RETAINED_TP1_PROGRESS = env_float("POST_CONFIRM_MIN_RETAINED_TP1_PROGRESS", 0.65)
-POST_CONFIRM_MAX_SNAPBACK = env_float("POST_CONFIRM_MAX_SNAPBACK", 0.0018)
-POST_CONFIRM_REQUIRE_STRUCTURE_HOLD = env_bool("POST_CONFIRM_REQUIRE_STRUCTURE_HOLD", True)
-POST_CONFIRM_SHORT_LOC_MAX = env_float("POST_CONFIRM_SHORT_LOC_MAX", 0.45)
-POST_CONFIRM_LONG_LOC_MIN = env_float("POST_CONFIRM_LONG_LOC_MIN", 0.55)
-
-# Prevent signals that are already too close to local stop or have no room to breathe.
-ENTRY_SAFETY_ENABLED = env_bool("ENTRY_SAFETY_ENABLED", True)
-ENTRY_MIN_DISTANCE_TO_SL = env_float("ENTRY_MIN_DISTANCE_TO_SL", 0.0038)
-ENTRY_MIN_DISTANCE_TO_SL_FRACTION = env_float("ENTRY_MIN_DISTANCE_TO_SL_FRACTION", 0.55)
-ENTRY_MIN_PROGRESS_BEFORE_SEND = env_float("ENTRY_MIN_PROGRESS_BEFORE_SEND", 0.10)
-
-# AERO/level reversal setups must prove the rejection twice, not once.
-STRICT_REJECTION_CONFIRM_ENABLED = env_bool("STRICT_REJECTION_CONFIRM_ENABLED", True)
-STRICT_REJECTION_STRATEGIES = {
-    "PRO_AERO_STYLE_SHORT",
-    "PRO_BOUNCE_REJECT_SHORT",
-    "PRO_PUMP_TRAP_SHORT",
-    "PRO_BEAT_STYLE_SHORT",
-    "PRO_EXTREME_LEVEL_REJECT_SHORT",
-    "PRO_EXTREME_LEVEL_RECLAIM_LONG",
-}
-
-# Early invalidation: this is not a Stop Loss.
-# If the signal starts moving against us and never showed progress, bot exits the idea before full SL.
-EARLY_INVALIDATION_ENABLED = env_bool("EARLY_INVALIDATION_ENABLED", True)
-EARLY_INVALIDATION_SECONDS = env_int("EARLY_INVALIDATION_SECONDS", 90)
-EARLY_INVALIDATION_ADVERSE_SL_FRACTION = env_float("EARLY_INVALIDATION_ADVERSE_SL_FRACTION", 0.55)
-EARLY_INVALIDATION_MAX_PROGRESS = env_float("EARLY_INVALIDATION_MAX_PROGRESS", 0.12)
-
-# TP ladder similar to BEAT/AERO examples, but not too silent
-TP1_MOVE = env_float("TP1_MOVE", 0.0085)
-TP2_MOVE = env_float("TP2_MOVE", 0.0145)
-TP3_MOVE = env_float("TP3_MOVE", 0.0205)
-TP4_MOVE = env_float("TP4_MOVE", 0.0305)
-TP5_MOVE = env_float("TP5_MOVE", 0.0410)
-TP_MOVES = [TP1_MOVE, TP2_MOVE, TP3_MOVE, TP4_MOVE, TP5_MOVE]
-
-# V14.10: TP3 realization mode.
-# We do not count a trade as successful at TP1 anymore. TP1/TP2 are only progress alerts.
-# The minimum successful realization is TP3 by default, because user examples usually take at least 3 targets.
-MIN_PROFIT_TARGET_INDEX = max(1, min(5, env_int("MIN_PROFIT_TARGET_INDEX", 3)))
-MIN_PROFIT_TARGET_LABEL = f"TP{MIN_PROFIT_TARGET_INDEX}"
-TP3_FEASIBILITY_ENABLED = env_bool("TP3_FEASIBILITY_ENABLED", True)
-TP3_MIN_RECENT_RANGE_MULT = env_float("TP3_MIN_RECENT_RANGE_MULT", 0.90)
-TP3_MIN_LIVE_PROGRESS_MULT = env_float("TP3_MIN_LIVE_PROGRESS_MULT", 0.10)
-TP3_CONFIRM_MIN_PROGRESS = env_float("TP3_CONFIRM_MIN_PROGRESS", 0.10)
-TP3_CONFIRM_MAX_PROGRESS = env_float("TP3_CONFIRM_MAX_PROGRESS", 0.62)
-TP3_POST_CONFIRM_MIN_RETAINED_PROGRESS = env_float("TP3_POST_CONFIRM_MIN_RETAINED_PROGRESS", 0.70)
-TP3_TARGET_MAX_MINUTES = env_int("TP3_TARGET_MAX_MINUTES", 16)
-TP3_MIN_PROGRESS_TO_KEEP = env_float("TP3_MIN_PROGRESS_TO_KEEP", 0.28)
-TP3_COUNT_TP1_AS_PROFIT = env_bool("TP3_COUNT_TP1_AS_PROFIT", False)
-
-# Local scalp stop, tighter than previous versions
-LEVERAGE_DISPLAY = env_int("LEVERAGE_DISPLAY", 10)
-LOCAL_SCALP_STOP_ENABLED = env_bool("LOCAL_SCALP_STOP_ENABLED", True)
-LOCAL_SCALP_MIN_SL_MOVE = env_float("LOCAL_SCALP_MIN_SL_MOVE", 0.0038)
-LOCAL_SCALP_MAX_SL_MOVE = env_float("LOCAL_SCALP_MAX_SL_MOVE", 0.0070)
-STRUCTURE_BUFFER = env_float("STRUCTURE_BUFFER", 0.0012)
-
-# Quality filters
-MIN_TP1_RR = env_float("MIN_TP1_RR", 0.65)
-MIN_LADDER_RR = env_float("MIN_LADDER_RR_HARD", 1.25)
-MIN_FINAL_RR = env_float("MIN_FINAL_RR_HARD", 3.00)
-MAX_SCALP_SL_ROI = env_float("MAX_SCALP_SL_ROI", 14.5)
-MIN_SCORE_TO_SEND = env_float("MIN_SCORE_TO_SEND", 80.0)
-
-# Strategy statistic protection
-STRATEGY_STATS_PROTECTION = env_bool("STRATEGY_STATS_PROTECTION", True)
-STRATEGY_MIN_CLOSED_FOR_BLOCK = env_int("STRATEGY_MIN_CLOSED_FOR_BLOCK", 18)
-STRATEGY_MIN_WR = env_float("STRATEGY_MIN_WR", 32.0)
-STRATEGY_MAX_SL_RATE = env_float("STRATEGY_MAX_SL_RATE", 48.0)
-
-# BEAT/AERO style requirements
-BEAT_MIN_1M3 = env_float("BEAT_MIN_1M3", 0.0038)
-BEAT_MIN_PULLBACK = env_float("BEAT_MIN_PULLBACK", 0.0045)
-BEAT_MIN_RECENT_RANGE = env_float("BEAT_MIN_RECENT_RANGE", 0.0120)
-BEAT_MIN_VOL1 = env_float("BEAT_MIN_VOL1", 0.38)
-BEAT_MIN_VOL5 = env_float("BEAT_MIN_VOL5", 0.45)
-BEAT_MIN_RANGE1 = env_float("BEAT_MIN_RANGE1", 0.60)
-BEAT_MIN_RANGE5 = env_float("BEAT_MIN_RANGE5", 0.65)
-
-AERO_MIN_1M3 = env_float("AERO_MIN_1M3", 0.0036)
-AERO_MIN_PULLBACK = env_float("AERO_MIN_PULLBACK", 0.0040)
-AERO_MIN_RECENT_RANGE = env_float("AERO_MIN_RECENT_RANGE", 0.0110)
-
-# GRASS-style bounce reject SHORT requirements.
-# These are intentionally not too strict so the bot does not go silent, but they force a real bounce/rejection
-# instead of a random late market-order short.
-BOUNCE_MIN_FROM_LOW = env_float("BOUNCE_MIN_FROM_LOW", 0.0060)       # price bounced at least 0.60% from local low
-BOUNCE_MAX_FROM_LOW = env_float("BOUNCE_MAX_FROM_LOW", 0.0450)       # avoid shorting too high after full reversal
-BOUNCE_MIN_REJECT_FROM_HIGH = env_float("BOUNCE_MIN_REJECT_FROM_HIGH", 0.0028)
-BOUNCE_MIN_1M3 = env_float("BOUNCE_MIN_1M3", 0.0028)
-BOUNCE_MAX_1M3_CHASE = env_float("BOUNCE_MAX_1M3_CHASE", 0.0140)
-BOUNCE_MIN_RECENT_RANGE = env_float("BOUNCE_MIN_RECENT_RANGE", 0.0100)
-BOUNCE_MIN_VOL1 = env_float("BOUNCE_MIN_VOL1", 0.42)
-BOUNCE_MIN_VOL5 = env_float("BOUNCE_MIN_VOL5", 0.45)
-BOUNCE_MIN_RANGE1 = env_float("BOUNCE_MIN_RANGE1", 0.62)
-BOUNCE_MIN_RANGE5 = env_float("BOUNCE_MIN_RANGE5", 0.65)
-BOUNCE_SHORT_LOC_MAX = env_float("BOUNCE_SHORT_LOC_MAX", 0.48)
-BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP = env_bool("BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP", True)
-BOUNCE_NEAR_LOW_BLOCK = env_bool("BOUNCE_NEAR_LOW_BLOCK", True)
-BOUNCE_ALLOW_B_PLUS = env_bool("BOUNCE_ALLOW_B_PLUS", True)
-
-# PUMP / squeeze trap SHORT requirements. This catches setups like PUMP SHORT:
-# strong upward expansion -> failed continuation -> rejection from recent high -> short.
-PUMP_MIN_15M_UP = env_float("PUMP_MIN_15M_UP", 0.0045)
-PUMP_MIN_30M_UP = env_float("PUMP_MIN_30M_UP", 0.0060)
-PUMP_MAX_30M_UP = env_float("PUMP_MAX_30M_UP", 0.1800)
-PUMP_MIN_REJECT_FROM_HIGH = env_float("PUMP_MIN_REJECT_FROM_HIGH", 0.0018)
-PUMP_MIN_1M3_DOWN = env_float("PUMP_MIN_1M3_DOWN", 0.0020)
-PUMP_MAX_1M3_CHASE = env_float("PUMP_MAX_1M3_CHASE", 0.0200)
-PUMP_MIN_RECENT_RANGE = env_float("PUMP_MIN_RECENT_RANGE", 0.0080)
-PUMP_MIN_VOL1 = env_float("PUMP_MIN_VOL1", 0.28)
-PUMP_MIN_VOL5 = env_float("PUMP_MIN_VOL5", 0.50)
-PUMP_MIN_RANGE1 = env_float("PUMP_MIN_RANGE1", 0.45)
-PUMP_MIN_RANGE5 = env_float("PUMP_MIN_RANGE5", 0.58)
-PUMP_SHORT_LOC_MAX = env_float("PUMP_SHORT_LOC_MAX", 0.52)
-PUMP_CONFIRM_MIN_TP1_PROGRESS = env_float("PUMP_CONFIRM_MIN_TP1_PROGRESS", 0.12)
-PUMP_CONFIRM_SHORT_LOC_MAX = env_float("PUMP_CONFIRM_SHORT_LOC_MAX", 0.48)
-PUMP_AVOID_NEAR_LOW = env_bool("PUMP_AVOID_NEAR_LOW", True)
-PUMP_ALLOW_B_PLUS = env_bool("PUMP_ALLOW_B_PLUS", True)
-
-# V14.06 adaptive confirmation. The previous V14.05 found pending setups but many expired
-# or were rejected by weak 1m volume even when 5m volume and price rejection were strong.
-# These settings keep quality, but allow trader-style traps like LAB/PUMP where vol1 may be low
-# exactly at the rejection candle while vol5 + range + 1m3 direction confirm the move.
-TRAP_FAST_CONFIRM_MIN_SECONDS = env_int("TRAP_FAST_CONFIRM_MIN_SECONDS", 12)
-TRAP_FAST_CONFIRM_MIN_TP1_PROGRESS = env_float("TRAP_FAST_CONFIRM_MIN_TP1_PROGRESS", 0.10)
-TRAP_FAST_CONFIRM_MIN_MOVE = env_float("TRAP_FAST_CONFIRM_MIN_MOVE", 0.00065)
-TRAP_FAST_CONFIRM_MIN_VOL1 = env_float("TRAP_FAST_CONFIRM_MIN_VOL1", 0.24)
-TRAP_FAST_CONFIRM_MIN_RANGE1 = env_float("TRAP_FAST_CONFIRM_MIN_RANGE1", 0.42)
-TRAP_FAST_CONFIRM_MIN_VOL5 = env_float("TRAP_FAST_CONFIRM_MIN_VOL5", 0.55)
-TRAP_FAST_CONFIRM_MIN_RANGE5 = env_float("TRAP_FAST_CONFIRM_MIN_RANGE5", 0.55)
-TRAP_FAST_CONFIRM_STRONG_1M3 = env_float("TRAP_FAST_CONFIRM_STRONG_1M3", 0.0085)
-PUMP_EXTREME_TRAP_ENABLED = env_bool("PUMP_EXTREME_TRAP_ENABLED", True)
-PUMP_EXTREME_MIN_1M3_DOWN = env_float("PUMP_EXTREME_MIN_1M3_DOWN", 0.0080)
-PUMP_EXTREME_MIN_VOL1 = env_float("PUMP_EXTREME_MIN_VOL1", 0.15)
-PUMP_EXTREME_MIN_VOL5 = env_float("PUMP_EXTREME_MIN_VOL5", 0.80)
-PUMP_EXTREME_MIN_RANGE1 = env_float("PUMP_EXTREME_MIN_RANGE1", 0.40)
-PUMP_EXTREME_MIN_RANGE5 = env_float("PUMP_EXTREME_MIN_RANGE5", 0.75)
-PUMP_CONFIRM_MIN_VOL1 = env_float("PUMP_CONFIRM_MIN_VOL1", 0.24)
-PUMP_CONFIRM_MIN_RANGE1 = env_float("PUMP_CONFIRM_MIN_RANGE1", 0.42)
-
-# V14.07 level-reaction requirements.
-# These catch: huge rise -> resistance rejection SHORT, huge fall -> support reclaim LONG.
-LEVEL_MIN_15M_EXTREME = env_float("LEVEL_MIN_15M_EXTREME", 0.0180)
-LEVEL_MIN_30M_EXTREME = env_float("LEVEL_MIN_30M_EXTREME", 0.0260)
-LEVEL_MIN_1H_EXTREME = env_float("LEVEL_MIN_1H_EXTREME", 0.0380)
-LEVEL_MIN_RECENT_RANGE = env_float("LEVEL_MIN_RECENT_RANGE", 0.0180)
-LEVEL_MAX_30M_EXTREME = env_float("LEVEL_MAX_30M_EXTREME", 0.2200)
-
-LEVEL_SHORT_MIN_REJECT = env_float("LEVEL_SHORT_MIN_REJECT", 0.0025)
-LEVEL_SHORT_MIN_1M3_DOWN = env_float("LEVEL_SHORT_MIN_1M3_DOWN", 0.0028)
-LEVEL_SHORT_MAX_CHASE_1M3 = env_float("LEVEL_SHORT_MAX_CHASE_1M3", 0.0200)
-LEVEL_SHORT_LOC_MAX = env_float("LEVEL_SHORT_LOC_MAX", 0.50)
-LEVEL_SHORT_MIN_VOL1 = env_float("LEVEL_SHORT_MIN_VOL1", 0.28)
-LEVEL_SHORT_MIN_VOL5 = env_float("LEVEL_SHORT_MIN_VOL5", 0.55)
-LEVEL_SHORT_MIN_RANGE1 = env_float("LEVEL_SHORT_MIN_RANGE1", 0.45)
-LEVEL_SHORT_MIN_RANGE5 = env_float("LEVEL_SHORT_MIN_RANGE5", 0.60)
-
-LEVEL_LONG_MIN_BOUNCE = env_float("LEVEL_LONG_MIN_BOUNCE", 0.0028)
-LEVEL_LONG_MIN_1M3_UP = env_float("LEVEL_LONG_MIN_1M3_UP", 0.0028)
-LEVEL_LONG_MAX_CHASE_1M3 = env_float("LEVEL_LONG_MAX_CHASE_1M3", 0.0200)
-LEVEL_LONG_LOC_MIN = env_float("LEVEL_LONG_LOC_MIN", 0.50)
-LEVEL_LONG_MIN_VOL1 = env_float("LEVEL_LONG_MIN_VOL1", 0.28)
-LEVEL_LONG_MIN_VOL5 = env_float("LEVEL_LONG_MIN_VOL5", 0.55)
-LEVEL_LONG_MIN_RANGE1 = env_float("LEVEL_LONG_MIN_RANGE1", 0.45)
-LEVEL_LONG_MIN_RANGE5 = env_float("LEVEL_LONG_MIN_RANGE5", 0.60)
-LEVEL_LONG_ALLOW_BTC_BEAR_EXCEPTION = env_bool("LEVEL_LONG_ALLOW_BTC_BEAR_EXCEPTION", True)
-
-# Professional multi-timeframe structure filter inspired by trader dashboards:
-# 4h/1h/15m context + MACD/OBV/volume-delta proxy + confirmed structure.
-# It is a final quality gate before a setup is allowed to wait for confirmation.
-PRO_MTF_FILTER_ENABLED = env_bool("PRO_MTF_FILTER_ENABLED", True)
-PRO_MTF_MIN_CONFIRMATIONS = env_float("PRO_MTF_MIN_CONFIRMATIONS", 2.5)
-PRO_MTF_A_PLUS_MIN_CONFIRMATIONS = env_float("PRO_MTF_A_PLUS_MIN_CONFIRMATIONS", 3.0)
-PRO_MTF_STRONG_SCORE_ESCAPE = env_float("PRO_MTF_STRONG_SCORE_ESCAPE", 93.0)
-PRO_MTF_BLOCK_BAD_DELTA = env_bool("PRO_MTF_BLOCK_BAD_DELTA", False)
-COINS_IN_ANALYSIS_TARGET = env_int("COINS_IN_ANALYSIS_TARGET", 20)
-
-# Market dump, but not old bad dump. Requires tape confirmation/pending unless A+.
-DUMP_MIN_1M3 = env_float("DUMP_MIN_1M3", 0.0048)
-DUMP_MIN_15M = env_float("DUMP_MIN_15M", 0.0035)
-DUMP_MIN_VOL1 = env_float("DUMP_MIN_VOL1", 0.55)
-DUMP_MIN_VOL5 = env_float("DUMP_MIN_VOL5", 0.55)
-DUMP_MIN_RANGE1 = env_float("DUMP_MIN_RANGE1", 0.70)
-DUMP_MIN_RANGE5 = env_float("DUMP_MIN_RANGE5", 0.70)
-DUMP_CLOSE_SHORT = env_float("DUMP_CLOSE_SHORT", 0.42)
-
-# Recovery long: allowed, but must be stronger than shorts.
-LONG_MIN_1M3 = env_float("LONG_MIN_1M3", 0.0052)
-LONG_MIN_VOL1 = env_float("LONG_MIN_VOL1", 0.70)
-LONG_MIN_RANGE1 = env_float("LONG_MIN_RANGE1", 0.85)
-LONG_CLOSE_LONG = env_float("LONG_CLOSE_LONG", 0.62)
-
-# Expiration after send
-FAST_MAX_MINUTES_TO_TP1 = env_int("FAST_MAX_MINUTES_TO_TP1", 6)
-FAST_HARD_EXPIRE_MINUTES = env_int("FAST_HARD_EXPIRE_MINUTES", 11)
-FAST_MIN_PROGRESS_TO_KEEP = env_float("FAST_MIN_PROGRESS_TO_KEEP", 0.20)
-
-# Symbol filters
-ULTRA_RISK_KEYWORDS = [x.strip().upper() for x in env_str(
-    "ULTRA_RISK_KEYWORDS",
-    "UP,DOWN,BULL,BEAR,3L,3S,5L,5S"
-).split(",") if x.strip()]
-
-HEAVY_BASES = set(x.strip().upper() for x in env_str(
-    "HEAVY_BASES",
-    "BTC,ETH,BNB,SOL,XRP,DOGE,ADA,TRX,LINK,AVAX,DOT,LTC,BCH,XMR,GMX,AAVE,UNI,ATOM"
-).split(",") if x.strip())
-
-# ============================================================
-# STATE
-# ============================================================
-
-STATE_LOCK = threading.RLock()
-SCAN_LOCK = threading.RLock()
-TRACK_LOCK = threading.RLock()
-HEARTBEAT = {"scan": time.time(), "track": time.time(), "watchdog_alerted": False}
-
-
-def empty_stat() -> Dict[str, int]:
-    return {"profit": 0, "sl": 0, "expired": 0, "early_exit": 0}
-
-
-def default_state() -> Dict[str, Any]:
-    return {
-        "version": APP_VERSION,
-        "deploy_marker": DEPLOY_MARKER,
-        "created_at": time.time(),
-        "last_scan_at": 0,
-        "last_scan_report_at": 0,
-        "last_track_at": 0,
-        "last_error": "",
-        "active_signals": [],
-        "pending_setups": [],
-        "cooldowns": {},
-        "stats": {
-            "total": empty_stat(),
-            "side": {},
-            "class": {},
-            "strategy": {},
-            "type": {},
-        },
-        "circuit": {
-            "daily_key": time.strftime("%Y-%m-%d", time.gmtime()),
-            "daily_sl": 0,
-            "consecutive_sl": 0,
-            "paused_until": 0,
-        },
-        "last_scan": {},
-    }
-
-
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
-        return default_state()
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            s = json.load(f)
-        base = default_state()
-        for k, v in base.items():
-            if k not in s:
-                s[k] = v
-        s["version"] = APP_VERSION
-        s["deploy_marker"] = DEPLOY_MARKER
-        return s
-    except Exception:
-        return default_state()
-
-
-STATE = load_state()
-
-
-def save_state() -> None:
-    with STATE_LOCK:
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(STATE, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, STATE_FILE)
-
-# ============================================================
-# UTILS
-# ============================================================
-
-def now_ts() -> float:
-    return time.time()
-
-
-def fmt_price(x: float) -> str:
-    if x >= 100:
-        return f"{x:.2f}"
-    if x >= 1:
-        return f"{x:.4f}".rstrip("0").rstrip(".")
-    if x >= 0.01:
-        return f"{x:.6f}".rstrip("0").rstrip(".")
-    return f"{x:.8f}".rstrip("0").rstrip(".")
-
-
-def display_symbol(symbol: str) -> str:
-    return symbol.replace("-", "/")
-
-
-def base_asset(symbol: str) -> str:
-    return symbol.replace("-USDT", "").replace("/USDT", "").upper()
-
-
-def is_ultra_risk(symbol: str) -> bool:
-    b = base_asset(symbol)
-    return any(k in b for k in ULTRA_RISK_KEYWORDS)
-
-
-def safe_div(a: float, b: float, default: float = 0.0) -> float:
-    try:
-        if b == 0:
-            return default
-        return a / b
-    except Exception:
-        return default
-
-
-def item_total(item: Dict[str, int]) -> int:
-    return int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0)) + int(item.get("early_exit", 0))
-
-
-def item_wr(item: Dict[str, int]) -> Tuple[int, float]:
-    total = item_total(item)
-    if total <= 0:
-        return 0, 0.0
-    return total, 100.0 * float(item.get("profit", 0)) / total
-
-
-def item_sl_rate(item: Dict[str, int]) -> float:
-    total = item_total(item)
-    if total <= 0:
-        return 0.0
-    return 100.0 * float(item.get("sl", 0)) / total
-
-
-def format_stat_line(name: str, item: Dict[str, int]) -> str:
-    total, wr = item_wr(item)
-    return (
-        f"{name}: {int(item.get('profit', 0))} profit / "
-        f"{int(item.get('sl', 0))} SL / "
-        f"{int(item.get('expired', 0))} expired / "
-        f"{int(item.get('early_exit', 0))} early-exit / "
-        f"WR {wr:.1f}%"
-    )
-
-
-def stats_summary_text(limit: int = 6) -> str:
-    st = STATE.get("stats", {})
-    lines = ["", "📊 <b>Статистика V14</b>"]
-    lines.append(format_stat_line("Итого", st.get("total", empty_stat())))
-    for title, key in [("Стороны", "side"), ("Стратегии", "strategy"), ("Типы", "type")]:
-        bucket = st.get(key, {}) or {}
-        if not bucket:
-            continue
-        lines.append("")
-        lines.append(f"<b>{title}:</b>")
-        items = sorted(bucket.items(), key=lambda kv: item_total(kv[1]), reverse=True)[:limit]
-        for name, item in items:
-            lines.append(format_stat_line(str(name), item))
-    return "\n".join(lines)
-
-# ============================================================
-# HTTP / BINGX
-# ============================================================
-
-def make_session() -> requests.Session:
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "V14ProfessionalScalper/1.0"})
-    retry = Retry(
-        total=API_RETRY_TOTAL,
-        connect=API_RETRY_TOTAL,
-        read=API_RETRY_TOTAL,
-        backoff_factor=0.35,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
-
-SESSION = make_session()
-
-
-def http_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None) -> Any:
-    url = BINGX_BASE.rstrip("/") + path
-    last = None
-    for _ in range(2):
-        try:
-            r = SESSION.get(url, params=params or {}, timeout=timeout or HTTP_TIMEOUT)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-            time.sleep(0.15)
-    raise last  # type: ignore
-
-
-def bingx_symbols() -> List[str]:
-    try:
-        data = http_get("/openApi/swap/v2/quote/contracts")
-        arr = data.get("data", []) if isinstance(data, dict) else []
-        out = []
-        for it in arr:
-            sym = str(it.get("symbol", ""))
-            if not sym or "USDT" not in sym:
-                continue
-            if not sym.endswith("USDT") and not sym.endswith("-USDT"):
-                continue
-            if "-" not in sym and sym.endswith("USDT"):
-                sym = sym[:-4] + "-USDT"
-            status = str(it.get("status", it.get("state", ""))).lower()
-            if status and any(x in status for x in ["offline", "delist", "suspend"]):
-                continue
-            out.append(sym)
-        out = sorted(list(dict.fromkeys(out)))
-        return out
-    except Exception as e:
-        STATE["last_error"] = f"symbols: {repr(e)}"
-        return []
-
-
-def parse_klines_payload(data: Any) -> List[Dict[str, float]]:
-    raw = data.get("data", []) if isinstance(data, dict) else data
-    if raw is None:
-        raw = []
-    out = []
-    for row in raw:
-        try:
-            if isinstance(row, dict):
-                t = float(row.get("time", row.get("openTime", row.get("t", 0))))
-                o = float(row.get("open", row.get("o")))
-                h = float(row.get("high", row.get("h")))
-                l = float(row.get("low", row.get("l")))
-                c = float(row.get("close", row.get("c")))
-                v = float(row.get("volume", row.get("v", row.get("quoteVolume", 0))))
-            else:
-                # BingX usually returns [time, open, high, low, close, volume]
-                t = float(row[0])
-                o = float(row[1])
-                h = float(row[2])
-                l = float(row[3])
-                c = float(row[4])
-                v = float(row[5]) if len(row) > 5 else 0.0
-            if o > 0 and h > 0 and l > 0 and c > 0:
-                out.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": max(v, 0.0)})
-        except Exception:
-            continue
-    out.sort(key=lambda x: x["t"])
-    return out
-
-
-def klines(symbol: str, interval: str, limit: int = 60) -> List[Dict[str, float]]:
-    data = http_get("/openApi/swap/v3/quote/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    out = parse_klines_payload(data)
-    if not out:
-        # fallback v2
-        data = http_get("/openApi/swap/v2/quote/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-        out = parse_klines_payload(data)
-    return out[-limit:]
-
-# ============================================================
-# INDICATORS / PRICE ACTION
-# ============================================================
-
-def closes(c: List[Dict[str, float]]) -> List[float]:
-    return [x["c"] for x in c]
-
-
-def highs(c: List[Dict[str, float]]) -> List[float]:
-    return [x["h"] for x in c]
-
-
-def lows(c: List[Dict[str, float]]) -> List[float]:
-    return [x["l"] for x in c]
-
-
-def volumes(c: List[Dict[str, float]]) -> List[float]:
-    return [x["v"] for x in c]
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 def pct(a: float, b: float) -> float:
@@ -662,2045 +83,1416 @@ def pct(a: float, b: float) -> float:
     return (a - b) / b
 
 
-def percent_change(c: List[Dict[str, float]], bars: int) -> float:
-    if len(c) < bars + 1:
-        return 0.0
-    return pct(c[-1]["c"], c[-1 - bars]["c"])
+def now_ts() -> float:
+    return time.time()
 
 
-def avg(vals: List[float], default: float = 0.0) -> float:
-    vals = [x for x in vals if math.isfinite(x)]
-    if not vals:
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
         return default
+
+
+def fmt_price(x: float) -> str:
+    if x <= 0:
+        return "0"
+    if x >= 1000:
+        return f"{x:.2f}"
+    if x >= 100:
+        return f"{x:.3f}"
+    if x >= 10:
+        return f"{x:.4f}"
+    if x >= 1:
+        return f"{x:.5f}"
+    if x >= 0.1:
+        return f"{x:.6f}"
+    return f"{x:.8f}"
+
+
+def roi_text(price_move_pct: float, leverage: int) -> str:
+    return f"{price_move_pct * leverage * 100:.1f}% ROI"
+
+# ----------------------------
+# Config
+# ----------------------------
+@dataclass
+class Config:
+    telegram_token: str = env_str("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = env_str("TELEGRAM_CHAT_ID", "")
+    admin_key: str = env_str("ADMIN_KEY", "")
+
+    bingx_base: str = env_str("BINGX_BASE", "https://open-api.bingx.com")
+
+    scan_interval_sec: int = env_int("SCAN_INTERVAL_SEC", 180)
+    request_timeout_sec: int = env_int("REQUEST_TIMEOUT_SEC", 10)
+    max_symbols_per_scan: int = env_int("MAX_SYMBOLS_PER_SCAN", 180)
+    hot_symbols_to_analyze: int = env_int("HOT_SYMBOLS_TO_ANALYZE", 45)
+    max_signals_per_scan: int = env_int("MAX_SIGNALS_PER_SCAN", 2)
+    max_active_signals: int = env_int("MAX_ACTIVE_SIGNALS", 5)
+
+    leverage: int = env_int("LEVERAGE", 10)
+    rm_per_signal_pct: float = env_float("RM_PER_SIGNAL_PCT", 0.5)
+
+    # Anti-silence: делаем мягче, чтобы бот не молчал сутками.
+    anti_silence_enabled: bool = env_bool("ANTI_SILENCE_ENABLED", True)
+    starvation_soft_minutes: int = env_int("STARVATION_SOFT_MINUTES", 60)
+    starvation_hard_minutes: int = env_int("STARVATION_HARD_MINUTES", 180)
+
+    min_quality_a: int = env_int("MIN_QUALITY_A", 82)
+    min_quality_b_plus: int = env_int("MIN_QUALITY_B_PLUS", 72)
+    min_quality_b: int = env_int("MIN_QUALITY_B", 64)
+
+    # Tolerance around levels.
+    level_tolerance_a: float = env_float("LEVEL_TOLERANCE_A", 0.0012)          # 0.12%
+    level_tolerance_b_plus: float = env_float("LEVEL_TOLERANCE_B_PLUS", 0.0020)
+    level_tolerance_b: float = env_float("LEVEL_TOLERANCE_B", 0.0028)
+
+    vwap_tolerance_b: float = env_float("VWAP_RECLAIM_TOLERANCE_B", 0.0020)
+    ema_tolerance_b: float = env_float("EMA_RECLAIM_TOLERANCE_B", 0.0025)
+
+    # SL / RR. Для B сигналов стоп компактнее.
+    max_sl_price_pct_a: float = env_float("MAX_SL_PRICE_PCT_A", 0.0065)  # 0.65% price = 6.5% ROI x10
+    max_sl_price_pct_b: float = env_float("MAX_SL_PRICE_PCT_B", 0.0055)
+    min_rr_a: float = env_float("MIN_RR_A", 1.80)
+    min_rr_b: float = env_float("MIN_RR_B", 1.30)
+
+    # ROI targets on leveraged position.
+    a_tp1_roi: float = env_float("A_TP1_ROI", 0.10)
+    a_tp2_roi: float = env_float("A_TP2_ROI", 0.16)
+    a_tp3_roi: float = env_float("A_TP3_ROI", 0.23)
+    a_tp4_roi: float = env_float("A_TP4_ROI", 0.32)
+    a_tp5_roi: float = env_float("A_TP5_ROI", 0.42)
+
+    bplus_tp1_roi: float = env_float("BPLUS_TP1_ROI", 0.08)
+    bplus_tp2_roi: float = env_float("BPLUS_TP2_ROI", 0.13)
+    bplus_tp3_roi: float = env_float("BPLUS_TP3_ROI", 0.18)
+
+    b_tp1_roi: float = env_float("B_TP1_ROI", 0.065)
+    b_tp2_roi: float = env_float("B_TP2_ROI", 0.105)
+    b_tp3_roi: float = env_float("B_TP3_ROI", 0.145)
+
+    # Filters.
+    min_5m_volume_ratio_a: float = env_float("MIN_5M_VOLUME_RATIO_A", 0.85)
+    min_5m_volume_ratio_b: float = env_float("MIN_5M_VOLUME_RATIO_B", 0.45)
+    min_recent_capacity_pct_a: float = env_float("MIN_RECENT_CAPACITY_PCT_A", 0.009)
+    min_recent_capacity_pct_b: float = env_float("MIN_RECENT_CAPACITY_PCT_B", 0.0055)
+    max_chase_15m_pct: float = env_float("MAX_CHASE_15M_PCT", 0.045)  # avoid entering after huge candle
+    max_chase_30m_pct: float = env_float("MAX_CHASE_30M_PCT", 0.075)
+
+    cooldown_minutes_a: int = env_int("COOLDOWN_MINUTES_A", 90)
+    cooldown_minutes_b: int = env_int("COOLDOWN_MINUTES_B", 45)
+    same_side_cooldown_minutes: int = env_int("SAME_SIDE_COOLDOWN_MINUTES", 120)
+
+    pending_confirmation_timeout_sec: int = env_int("PENDING_CONFIRMATION_TIMEOUT_SEC", 12 * 60)
+    pending_enabled: bool = env_bool("PENDING_ENABLED", True)
+
+    signal_expiry_minutes: int = env_int("SIGNAL_EXPIRY_MINUTES", 180)
+    track_active_signals: bool = env_bool("TRACK_ACTIVE_SIGNALS", True)
+
+    # Updates. По умолчанию не спамим scan update.
+    send_scan_updates: bool = env_bool("SEND_SCAN_UPDATES", False)
+    scan_update_min_interval_sec: int = env_int("SCAN_UPDATE_MIN_INTERVAL_SEC", 3 * 60 * 60)
+
+    state_file: str = env_str("STATE_FILE", "/tmp/v14_11_state.json")
+
+CFG = Config()
+
+# ----------------------------
+# HTTP Session
+# ----------------------------
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.35,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": f"{VERSION}/1.0"})
+    return s
+
+SESSION = make_session()
+STATE_LOCK = threading.RLock()
+SCAN_LOCK = asyncio.Lock()
+
+# ----------------------------
+# State
+# ----------------------------
+def default_state() -> Dict[str, Any]:
+    return {
+        "version": VERSION,
+        "bot_start_ts": now_ts(),
+        "last_signal_ts": 0,
+        "last_scan_ts": 0,
+        "last_scan_summary": {},
+        "last_scan_update_ts": 0,
+        "cooldowns": {},
+        "side_cooldowns": {},
+        "pending": {},
+        "active": {},
+        "stats": {"profit": 0, "sl": 0, "expired": 0, "early": 0},
+        "sent_today": {},
+    }
+
+
+def load_state() -> Dict[str, Any]:
+    with STATE_LOCK:
+        try:
+            if os.path.exists(CFG.state_file):
+                with open(CFG.state_file, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+            else:
+                st = default_state()
+        except Exception:
+            log.exception("Cannot load state, using default")
+            st = default_state()
+
+        base = default_state()
+        for k, v in base.items():
+            st.setdefault(k, v)
+        st["version"] = VERSION
+        return st
+
+
+def save_state_atomic(state: Dict[str, Any]) -> None:
+    with STATE_LOCK:
+        folder = os.path.dirname(CFG.state_file) or "."
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="v14_11_", suffix=".json", dir=folder)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(tmp_path, CFG.state_file)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
+
+STATE = load_state()
+save_state_atomic(STATE)
+
+# ----------------------------
+# Telegram
+# ----------------------------
+def telegram_send(text: str, disable_preview: bool = True) -> bool:
+    if not CFG.telegram_token or not CFG.telegram_chat_id:
+        log.warning("Telegram ENV missing. Message not sent:\n%s", text)
+        return False
+    url = f"https://api.telegram.org/bot{CFG.telegram_token}/sendMessage"
+    payload = {
+        "chat_id": CFG.telegram_chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_preview,
+    }
+    try:
+        r = SESSION.post(url, json=payload, timeout=CFG.request_timeout_sec)
+        if r.status_code >= 300:
+            log.warning("Telegram error %s: %s", r.status_code, r.text[:500])
+            return False
+        return True
+    except Exception:
+        log.exception("Telegram send failed")
+        return False
+
+
+def e(s: Any) -> str:
+    return html.escape(str(s), quote=False)
+
+# ----------------------------
+# BingX API
+# ----------------------------
+def bingx_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = CFG.bingx_base.rstrip("/") + path
+    r = SESSION.get(url, params=params or {}, timeout=CFG.request_timeout_sec)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        # BingX usually: {code:0,data:...}
+        if str(data.get("code", "0")) not in ("0", "200") and "data" not in data:
+            raise RuntimeError(f"BingX API error: {data}")
+        return data.get("data", data)
+    return data
+
+
+def to_bingx_symbol(symbol: str) -> str:
+    return symbol.replace("/", "-").upper()
+
+
+def to_display_symbol(symbol: str) -> str:
+    return symbol.replace("-", "/").upper()
+
+
+def normalize_symbols_from_contracts(data: Any) -> List[str]:
+    symbols: List[str] = []
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("list") or data.get("contracts") or []
+    if not isinstance(data, list):
+        return []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        sym = str(item.get("symbol") or item.get("contract") or item.get("pair") or "").upper()
+        if not sym:
+            continue
+        if "USDT" not in sym:
+            continue
+        status = str(item.get("status", item.get("state", "1"))).lower()
+        if status in ("0", "offline", "delisted", "suspend", "suspended"):
+            continue
+        if "-" not in sym and "/" in sym:
+            sym = sym.replace("/", "-")
+        if sym.endswith("-USDT") or sym.endswith("USDT"):
+            if "-" not in sym:
+                sym = sym.replace("USDT", "-USDT")
+            symbols.append(sym)
+    return sorted(set(symbols))
+
+
+def fetch_contract_symbols() -> List[str]:
+    paths = [
+        "/openApi/swap/v2/quote/contracts",
+        "/openApi/swap/v2/quote/contract",
+    ]
+    for p in paths:
+        try:
+            data = bingx_get(p)
+            syms = normalize_symbols_from_contracts(data)
+            if syms:
+                return syms
+        except Exception as ex:
+            log.warning("contracts endpoint failed %s: %s", p, ex)
+    # Fallback small universe.
+    return [
+        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "ADA-USDT",
+        "DOGE-USDT", "LINK-USDT", "AVAX-USDT", "SUI-USDT", "APT-USDT", "ARB-USDT",
+        "OP-USDT", "INJ-USDT", "TIA-USDT", "NEAR-USDT", "SEI-USDT", "LDO-USDT",
+        "APE-USDT", "FIL-USDT", "ATOM-USDT", "DYDX-USDT", "JUP-USDT", "WLD-USDT",
+    ]
+
+
+def fetch_tickers() -> Dict[str, Dict[str, Any]]:
+    paths = [
+        "/openApi/swap/v2/quote/ticker",
+        "/openApi/swap/v1/ticker/24hr",
+    ]
+    for p in paths:
+        try:
+            data = bingx_get(p)
+            if isinstance(data, dict) and "data" in data:
+                data = data["data"]
+            items = data if isinstance(data, list) else []
+            out: Dict[str, Dict[str, Any]] = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sym = str(it.get("symbol") or "").upper()
+                if not sym or "USDT" not in sym:
+                    continue
+                sym = to_bingx_symbol(sym)
+                out[sym] = it
+            if out:
+                return out
+        except Exception as ex:
+            log.warning("ticker endpoint failed %s: %s", p, ex)
+    return {}
+
+
+def parse_candles(raw: Any) -> List[Dict[str, float]]:
+    if isinstance(raw, dict):
+        raw = raw.get("data") or raw.get("list") or raw.get("klines") or raw.get("candles") or []
+    if not isinstance(raw, list):
+        return []
+
+    candles: List[Dict[str, float]] = []
+    for row in raw:
+        try:
+            if isinstance(row, dict):
+                ts = safe_float(row.get("time") or row.get("openTime") or row.get("timestamp") or row.get("T") or 0)
+                o = safe_float(row.get("open") or row.get("o"))
+                h = safe_float(row.get("high") or row.get("h"))
+                l = safe_float(row.get("low") or row.get("l"))
+                c = safe_float(row.get("close") or row.get("c"))
+                v = safe_float(row.get("volume") or row.get("vol") or row.get("v") or row.get("quoteVolume") or 0)
+            elif isinstance(row, (list, tuple)) and len(row) >= 6:
+                # Often: [time, open, high, low, close, volume]
+                ts = safe_float(row[0])
+                o = safe_float(row[1])
+                h = safe_float(row[2])
+                l = safe_float(row[3])
+                c = safe_float(row[4])
+                v = safe_float(row[5])
+            else:
+                continue
+            if o > 0 and h > 0 and l > 0 and c > 0:
+                candles.append({"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": max(v, 0.0)})
+        except Exception:
+            continue
+
+    # Sort ascending by timestamp if possible.
+    candles.sort(key=lambda x: x.get("ts", 0))
+    return candles
+
+
+def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Dict[str, float]]:
+    sym = to_bingx_symbol(symbol)
+    endpoints = [
+        ("/openApi/swap/v3/quote/klines", {"symbol": sym, "interval": interval, "limit": limit}),
+        ("/openApi/swap/v2/quote/klines", {"symbol": sym, "interval": interval, "limit": limit}),
+    ]
+    last_error = None
+    for path, params in endpoints:
+        try:
+            raw = bingx_get(path, params=params)
+            candles = parse_candles(raw)
+            if len(candles) >= 10:
+                return candles[-limit:]
+        except Exception as ex:
+            last_error = ex
+    if last_error:
+        log.debug("klines failed %s %s: %s", sym, interval, last_error)
+    return []
+
+# ----------------------------
+# Indicators
+# ----------------------------
+def closes(c: List[Dict[str, float]]) -> List[float]:
+    return [x["close"] for x in c]
+
+
+def highs(c: List[Dict[str, float]]) -> List[float]:
+    return [x["high"] for x in c]
+
+
+def lows(c: List[Dict[str, float]]) -> List[float]:
+    return [x["low"] for x in c]
+
+
+def volumes(c: List[Dict[str, float]]) -> List[float]:
+    return [x["volume"] for x in c]
+
+
+def ema_values(values: List[float], period: int) -> List[float]:
+    if not values:
+        return []
+    k = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def ema_last(values: List[float], period: int) -> float:
+    ev = ema_values(values, period)
+    return ev[-1] if ev else 0.0
+
+
+def sma(values: List[float], period: int) -> float:
+    if not values:
+        return 0.0
+    vals = values[-period:]
     return sum(vals) / len(vals)
 
 
-def ema(values: List[float], length: int) -> float:
-    if not values:
+def rsi_last(values: List[float], period: int = 14) -> float:
+    if len(values) < period + 2:
+        return 50.0
+    gains = []
+    losses = []
+    recent = values[-(period + 1):]
+    for i in range(1, len(recent)):
+        d = recent[i] - recent[i - 1]
+        if d >= 0:
+            gains.append(d)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(d))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def atr_last(candles: List[Dict[str, float]], period: int = 14) -> float:
+    if len(candles) < period + 2:
         return 0.0
-    if len(values) < length:
-        return avg(values, values[-1])
-    k = 2.0 / (length + 1.0)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1.0 - k)
-    return e
+    trs: List[float] = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        pc = candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    vals = trs[-period:]
+    return sum(vals) / len(vals) if vals else 0.0
 
 
-def vwap(c: List[Dict[str, float]], length: int = 20) -> float:
-    arr = c[-length:] if len(c) >= length else c
+def vwap_last(candles: List[Dict[str, float]], period: int = 48) -> float:
+    if not candles:
+        return 0.0
+    part = candles[-period:]
     pv = 0.0
     vv = 0.0
-    for x in arr:
-        typical = (x["h"] + x["l"] + x["c"]) / 3.0
-        pv += typical * x["v"]
-        vv += x["v"]
+    for x in part:
+        typical = (x["high"] + x["low"] + x["close"]) / 3
+        v = max(x["volume"], 0.0)
+        pv += typical * v
+        vv += v
     if vv <= 0:
-        return arr[-1]["c"] if arr else 0.0
+        return part[-1]["close"]
     return pv / vv
 
 
-def atr(c: List[Dict[str, float]], length: int = 14) -> float:
-    if len(c) < 2:
+def macd_hist_last(values: List[float]) -> float:
+    if len(values) < 35:
         return 0.0
-    trs = []
-    for i in range(1, len(c)):
-        h = c[i]["h"]
-        l = c[i]["l"]
-        pc = c[i - 1]["c"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if not trs:
+    e12 = ema_values(values, 12)
+    e26 = ema_values(values, 26)
+    n = min(len(e12), len(e26))
+    macd = [e12[-n + i] - e26[-n + i] for i in range(n)]
+    sig = ema_values(macd, 9)
+    return macd[-1] - sig[-1] if sig else 0.0
+
+
+def recent_capacity_pct(c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> float:
+    """Recent realistic movement capacity without leverage."""
+    vals = []
+    for c, n in ((c5, 18), (c15, 12)):
+        for x in c[-n:]:
+            if x["close"] > 0:
+                vals.append((x["high"] - x["low"]) / x["close"])
+    if not vals:
         return 0.0
-    return avg(trs[-length:])
+    vals = sorted(vals)
+    # 75th percentile, not max, чтобы не целиться в случайный фитиль.
+    idx = int(0.75 * (len(vals) - 1))
+    return vals[idx]
 
 
-def candle_range(x: Dict[str, float]) -> float:
-    return max(x["h"] - x["l"], 0.0)
-
-
-def close_location(x: Dict[str, float]) -> float:
-    r = candle_range(x)
-    if r <= 0:
-        return 0.5
-    return (x["c"] - x["l"]) / r
-
-
-def volume_ratio(c: List[Dict[str, float]], lookback: int = 20) -> float:
-    if len(c) < 3:
-        return 1.0
-    cur = c[-1]["v"]
-    hist = [x["v"] for x in c[-lookback - 1:-1] if x["v"] >= 0]
-    base = avg(hist, cur or 1.0)
-    if base <= 0:
-        return 1.0 if cur <= 0 else 10.0
-    return min(cur / base, 20.0)
-
-
-def range_ratio(c: List[Dict[str, float]], lookback: int = 20) -> float:
-    if len(c) < 3:
-        return 1.0
-    cur = candle_range(c[-1])
-    hist = [candle_range(x) for x in c[-lookback - 1:-1]]
-    base = avg(hist, cur or 1.0)
-    if base <= 0:
-        return 1.0 if cur <= 0 else 10.0
-    return min(cur / base, 10.0)
-
-
-def recent_range_pct(c: List[Dict[str, float]], bars: int = 12) -> float:
-    if len(c) < 2:
+def vol_ratio(candles: List[Dict[str, float]], lookback: int = 30) -> float:
+    if len(candles) < 8:
         return 0.0
-    arr = c[-bars:] if len(c) >= bars else c
-    hi = max(highs(arr))
-    lo = min(lows(arr))
-    last = arr[-1]["c"]
-    return safe_div(hi - lo, last, 0.0)
+    # Берём последнюю закрытую свечу. Если API даёт текущую свечу последней, это всё равно лучше, чем 0.
+    last_v = candles[-1]["volume"]
+    base = [x["volume"] for x in candles[-(lookback + 1):-1] if x["volume"] > 0]
+    if not base:
+        return 1.0 if last_v > 0 else 0.0
+    avg = sum(base) / len(base)
+    if avg <= 0:
+        return 0.0
+    return last_v / avg
 
 
-def two_last_same_color(c: List[Dict[str, float]], side: str) -> bool:
-    if len(c) < 2:
+def find_support_resistance(candles: List[Dict[str, float]], lookback: int = 50) -> Tuple[float, float]:
+    part = candles[-lookback:] if len(candles) >= lookback else candles[:]
+    if not part:
+        return 0.0, 0.0
+    # Более устойчиво: не абсолютный low/high, а ближние экстремумы.
+    lows_sorted = sorted([x["low"] for x in part])
+    highs_sorted = sorted([x["high"] for x in part], reverse=True)
+    support = lows_sorted[min(2, len(lows_sorted) - 1)]
+    resistance = highs_sorted[min(2, len(highs_sorted) - 1)]
+    return support, resistance
+
+# ----------------------------
+# Market mode / ranking
+# ----------------------------
+QUALITY_BASES = {
+    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "LINK", "AVAX", "SUI", "APT", "ARB", "OP",
+    "INJ", "TIA", "NEAR", "SEI", "LDO", "APE", "FIL", "ATOM", "DYDX", "JUP", "WLD", "UNI", "AAVE",
+    "ORDI", "TON", "TRX", "DOT", "ETC", "LTC", "BCH", "1000PEPE", "1000BONK", "FET", "RENDER",
+}
+
+ULTRA_RISK_WORDS = (
+    "TEST", "BEER", "PUMP", "PONKE", "WHY", "MOTHER", "TROLL", "CAT", "DOGS", "RATS",
+)
+
+
+def base_asset(symbol: str) -> str:
+    s = to_bingx_symbol(symbol)
+    return s.split("-")[0]
+
+
+def is_ultra_risk(symbol: str) -> bool:
+    base = base_asset(symbol)
+    if base in QUALITY_BASES:
         return False
-    a, b = c[-2], c[-1]
-    if side == "SHORT":
-        return a["c"] < a["o"] and b["c"] < b["o"]
-    return a["c"] > a["o"] and b["c"] > b["o"]
+    # Не режем всё подряд, иначе бот опять будет молчать. Только явный мусор.
+    return any(w in base for w in ULTRA_RISK_WORDS)
 
 
-def micro_break(c1: List[Dict[str, float]], side: str, bars: int = 4) -> bool:
-    if len(c1) < bars + 2:
-        return False
-    last = c1[-1]
-    prev = c1[-bars - 1:-1]
-    if side == "SHORT":
-        return last["c"] <= min(lows(prev)) or last["l"] <= min(lows(prev))
-    return last["c"] >= max(highs(prev)) or last["h"] >= max(highs(prev))
-
-
-def macd_hist(c: List[Dict[str, float]], fast: int = 12, slow: int = 26, signal: int = 9) -> float:
-    """MACD histogram approximation from candle closes. Positive = bullish momentum, negative = bearish."""
-    cl = closes(c)
-    if len(cl) < slow + signal:
-        return 0.0
-    macd_line = []
-    # Use rolling EMA approximations over growing windows; enough for a filter, not for charting.
-    for i in range(slow, len(cl) + 1):
-        sub = cl[:i]
-        macd_line.append(ema(sub[-max(slow * 3, slow):], fast) - ema(sub[-max(slow * 3, slow):], slow))
-    if len(macd_line) < signal:
-        return macd_line[-1] if macd_line else 0.0
-    sig = ema(macd_line, signal)
-    return macd_line[-1] - sig
-
-
-def obv_slope(c: List[Dict[str, float]], length: int = 10) -> float:
-    """Normalized OBV slope. Positive = accumulation, negative = distribution."""
-    if len(c) < length + 2:
-        return 0.0
-    vals = [0.0]
-    for i in range(1, len(c)):
-        if c[i]["c"] > c[i - 1]["c"]:
-            vals.append(vals[-1] + c[i]["v"])
-        elif c[i]["c"] < c[i - 1]["c"]:
-            vals.append(vals[-1] - c[i]["v"])
-        else:
-            vals.append(vals[-1])
-    recent = vals[-length:]
-    denom = sum(abs(x) for x in recent) / max(len(recent), 1)
-    if denom <= 0:
-        denom = avg([x["v"] for x in c[-length:]], 1.0)
-    return safe_div(recent[-1] - recent[0], denom * max(length, 1), 0.0)
-
-
-def volume_delta_proxy(c: List[Dict[str, float]], length: int = 8) -> float:
-    """Candle-based volume delta proxy in [-1, 1]. Green volume positive, red volume negative."""
-    if len(c) < 2:
-        return 0.0
-    arr = c[-length:] if len(c) >= length else c
-    signed = 0.0
-    total = 0.0
-    for x in arr:
-        rng = candle_range(x)
-        body = x["c"] - x["o"]
-        # Weight by body dominance; wicks reduce confidence.
-        dominance = abs(body) / rng if rng > 0 else 0.0
-        signed += (1.0 if body > 0 else -1.0 if body < 0 else 0.0) * x["v"] * max(0.25, dominance)
-        total += x["v"]
-    return max(-1.0, min(1.0, safe_div(signed, total, 0.0)))
-
-
-def pro_mtf_confirmation_score(tr: Dict[str, Any]) -> Tuple[float, str, List[str]]:
-    """Return professional MTF confirmation score and explanation."""
-    ctx = tr.get("ctx", {}) or {}
-    side = tr.get("side", "")
-    score = 0.0
-    passed: List[str] = []
-    failed: List[str] = []
-
-    ch1h = float(ctx.get("ch1h_mtf", 0.0))
-    ch4h = float(ctx.get("ch4h_mtf", 0.0))
-    macd15 = float(ctx.get("macd15", 0.0))
-    macd15_prev = float(ctx.get("macd15_prev", 0.0))
-    obv5 = float(ctx.get("obv5_slope", 0.0))
-    obv15 = float(ctx.get("obv15_slope", 0.0))
-    vd1 = float(ctx.get("vdelta1", 0.0))
-    vd5 = float(ctx.get("vdelta5", 0.0))
-
-    if side == "SHORT":
-        # Context should not be violently against the short unless this is a trap/rejection setup.
-        trap = tr.get("strategy") in {"PRO_PUMP_TRAP_SHORT", "PRO_BOUNCE_REJECT_SHORT", "PRO_BEAT_STYLE_SHORT", "PRO_AERO_STYLE_SHORT", "PRO_EXTREME_LEVEL_REJECT_SHORT", "PRO_EXTREME_LEVEL_RECLAIM_LONG"}
-        if ch1h <= 0.006 or trap:
-            score += 0.6; passed.append("1h/4h context ok")
-        else:
-            failed.append("1h контекст против SHORT")
-        if macd15 <= 0 or macd15 < macd15_prev:
-            score += 0.8; passed.append("15m MACD вниз/слабеет")
-        else:
-            failed.append("15m MACD не подтверждает")
-        if obv5 < -0.02 or obv15 < -0.02:
-            score += 0.8; passed.append("OBV distribution")
-        else:
-            failed.append("OBV без распределения")
-        if vd1 < -0.05 or vd5 < -0.05:
-            score += 0.8; passed.append("Vol Δ sell pressure")
-        else:
-            failed.append("Vol Δ слабый")
-        if ctx.get("break_short") or ctx.get("two_red") or ctx.get("under_ema_or_vwap") or float(ctx.get("reject_from_high_10m", 0.0)) >= 0.002:
-            score += 1.0; passed.append("структура SHORT подтверждена")
-        else:
-            failed.append("структура SHORT не подтверждена")
-        if float(ctx.get("loc1", 0.5)) <= 0.48:
-            score += 0.5; passed.append("1m close near low")
-        else:
-            failed.append("закрытие 1m не у low")
+def get_anti_silence_mode(state: Dict[str, Any]) -> str:
+    if not CFG.anti_silence_enabled:
+        return "A_ONLY"
+    now = now_ts()
+    last_signal = safe_float(state.get("last_signal_ts") or 0)
+    start = safe_float(state.get("bot_start_ts") or now)
+    if last_signal > 0:
+        silent_min = (now - last_signal) / 60
     else:
-        if ch1h >= -0.006 or float(ctx.get("ch15m", 0.0)) >= 0.004:
-            score += 0.6; passed.append("1h/RS context ok")
-        else:
-            failed.append("1h контекст против LONG")
-        if macd15 >= 0 or macd15 > macd15_prev:
-            score += 0.8; passed.append("15m MACD вверх/усиливается")
-        else:
-            failed.append("15m MACD не подтверждает")
-        if obv5 > 0.02 or obv15 > 0.02:
-            score += 0.8; passed.append("OBV accumulation")
-        else:
-            failed.append("OBV без накопления")
-        if vd1 > 0.05 or vd5 > 0.05:
-            score += 0.8; passed.append("Vol Δ buy pressure")
-        else:
-            failed.append("Vol Δ слабый")
-        if ctx.get("break_long") or ctx.get("two_green") or float(ctx.get("bounce_from_low", 0.0)) >= 0.0035:
-            score += 1.0; passed.append("структура LONG подтверждена")
-        else:
-            failed.append("структура LONG не подтверждена")
-        if float(ctx.get("loc1", 0.5)) >= 0.52:
-            score += 0.5; passed.append("1m close near high")
-        else:
-            failed.append("закрытие 1m не у high")
-
-    note = "; ".join(passed[:4])
-    return score, note, failed
-
-# ============================================================
-# MARKET CONTEXT / HOT SCANNER
-# ============================================================
-
-def market_context() -> Dict[str, Any]:
-    try:
-        btc1 = klines("BTC-USDT", "1m", 80)
-        btc5 = klines("BTC-USDT", "5m", 80)
-        eth5 = klines("ETH-USDT", "5m", 80)
-        btc_1h = percent_change(btc5, 12)
-        btc_6h = percent_change(btc5, 72) if len(btc5) >= 73 else percent_change(btc5, min(20, len(btc5)-1))
-        eth_1h = percent_change(eth5, 12)
-        btc_1m3 = percent_change(btc1, 3)
-        if btc_6h <= -0.025 or btc_1h <= -0.008:
-            regime = "BTC BEAR"
-        elif btc_6h >= 0.025 or btc_1h >= 0.008:
-            regime = "BTC BULL"
-        else:
-            regime = "BTC RANGE"
-        panic = btc_1h <= -0.012 or btc_1m3 <= -0.004
-        return {
-            "regime": regime,
-            "btc_1h": btc_1h,
-            "btc_6h": btc_6h,
-            "btc_1m3": btc_1m3,
-            "eth_1h": eth_1h,
-            "panic": panic,
-            "text": f"{regime}: 1h {btc_1h*100:+.2f}%, 6h {btc_6h*100:+.2f}%, BTC 1m3 {btc_1m3*100:+.2f}%",
-        }
-    except Exception as e:
-        return {"regime": "UNKNOWN", "btc_1h": 0.0, "btc_6h": 0.0, "btc_1m3": 0.0, "eth_1h": 0.0, "panic": False, "text": f"BTC UNKNOWN: {repr(e)}"}
+        silent_min = (now - start) / 60
+    if silent_min >= CFG.starvation_hard_minutes:
+        return "B_FALLBACK"
+    if silent_min >= CFG.starvation_soft_minutes:
+        return "B_PLUS"
+    return "A_ONLY"
 
 
-def hot_score(symbol: str) -> Optional[Tuple[float, str, Dict[str, float]]]:
-    if is_ultra_risk(symbol):
-        return None
-    try:
-        c1 = klines(symbol, "1m", 35)
-        c5 = klines(symbol, "5m", 35)
-        if len(c1) < 15 or len(c5) < 8:
-            return None
-        ch1m3 = percent_change(c1, 3)
-        ch15m = percent_change(c5, 3)
-        ch30m = percent_change(c5, 6)
-        vr1 = volume_ratio(c1, 20)
-        vr5 = volume_ratio(c5, 20)
-        rr1 = range_ratio(c1, 20)
-        rr5 = range_ratio(c5, 20)
-        r15 = recent_range_pct(c1, 15)
-        live = abs(ch1m3) * 10500 + min(vr1, 4.0) * 10 + min(rr1, 4.0) * 12
-        recent = abs(ch15m) * 900 + abs(ch30m) * 380 + min(vr5, 4.0) * 5 + min(rr5, 4.0) * 5
-        score = live + recent + min(r15 * 600, 30)
-        dead = abs(ch1m3) < 0.0012 and rr1 < 0.55 and vr1 < 0.55
-        if dead:
-            score *= 0.20
-        tag = "LIVE/MOM" if (abs(ch1m3) >= 0.003 or rr1 >= 1.0) else "WATCH"
-        note = f"{tag}: 1m3 {ch1m3*100:+.2f}%, 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, vol1 x{vr1:.2f}, vol5 x{vr5:.2f}, range1 x{rr1:.2f}, range5 x{rr5:.2f}"
-        return score, note, {"ch1m3": ch1m3, "ch15m": ch15m, "ch30m": ch30m, "vol1": vr1, "vol5": vr5, "range1": rr1, "range5": rr5}
-    except Exception:
-        return None
+def silent_minutes(state: Dict[str, Any]) -> float:
+    now = now_ts()
+    last_signal = safe_float(state.get("last_signal_ts") or 0)
+    start = safe_float(state.get("bot_start_ts") or now)
+    ref = last_signal if last_signal > 0 else start
+    return max(0.0, (now - ref) / 60)
 
 
-def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
-    universe = [s for s in symbols if not is_ultra_risk(s)][:MAX_ANALYZE_SYMBOLS]
-    scores: List[Tuple[float, str, str]] = []
-    notes: List[str] = []
-    with ThreadPoolExecutor(max_workers=max(2, HOT_WORKERS)) as ex:
-        futs = {ex.submit(hot_score, s): s for s in universe}
-        for fut in as_completed(futs):
-            s = futs[fut]
-            try:
-                res = fut.result()
-                if not res:
-                    continue
-                sc, note, _ = res
-                scores.append((sc, s, note))
-            except Exception:
-                continue
-    scores.sort(reverse=True, key=lambda x: x[0])
-    for sc, s, note in scores[:8]:
-        notes.append(f"{display_symbol(s)} hot {sc:.1f}: {note}")
-    selected = [s for sc, s, _ in scores if sc >= MIN_HOT_SCORE][:HOT_SYMBOLS_TO_ANALYZE]
-    if len(selected) < min(30, HOT_SYMBOLS_TO_ANALYZE):
-        for _, s, _ in scores:
-            if s not in selected:
-                selected.append(s)
-            if len(selected) >= min(30, HOT_SYMBOLS_TO_ANALYZE):
-                break
-    return selected, notes
-
-# ============================================================
-# SYMBOL CONTEXT
-# ============================================================
-
-def symbol_context(symbol: str) -> Optional[Dict[str, Any]]:
-    try:
-        c1 = klines(symbol, "1m", 80)
-        c5 = klines(symbol, "5m", 80)
-        c15 = klines(symbol, "15m", 60)
-        if len(c1) < 30 or len(c5) < 20:
-            return None
-        price = c1[-1]["c"]
-        cl1 = closes(c1)
-        cl5 = closes(c5)
-        ctx = {
-            "symbol": symbol,
-            "price": price,
-            "c1": c1,
-            "c5": c5,
-            "c15": c15,
-            "ch1m1": percent_change(c1, 1),
-            "ch1m3": percent_change(c1, 3),
-            "ch1m5": percent_change(c1, 5),
-            "ch15m": percent_change(c5, 3),
-            "ch30m": percent_change(c5, 6),
-            "ch1h": percent_change(c5, 12),
-            "vol1": volume_ratio(c1, 20),
-            "vol5": volume_ratio(c5, 20),
-            "range1": range_ratio(c1, 20),
-            "range5": range_ratio(c5, 20),
-            "loc1": close_location(c1[-1]),
-            "loc5": close_location(c5[-1]),
-            "ema1_9": ema(cl1[-30:], 9),
-            "ema1_21": ema(cl1[-50:], 21),
-            "ema5_9": ema(cl5[-30:], 9),
-            "ema5_21": ema(cl5[-50:], 21),
-            "vwap1": vwap(c1, 20),
-            "vwap5": vwap(c5, 20),
-            "atr1": atr(c1, 14),
-            "recent_range_15m": recent_range_pct(c1, 15),
-            "recent_range_30m": recent_range_pct(c1, 30),
-            "recent_high_10m": max(highs(c1[-10:])),
-            "recent_low_10m": min(lows(c1[-10:])),
-            "recent_high_20m": max(highs(c1[-20:])),
-            "recent_low_20m": min(lows(c1[-20:])),
-            "last_red": c1[-1]["c"] < c1[-1]["o"],
-            "last_green": c1[-1]["c"] > c1[-1]["o"],
-            "two_red": two_last_same_color(c1, "SHORT"),
-            "two_green": two_last_same_color(c1, "LONG"),
-            "break_short": micro_break(c1, "SHORT", 4),
-            "break_long": micro_break(c1, "LONG", 4),
-        }
-        ctx["pullback_from_high"] = max(0.0, safe_div(ctx["recent_high_20m"] - price, price))
-        ctx["bounce_from_low"] = max(0.0, safe_div(price - ctx["recent_low_20m"], price))
-        ctx["bounce_from_low_10m"] = max(0.0, safe_div(price - ctx["recent_low_10m"], price))
-        ctx["reject_from_high_10m"] = max(0.0, safe_div(ctx["recent_high_10m"] - price, price))
-        ctx["distance_from_high_20m"] = max(0.0, safe_div(ctx["recent_high_20m"] - price, price, 0.0))
-        ctx["distance_from_low_20m"] = max(0.0, safe_div(price - ctx["recent_low_20m"], price, 0.0))
-        ctx["level_range_20m"] = max(0.0, safe_div(ctx["recent_high_20m"] - ctx["recent_low_20m"], price, 0.0))
-        ctx["selloff_15m"] = max(0.0, safe_div(max(highs(c1[-15:])) - min(lows(c1[-15:])), price, 0.0))
-        # MTF / pro-dashboard style filters. 1h/4h are approximated from 15m candles to keep scanning fast.
-        ctx["ch1h_mtf"] = percent_change(c15, 4) if len(c15) >= 5 else ctx["ch1h"]
-        ctx["ch4h_mtf"] = percent_change(c15, 16) if len(c15) >= 17 else ctx["ch1h"]
-        ctx["macd15"] = macd_hist(c15) if len(c15) >= 35 else 0.0
-        ctx["macd15_prev"] = macd_hist(c15[:-1]) if len(c15) >= 36 else 0.0
-        ctx["obv5_slope"] = obv_slope(c5, 10)
-        ctx["obv15_slope"] = obv_slope(c15, 8) if len(c15) >= 10 else 0.0
-        ctx["vdelta1"] = volume_delta_proxy(c1, 8)
-        ctx["vdelta5"] = volume_delta_proxy(c5, 6)
-        ctx["under_ema_or_vwap"] = price < ctx["ema1_9"] or price < ctx["vwap1"]
-        ctx["under_both_ema_vwap"] = price < ctx["ema1_9"] and price < ctx["vwap1"]
-        ctx["above_ema_or_vwap"] = price > ctx["ema1_9"] or price > ctx["vwap1"]
-        ctx["above_both_ema_vwap"] = price > ctx["ema1_9"] and price > ctx["vwap1"]
-        return ctx
-    except Exception:
-        return None
-
-# ============================================================
-# TRADE / QUALITY
-# ============================================================
-
-def build_trade(ctx: Dict[str, Any], side: str, strategy: str, setup_type: str, score: float, reason: str) -> Dict[str, Any]:
-    entry = float(ctx["price"])
-    c1 = ctx["c1"]
-    if side == "SHORT":
-        tps = [entry * (1.0 - m) for m in TP_MOVES]
-        structural_move = safe_div(max(ctx.get("recent_high_10m", entry), entry) - entry, entry, 0.0) + STRUCTURE_BUFFER
-        sl_move = max(structural_move, LOCAL_SCALP_MIN_SL_MOVE)
-        if LOCAL_SCALP_STOP_ENABLED:
-            sl_move = min(sl_move, LOCAL_SCALP_MAX_SL_MOVE)
-        sl = entry * (1.0 + sl_move)
-        tp1_reward = safe_div(entry - tps[0], entry, 0.0)
-        final_reward = safe_div(entry - tps[-1], entry, 0.0)
-        ladder_reward = avg([safe_div(entry - x, entry, 0.0) for x in tps])
+def ticker_score(symbol: str, t: Dict[str, Any]) -> float:
+    # Flexible field names.
+    qv = safe_float(t.get("quoteVolume") or t.get("quoteVol") or t.get("turnover") or t.get("volume") or 0)
+    chg = safe_float(t.get("priceChangePercent") or t.get("priceChangeRate") or t.get("change") or t.get("changeRate") or 0)
+    if abs(chg) > 2:  # maybe percent already, e.g. 5.5
+        chg_pct = abs(chg) / 100
     else:
-        tps = [entry * (1.0 + m) for m in TP_MOVES]
-        structural_move = safe_div(entry - min(ctx.get("recent_low_10m", entry), entry), entry, 0.0) + STRUCTURE_BUFFER
-        sl_move = max(structural_move, LOCAL_SCALP_MIN_SL_MOVE)
-        if LOCAL_SCALP_STOP_ENABLED:
-            sl_move = min(sl_move, LOCAL_SCALP_MAX_SL_MOVE)
-        sl = entry * (1.0 - sl_move)
-        tp1_reward = safe_div(tps[0] - entry, entry, 0.0)
-        final_reward = safe_div(tps[-1] - entry, entry, 0.0)
-        ladder_reward = avg([safe_div(x - entry, entry, 0.0) for x in tps])
+        chg_pct = abs(chg)
+    base_bonus = 20 if base_asset(symbol) in QUALITY_BASES else 0
+    risk_penalty = -60 if is_ultra_risk(symbol) else 0
+    return math.log10(max(qv, 1.0)) * 12 + chg_pct * 120 + base_bonus + risk_penalty
 
-    tp1_rr = safe_div(tp1_reward, sl_move, 0.0)
-    ladder_rr = safe_div(ladder_reward, sl_move, 0.0)
-    final_rr = safe_div(final_reward, sl_move, 0.0)
-    roi_sl = sl_move * LEVERAGE_DISPLAY * 100.0
-    roi_tp1 = tp1_reward * LEVERAGE_DISPLAY * 100.0
+
+def rank_symbols(symbols: List[str], tickers: Dict[str, Dict[str, Any]]) -> List[str]:
+    scored = []
+    for s in symbols:
+        if not s.endswith("-USDT"):
+            continue
+        if is_ultra_risk(s) and len(symbols) > 40:
+            # Явный мусор оставляем внизу, но не обязательно полностью удаляем.
+            pass
+        scored.append((ticker_score(s, tickers.get(s, {})), s))
+    scored.sort(reverse=True)
+    return [s for _, s in scored[:CFG.max_symbols_per_scan]]
+
+
+def btc_context() -> Dict[str, Any]:
+    c1h = fetch_klines("BTC-USDT", "1h", 80)
+    c5 = fetch_klines("BTC-USDT", "5m", 80)
+    if len(c1h) < 10 or len(c5) < 10:
+        return {"mode": "BTC UNKNOWN", "bias_long": True, "bias_short": True, "m1_3": 0.0, "h1": 0.0, "h6": 0.0}
+    h1 = pct(c1h[-1]["close"], c1h[-2]["close"])
+    h6 = pct(c1h[-1]["close"], c1h[-7]["close"]) if len(c1h) >= 7 else 0.0
+    m1_3 = pct(c5[-1]["close"], c5[-4]["close"]) if len(c5) >= 4 else 0.0
+    close = c1h[-1]["close"]
+    ema50 = ema_last(closes(c1h), 50)
+    if abs(h6) < 0.008 and abs(h1) < 0.006:
+        mode = "BTC RANGE"
+    elif close > ema50 and h6 > 0:
+        mode = "BTC BULL"
+    elif close < ema50 and h6 < 0:
+        mode = "BTC BEAR"
+    else:
+        mode = "BTC MIXED"
     return {
-        "id": f"{symbol_key(ctx['symbol'])}_{int(time.time()*1000)}_{side}_{strategy}",
-        "symbol": ctx["symbol"],
-        "side": side,
-        "strategy": strategy,
-        "type": setup_type,
-        "class": "A+" if score >= 88 else "B",
-        "score": round(score, 1),
-        "entry": entry,
-        "sl": sl,
-        "tps": tps,
-        "tp1": tps[0],
-        "tp2": tps[1],
-        "tp3": tps[2],
-        "tp4": tps[3],
-        "tp5": tps[4],
-        "min_profit_target_index": MIN_PROFIT_TARGET_INDEX,
-        "min_profit_target_label": MIN_PROFIT_TARGET_LABEL,
-        "created_at": now_ts(),
-        "reason": reason,
-        "ctx": {
-            "ch1m3": ctx.get("ch1m3", 0),
-            "ch15m": ctx.get("ch15m", 0),
-            "ch30m": ctx.get("ch30m", 0),
-            "vol1": ctx.get("vol1", 0),
-            "vol5": ctx.get("vol5", 0),
-            "range1": ctx.get("range1", 0),
-            "range5": ctx.get("range5", 0),
-            "loc1": ctx.get("loc1", 0.5),
-            "pullback_from_high": ctx.get("pullback_from_high", 0),
-            "bounce_from_low": ctx.get("bounce_from_low", 0),
-            "reject_from_high_10m": ctx.get("reject_from_high_10m", 0),
-            "bounce_from_low_10m": ctx.get("bounce_from_low_10m", 0),
-            "distance_from_high_20m": ctx.get("distance_from_high_20m", 0),
-            "distance_from_low_20m": ctx.get("distance_from_low_20m", 0),
-            "level_range_20m": ctx.get("level_range_20m", 0),
-            "recent_range_15m": ctx.get("recent_range_15m", 0),
-            "recent_range_30m": ctx.get("recent_range_30m", 0),
-            "break_short": ctx.get("break_short", False),
-            "break_long": ctx.get("break_long", False),
-            "two_red": ctx.get("two_red", False),
-            "two_green": ctx.get("two_green", False),
-            "last_red": ctx.get("last_red", False),
-            "last_green": ctx.get("last_green", False),
-            "under_ema_or_vwap": ctx.get("under_ema_or_vwap", False),
-            "under_both_ema_vwap": ctx.get("under_both_ema_vwap", False),
-            "ch1h_mtf": ctx.get("ch1h_mtf", 0),
-            "ch4h_mtf": ctx.get("ch4h_mtf", 0),
-            "macd15": ctx.get("macd15", 0),
-            "macd15_prev": ctx.get("macd15_prev", 0),
-            "obv5_slope": ctx.get("obv5_slope", 0),
-            "obv15_slope": ctx.get("obv15_slope", 0),
-            "vdelta1": ctx.get("vdelta1", 0),
-            "vdelta5": ctx.get("vdelta5", 0),
-        },
-        "risk": {
-            "sl_move": sl_move,
-            "tp1_rr": tp1_rr,
-            "ladder_rr": ladder_rr,
-            "final_rr": final_rr,
-            "roi_sl": roi_sl,
-            "roi_tp1": roi_tp1,
-        },
-        "max_progress": 0.0,
+        "mode": mode,
+        "bias_long": not (mode == "BTC BEAR" and h1 < -0.004),
+        "bias_short": not (mode == "BTC BULL" and h1 > 0.004),
+        "m1_3": m1_3,
+        "h1": h1,
+        "h6": h6,
     }
 
-
-def symbol_key(symbol: str) -> str:
-    return symbol.replace("-", "_").replace("/", "_")
-
-
-def pro_mtf_filter_ok(tr: Dict[str, Any], blocks: Dict[str, int], near: List[str]) -> bool:
-    if not PRO_MTF_FILTER_ENABLED:
+# ----------------------------
+# Signal analysis
+# ----------------------------
+def in_cooldown(state: Dict[str, Any], symbol: str, side: str) -> bool:
+    now = now_ts()
+    cd = state.get("cooldowns", {})
+    side_cd = state.get("side_cooldowns", {})
+    if safe_float(cd.get(symbol, 0)) > now:
         return True
-    score, note, failed = pro_mtf_confirmation_score(tr)
-    required = PRO_MTF_A_PLUS_MIN_CONFIRMATIONS if tr.get("class") == "A+" else PRO_MTF_MIN_CONFIRMATIONS
-    # Very strong setups may pass with a small deficit, but only if delta is not directly against the trade.
-    ctx = tr.get("ctx", {}) or {}
-    side = tr.get("side", "")
-    bad_delta = False
-    if side == "SHORT":
-        bad_delta = float(ctx.get("vdelta1", 0.0)) > 0.25 and float(ctx.get("vdelta5", 0.0)) > 0.15
-    elif side == "LONG":
-        bad_delta = float(ctx.get("vdelta1", 0.0)) < -0.25 and float(ctx.get("vdelta5", 0.0)) < -0.15
-
-    escape = tr.get("score", 0) >= PRO_MTF_STRONG_SCORE_ESCAPE and score >= required - 0.7 and not bad_delta
-    if (score >= required and not (PRO_MTF_BLOCK_BAD_DELTA and bad_delta)) or escape:
-        tr["reason"] = tr.get("reason", "") + f" MTF-фильтр: {score:.1f}/{required:.1f}; {note}."
-        tr.setdefault("ctx", {})["mtf_score"] = score
+    if safe_float(side_cd.get(f"{symbol}:{side}", 0)) > now:
         return True
-
-    blocks["mtf_structure_block"] = blocks.get("mtf_structure_block", 0) + 1
-    if bad_delta:
-        blocks["mtf_bad_delta_block"] = blocks.get("mtf_bad_delta_block", 0) + 1
-    if len(near) < 10:
-        near.append(f"{display_symbol(tr['symbol'])} {side}: MTF {score:.1f}/{required:.1f} блок · " + "; ".join(failed[:3]))
     return False
 
 
-def trade_quality_ok(tr: Dict[str, Any], blocks: Dict[str, int], near: List[str]) -> bool:
-    sym = tr["symbol"]
-    risk = tr["risk"]
-    if tr["score"] < MIN_SCORE_TO_SEND:
-        blocks["score_too_low"] = blocks.get("score_too_low", 0) + 1
-        return False
-    if risk["roi_sl"] > MAX_SCALP_SL_ROI:
-        blocks["sl_roi_too_high_block"] = blocks.get("sl_roi_too_high_block", 0) + 1
-        if len(near) < 10:
-            near.append(f"{display_symbol(sym)} {tr['side']}: SL risk too high {risk['roi_sl']:.1f}% ROI")
-        return False
-    if risk["tp1_rr"] < MIN_TP1_RR:
-        blocks["tp1_rr_block"] = blocks.get("tp1_rr_block", 0) + 1
-        return False
-    if risk["ladder_rr"] < MIN_LADDER_RR:
-        blocks["ladder_rr_block"] = blocks.get("ladder_rr_block", 0) + 1
-        return False
-    if risk["final_rr"] < MIN_FINAL_RR:
-        blocks["final_rr_block"] = blocks.get("final_rr_block", 0) + 1
-        return False
-    # Heavy coins require A+ only, because their fast ladder is often less clean.
-    if base_asset(sym) in HEAVY_BASES and tr["score"] < 90:
-        blocks["heavy_coin_score_block"] = blocks.get("heavy_coin_score_block", 0) + 1
-        return False
-
-    # V14.10: minimum target feasibility. A signal should not be sent if the recent market
-    # cannot realistically carry price to TP3. TP1 is not enough for this system anymore.
-    if TP3_FEASIBILITY_ENABLED and len(tr.get("tps", [])) >= 3:
-        entry = float(tr.get("entry", 0.0) or 0.0)
-        tp3 = float(tr["tps"][MIN_PROFIT_TARGET_INDEX - 1])
-        ctx = tr.get("ctx", {})
-        need = abs(tp3 - entry) / max(entry, 1e-12)
-        recent_capacity = max(
-            abs(float(ctx.get("ch15m", 0.0) or 0.0)),
-            abs(float(ctx.get("ch30m", 0.0) or 0.0)),
-            float(ctx.get("recent_range_15m", 0.0) or 0.0),
-            float(ctx.get("recent_range_30m", 0.0) or 0.0),
-            float(ctx.get("level_range_20m", 0.0) or 0.0),
-        )
-        live_capacity = abs(float(ctx.get("ch1m3", 0.0) or 0.0))
-        if recent_capacity < need * TP3_MIN_RECENT_RANGE_MULT:
-            blocks["tp3_feasibility_block"] = blocks.get("tp3_feasibility_block", 0) + 1
-            if len(near) < 10:
-                near.append(f"{display_symbol(sym)} {tr['side']}: {MIN_PROFIT_TARGET_LABEL} not realistic; need {need*100:.2f}%, recent capacity {recent_capacity*100:.2f}%")
-            return False
-        if live_capacity < need * TP3_MIN_LIVE_PROGRESS_MULT:
-            blocks["tp3_live_momentum_block"] = blocks.get("tp3_live_momentum_block", 0) + 1
-            if len(near) < 10:
-                near.append(f"{display_symbol(sym)} {tr['side']}: live push too weak for {MIN_PROFIT_TARGET_LABEL}; 1m3 {live_capacity*100:.2f}% / need {need*TP3_MIN_LIVE_PROGRESS_MULT*100:.2f}%")
-            return False
-
-    if not pro_mtf_filter_ok(tr, blocks, near):
-        return False
-    return True
-
-# ============================================================
-# STATS / COOLDOWNS / KILL SWITCH
-# ============================================================
-
-def day_key() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-
-def circuit_paused() -> Tuple[bool, float]:
-    with STATE_LOCK:
-        until = float(STATE.get("circuit", {}).get("paused_until", 0) or 0)
-    return now_ts() < until, until
-
-
-def update_circuit_breaker(outcome: str) -> None:
-    if not CIRCUIT_BREAKER_ENABLED:
-        return
-    notify_text = None
-    with STATE_LOCK:
-        c = STATE.setdefault("circuit", default_state()["circuit"])
-        if c.get("daily_key") != day_key():
-            c["daily_key"] = day_key()
-            c["daily_sl"] = 0
-            c["consecutive_sl"] = 0
-        if outcome == "sl":
-            c["daily_sl"] = int(c.get("daily_sl", 0)) + 1
-            c["consecutive_sl"] = int(c.get("consecutive_sl", 0)) + 1
-        elif outcome == "profit":
-            c["consecutive_sl"] = 0
-        should_pause = (
-            outcome == "sl"
-            and (int(c.get("consecutive_sl", 0)) >= MAX_CONSECUTIVE_SL or int(c.get("daily_sl", 0)) >= MAX_DAILY_SL)
-            and now_ts() >= float(c.get("paused_until", 0) or 0)
-        )
-        if should_pause:
-            c["paused_until"] = now_ts() + CIRCUIT_BREAKER_PAUSE_MINUTES * 60
-            notify_text = (
-                f"⛔ <b>CIRCUIT BREAKER</b>\n"
-                f"Новые сигналы на паузе на {CIRCUIT_BREAKER_PAUSE_MINUTES} минут.\n"
-                f"SL подряд: {c.get('consecutive_sl', 0)} · SL за день: {c.get('daily_sl', 0)}\n"
-                f"Активные сигналы продолжают отслеживаться."
-            )
-            c["consecutive_sl"] = 0
-    if notify_text:
-        send_telegram(notify_text)
-
-
-def reset_circuit_breaker() -> None:
-    with STATE_LOCK:
-        STATE["circuit"] = default_state()["circuit"]
-        save_state()
-
-def update_stat_bucket(bucket: Dict[str, Dict[str, int]], key: str, outcome: str) -> None:
-    item = bucket.setdefault(key, empty_stat())
-    item[outcome] = int(item.get(outcome, 0)) + 1
-
-
-def record_outcome(tr: Dict[str, Any], outcome: str) -> None:
-    with STATE_LOCK:
-        STATE["stats"].setdefault("total", empty_stat())[outcome] += 1
-        update_stat_bucket(STATE["stats"].setdefault("side", {}), tr["side"], outcome)
-        update_stat_bucket(STATE["stats"].setdefault("class", {}), tr.get("class", "?"), outcome)
-        update_stat_bucket(STATE["stats"].setdefault("strategy", {}), tr["strategy"], outcome)
-        update_stat_bucket(STATE["stats"].setdefault("type", {}), tr["type"], outcome)
-    update_circuit_breaker(outcome)
-    save_state()
-
-
-def strategy_allowed(strategy: str) -> Tuple[bool, str]:
-    if not STRATEGY_STATS_PROTECTION:
-        return True, "ok"
-    item = STATE.get("stats", {}).get("strategy", {}).get(strategy, empty_stat())
-    total, wr = item_wr(item)
-    slr = item_sl_rate(item)
-    if total >= STRATEGY_MIN_CLOSED_FOR_BLOCK and (wr < STRATEGY_MIN_WR or slr > STRATEGY_MAX_SL_RATE):
-        return False, f"strategy blocked by stats: WR {wr:.1f}%, SL-rate {slr:.1f}% after {total}"
-    return True, "ok"
-
-
-def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
-    cd = STATE.setdefault("cooldowns", {})
+def set_cooldown(state: Dict[str, Any], symbol: str, side: str, mode: str) -> None:
     now = now_ts()
-    s_key = f"pair:{symbol}"
-    st_key = f"strategy:{strategy}"
-    if now - float(cd.get(s_key, 0)) < PAIR_COOLDOWN_SECONDS:
-        return False, "pair cooldown"
-    if now - float(cd.get(st_key, 0)) < STRATEGY_COOLDOWN_SECONDS:
-        return False, "strategy cooldown"
-    return True, "ok"
+    minutes = CFG.cooldown_minutes_a if mode == "A" else CFG.cooldown_minutes_b
+    state.setdefault("cooldowns", {})[symbol] = now + minutes * 60
+    state.setdefault("side_cooldowns", {})[f"{symbol}:{side}"] = now + CFG.same_side_cooldown_minutes * 60
 
 
-def set_cooldown(symbol: str, strategy: str) -> None:
-    with STATE_LOCK:
-        cd = STATE.setdefault("cooldowns", {})
-        cd[f"pair:{symbol}"] = now_ts()
-        cd[f"strategy:{strategy}"] = now_ts()
-        save_state()
+def mode_threshold(anti_mode: str) -> Tuple[int, str]:
+    if anti_mode == "B_FALLBACK":
+        return CFG.min_quality_b, "B"
+    if anti_mode == "B_PLUS":
+        return CFG.min_quality_b_plus, "B_PLUS"
+    return CFG.min_quality_a, "A"
 
-# ============================================================
-# STRATEGIES
-# ============================================================
 
-def score_common(ctx: Dict[str, Any], side: str, base: float = 70.0) -> float:
-    ch = ctx["ch1m3"] if side == "LONG" else -ctx["ch1m3"]
-    ch15 = ctx["ch15m"] if side == "LONG" else -ctx["ch15m"]
-    score = base
-    score += min(max(ch, 0) * 4200, 18)
-    score += min(max(ch15, 0) * 900, 8)
-    score += min(ctx["vol1"], 2.2) * 3.5
-    score += min(ctx["vol5"], 2.2) * 2.5
-    score += min(ctx["range1"], 3.0) * 3.0
-    score += min(ctx["range5"], 3.0) * 2.5
-    if side == "SHORT":
-        score += max(0, 0.5 - ctx["loc1"]) * 12
-        if ctx["two_red"]:
-            score += 5
-        if ctx["break_short"]:
-            score += 5
+def classify_signal_mode(quality: float, anti_mode: str) -> Optional[str]:
+    if quality >= CFG.min_quality_a:
+        return "A"
+    if anti_mode in ("B_PLUS", "B_FALLBACK") and quality >= CFG.min_quality_b_plus:
+        return "B_PLUS"
+    if anti_mode == "B_FALLBACK" and quality >= CFG.min_quality_b:
+        return "B"
+    return None
+
+
+def tolerance_for_mode(mode: str) -> float:
+    if mode == "A":
+        return CFG.level_tolerance_a
+    if mode == "B_PLUS":
+        return CFG.level_tolerance_b_plus
+    return CFG.level_tolerance_b
+
+
+def build_adaptive_ladder(side: str, entry: float, leverage: int, signal_mode: str, cap_pct: float) -> List[float]:
+    if signal_mode == "A":
+        roi_targets = [CFG.a_tp1_roi, CFG.a_tp2_roi, CFG.a_tp3_roi, CFG.a_tp4_roi, CFG.a_tp5_roi]
+    elif signal_mode == "B_PLUS":
+        roi_targets = [CFG.bplus_tp1_roi, CFG.bplus_tp2_roi, CFG.bplus_tp3_roi]
     else:
-        score += max(0, ctx["loc1"] - 0.5) * 12
-        if ctx["two_green"]:
+        roi_targets = [CFG.b_tp1_roi, CFG.b_tp2_roi, CFG.b_tp3_roi]
+
+    raw_moves = [r / max(1, leverage) for r in roi_targets]
+
+    # Вместо tp3_feasibility_block: сжимаем лестницу под недавнюю capacity.
+    # Минимум не делаем слишком маленьким, иначе сигнал бессмысленен.
+    if signal_mode == "A":
+        max_realistic = max(0.010, min(cap_pct * 1.15, 0.035))
+    elif signal_mode == "B_PLUS":
+        max_realistic = max(0.0075, min(cap_pct * 1.05, 0.024))
+    else:
+        max_realistic = max(0.0060, min(cap_pct * 0.98, 0.018))
+
+    moves: List[float] = []
+    for mv in raw_moves:
+        if mv <= max_realistic:
+            moves.append(mv)
+
+    # Если рынок не тянет старые цели, строим compact ladder.
+    if len(moves) < 2:
+        moves = [
+            clamp(max_realistic * 0.45, 0.0045, 0.0075),
+            clamp(max_realistic * 0.75, 0.0070, 0.0120),
+        ]
+    if len(moves) == 2 and max_realistic >= 0.0115:
+        moves.append(clamp(max_realistic * 0.95, 0.0100, 0.0175))
+
+    tps: List[float] = []
+    for mv in moves:
+        if side == "LONG":
+            tps.append(entry * (1 + mv))
+        else:
+            tps.append(entry * (1 - mv))
+    return tps
+
+
+def build_sl(side: str, entry: float, support: float, resistance: float, atr5: float, signal_mode: str) -> float:
+    max_sl_pct = CFG.max_sl_price_pct_a if signal_mode == "A" else CFG.max_sl_price_pct_b
+    atr_pct = atr5 / entry if entry > 0 else 0.0
+    sl_dist = clamp(max(atr_pct * 0.85, 0.0035), 0.0035, max_sl_pct)
+
+    if side == "LONG":
+        level_sl = support * 0.997 if support > 0 else entry * (1 - sl_dist)
+        sl = min(entry * (1 - sl_dist), level_sl)
+        # Never wider than max.
+        if (entry - sl) / entry > max_sl_pct:
+            sl = entry * (1 - max_sl_pct)
+    else:
+        level_sl = resistance * 1.003 if resistance > 0 else entry * (1 + sl_dist)
+        sl = max(entry * (1 + sl_dist), level_sl)
+        if (sl - entry) / entry > max_sl_pct:
+            sl = entry * (1 + max_sl_pct)
+    return sl
+
+
+def rr_ok(side: str, entry: float, sl: float, tps: List[float], signal_mode: str) -> bool:
+    if not tps:
+        return False
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return False
+    # RR по TP2, если есть, иначе TP1.
+    target = tps[1] if len(tps) >= 2 else tps[0]
+    reward = abs(target - entry)
+    min_rr = CFG.min_rr_a if signal_mode == "A" else CFG.min_rr_b
+    return (reward / risk) >= min_rr
+
+
+def active_count(state: Dict[str, Any]) -> int:
+    return len(state.get("active", {}) or {})
+
+
+def analyze_symbol(symbol: str, anti_mode: str, btc: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
+    if in_cooldown(state, symbol, "LONG") and in_cooldown(state, symbol, "SHORT"):
+        return None, "cooldown"
+    if active_count(state) >= CFG.max_active_signals:
+        return None, "max_active"
+
+    c1h = fetch_klines(symbol, "1h", 100)
+    c15 = fetch_klines(symbol, "15m", 120)
+    c5 = fetch_klines(symbol, "5m", 120)
+    c1 = fetch_klines(symbol, "1m", 40)
+    if len(c15) < 60 or len(c5) < 60:
+        return None, "no_data"
+
+    # Use last candles. Some APIs include active candle, but for scalping we accept this.
+    close = c5[-1]["close"]
+    if close <= 0:
+        return None, "bad_price"
+
+    cls5 = closes(c5)
+    cls15 = closes(c15)
+    cls1h = closes(c1h) if len(c1h) >= 30 else cls15
+
+    ema20_5 = ema_last(cls5, 20)
+    ema50_5 = ema_last(cls5, 50)
+    ema50_15 = ema_last(cls15, 50)
+    ema200_15 = ema_last(cls15, 200) if len(cls15) >= 80 else ema_last(cls15, 80)
+    ema50_1h = ema_last(cls1h, 50)
+    vwap5 = vwap_last(c5, 48)
+    rsi5 = rsi_last(cls5, 14)
+    rsi15 = rsi_last(cls15, 14)
+    macd5 = macd_hist_last(cls5)
+    macd15 = macd_hist_last(cls15)
+    atr5 = atr_last(c5, 14)
+    atr_pct = atr5 / close if close > 0 else 0
+    vr5 = vol_ratio(c5, 30)
+    vr15 = vol_ratio(c15, 30)
+    cap = recent_capacity_pct(c5, c15)
+
+    support15, resistance15 = find_support_resistance(c15, 50)
+    support5, resistance5 = find_support_resistance(c5, 50)
+    support = max(support15, support5) if support15 and support5 else (support15 or support5)
+    resistance = min(resistance15, resistance5) if resistance15 and resistance5 else (resistance15 or resistance5)
+
+    move15 = pct(c15[-1]["close"], c15[-2]["close"]) if len(c15) >= 2 else 0.0
+    move30 = pct(c15[-1]["close"], c15[-3]["close"]) if len(c15) >= 3 else 0.0
+    move5_3 = pct(c5[-1]["close"], c5[-4]["close"]) if len(c5) >= 4 else 0.0
+    move1_3 = pct(c1[-1]["close"], c1[-4]["close"]) if len(c1) >= 4 else 0.0
+
+    # Avoid ultra vertical chase.
+    chase_long = move15 > CFG.max_chase_15m_pct or move30 > CFG.max_chase_30m_pct
+    chase_short = move15 < -CFG.max_chase_15m_pct or move30 < -CFG.max_chase_30m_pct
+
+    # Score both sides, then pick best.
+    candidates: List[Tuple[float, str, List[str]]] = []
+
+    for side in ("LONG", "SHORT"):
+        if in_cooldown(state, symbol, side):
+            continue
+        score = 0.0
+        reasons: List[str] = []
+
+        # Determine broad permission.
+        if side == "LONG" and not btc.get("bias_long", True):
+            score -= 12
+            reasons.append("BTC против LONG")
+        if side == "SHORT" and not btc.get("bias_short", True):
+            score -= 12
+            reasons.append("BTC против SHORT")
+
+        # Base quality / liquidity.
+        if base_asset(symbol) in QUALITY_BASES:
+            score += 7
+            reasons.append("качественная база")
+        if is_ultra_risk(symbol):
+            score -= 18
+            reasons.append("ultra-risk penalty")
+
+        # Activity / capacity.
+        if cap >= CFG.min_recent_capacity_pct_a:
+            score += 10
+            reasons.append(f"capacity {cap*100:.2f}%")
+        elif cap >= CFG.min_recent_capacity_pct_b:
+            score += 6
+            reasons.append(f"compact capacity {cap*100:.2f}%")
+        else:
+            score -= 8
+
+        if atr_pct >= 0.0035:
             score += 5
-        if ctx["break_long"]:
-            score += 5
-    return min(score, 99.0)
 
+        # Volume. В fallback не требуем идеальный объём, но полный ноль не любим.
+        if vr5 >= CFG.min_5m_volume_ratio_a or vr15 >= 0.85:
+            score += 12
+            reasons.append(f"volume x{max(vr5, vr15):.2f}")
+        elif vr5 >= CFG.min_5m_volume_ratio_b or vr15 >= 0.45:
+            score += 7
+            reasons.append(f"volume ok x{max(vr5, vr15):.2f}")
+        elif max(vr5, vr15) < 0.15:
+            score -= 14
+            reasons.append("volume weak")
 
-def detect_extreme_level_reject_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """V14.07: resistance/level rejection SHORT after a large rise.
+        if side == "LONG":
+            tol = CFG.level_tolerance_b  # score stage uses flexible tolerance; final mode will validate.
+            near_support = support > 0 and abs(close - support) / close <= tol * 2.2
+            reclaimed_vwap = close >= vwap5 * (1 - CFG.vwap_tolerance_b)
+            above_ema = close >= ema20_5 * (1 - CFG.ema_tolerance_b) or close >= ema50_5 * (1 - CFG.ema_tolerance_b)
+            trend_ok = close >= ema50_15 * 0.996 or close >= ema50_1h * 0.994
+            impulse = move5_3 > 0.0015 or move1_3 > 0.0008 or macd5 > 0
+            rsi_ok = 38 <= rsi5 <= 68 or rsi5 > 50
 
-    Pattern: price expanded hard upward into a local high/resistance zone, then failed to
-    hold the high and the 1m tape turns down. This is the "price grew many percent ->
-    catch the bounce/reject from level" setup.
-    """
-    if not (ALLOW_SHORT and EXTREME_LEVEL_REACTION_ENABLED and LEVEL_REJECT_SHORT_ENABLED):
-        return None
+            if near_support:
+                score += 15
+                reasons.append("support bounce")
+            if reclaimed_vwap:
+                score += 13
+                reasons.append("VWAP reclaim")
+            if above_ema:
+                score += 10
+                reasons.append("EMA reclaim")
+            if trend_ok:
+                score += 10
+                reasons.append("15m/1h trend ok")
+            if impulse:
+                score += 13
+                reasons.append("micro impulse LONG")
+            if rsi_ok:
+                score += 5
+            if macd15 > 0:
+                score += 5
+            if chase_long:
+                score -= 18
+                reasons.append("anti-chase")
+            if rsi5 > 78:
+                score -= 10
+                reasons.append("RSI overheated")
 
-    extreme_up = (
-        ctx["ch15m"] >= LEVEL_MIN_15M_EXTREME
-        or ctx["ch30m"] >= LEVEL_MIN_30M_EXTREME
-        or ctx.get("ch1h", 0.0) >= LEVEL_MIN_1H_EXTREME
-    )
-    if not extreme_up:
-        return None
-    if ctx["ch30m"] > LEVEL_MAX_30M_EXTREME and not (ctx["break_short"] and ctx["range1"] >= 1.10):
-        return None
-    if ctx["recent_range_30m"] < LEVEL_MIN_RECENT_RANGE and ctx.get("level_range_20m", 0.0) < LEVEL_MIN_RECENT_RANGE:
-        return None
+        else:  # SHORT
+            tol = CFG.level_tolerance_b
+            near_resistance = resistance > 0 and abs(close - resistance) / close <= tol * 2.2
+            rejected_vwap = close <= vwap5 * (1 + CFG.vwap_tolerance_b)
+            below_ema = close <= ema20_5 * (1 + CFG.ema_tolerance_b) or close <= ema50_5 * (1 + CFG.ema_tolerance_b)
+            trend_ok = close <= ema50_15 * 1.004 or close <= ema50_1h * 1.006
+            impulse = move5_3 < -0.0015 or move1_3 < -0.0008 or macd5 < 0
+            rsi_ok = 32 <= rsi5 <= 62 or rsi5 < 50
 
-    reject = max(ctx.get("reject_from_high_10m", 0.0), ctx.get("pullback_from_high", 0.0), ctx.get("distance_from_high_20m", 0.0))
-    if reject < LEVEL_SHORT_MIN_REJECT:
-        return None
-    if ctx["ch1m3"] > -LEVEL_SHORT_MIN_1M3_DOWN:
-        return None
-    if abs(ctx["ch1m3"]) > LEVEL_SHORT_MAX_CHASE_1M3:
-        return None
-    if ctx["loc1"] > LEVEL_SHORT_LOC_MAX:
-        return None
-    if ctx["vol5"] < LEVEL_SHORT_MIN_VOL5 or ctx["range5"] < LEVEL_SHORT_MIN_RANGE5:
-        return None
-    # vol1 can be low right after a trap, but then range/5m participation must confirm.
-    if ctx["vol1"] < LEVEL_SHORT_MIN_VOL1 and not (ctx["range1"] >= 1.05 and ctx["vol5"] >= LEVEL_SHORT_MIN_VOL5 * 1.35):
-        return None
-    if ctx["range1"] < LEVEL_SHORT_MIN_RANGE1:
-        return None
-    if not (ctx["last_red"] or ctx["two_red"] or ctx["break_short"]):
-        return None
-    if not (ctx.get("under_ema_or_vwap") or ctx["break_short"] or ctx["two_red"]):
-        return None
+            if near_resistance:
+                score += 15
+                reasons.append("resistance rejection")
+            if rejected_vwap:
+                score += 13
+                reasons.append("VWAP reject")
+            if below_ema:
+                score += 10
+                reasons.append("EMA reject")
+            if trend_ok:
+                score += 10
+                reasons.append("15m/1h trend ok")
+            if impulse:
+                score += 13
+                reasons.append("micro impulse SHORT")
+            if rsi_ok:
+                score += 5
+            if macd15 < 0:
+                score += 5
+            if chase_short:
+                score -= 18
+                reasons.append("anti-chase")
+            if rsi5 < 22:
+                score -= 10
+                reasons.append("RSI oversold")
 
-    score = score_common(ctx, "SHORT", 80.0)
-    score += min(max(ctx["ch15m"], ctx["ch30m"], 0.0) * 500, 10)
-    score += min(reject * 1500, 9)
-    if ctx["break_short"]:
-        score += 5
-    if ctx.get("vdelta1", 0.0) < -0.05 or ctx.get("vdelta5", 0.0) < -0.05:
-        score += 4
+        # Range / flat penalty.
+        if atr_pct < 0.0022 and cap < 0.0045:
+            score -= 14
+            reasons.append("flat")
 
-    reason = (
-        "EXTREME LEVEL REJECT SHORT: цена сильно выросла в уровень/локальный high → не удержала зону → "
-        "появился reject и live tape вниз. "
-        f"15m {ctx['ch15m']*100:+.2f}%, 30m {ctx['ch30m']*100:+.2f}%, 1h {ctx.get('ch1h',0)*100:+.2f}%, "
-        f"reject {reject*100:.2f}%, 1m3 {ctx['ch1m3']*100:+.2f}%, "
-        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
-    )
-    return build_trade(ctx, "SHORT", "PRO_EXTREME_LEVEL_REJECT_SHORT", "EXTREME LEVEL REJECT SHORT", score, reason)
+        candidates.append((score, side, reasons))
 
-
-def detect_extreme_level_reclaim_long(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """V14.07: support/level reclaim LONG after a large fall.
-
-    Pattern: price dumped hard into a local low/support zone, then reclaimed and 1m tape
-    turns up. This catches "price fell many percent -> bounce/reclaim from level" setups,
-    while avoiding blind falling-knife longs.
-    """
-    if not (ALLOW_LONG and EXTREME_LEVEL_REACTION_ENABLED and LEVEL_RECLAIM_LONG_ENABLED):
-        return None
-
-    extreme_down = (
-        ctx["ch15m"] <= -LEVEL_MIN_15M_EXTREME
-        or ctx["ch30m"] <= -LEVEL_MIN_30M_EXTREME
-        or ctx.get("ch1h", 0.0) <= -LEVEL_MIN_1H_EXTREME
-    )
-    if not extreme_down:
-        return None
-    if ctx["ch30m"] < -LEVEL_MAX_30M_EXTREME and not (ctx["break_long"] and ctx["range1"] >= 1.10):
-        return None
-    if ctx["recent_range_30m"] < LEVEL_MIN_RECENT_RANGE and ctx.get("level_range_20m", 0.0) < LEVEL_MIN_RECENT_RANGE:
-        return None
-
-    bounce = max(ctx.get("bounce_from_low", 0.0), ctx.get("bounce_from_low_10m", 0.0), ctx.get("distance_from_low_20m", 0.0))
-    if bounce < LEVEL_LONG_MIN_BOUNCE:
-        return None
-    if ctx["ch1m3"] < LEVEL_LONG_MIN_1M3_UP:
-        return None
-    if abs(ctx["ch1m3"]) > LEVEL_LONG_MAX_CHASE_1M3:
-        return None
-    if ctx["loc1"] < LEVEL_LONG_LOC_MIN:
-        return None
-    if ctx["vol5"] < LEVEL_LONG_MIN_VOL5 or ctx["range5"] < LEVEL_LONG_MIN_RANGE5:
-        return None
-    if ctx["vol1"] < LEVEL_LONG_MIN_VOL1 and not (ctx["range1"] >= 1.05 and ctx["vol5"] >= LEVEL_LONG_MIN_VOL5 * 1.35):
-        return None
-    if ctx["range1"] < LEVEL_LONG_MIN_RANGE1:
-        return None
-    if not (ctx["last_green"] or ctx["two_green"] or ctx["break_long"]):
-        return None
-    # Must reclaim at least one fast level. Otherwise it is just a weak bounce inside a dump.
-    if not (ctx["price"] > ctx["ema1_9"] or ctx["price"] > ctx["vwap1"] or ctx["break_long"] or ctx["two_green"]):
-        return None
-    # In BTC bear, allow only strong capitulation bounces / relative strength exceptions.
-    if market.get("regime") == "BTC BEAR" and not LEVEL_LONG_ALLOW_BTC_BEAR_EXCEPTION:
-        return None
-    if market.get("regime") == "BTC BEAR" and ctx["ch1m3"] < LEVEL_LONG_MIN_1M3_UP * 1.35 and ctx["range1"] < 1.0:
-        return None
-
-    score = score_common(ctx, "LONG", 80.0)
-    score += min(max(-ctx["ch15m"], -ctx["ch30m"], 0.0) * 500, 10)
-    score += min(bounce * 1500, 9)
-    if ctx["break_long"]:
-        score += 5
-    if ctx.get("vdelta1", 0.0) > 0.05 or ctx.get("vdelta5", 0.0) > 0.05:
-        score += 4
-
-    reason = (
-        "EXTREME LEVEL RECLAIM LONG: цена сильно упала в уровень/локальный low → продавец не продолжил → "
-        "появился reclaim и live tape вверх. "
-        f"15m {ctx['ch15m']*100:+.2f}%, 30m {ctx['ch30m']*100:+.2f}%, 1h {ctx.get('ch1h',0)*100:+.2f}%, "
-        f"bounce {bounce*100:.2f}%, 1m3 {ctx['ch1m3']*100:+.2f}%, "
-        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
-    )
-    return build_trade(ctx, "LONG", "PRO_EXTREME_LEVEL_RECLAIM_LONG", "EXTREME LEVEL RECLAIM LONG", score, reason)
-
-
-def detect_pump_trap_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    PUMP-style trap short.
-    Pattern: fast upside expansion / pump -> rejection from local high -> confirmed downside tape.
-    This is the type of trade from the PUMP example: entry after the pump fails,
-    close to the rejection zone, with TP1 around 0.8-1.0% and TP5 around 4%.
-    """
-    if not (ALLOW_SHORT and PUMP_TRAP_SHORT_ENABLED):
-        return None
-
-    # There must be a real upside expansion first; otherwise this is just a normal dump.
-    had_pump = ctx["ch15m"] >= PUMP_MIN_15M_UP or ctx["ch30m"] >= PUMP_MIN_30M_UP
-    if not had_pump:
-        return None
-
-    # Avoid extreme late-parabolic tops unless it is a true trap: strong rejection/downside tape
-    # with 5m participation. V14.05 was too strict here and skipped LAB-like traps
-    # where 30m was +10% but 1m3 flipped hard down.
-    extreme_trap_ok = (
-        PUMP_EXTREME_TRAP_ENABLED
-        and ctx["ch1m3"] <= -PUMP_EXTREME_MIN_1M3_DOWN
-        and ctx["vol1"] >= PUMP_EXTREME_MIN_VOL1
-        and ctx["vol5"] >= PUMP_EXTREME_MIN_VOL5
-        and ctx["range1"] >= PUMP_EXTREME_MIN_RANGE1
-        and ctx["range5"] >= PUMP_EXTREME_MIN_RANGE5
-    )
-    if ctx["ch30m"] > PUMP_MAX_30M_UP and not (ctx["break_short"] and ctx["vol1"] >= 0.80 and ctx["range1"] >= 1.20) and not extreme_trap_ok:
-        return None
-
-    # Must reject from recent high. This prevents shorting random weakness.
-    reject = max(ctx.get("reject_from_high_10m", 0.0), ctx.get("pullback_from_high", 0.0))
-    if reject < PUMP_MIN_REJECT_FROM_HIGH:
-        return None
-
-    # Fresh downside pressure, but not too late/chased.
-    if ctx["ch1m3"] > -PUMP_MIN_1M3_DOWN:
-        return None
-    if abs(ctx["ch1m3"]) > PUMP_MAX_1M3_CHASE:
-        return None
-
-    # Enough recent range for a 5-target ladder like the examples.
-    if ctx["recent_range_30m"] < PUMP_MIN_RECENT_RANGE:
-        return None
-
-    # Tape must be alive. For strong trap flips, allow weaker vol1 if vol5/range confirm.
-    if ctx["vol5"] < PUMP_MIN_VOL5:
-        return None
-    if ctx["vol1"] < PUMP_MIN_VOL1 and not extreme_trap_ok:
-        return None
-    if ctx["vol1"] < PUMP_EXTREME_MIN_VOL1:
-        return None
-    if ctx["range5"] < PUMP_MIN_RANGE5:
-        return None
-    if ctx["range1"] < PUMP_MIN_RANGE1 and not extreme_trap_ok:
-        return None
-    if ctx["range1"] < PUMP_EXTREME_MIN_RANGE1:
-        return None
-
-    # Candle must close under control of sellers.
-    if ctx["loc1"] > PUMP_SHORT_LOC_MAX:
-        return None
-    if not (ctx["last_red"] or ctx["two_red"] or ctx["break_short"]):
-        return None
-
-    # Price should lose momentum area: EMA/VWAP or have a clean micro-break.
-    if not (ctx.get("under_ema_or_vwap") or ctx["break_short"] or ctx["two_red"]):
-        return None
-
-    # Do not send if already sitting on the local low; the example trades enter before the whole move is gone.
-    if PUMP_AVOID_NEAR_LOW and ctx["bounce_from_low"] < max(TP1_MOVE * 0.45, 0.0035):
-        return None
-
-    score = score_common(ctx, "SHORT", 78.0)
-    score += min(max(ctx["ch15m"], 0.0) * 850, 7)
-    score += min(max(ctx["ch30m"], 0.0) * 450, 7)
-    score += min(reject * 1400, 8)
-    if ctx.get("under_both_ema_vwap"):
-        score += 4
-    if ctx["break_short"]:
-        score += 5
-
-    if not PUMP_ALLOW_B_PLUS and score < 88:
-        return None
-
-    reason = (
-        "PUMP TRAP SHORT: быстрый памп/расширение вверх → failure/reject от локального high → tape развернулся вниз. "
-        f"pump15 {ctx['ch15m']*100:+.2f}%, pump30 {ctx['ch30m']*100:+.2f}%, "
-        f"reject {reject*100:.2f}%, 1m3 {ctx['ch1m3']*100:.2f}%, "
-        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, "
-        f"range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
-    )
-    return build_trade(ctx, "SHORT", "PRO_PUMP_TRAP_SHORT", "PUMP TRAP SHORT", score, reason)
-
-
-def detect_beat_style_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not (ALLOW_SHORT and BEAT_STYLE_SHORT_ENABLED):
-        return None
-    if ctx["ch1m3"] > -BEAT_MIN_1M3:
-        return None
-    if ctx["pullback_from_high"] < BEAT_MIN_PULLBACK:
-        return None
-    if ctx["recent_range_30m"] < BEAT_MIN_RECENT_RANGE:
-        return None
-    if ctx["vol1"] < BEAT_MIN_VOL1 or ctx["vol5"] < BEAT_MIN_VOL5:
-        return None
-    if ctx["range1"] < BEAT_MIN_RANGE1 or ctx["range5"] < BEAT_MIN_RANGE5:
-        return None
-    if ctx["loc1"] > 0.55:
-        return None
-    if not (ctx["last_red"] or ctx["two_red"] or ctx["break_short"]):
-        return None
-    if ctx["price"] > max(ctx["ema1_9"], ctx["vwap1"]) and not ctx["break_short"]:
-        return None
-    score = score_common(ctx, "SHORT", 73.0)
-    score += min(ctx["pullback_from_high"] * 1000, 8)
-    reason = (
-        "BEAT STYLE SHORT: откат/вынос вверх → reject → live downside pressure. "
-        f"pullback {ctx['pullback_from_high']*100:.2f}%, 1m3 {ctx['ch1m3']*100:.2f}%, "
-        f"15m {ctx['ch15m']*100:.2f}%, vol1 x{ctx['vol1']:.2f}, range1 x{ctx['range1']:.2f}."
-    )
-    return build_trade(ctx, "SHORT", "PRO_BEAT_STYLE_SHORT", "BEAT STYLE SHORT", score, reason)
-
-
-def detect_aero_style_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not (ALLOW_SHORT and AERO_STYLE_ENABLED):
-        return None
-    if ctx["ch1m3"] > -AERO_MIN_1M3:
-        return None
-    if ctx["pullback_from_high"] < AERO_MIN_PULLBACK:
-        return None
-    if ctx["recent_range_30m"] < AERO_MIN_RECENT_RANGE:
-        return None
-    if ctx["loc1"] > 0.50:
-        return None
-    if ctx["vol1"] < 0.42 or ctx["range1"] < 0.75:
-        return None
-    if not (ctx["break_short"] or ctx["two_red"]):
-        return None
-    score = score_common(ctx, "SHORT", 75.0)
-    reason = (
-        "AERO STYLE SHORT: перехват после отката, пробой микро-структуры вниз, "
-        f"1m3 {ctx['ch1m3']*100:.2f}%, range5 x{ctx['range5']:.2f}."
-    )
-    return build_trade(ctx, "SHORT", "PRO_AERO_STYLE_SHORT", "AERO STYLE SHORT", score, reason)
-
-
-def detect_bounce_reject_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    GRASS/AERO/BEAT-style bounce rejection short.
-    Pattern: prior weakness/selloff -> bounce upward/retest -> rejection -> short continuation.
-    This is not a late dump short: it requires the current price to be above the local low,
-    then to start rolling over from the local high/retest zone.
-    """
-    if not (ALLOW_SHORT and BOUNCE_REJECT_SHORT_ENABLED):
-        return None
-
-    # There must be a real bounce from a local low; otherwise we are shorting the bottom.
-    if ctx["bounce_from_low"] < BOUNCE_MIN_FROM_LOW:
-        return None
-    if ctx["bounce_from_low"] > BOUNCE_MAX_FROM_LOW:
-        return None
-
-    # There must also be rejection from the recent bounce high.
-    reject = max(ctx.get("reject_from_high_10m", 0.0), ctx.get("pullback_from_high", 0.0))
-    if reject < BOUNCE_MIN_REJECT_FROM_HIGH:
-        return None
-
-    # Fresh downside pressure, but not already too chased.
-    if ctx["ch1m3"] > -BOUNCE_MIN_1M3:
-        return None
-    if abs(ctx["ch1m3"]) > BOUNCE_MAX_1M3_CHASE:
-        return None
-
-    # Recent volatility must be enough for a 5-target ladder.
-    if ctx["recent_range_30m"] < BOUNCE_MIN_RECENT_RANGE:
-        return None
-
-    # Tape must be alive.
-    if ctx["vol1"] < BOUNCE_MIN_VOL1 or ctx["vol5"] < BOUNCE_MIN_VOL5:
-        return None
-    if ctx["range1"] < BOUNCE_MIN_RANGE1 or ctx["range5"] < BOUNCE_MIN_RANGE5:
-        return None
-
-    # The 1m candle must show rejection/downside control.
-    if ctx["loc1"] > BOUNCE_SHORT_LOC_MAX:
-        return None
-    if not (ctx["last_red"] or ctx["two_red"] or ctx["break_short"]):
-        return None
-
-    # After bounce/retest, price should lose 1m EMA or VWAP, unless we have a confirmed micro-break.
-    if BOUNCE_REQUIRE_CLOSE_UNDER_EMA_OR_VWAP and not (ctx.get("under_ema_or_vwap") or ctx["break_short"] or ctx["two_red"]):
-        return None
-
-    # Do not short if price is already sitting on the recent low; there must be room for TP1/TP2.
-    if BOUNCE_NEAR_LOW_BLOCK and ctx["bounce_from_low"] < max(TP1_MOVE * 0.75, 0.0045):
-        return None
-
-    score = score_common(ctx, "SHORT", 76.0)
-    score += min(ctx["bounce_from_low"] * 800, 7)
-    score += min(reject * 1200, 8)
-    if ctx.get("under_both_ema_vwap"):
-        score += 4
-    if ctx["break_short"]:
-        score += 4
-    if market.get("regime") == "BTC BEAR" or market.get("panic"):
-        score += 2
-
-    # Allow good B+ setups, but weak B setups are filtered.
-    if not BOUNCE_ALLOW_B_PLUS and score < 88:
-        return None
-
-    reason = (
-        "BOUNCE REJECT SHORT: отскок вверх после слабости → retest/reject → перехват вниз. "
-        f"bounce from low {ctx['bounce_from_low']*100:.2f}%, reject {reject*100:.2f}%, "
-        f"1m3 {ctx['ch1m3']*100:.2f}%, 15m {ctx['ch15m']*100:.2f}%, "
-        f"vol1 x{ctx['vol1']:.2f}, vol5 x{ctx['vol5']:.2f}, "
-        f"range1 x{ctx['range1']:.2f}, range5 x{ctx['range5']:.2f}."
-    )
-    return build_trade(ctx, "SHORT", "PRO_BOUNCE_REJECT_SHORT", "BOUNCE REJECT SHORT", score, reason)
-
-def detect_market_dump_short(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not (ALLOW_SHORT and MARKET_DUMP_SHORT_ENABLED):
-        return None
-    # Not old broad dump. Requires the coin itself to be weak and live tape to confirm.
-    if ctx["ch1m3"] > -DUMP_MIN_1M3:
-        return None
-    if ctx["ch15m"] > -DUMP_MIN_15M and ctx["ch30m"] > -DUMP_MIN_15M:
-        return None
-    if ctx["vol1"] < DUMP_MIN_VOL1 or ctx["vol5"] < DUMP_MIN_VOL5:
-        return None
-    if ctx["range1"] < DUMP_MIN_RANGE1 or ctx["range5"] < DUMP_MIN_RANGE5:
-        return None
-    if ctx["loc1"] > DUMP_CLOSE_SHORT:
-        return None
-    if not (ctx["two_red"] or ctx["break_short"]):
-        return None
-    score = score_common(ctx, "SHORT", 71.0)
-    if market.get("panic") or market.get("regime") == "BTC BEAR":
-        score += 4
-    reason = (
-        "MARKET DUMP SHORT V14: рыночный слив + альт слабый + подтверждённый tape вниз. "
-        f"BTC {market.get('regime')}; 1m3 {ctx['ch1m3']*100:.2f}%, 15m {ctx['ch15m']*100:.2f}%, "
-        f"vol1 x{ctx['vol1']:.2f}, range1 x{ctx['range1']:.2f}."
-    )
-    return build_trade(ctx, "SHORT", "PRO_MARKET_DUMP_SHORT_V14", "MARKET DUMP SHORT V14", score, reason)
-
-
-def detect_confirmed_tape_long(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not (ALLOW_LONG and CONFIRMED_TAPE_ENABLED and RECOVERY_RECLAIM_LONG_ENABLED):
-        return None
-    # LONG must be much cleaner than short because previous long stats were weak.
-    if ctx["ch1m3"] < LONG_MIN_1M3:
-        return None
-    if ctx["vol1"] < LONG_MIN_VOL1 or ctx["range1"] < LONG_MIN_RANGE1:
-        return None
-    if ctx["loc1"] < LONG_CLOSE_LONG:
-        return None
-    if not (ctx["break_long"] or ctx["two_green"]):
-        return None
-    # Must reclaim 1m EMA/VWAP; avoid buying under local trend.
-    if ctx["price"] < max(ctx["ema1_9"], ctx["vwap1"]):
-        return None
-    # If BTC is bear, require relative strength.
-    if market.get("regime") == "BTC BEAR" and ctx["ch15m"] < 0.004:
-        return None
-    if ctx["bounce_from_low"] < 0.0035:
-        return None
-    score = score_common(ctx, "LONG", 74.0)
-    if ctx["ch15m"] > 0:
-        score += min(ctx["ch15m"] * 900, 8)
-    reason = (
-        "CONFIRMED TAPE LONG: sweep/reclaim + сила против рынка + live pressure вверх. "
-        f"bounce {ctx['bounce_from_low']*100:.2f}%, 1m3 {ctx['ch1m3']*100:.2f}%, vol1 x{ctx['vol1']:.2f}."
-    )
-    return build_trade(ctx, "LONG", "PRO_CONFIRMED_TAPE_LONG", "CONFIRMED TAPE LONG", score, reason)
-
-
-def detect_aero_style_long(ctx: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not (ALLOW_LONG and AERO_STYLE_ENABLED):
-        return None
-    if ctx["ch1m3"] < LONG_MIN_1M3:
-        return None
-    if ctx["bounce_from_low"] < AERO_MIN_PULLBACK:
-        return None
-    if ctx["recent_range_30m"] < AERO_MIN_RECENT_RANGE:
-        return None
-    if ctx["loc1"] < LONG_CLOSE_LONG:
-        return None
-    if ctx["vol1"] < LONG_MIN_VOL1 or ctx["range1"] < LONG_MIN_RANGE1:
-        return None
-    if not (ctx["break_long"] or ctx["two_green"]):
-        return None
-    score = score_common(ctx, "LONG", 76.0)
-    reason = (
-        "AERO STYLE LONG: вынос вниз/reclaim, сильное закрытие 1m, пробой микро-структуры вверх. "
-        f"1m3 {ctx['ch1m3']*100:.2f}%, 15m {ctx['ch15m']*100:.2f}%."
-    )
-    return build_trade(ctx, "LONG", "PRO_AERO_STYLE_LONG", "AERO STYLE LONG", score, reason)
-
-
-def analyze_symbol(symbol: str, market: Dict[str, Any], blocks: Dict[str, int], near: List[str]) -> List[Dict[str, Any]]:
-    if is_ultra_risk(symbol):
-        blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
-        return []
-    ctx = symbol_context(symbol)
-    if not ctx:
-        blocks["no_candles"] = blocks.get("no_candles", 0) + 1
-        return []
-    candidates = []
-    detectors = [
-        detect_extreme_level_reject_short,
-        detect_extreme_level_reclaim_long,
-        detect_pump_trap_short,
-        detect_bounce_reject_short,
-        detect_beat_style_short,
-        detect_aero_style_short,
-        detect_market_dump_short,
-        detect_confirmed_tape_long,
-        detect_aero_style_long,
-    ]
-    for det in detectors:
-        tr = det(ctx, market)
-        if not tr:
-            continue
-        ok, why = strategy_allowed(tr["strategy"])
-        if not ok:
-            blocks["strategy_stats_block"] = blocks.get("strategy_stats_block", 0) + 1
-            if len(near) < 10:
-                near.append(f"{display_symbol(symbol)} {tr['side']}: {why}")
-            continue
-        ok, why = cooldown_ok(symbol, tr["strategy"])
-        if not ok:
-            blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
-            continue
-        if not trade_quality_ok(tr, blocks, near):
-            continue
-        candidates.append(tr)
     if not candidates:
-        blocks["no_v14_setup"] = blocks.get("no_v14_setup", 0) + 1
-    return candidates
+        return None, "cooldown"
 
-# ============================================================
-# PENDING CONFIRMATION ENGINE
-# ============================================================
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    quality, side, reasons = candidates[0]
+    quality = clamp(quality, 0, 96)
+    signal_mode = classify_signal_mode(quality, anti_mode)
+    if not signal_mode:
+        return None, "quality_too_low"
 
-def setup_signature(tr: Dict[str, Any]) -> str:
-    return f"{tr['symbol']}|{tr['side']}|{tr['strategy']}"
+    # Final validations based on selected mode.
+    min_vol = CFG.min_5m_volume_ratio_a if signal_mode == "A" else CFG.min_5m_volume_ratio_b
+    if max(vr5, vr15) < min_vol and signal_mode != "B":
+        return None, "volume_block"
+    if max(vr5, vr15) < 0.15:
+        return None, "dead_volume_block"
 
+    min_cap = CFG.min_recent_capacity_pct_a if signal_mode == "A" else CFG.min_recent_capacity_pct_b
+    if cap < min_cap:
+        return None, "capacity_block"
 
-def add_pending(tr: Dict[str, Any]) -> None:
-    sig = setup_signature(tr)
-    with STATE_LOCK:
-        arr = STATE.setdefault("pending_setups", [])
-        for x in arr:
-            if x.get("sig") == sig:
-                x["updated_at"] = now_ts()
-                x["seed"] = tr
-                save_state()
-                return
-        arr.append({"sig": sig, "created_at": now_ts(), "updated_at": now_ts(), "seed": tr})
-        # keep small
-        STATE["pending_setups"] = arr[-80:]
-        save_state()
+    if side == "LONG" and chase_long and signal_mode == "A":
+        return None, "anti_chase_block"
+    if side == "SHORT" and chase_short and signal_mode == "A":
+        return None, "anti_chase_block"
 
+    entry = close
+    sl = build_sl(side, entry, support, resistance, atr5, signal_mode)
+    tps = build_adaptive_ladder(side, entry, CFG.leverage, signal_mode, cap)
 
-def confirm_pending_setups(market: Dict[str, Any], blocks: Dict[str, int], near: List[str]) -> List[Dict[str, Any]]:
-    if not CONFIRMATION_ENGINE_ENABLED:
-        return []
-    ready: List[Dict[str, Any]] = []
-    keep: List[Dict[str, Any]] = []
-    now = now_ts()
-    arr = list(STATE.get("pending_setups", []))
-    for item in arr:
-        seed = item.get("seed", {})
-        created = float(item.get("created_at", now))
-        age = now - created
-        if age > CONFIRM_MAX_SECONDS:
-            blocks["pending_expired"] = blocks.get("pending_expired", 0) + 1
-            continue
-        trap_strategy = seed.get("strategy") in {"PRO_PUMP_TRAP_SHORT", "PRO_BOUNCE_REJECT_SHORT", "PRO_BEAT_STYLE_SHORT", "PRO_AERO_STYLE_SHORT", "PRO_EXTREME_LEVEL_REJECT_SHORT", "PRO_EXTREME_LEVEL_RECLAIM_LONG"}
-        min_confirm_age = TRAP_FAST_CONFIRM_MIN_SECONDS if trap_strategy else CONFIRM_MIN_SECONDS
-        if age < min_confirm_age:
-            keep.append(item)
-            continue
-        sym = seed.get("symbol")
-        side = seed.get("side")
-        if not sym or not side:
-            continue
-        ctx = symbol_context(sym)
-        if not ctx:
-            keep.append(item)
-            continue
-        entry0 = float(seed.get("entry", ctx["price"]))
-        current = float(ctx["price"])
-        if side == "SHORT":
-            progress = safe_div(entry0 - current, entry0, 0.0)
-            tape_ok = ctx["loc1"] <= CONFIRM_SHORT_LOC_MAX and (ctx["last_red"] or ctx["break_short"] or ctx["two_red"])
-            not_snapback = ctx.get("ch1m1", 0.0) <= CONFIRM_MAX_OPPOSITE_1M
-            micro_ok = (ctx["break_short"] or ctx["two_red"]) if CONFIRM_REQUIRE_MICRO_BREAK else True
-        else:
-            progress = safe_div(current - entry0, entry0, 0.0)
-            tape_ok = ctx["loc1"] >= CONFIRM_LONG_LOC_MIN and (ctx["last_green"] or ctx["break_long"] or ctx["two_green"])
-            not_snapback = ctx.get("ch1m1", 0.0) >= -CONFIRM_MAX_OPPOSITE_1M
-            micro_ok = (ctx["break_long"] or ctx["two_green"]) if CONFIRM_REQUIRE_MICRO_BREAK else True
-
-        # Progress is measured both as raw price move and as share of TP1.
-        # This prevents sending a signal before the tape really starts moving.
-        tp1_move = abs(float(seed.get("tp1", current)) - entry0) / entry0 if entry0 else 0.0
-        tp1_progress = safe_div(progress, tp1_move, 0.0)
-        seed_tps = seed.get("tps", []) or []
-        tp3_ref = float(seed_tps[MIN_PROFIT_TARGET_INDEX - 1]) if len(seed_tps) >= MIN_PROFIT_TARGET_INDEX else float(seed.get("tp1", current))
-        tp3_move = abs(tp3_ref - entry0) / entry0 if entry0 else 0.0
-        tp3_progress = safe_div(progress, tp3_move, 0.0)
-        base_live_ok = ctx.get("vol1", 0.0) >= CONFIRM_MIN_VOL1 and ctx.get("range1", 0.0) >= CONFIRM_MIN_RANGE1
-        trap_live_ok = False
-        if trap_strategy:
-            trap_live_ok = (
-                ctx.get("vol1", 0.0) >= TRAP_FAST_CONFIRM_MIN_VOL1
-                and ctx.get("range1", 0.0) >= TRAP_FAST_CONFIRM_MIN_RANGE1
-                and ctx.get("vol5", 0.0) >= TRAP_FAST_CONFIRM_MIN_VOL5
-                and ctx.get("range5", 0.0) >= TRAP_FAST_CONFIRM_MIN_RANGE5
-            ) or (
-                abs(ctx.get("ch1m3", 0.0)) >= TRAP_FAST_CONFIRM_STRONG_1M3
-                and ctx.get("vol5", 0.0) >= TRAP_FAST_CONFIRM_MIN_VOL5
-                and ctx.get("range1", 0.0) >= TRAP_FAST_CONFIRM_MIN_RANGE1
-            )
-        live_ok = base_live_ok or trap_live_ok
-        min_move_needed = TRAP_FAST_CONFIRM_MIN_MOVE if trap_strategy else CONFIRM_MIN_MOVE
-        min_tp1_progress_needed = TRAP_FAST_CONFIRM_MIN_TP1_PROGRESS if trap_strategy else CONFIRM_MIN_TP1_PROGRESS
-        chase_ok = progress <= CONFIRM_MAX_CHASE and tp1_progress <= CONFIRM_MAX_TP1_PROGRESS
-        # V14.10: confirmation must also prove that TP3 is realistic.
-        # We do not want trades that barely touch TP1 and die.
-        tp3_progress_ok = tp3_progress >= TP3_CONFIRM_MIN_PROGRESS
-        tp3_not_chased = tp3_progress <= TP3_CONFIRM_MAX_PROGRESS
-        confirm_ok = (
-            progress >= min_move_needed
-            and tp1_progress >= min_tp1_progress_needed
-            and tp3_progress_ok
-            and tp3_not_chased
-            and chase_ok
-            and tape_ok
-            and live_ok
-            and not_snapback
-            and micro_ok
-        )
-
-        if seed.get("strategy") == "PRO_PUMP_TRAP_SHORT" and side == "SHORT":
-            pump_fast_exception = (
-                abs(ctx.get("ch1m3", 0.0)) >= PUMP_EXTREME_MIN_1M3_DOWN
-                and ctx.get("vol5", 0.0) >= PUMP_EXTREME_MIN_VOL5
-                and ctx.get("range1", 0.0) >= PUMP_EXTREME_MIN_RANGE1
-                and ctx.get("range5", 0.0) >= PUMP_EXTREME_MIN_RANGE5
-            )
-            pump_tape_ok = (
-                tp1_progress >= PUMP_CONFIRM_MIN_TP1_PROGRESS
-                and ctx.get("loc1", 0.5) <= PUMP_CONFIRM_SHORT_LOC_MAX
-                and (ctx.get("last_red") or ctx.get("two_red") or ctx.get("break_short"))
-                and (ctx.get("vol1", 0.0) >= PUMP_CONFIRM_MIN_VOL1 or pump_fast_exception)
-                and ctx.get("range1", 0.0) >= PUMP_CONFIRM_MIN_RANGE1
-            )
-            confirm_ok = confirm_ok and pump_tape_ok
-
-        if confirm_ok:
-            # V14.10 two-step confirmation:
-            # 1) first confirmation is recorded, not sent;
-            # 2) after a short hold, the same setup must still hold without snapback;
-            # 3) only then we rebuild at CURRENT price and send.
-            first_confirm_at = float(item.get("first_confirm_at", 0.0) or 0.0)
-            first_confirm_price = float(item.get("first_confirm_price", current) or current)
-            first_confirm_progress = float(item.get("first_confirm_tp1_progress", tp1_progress) or tp1_progress)
-            first_confirm_tp3_progress = float(item.get("first_confirm_tp3_progress", tp3_progress) or tp3_progress)
-
-            strict_strategy = seed.get("strategy") in STRICT_REJECTION_STRATEGIES
-            if POST_CONFIRM_HOLD_ENABLED:
-                if first_confirm_at <= 0:
-                    item["first_confirm_at"] = now
-                    item["first_confirm_price"] = current
-                    item["first_confirm_tp1_progress"] = tp1_progress
-                    item["first_confirm_tp3_progress"] = tp3_progress
-                    keep.append(item)
-                    blocks["pending_first_confirm_hold"] = blocks.get("pending_first_confirm_hold", 0) + 1
-                    continue
-
-                hold_age = now - first_confirm_at
-                if hold_age < POST_CONFIRM_HOLD_SECONDS:
-                    keep.append(item)
-                    blocks["pending_post_confirm_hold"] = blocks.get("pending_post_confirm_hold", 0) + 1
-                    continue
-
-                # Snapback guard: after first confirmation, price must not reclaim against the setup.
-                if side == "SHORT":
-                    snapback = current > first_confirm_price * (1 + POST_CONFIRM_MAX_SNAPBACK)
-                    retained_ok = (
-                        tp1_progress >= max(min_tp1_progress_needed * POST_CONFIRM_MIN_RETAINED_TP1_PROGRESS, ENTRY_MIN_PROGRESS_BEFORE_SEND)
-                        and tp3_progress >= max(TP3_CONFIRM_MIN_PROGRESS * TP3_POST_CONFIRM_MIN_RETAINED_PROGRESS, 0.06)
-                    )
-                    structure_hold = (ctx.get("loc1", 0.5) <= POST_CONFIRM_SHORT_LOC_MAX and (ctx.get("last_red") or ctx.get("two_red") or ctx.get("break_short")))
-                    if POST_CONFIRM_REQUIRE_STRUCTURE_HOLD and strict_strategy:
-                        structure_hold = structure_hold and (ctx.get("under_ema_or_vwap") or ctx.get("break_short"))
-                else:
-                    snapback = current < first_confirm_price * (1 - POST_CONFIRM_MAX_SNAPBACK)
-                    retained_ok = (
-                        tp1_progress >= max(min_tp1_progress_needed * POST_CONFIRM_MIN_RETAINED_TP1_PROGRESS, ENTRY_MIN_PROGRESS_BEFORE_SEND)
-                        and tp3_progress >= max(TP3_CONFIRM_MIN_PROGRESS * TP3_POST_CONFIRM_MIN_RETAINED_PROGRESS, 0.06)
-                    )
-                    structure_hold = (ctx.get("loc1", 0.5) >= POST_CONFIRM_LONG_LOC_MIN and (ctx.get("last_green") or ctx.get("two_green") or ctx.get("break_long")))
-                    if POST_CONFIRM_REQUIRE_STRUCTURE_HOLD and strict_strategy:
-                        structure_hold = structure_hold and (ctx.get("above_ema_or_vwap") or ctx.get("break_long"))
-
-                if snapback:
-                    blocks["pending_snapback_block"] = blocks.get("pending_snapback_block", 0) + 1
-                    if len(near) < 10:
-                        near.append(f"{display_symbol(sym)} {side}: snapback after first confirm; setup cancelled before Telegram")
-                    continue
-                if not retained_ok:
-                    blocks["pending_progress_lost_block"] = blocks.get("pending_progress_lost_block", 0) + 1
-                    keep.append(item)
-                    continue
-                if not structure_hold:
-                    blocks["pending_structure_lost_block"] = blocks.get("pending_structure_lost_block", 0) + 1
-                    keep.append(item)
-                    continue
-
-            # rebuild at current price, not stale entry
-            rebuilt = build_trade(ctx, side, seed["strategy"], seed["type"], max(float(seed.get("score", 80)), 86.0), seed.get("reason", "") + f" Подтверждение V14.10: first confirm + hold {POST_CONFIRM_HOLD_SECONDS}s; цена удержала структуру, прошла {tp1_progress*100:.0f}% пути к TP1 и {tp3_progress*100:.0f}% пути к {MIN_PROFIT_TARGET_LABEL} до отправки.")
-
-            # Entry safety: do not send if the current entry is too close to its local stop.
-            if ENTRY_SAFETY_ENABLED:
-                entry_now = float(rebuilt.get("entry", current) or current)
-                sl_now = float(rebuilt.get("sl", 0.0) or 0.0)
-                sl_dist = abs(entry_now - sl_now) / max(entry_now, 1e-12)
-                min_dist = max(ENTRY_MIN_DISTANCE_TO_SL, LOCAL_SCALP_MAX_SL_MOVE * ENTRY_MIN_DISTANCE_TO_SL_FRACTION)
-                if sl_dist < min_dist:
-                    blocks["entry_too_close_to_sl_block"] = blocks.get("entry_too_close_to_sl_block", 0) + 1
-                    if len(near) < 10:
-                        near.append(f"{display_symbol(sym)} {side}: entry too close to SL {sl_dist*100:.2f}%")
-                    continue
-
-            ok, why = strategy_allowed(rebuilt["strategy"])
-            if ok and trade_quality_ok(rebuilt, blocks, near):
-                ready.append(rebuilt)
+    if not rr_ok(side, entry, sl, tps, signal_mode):
+        # Anti-silence: для B можно один раз сжать SL до лимита и перепроверить.
+        if signal_mode in ("B", "B_PLUS"):
+            if side == "LONG":
+                sl = entry * (1 - CFG.max_sl_price_pct_b * 0.90)
             else:
-                blocks["pending_quality_block"] = blocks.get("pending_quality_block", 0) + 1
-        else:
-            if not live_ok:
-                blocks["pending_live_weak"] = blocks.get("pending_live_weak", 0) + 1
-            if not tape_ok or not not_snapback:
-                blocks["pending_tape_reject"] = blocks.get("pending_tape_reject", 0) + 1
-            if not tp3_progress_ok:
-                blocks["pending_tp3_progress_block"] = blocks.get("pending_tp3_progress_block", 0) + 1
-            if not tp3_not_chased:
-                blocks["pending_tp3_chase_block"] = blocks.get("pending_tp3_chase_block", 0) + 1
-            if progress > CONFIRM_MAX_CHASE or tp1_progress > CONFIRM_MAX_TP1_PROGRESS:
-                blocks["pending_chase_block"] = blocks.get("pending_chase_block", 0) + 1
-            keep.append(item)
-    with STATE_LOCK:
-        STATE["pending_setups"] = keep[-80:]
-        save_state()
+                sl = entry * (1 + CFG.max_sl_price_pct_b * 0.90)
+        if not rr_ok(side, entry, sl, tps, signal_mode):
+            return None, "rr_block"
+
+    # Optional pending confirmation: only when signal is not strong enough and not hard fallback.
+    needs_pending = CFG.pending_enabled and signal_mode == "B_PLUS" and anti_mode != "B_FALLBACK" and quality < (CFG.min_quality_b_plus + 4)
+
+    candidate = {
+        "id": f"{symbol}:{side}:{int(now_ts())}",
+        "symbol": symbol,
+        "display_symbol": to_display_symbol(symbol),
+        "side": side,
+        "mode": signal_mode,
+        "anti_mode": anti_mode,
+        "quality": round(quality, 1),
+        "entry": entry,
+        "sl": sl,
+        "tps": tps,
+        "leverage": CFG.leverage,
+        "rm_pct": CFG.rm_per_signal_pct,
+        "reasons": reasons[:8],
+        "metrics": {
+            "cap": cap,
+            "atr_pct": atr_pct,
+            "vr5": vr5,
+            "vr15": vr15,
+            "rsi5": rsi5,
+            "rsi15": rsi15,
+            "move1_3": move1_3,
+            "move5_3": move5_3,
+            "move15": move15,
+            "move30": move30,
+            "support": support,
+            "resistance": resistance,
+            "vwap5": vwap5,
+            "ema50_5": ema50_5,
+            "ema50_15": ema50_15,
+            "ema200_15": ema200_15,
+        },
+        "created_ts": now_ts(),
+        "status": "pending" if needs_pending else "ready",
+    }
+
+    if needs_pending:
+        state.setdefault("pending", {})[symbol] = candidate
+        return None, "pending_wait_confirmation"
+
+    return candidate, "ok"
+
+
+def check_pending_confirmations(state: Dict[str, Any], btc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ready: List[Dict[str, Any]] = []
+    pending = dict(state.get("pending", {}) or {})
+    now = now_ts()
+    for symbol, cand in pending.items():
+        created = safe_float(cand.get("created_ts", 0))
+        if now - created > CFG.pending_confirmation_timeout_sec:
+            state.get("pending", {}).pop(symbol, None)
+            continue
+        c5 = fetch_klines(symbol, "5m", 20)
+        if len(c5) < 5:
+            continue
+        close = c5[-1]["close"]
+        side = cand.get("side")
+        entry = safe_float(cand.get("entry"))
+        # Confirmation: price moved slightly in our direction and did not hit SL.
+        if side == "LONG" and close >= entry * 1.001:
+            cand["status"] = "ready"
+            cand["entry"] = close
+            # rebuild tps from new entry
+            cap = safe_float(cand.get("metrics", {}).get("cap", 0.008))
+            cand["tps"] = build_adaptive_ladder("LONG", close, CFG.leverage, cand.get("mode", "B_PLUS"), cap)
+            ready.append(cand)
+            state.get("pending", {}).pop(symbol, None)
+        elif side == "SHORT" and close <= entry * 0.999:
+            cand["status"] = "ready"
+            cand["entry"] = close
+            cap = safe_float(cand.get("metrics", {}).get("cap", 0.008))
+            cand["tps"] = build_adaptive_ladder("SHORT", close, CFG.leverage, cand.get("mode", "B_PLUS"), cap)
+            ready.append(cand)
+            state.get("pending", {}).pop(symbol, None)
     return ready
 
+# ----------------------------
+# Signal text / tracking
+# ----------------------------
+def format_signal(c: Dict[str, Any], btc: Dict[str, Any]) -> str:
+    side = c["side"]
+    emoji = "🟢" if side == "LONG" else "🔴"
+    mode = c.get("mode", "A")
+    mode_label = "A SETUP" if mode == "A" else ("B+ COMPACT SCALP" if mode == "B_PLUS" else "B ANTI-SILENCE SCALP")
+    entry = safe_float(c["entry"])
+    sl = safe_float(c["sl"])
+    tps = [safe_float(x) for x in c.get("tps", [])]
+    risk_pct = abs(entry - sl) / entry if entry > 0 else 0
 
-def should_send_immediately(tr: Dict[str, Any]) -> bool:
-    # V14.02: by default every setup must pass pending confirmation.
-    # This reduces "entered and instantly stopped" trades.
-    if not ALLOW_IMMEDIATE_SEND:
-        return False
-    if tr["score"] < IMMEDIATE_A_PLUS_SCORE:
-        return False
-    c = tr.get("ctx", {})
-    if tr["side"] == "SHORT":
-        return c.get("loc1", 0.5) <= 0.25 and c.get("range1", 0) >= 1.45 and c.get("vol1", 0) >= 0.95
-    return c.get("loc1", 0.5) >= 0.75 and c.get("range1", 0) >= 1.45 and c.get("vol1", 0) >= 1.05
-
-# ============================================================
-# TELEGRAM / SIGNALS
-# ============================================================
-
-def send_telegram(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        STATE["last_error"] = "Telegram env missing"
-        save_state()
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        r = SESSION.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=HTTP_TIMEOUT)
-        if r.status_code >= 400:
-            STATE["last_error"] = f"telegram {r.status_code}: {r.text[:200]}"
-            save_state()
-            return False
-        return True
-    except Exception as e:
-        STATE["last_error"] = f"telegram: {repr(e)}"
-        save_state()
-        return False
-
-
-def build_signal_message(tr: Dict[str, Any], market: Dict[str, Any]) -> str:
-    emoji = "🔴" if tr["side"] == "SHORT" else "🟢"
-    risk = tr["risk"]
-    tps = tr["tps"]
-    c = tr.get("ctx", {})
-    return (
-        f"{emoji} <b>{tr['side']} {display_symbol(tr['symbol'])}</b>\n"
-        f"Класс: <b>{tr['class']}</b> · Score {tr['score']:.1f} · {tr['type']}\n"
-        f"Стратегия: <b>{tr['strategy']}</b>\n\n"
-        f"Вход: <b>{fmt_price(tr['entry'])}</b>\n"
-        f"TP1: {fmt_price(tps[0])} · ≈ {risk['roi_tp1']:.1f}% ROI x{LEVERAGE_DISPLAY}\n"
-        f"TP2: {fmt_price(tps[1])}\n"
-        f"TP3: {fmt_price(tps[2])}\n"
-        f"TP4: {fmt_price(tps[3])}\n"
-        f"TP5: {fmt_price(tps[4])}\n"
-        f"SL: <b>{fmt_price(tr['sl'])}</b> · риск ≈ {risk['roi_sl']:.1f}% ROI x{LEVERAGE_DISPLAY}\n"
-        f"RR TP1: {risk['tp1_rr']:.2f} · Ladder RR: {risk['ladder_rr']:.2f} · Final RR: {risk['final_rr']:.2f}\n\n"
-        f"📌 <b>Логика:</b>\n{tr['reason']}\n"
-        f"1m3: {c.get('ch1m3', 0)*100:+.2f}% · 15m: {c.get('ch15m', 0)*100:+.2f}% · 30m: {c.get('ch30m', 0)*100:+.2f}%\n"
-        f"Vol1 x{c.get('vol1', 0):.2f} · Vol5 x{c.get('vol5', 0):.2f} · Range1 x{c.get('range1', 0):.2f} · Range5 x{c.get('range5', 0):.2f}\n"
-        f"BTC: {market.get('text', 'unknown')}\n\n"
-        f"⏱ Правило V14.10: TP1/TP2 — только прогресс. Успешная реализация считается от {MIN_PROFIT_TARGET_LABEL}. "
-        f"Если до {MIN_PROFIT_TARGET_LABEL} нет развития за {TP3_TARGET_MAX_MINUTES} мин — сигнал убирается. "
-        f"Старый Instant Edge отключён."
-    )
-
-
-def add_active_signal(tr: Dict[str, Any]) -> None:
-    # Reset creation time at the actual Telegram send moment.
-    # Pending time should not count as time-in-trade.
-    tr["created_at"] = now_ts()
-    tr["sent_at"] = now_ts()
-    tr["max_progress"] = 0.0
-    tr["max_progress_tp3"] = 0.0
-    for i in range(1, 6):
-        tr.setdefault(f"tp{i}_hit", False)
-    with STATE_LOCK:
-        arr = STATE.setdefault("active_signals", [])
-        arr.append(tr)
-        STATE["active_signals"] = arr[-20:]
-        set_cooldown(tr["symbol"], tr["strategy"])
-        save_state()
-
-# ============================================================
-# TRACKING
-# ============================================================
-
-def current_price(symbol: str) -> Optional[float]:
-    try:
-        c1 = klines(symbol, "1m", 3)
-        if c1:
-            return float(c1[-1]["c"])
-    except Exception:
-        return None
-    return None
-
-
-def progress_to_tp1(tr: Dict[str, Any], price: float) -> float:
-    entry = tr["entry"]
-    tp1 = tr["tp1"]
-    if tr["side"] == "SHORT":
-        return safe_div(entry - price, entry - tp1, 0.0)
-    return safe_div(price - entry, tp1 - entry, 0.0)
-
-
-def progress_to_target(tr: Dict[str, Any], price: float, target_index: int) -> float:
-    idx = max(1, min(5, int(target_index))) - 1
-    tps = tr.get("tps") or [tr.get("tp1")]
-    if len(tps) <= idx:
-        idx = 0
-    entry = float(tr["entry"])
-    target = float(tps[idx])
-    if tr["side"] == "SHORT":
-        return safe_div(entry - price, entry - target, 0.0)
-    return safe_div(price - entry, target - entry, 0.0)
-
-
-def target_hit(tr: Dict[str, Any], price: float, target_index: int) -> bool:
-    idx = max(1, min(5, int(target_index))) - 1
-    tps = tr.get("tps") or [tr.get("tp1")]
-    if len(tps) <= idx:
-        return False
-    target = float(tps[idx])
-    return price <= target if tr["side"] == "SHORT" else price >= target
-
-
-def adverse_sl_fraction(tr: Dict[str, Any], price: float) -> float:
-    entry = float(tr["entry"])
-    sl = float(tr["sl"])
-    if tr["side"] == "SHORT":
-        return max(0.0, safe_div(price - entry, sl - entry, 0.0))
-    return max(0.0, safe_div(entry - price, entry - sl, 0.0))
-
-
-def early_invalidation_reason(tr: Dict[str, Any], price: float, age_min: float) -> Optional[str]:
-    if not EARLY_INVALIDATION_ENABLED:
-        return None
-    if age_min * 60.0 < EARLY_INVALIDATION_SECONDS:
-        return None
-    if float(tr.get("max_progress", 0.0)) > EARLY_INVALIDATION_MAX_PROGRESS:
-        return None
-    frac = adverse_sl_fraction(tr, price)
-    if frac >= EARLY_INVALIDATION_ADVERSE_SL_FRACTION and frac < 1.0:
-        return f"движение против входа {frac*100:.0f}% пути до SL, прогресс к TP1 слабый"
-    return None
-
-
-def _track_active_signals_core() -> None:
-    now = now_ts()
-    with STATE_LOCK:
-        active = list(STATE.get("active_signals", []))
-    keep = []
-    for tr in active:
-        sym = tr["symbol"]
-        px = current_price(sym)
-        if px is None:
-            keep.append(tr)
-            continue
-
-        age_min = (now - float(tr.get("created_at", now))) / 60.0
-        side = tr["side"]
-        min_target_idx = int(tr.get("min_profit_target_index", MIN_PROFIT_TARGET_INDEX) or MIN_PROFIT_TARGET_INDEX)
-        min_target_idx = max(1, min(5, min_target_idx))
-        min_target_label = f"TP{min_target_idx}"
-
-        hit_sl = px >= tr["sl"] if side == "SHORT" else px <= tr["sl"]
-        prog_tp1 = max(0.0, min(progress_to_tp1(tr, px), 3.0))
-        prog_min_target = max(0.0, min(progress_to_target(tr, px, min_target_idx), 2.0))
-        tr["max_progress"] = max(float(tr.get("max_progress", 0.0)), prog_tp1)
-        tr["max_progress_tp3"] = max(float(tr.get("max_progress_tp3", 0.0)), prog_min_target)
-
-        # TP1/TP2 are progress alerts only. Profit is counted only at TP3 by default.
-        for idx in range(1, min_target_idx):
-            if not tr.get(f"tp{idx}_hit") and target_hit(tr, px, idx):
-                tr[f"tp{idx}_hit"] = True
-                send_telegram(
-                    f"🎯 <b>TP{idx} HIT / progress only</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
-                    f"Стратегия: {tr['strategy']}\nВход: {fmt_price(tr['entry'])}\n"
-                    f"TP{idx}: {fmt_price(tr['tps'][idx-1])}\nТекущая цена: {fmt_price(px)}\n"
-                    f"Минимальная цель системы: {min_target_label}"
-                )
-
-        if target_hit(tr, px, min_target_idx):
-            tr[f"tp{min_target_idx}_hit"] = True
-            record_outcome(tr, "profit")
-            send_telegram(
-                f"✅ <b>{min_target_label} REALIZED / TAKE PROFIT</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
-                f"Стратегия: {tr['strategy']}\nВход: {fmt_price(tr['entry'])}\n"
-                f"{min_target_label}: {fmt_price(tr['tps'][min_target_idx-1])}\nТекущая цена: {fmt_price(px)}\n"
-                f"Время в сделке: {age_min:.1f} мин"
-                + stats_summary_text()
-            )
-            continue
-
-        if hit_sl:
-            record_outcome(tr, "sl")
-            send_telegram(
-                f"❌ <b>Stop Loss</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
-                f"Стратегия: {tr['strategy']}\nВход: {fmt_price(tr['entry'])}\nSL: {fmt_price(tr['sl'])}\nТекущая цена: {fmt_price(px)}\n"
-                f"Макс прогресс к TP1: {tr.get('max_progress', 0.0)*100:.1f}% · к {min_target_label}: {tr.get('max_progress_tp3', 0.0)*100:.1f}%"
-                + stats_summary_text()
-            )
-            continue
-
-        early_reason = early_invalidation_reason(tr, px, age_min)
-        if early_reason:
-            record_outcome(tr, "early_exit")
-            send_telegram(
-                f"🟠 <b>EARLY INVALIDATION / выйти раньше SL</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
-                f"Стратегия: {tr['strategy']}\nПричина: {early_reason}\n"
-                f"Вход: {fmt_price(tr['entry'])}\nТекущая цена: {fmt_price(px)}\nSL: {fmt_price(tr['sl'])}\n"
-                f"Макс прогресс к {min_target_label}: {tr.get('max_progress_tp3', 0.0)*100:.1f}%"
-                + stats_summary_text()
-            )
-            continue
-
-        # If it cannot even start moving toward TP1 quickly, remove it.
-        if age_min >= FAST_MAX_MINUTES_TO_TP1 and tr.get("max_progress", 0.0) < FAST_MIN_PROGRESS_TO_KEEP:
-            record_outcome(tr, "expired")
-            send_telegram(
-                f"⏱ <b>FAST TRADE EXPIRED</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
-                f"Стратегия: {tr['strategy']}\nЦена не начала движение за {FAST_MAX_MINUTES_TO_TP1} минут.\n"
-                f"Вход: {fmt_price(tr['entry'])}\nТекущая цена: {fmt_price(px)}\n"
-                f"TP1: {fmt_price(tr['tp1'])} · минимальная цель {min_target_label}\n"
-                f"Прогресс к TP1: {tr.get('max_progress', 0.0)*100:.1f}% · к {min_target_label}: {tr.get('max_progress_tp3', 0.0)*100:.1f}%"
-                + stats_summary_text()
-            )
-            continue
-
-        # Even if TP1/TP2 were touched, it is not a full win until TP3.
-        if age_min >= TP3_TARGET_MAX_MINUTES and not tr.get(f"tp{min_target_idx}_hit"):
-            record_outcome(tr, "expired")
-            send_telegram(
-                f"⏱ <b>{min_target_label} NOT REACHED / EXPIRED</b>\n{tr['class']} · {tr['side']} {display_symbol(sym)}\n"
-                f"Стратегия: {tr['strategy']}\nВход: {fmt_price(tr['entry'])}\nТекущая цена: {fmt_price(px)}\n"
-                f"Макс прогресс к TP1: {tr.get('max_progress', 0.0)*100:.1f}% · к {min_target_label}: {tr.get('max_progress_tp3', 0.0)*100:.1f}%\n"
-                f"TP1/TP2 не считаются полной реализацией в V14.10."
-                + stats_summary_text()
-            )
-            continue
-
-        keep.append(tr)
-
-    with STATE_LOCK:
-        STATE["active_signals"] = keep
-        STATE["last_track_at"] = now
-        save_state()
-
-
-def track_active_signals() -> None:
-    if not TRACK_LOCK.acquire(blocking=False):
-        return
-    try:
-        HEARTBEAT["track"] = now_ts()
-        return _track_active_signals_core()
-    finally:
-        TRACK_LOCK.release()
-
-
-# ============================================================
-# SCAN
-# ============================================================
-
-def _run_scan_core() -> Dict[str, Any]:
-    start = now_ts()
-    blocks: Dict[str, int] = {}
-    near: List[str] = []
-    sent = 0
-    candidates: List[Dict[str, Any]] = []
-    hot_notes: List[str] = []
-
-    try:
-        track_active_signals()
-        market = market_context()
-        # Confirm existing pending setups first. This is the professional layer.
-        confirmed = confirm_pending_setups(market, blocks, near)
-        candidates.extend(confirmed)
-
-        symbols = bingx_symbols()
-        if not symbols:
-            raise RuntimeError("empty symbols")
-
-        selected, hot_notes = select_hot_symbols(symbols)
-        checked = 0
-        for sym in selected:
-            checked += 1
-            # Even if active slot full, continue diagnostics only lightly.
-            found = analyze_symbol(sym, market, blocks, near)
-            for tr in found:
-                if should_send_immediately(tr):
-                    candidates.append(tr)
-                elif CONFIRMATION_ENGINE_ENABLED:
-                    add_pending(tr)
-                    blocks["pending_wait_confirmation"] = blocks.get("pending_wait_confirmation", 0) + 1
-                else:
-                    candidates.append(tr)
-
-        # Sort by score and quality.
-        candidates.sort(key=lambda x: (x.get("score", 0), x.get("risk", {}).get("final_rr", 0)), reverse=True)
-
-        with STATE_LOCK:
-            active_count = len(STATE.get("active_signals", []))
-        free_slots = max(0, MAX_ACTIVE_SIGNALS - active_count)
-        send_limit = min(MAX_SIGNALS_PER_SCAN, free_slots, len(candidates))
-        if send_limit <= 0 and candidates:
-            blocks["active_slots_full_send_block"] = blocks.get("active_slots_full_send_block", 0) + 1
-        for tr in candidates[:send_limit]:
-            if send_telegram(build_signal_message(tr, market)):
-                add_active_signal(tr)
-                sent += 1
-
-        diag = {
-            "title": "Диагностика V14.10 Final Hardened Level Scalper",
-            "checked": checked,
-            "universe": len(symbols),
-            "coins_in_analysis": min(COINS_IN_ANALYSIS_TARGET, len(selected)),
-            "pending_setups": len(STATE.get("pending_setups", [])),
-            "active_signals": len(STATE.get("active_signals", [])),
-            "candidates": len(candidates),
-            "sent": sent,
-            "seconds": round(now_ts() - start, 1),
-            "btc": market.get("text", "unknown"),
-            "hot_symbols": hot_notes,
-            "blocks": dict(sorted(blocks.items(), key=lambda x: x[1], reverse=True)),
-            "near_miss": near[:10],
-            "last_error": STATE.get("last_error", ""),
-        }
-        with STATE_LOCK:
-            STATE["last_scan"] = diag
-            STATE["last_scan_at"] = now_ts()
-            save_state()
-        return diag
-    except Exception as e:
-        STATE["last_error"] = f"scan: {repr(e)}"
-        save_state()
-        return {"error": repr(e), "last_error": STATE.get("last_error", "")}
-
-
-
-def run_scan() -> Dict[str, Any]:
-    if not SCAN_LOCK.acquire(blocking=False):
-        return {"skipped": "scan already running", "last_error": STATE.get("last_error", "")}
-    try:
-        HEARTBEAT["scan"] = now_ts()
-        paused, until = circuit_paused()
-        if paused:
-            diag = {
-                "title": "Диагностика V14.10 Final Hardened Level Scalper",
-                "checked": 0,
-                "universe": 0,
-                "coins_in_analysis": 0,
-                "pending_setups": len(STATE.get("pending_setups", [])),
-                "active_signals": len(STATE.get("active_signals", [])),
-                "candidates": 0,
-                "sent": 0,
-                "seconds": 0,
-                "btc": f"Circuit breaker pause until {time.strftime('%H:%M UTC', time.gmtime(until))}",
-                "hot_symbols": [],
-                "blocks": {"circuit_breaker_paused": 1},
-                "near_miss": [],
-                "last_error": STATE.get("last_error", ""),
-            }
-            with STATE_LOCK:
-                STATE["last_scan"] = diag
-                STATE["last_scan_at"] = now_ts()
-                save_state()
-            return diag
-        diag = _run_scan_core()
-        if isinstance(diag, dict):
-            diag["title"] = "Диагностика V14.10 Final Hardened Level Scalper"
-        return diag
-    finally:
-        SCAN_LOCK.release()
-
-
-def format_diag(diag: Dict[str, Any]) -> str:
-    if "error" in diag:
-        return f"❌ Ошибка scan: {diag['error']}"
     lines = []
-    lines.append(f"🧪 {diag.get('title', 'Диагностика')}" )
-    lines.append(f"Проверено: {diag.get('checked', 0)} из universe {diag.get('universe', 0)}")
-    lines.append(f"Монет в анализе: {diag.get('coins_in_analysis', 0)} · pending: {diag.get('pending_setups', 0)} · active: {diag.get('active_signals', 0)}")
-    lines.append(f"Кандидатов: {diag.get('candidates', 0)} · отправлено: {diag.get('sent', 0)} · время: {diag.get('seconds', 0)}с")
-    lines.append(f"BTC: {diag.get('btc', '')}")
+    lines.append(f"{emoji} <b>{mode_label}</b>")
     lines.append("")
-    lines.append("Hot symbols:")
-    for x in diag.get("hot_symbols", []):
-        lines.append(x)
+    lines.append(f"<b>{e(c.get('display_symbol', c.get('symbol')))} · {side}</b>")
+    lines.append(f"Strategy: {VERSION}")
+    lines.append(f"Quality: <b>{c.get('quality')}%</b>")
+    lines.append(f"Mode: <b>{e(c.get('anti_mode', 'A_ONLY'))}</b>")
     lines.append("")
-    lines.append("Главные блокировки:")
-    blocks = diag.get("blocks", {})
-    if blocks:
-        for k, v in blocks.items():
-            lines.append(f"{k}: {v}")
-    else:
-        lines.append("—")
-    near = diag.get("near_miss", [])
-    if near:
-        lines.append("")
-        lines.append("Почти прошли:")
-        for x in near:
-            lines.append(x)
+    lines.append(f"Entry: <b>{fmt_price(entry)}</b>")
+    lines.append(f"Leverage: <b>x{int(c.get('leverage', CFG.leverage))}</b>")
+    lines.append(f"RM: ≤<b>{CFG.rm_per_signal_pct:.2f}%</b> от депозита")
+    lines.append(f"SL: <b>{fmt_price(sl)}</b> (~{risk_pct * CFG.leverage * 100:.1f}% ROI risk)")
     lines.append("")
-    lines.append(f"Last error: {diag.get('last_error', '')}")
-    return "\n".join(lines)
+    for i, tp in enumerate(tps, 1):
+        mv = abs(tp - entry) / entry if entry else 0
+        lines.append(f"TP{i}: <b>{fmt_price(tp)}</b> (+{roi_text(mv, CFG.leverage)})")
+    lines.append("")
+    lines.append(f"BTC: {e(btc.get('mode'))} · 1h {btc.get('h1', 0)*100:+.2f}% · 6h {btc.get('h6', 0)*100:+.2f}%")
+    lines.append("Reason:")
+    for r in c.get("reasons", [])[:6]:
+        lines.append(f"• {e(r)}")
 
-# ============================================================
-# LOOPS
-# ============================================================
-
-_STOP = False
-
-
-
-def format_telegram_scan_report(diag: Dict[str, Any]) -> str:
-    """Compact Telegram status update: shows scan activity without spamming full diagnostics."""
-    if "error" in diag:
-        return f"⚠️ V14 scan error\n{diag.get('error')}\nLast error: {diag.get('last_error', '')}"
-
-    blocks = diag.get("blocks", {}) or {}
-    top_blocks = ", ".join([f"{k}:{v}" for k, v in list(blocks.items())[:5]]) or "нет"
-
-    total_item = STATE.get("stats", {}).get("total", empty_stat())
-    _, total_wr = item_wr(total_item)
-    lines = [
-        f"🧪 V14 scan update",
-        f"{APP_VERSION}",
-        f"Проверено: {diag.get('checked', 0)} из {diag.get('universe', 0)} · монет в анализе: {diag.get('coins_in_analysis', 0)} · кандидатов: {diag.get('candidates', 0)} · отправлено: {diag.get('sent', 0)} · {diag.get('seconds', 0)}с",
-        f"Active: {diag.get('active_signals', 0)} · Pending confirmation: {diag.get('pending_setups', 0)}",
-        f"BTC: {diag.get('btc', '')}",
-        f"Stats: {int(total_item.get('profit',0))} profit / {int(total_item.get('sl',0))} SL / {int(total_item.get('expired',0))} expired / {int(total_item.get('early_exit',0))} early · WR {total_wr:.1f}%",
-        f"Блокировки: {top_blocks}",
-    ]
-    if TELEGRAM_SCAN_REPORT_INCLUDE_HOT:
-        hot = diag.get("hot_symbols", [])[:5]
-        if hot:
-            lines.append("")
-            lines.append("Hot symbols:")
-            lines.extend(hot)
-    near = diag.get("near_miss", [])[:4]
-    if near:
-        lines.append("")
-        lines.append("Почти прошли:")
-        lines.extend(near)
+    metrics = c.get("metrics", {})
+    lines.append("")
+    lines.append(
+        f"Capacity {safe_float(metrics.get('cap'))*100:.2f}% · "
+        f"Vol5 x{safe_float(metrics.get('vr5')):.2f} · "
+        f"RSI5 {safe_float(metrics.get('rsi5')):.1f}"
+    )
+    lines.append("")
+    lines.append("⚠️ Это сигнал, не гарантия прибыли. Бот не открывает сделки сам. Соблюдай риск.")
     return "\n".join(lines)
 
 
-def maybe_send_scan_report(diag: Dict[str, Any]) -> None:
-    if not TELEGRAM_SCAN_REPORTS_ENABLED:
+def register_active_signal(state: Dict[str, Any], c: Dict[str, Any]) -> None:
+    sid = c.get("id") or f"{c['symbol']}:{c['side']}:{int(now_ts())}"
+    c = dict(c)
+    c["id"] = sid
+    c["sent_ts"] = now_ts()
+    c["hit_tps"] = []
+    c["status"] = "active"
+    state.setdefault("active", {})[sid] = c
+
+
+def mark_signal_sent(state: Dict[str, Any], c: Dict[str, Any]) -> None:
+    state["last_signal_ts"] = now_ts()
+    set_cooldown(state, c["symbol"], c["side"], c.get("mode", "B"))
+    if CFG.track_active_signals:
+        register_active_signal(state, c)
+
+
+def current_price(symbol: str) -> float:
+    c = fetch_klines(symbol, "1m", 5)
+    if c:
+        return c[-1]["close"]
+    c = fetch_klines(symbol, "5m", 5)
+    if c:
+        return c[-1]["close"]
+    return 0.0
+
+
+def track_active_signals(state: Dict[str, Any]) -> None:
+    if not CFG.track_active_signals:
         return
+    active = dict(state.get("active", {}) or {})
     now = now_ts()
-    with STATE_LOCK:
-        last = float(STATE.get("last_scan_report_at", 0) or 0)
-    if now - last < max(60, TELEGRAM_SCAN_REPORT_EVERY_SECONDS):
-        return
-    if send_telegram(format_telegram_scan_report(diag)):
-        with STATE_LOCK:
-            STATE["last_scan_report_at"] = now
-            save_state()
-
-
-def scan_loop() -> None:
-    while not _STOP:
+    for sid, sig in active.items():
         try:
-            if AUTO_SCAN_ENABLED:
-                diag = run_scan()
-                maybe_send_scan_report(diag)
-        except Exception as e:
-            STATE["last_error"] = f"scan_loop: {repr(e)}"
-            save_state()
-        time.sleep(max(5, AUTO_SCAN_SECONDS))
+            symbol = sig.get("symbol")
+            side = sig.get("side")
+            entry = safe_float(sig.get("entry"))
+            sl = safe_float(sig.get("sl"))
+            tps = [safe_float(x) for x in sig.get("tps", [])]
+            hit = list(sig.get("hit_tps", []) or [])
+            sent_ts = safe_float(sig.get("sent_ts", now))
+            if now - sent_ts > CFG.signal_expiry_minutes * 60:
+                telegram_send(f"⏱️ <b>Expired</b>\n{e(to_display_symbol(symbol))} · {e(side)}\nСделка не реализовалась быстро, сигнал закрыт по времени.")
+                state.setdefault("stats", {})["expired"] = state.setdefault("stats", {}).get("expired", 0) + 1
+                state.get("active", {}).pop(sid, None)
+                continue
 
+            price = current_price(symbol)
+            if price <= 0:
+                continue
 
-def track_loop() -> None:
-    while not _STOP:
+            if side == "LONG":
+                if price <= sl:
+                    telegram_send(f"❌ <b>Stop Loss</b>\n{e(to_display_symbol(symbol))} · LONG\nEntry {fmt_price(entry)} · SL {fmt_price(sl)} · Last {fmt_price(price)}")
+                    state.setdefault("stats", {})["sl"] = state.setdefault("stats", {}).get("sl", 0) + 1
+                    state.get("active", {}).pop(sid, None)
+                    continue
+                for idx, tp in enumerate(tps, 1):
+                    if idx not in hit and price >= tp:
+                        hit.append(idx)
+                        mv = abs(tp - entry) / entry
+                        telegram_send(f"✅ <b>TP{idx} HIT</b>\n{e(to_display_symbol(symbol))} · LONG\nTP{idx}: {fmt_price(tp)} (+{roi_text(mv, CFG.leverage)})")
+            else:
+                if price >= sl:
+                    telegram_send(f"❌ <b>Stop Loss</b>\n{e(to_display_symbol(symbol))} · SHORT\nEntry {fmt_price(entry)} · SL {fmt_price(sl)} · Last {fmt_price(price)}")
+                    state.setdefault("stats", {})["sl"] = state.setdefault("stats", {}).get("sl", 0) + 1
+                    state.get("active", {}).pop(sid, None)
+                    continue
+                for idx, tp in enumerate(tps, 1):
+                    if idx not in hit and price <= tp:
+                        hit.append(idx)
+                        mv = abs(tp - entry) / entry
+                        telegram_send(f"✅ <b>TP{idx} HIT</b>\n{e(to_display_symbol(symbol))} · SHORT\nTP{idx}: {fmt_price(tp)} (+{roi_text(mv, CFG.leverage)})")
+
+            # If all TPs reached, close active as profit.
+            if len(hit) >= len(tps) and tps:
+                telegram_send(f"🏁 <b>All targets reached</b>\n{e(to_display_symbol(symbol))} · {e(side)}\nВсе цели взяты.")
+                state.setdefault("stats", {})["profit"] = state.setdefault("stats", {}).get("profit", 0) + 1
+                state.get("active", {}).pop(sid, None)
+            else:
+                sig["hit_tps"] = sorted(set(hit))
+                state.setdefault("active", {})[sid] = sig
+        except Exception:
+            log.exception("track signal failed: %s", sid)
+
+# ----------------------------
+# Scan loop
+# ----------------------------
+def scan_once_sync(manual: bool = False) -> Dict[str, Any]:
+    start = now_ts()
+    state = STATE
+
+    # Track existing signals first.
+    track_active_signals(state)
+
+    anti_mode = get_anti_silence_mode(state)
+    btc = btc_context()
+    symbols = fetch_contract_symbols()
+    tickers = fetch_tickers()
+    ranked = rank_symbols(symbols, tickers)
+
+    checked = 0
+    sent = 0
+    candidates_count = 0
+    block_counts: Dict[str, int] = {}
+    hot_preview: List[str] = []
+    near_miss: List[str] = []
+
+    # First confirm pending.
+    ready_from_pending = check_pending_confirmations(state, btc)
+    for c in ready_from_pending[:CFG.max_signals_per_scan]:
+        if active_count(state) >= CFG.max_active_signals:
+            break
+        if telegram_send(format_signal(c, btc)):
+            mark_signal_sent(state, c)
+            sent += 1
+
+    # Analyze hot symbols.
+    for symbol in ranked[:CFG.hot_symbols_to_analyze]:
+        if sent >= CFG.max_signals_per_scan:
+            break
+        checked += 1
         try:
-            track_active_signals()
-        except Exception as e:
-            STATE["last_error"] = f"track_loop: {repr(e)}"
-            save_state()
-        time.sleep(max(2, AUTO_TRACK_SECONDS))
+            c15 = fetch_klines(symbol, "15m", 6)
+            c5 = fetch_klines(symbol, "5m", 8)
+            c1 = fetch_klines(symbol, "1m", 6)
+            if len(c15) >= 3 and len(c5) >= 3:
+                m15 = pct(c15[-1]["close"], c15[-2]["close"])
+                m30 = pct(c15[-1]["close"], c15[-3]["close"])
+                m1_3 = pct(c1[-1]["close"], c1[-4]["close"]) if len(c1) >= 4 else 0
+                hot_preview.append(f"{to_display_symbol(symbol)}: 1m3 {m1_3*100:+.2f}%, 15m {m15*100:+.2f}%, 30m {m30*100:+.2f}%")
+        except Exception:
+            pass
 
+        cand, reason = analyze_symbol(symbol, anti_mode, btc, state)
+        if cand:
+            candidates_count += 1
+            if telegram_send(format_signal(cand, btc)):
+                mark_signal_sent(state, cand)
+                sent += 1
+            else:
+                block_counts["telegram_failed"] = block_counts.get("telegram_failed", 0) + 1
+        else:
+            block_counts[reason] = block_counts.get(reason, 0) + 1
+            if reason in ("quality_too_low", "rr_block", "capacity_block", "volume_block", "pending_wait_confirmation"):
+                near_miss.append(f"{to_display_symbol(symbol)}: {reason}")
 
-def watchdog_loop() -> None:
-    while not _STOP:
-        try:
-            if WATCHDOG_ENABLED:
-                now = now_ts()
-                scan_stale = AUTO_SCAN_ENABLED and (now - float(HEARTBEAT.get("scan", now))) > WATCHDOG_STALE_MINUTES * 60
-                track_stale = (now - float(HEARTBEAT.get("track", now))) > WATCHDOG_STALE_MINUTES * 60
-                if (scan_stale or track_stale) and not HEARTBEAT.get("watchdog_alerted", False):
-                    HEARTBEAT["watchdog_alerted"] = True
-                    send_telegram(
-                        f"🚨 <b>WATCHDOG</b>\n"
-                        f"Loop stale > {WATCHDOG_STALE_MINUTES} мин. scan_stale={scan_stale}, track_stale={track_stale}.\n"
-                        f"Проверь /health и Render logs."
-                    )
-                if not (scan_stale or track_stale):
-                    HEARTBEAT["watchdog_alerted"] = False
-        except Exception as e:
-            STATE["last_error"] = f"watchdog_loop: {repr(e)}"
-            save_state()
-        time.sleep(60)
-
-
-@app.on_event("startup")
-def startup_event() -> None:
-    if SEND_STARTUP_TELEGRAM:
-        send_telegram(
-            "✅ Bot activated\n"
-            f"{APP_VERSION}\n"
-            f"{DEPLOY_MARKER}\n"
-            f"Scan: every {AUTO_SCAN_SECONDS}s · Track: every {AUTO_TRACK_SECONDS}s\n"
-            f"Max active: {MAX_ACTIVE_SIGNALS} · Max per scan: {MAX_SIGNALS_PER_SCAN}\n"
-            f"Circuit breaker: {CIRCUIT_BREAKER_ENABLED} · {MAX_CONSECUTIVE_SL} SL подряд / {MAX_DAILY_SL} SL в день\n"
-            f"Confirmation engine: {CONFIRMATION_ENGINE_ENABLED}\n"
-            f"Instant Edge disabled: {INSTANT_EDGE_HARD_DISABLED}\n"
-            f"Bounce Reject SHORT: {BOUNCE_REJECT_SHORT_ENABLED}\n"
-            f"PUMP Trap SHORT: {PUMP_TRAP_SHORT_ENABLED}\n"
-            f"Extreme Level Reaction: {EXTREME_LEVEL_REACTION_ENABLED}\n"
-            f"Immediate send: {ALLOW_IMMEDIATE_SEND} · Early invalidation: {EARLY_INVALIDATION_ENABLED}"
-        )
-    threading.Thread(target=scan_loop, daemon=True).start()
-    threading.Thread(target=track_loop, daemon=True).start()
-    threading.Thread(target=watchdog_loop, daemon=True).start()
-
-# ============================================================
-# API ENDPOINTS
-# ============================================================
-
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {"app": APP_NAME, "version": APP_VERSION, "deploy_marker": DEPLOY_MARKER}
-
-
-@app.get("/version")
-def version() -> Dict[str, Any]:
-    return {
-        "app": APP_NAME,
-        "version": APP_VERSION,
-        "deploy_marker": DEPLOY_MARKER,
-        "instant_edge_enabled": INSTANT_EDGE_ENABLED,
-        "confirmation_engine": CONFIRMATION_ENGINE_ENABLED,
-        "state_file": STATE_FILE,
-        "send_startup_telegram": SEND_STARTUP_TELEGRAM,
-        "telegram_scan_reports_enabled": TELEGRAM_SCAN_REPORTS_ENABLED,
-        "telegram_scan_report_every_seconds": TELEGRAM_SCAN_REPORT_EVERY_SECONDS,
-        "allow_immediate_send": ALLOW_IMMEDIATE_SEND,
-        "early_invalidation_enabled": EARLY_INVALIDATION_ENABLED,
-        "confirm_min_tp1_progress": CONFIRM_MIN_TP1_PROGRESS,
-        "pump_trap_short_enabled": PUMP_TRAP_SHORT_ENABLED,
-        "extreme_level_reaction_enabled": EXTREME_LEVEL_REACTION_ENABLED,
-        "pro_mtf_filter_enabled": PRO_MTF_FILTER_ENABLED,
-        "pro_mtf_min_confirmations": PRO_MTF_MIN_CONFIRMATIONS,
-        "coins_in_analysis_target": COINS_IN_ANALYSIS_TARGET,
-        "tp_moves": TP_MOVES,
-        "circuit_breaker_enabled": CIRCUIT_BREAKER_ENABLED,
-        "max_consecutive_sl": MAX_CONSECUTIVE_SL,
-        "max_daily_sl": MAX_DAILY_SL,
-        "watchdog_enabled": WATCHDOG_ENABLED,
+    elapsed = now_ts() - start
+    summary = {
+        "version": VERSION,
+        "checked": checked,
+        "universe": len(symbols),
+        "analyzed_limit": CFG.hot_symbols_to_analyze,
+        "candidates": candidates_count,
+        "sent": sent,
+        "elapsed_sec": round(elapsed, 1),
+        "anti_silence_mode": anti_mode,
+        "silent_minutes": round(silent_minutes(state), 1),
+        "active": len(state.get("active", {}) or {}),
+        "pending": len(state.get("pending", {}) or {}),
+        "btc": btc,
+        "stats": state.get("stats", {}),
+        "blocks": dict(sorted(block_counts.items(), key=lambda x: x[1], reverse=True)),
+        "hot_symbols": hot_preview[:8],
+        "near_miss": near_miss[:8],
     }
+    state["last_scan_ts"] = now_ts()
+    state["last_scan_summary"] = summary
 
+    # Limited scan update.
+    if CFG.send_scan_updates or manual:
+        last_upd = safe_float(state.get("last_scan_update_ts", 0))
+        if manual or now_ts() - last_upd >= CFG.scan_update_min_interval_sec:
+            telegram_send(format_scan_update(summary))
+            state["last_scan_update_ts"] = now_ts()
+
+    save_state_atomic(state)
+    return summary
+
+
+def format_scan_update(s: Dict[str, Any]) -> str:
+    btc = s.get("btc", {})
+    stats = s.get("stats", {})
+    blocks = s.get("blocks", {})
+    lines = []
+    lines.append(f"🧪 <b>V14 scan update</b>")
+    lines.append(e(s.get("version", VERSION)))
+    lines.append(
+        f"Проверено: {s.get('checked')} из {s.get('universe')} · "
+        f"кандидатов: {s.get('candidates')} · отправлено: {s.get('sent')} · {s.get('elapsed_sec')}с"
+    )
+    lines.append(f"Mode: <b>{e(s.get('anti_silence_mode'))}</b> · silence {s.get('silent_minutes')} min")
+    lines.append(f"Active: {s.get('active')} · Pending confirmation: {s.get('pending')}")
+    lines.append(f"BTC: {e(btc.get('mode'))}: 1h {safe_float(btc.get('h1'))*100:+.2f}%, 6h {safe_float(btc.get('h6'))*100:+.2f}%")
+    lines.append(f"Stats: {stats.get('profit',0)} profit / {stats.get('sl',0)} SL / {stats.get('expired',0)} expired / {stats.get('early',0)} early")
+    if blocks:
+        lines.append("Блокировки: " + ", ".join([f"{e(k)}:{v}" for k, v in list(blocks.items())[:8]]))
+    hot = s.get("hot_symbols") or []
+    if hot:
+        lines.append("")
+        lines.append("Hot symbols:")
+        for x in hot[:5]:
+            lines.append(e(x))
+    miss = s.get("near_miss") or []
+    if miss:
+        lines.append("")
+        lines.append("Почти прошли:")
+        for x in miss[:5]:
+            lines.append(e(x))
+    return "\n".join(lines)
+
+async def scan_once(manual: bool = False) -> Dict[str, Any]:
+    async with SCAN_LOCK:
+        return await asyncio.to_thread(scan_once_sync, manual)
+
+async def background_worker() -> None:
+    log.info("Background worker started: %s", VERSION)
+    while True:
+        try:
+            await scan_once(manual=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("scan loop error")
+        await asyncio.sleep(max(30, CFG.scan_interval_sec))
+
+# ----------------------------
+# FastAPI
+# ----------------------------
+WORKER_TASK: Optional[asyncio.Task] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global WORKER_TASK
+    # Startup message once per process.
+    log.info("Starting %s", VERSION)
+    if CFG.telegram_token and CFG.telegram_chat_id:
+        telegram_send(f"🚀 <b>{e(VERSION)} started</b>\nAnti-silence: ON · soft {CFG.starvation_soft_minutes}m · hard {CFG.starvation_hard_minutes}m")
+    WORKER_TASK = asyncio.create_task(background_worker())
+    try:
+        yield
+    finally:
+        if WORKER_TASK:
+            WORKER_TASK.cancel()
+            try:
+                await WORKER_TASK
+            except Exception:
+                pass
+
+app = FastAPI(title=VERSION, lifespan=lifespan)
+
+
+def check_admin(key: Optional[str]) -> bool:
+    if not CFG.admin_key:
+        return True
+    return key == CFG.admin_key
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    st = STATE
+    last = st.get("last_scan_summary", {})
+    html_body = f"""
+    <html>
+      <head><title>{e(VERSION)}</title></head>
+      <body style="font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; line-height: 1.5;">
+        <h2>{e(VERSION)}</h2>
+        <p><b>Status:</b> running</p>
+        <p><b>Anti-silence mode:</b> {e(get_anti_silence_mode(st))}</p>
+        <p><b>Silent minutes:</b> {silent_minutes(st):.1f}</p>
+        <p><b>Last scan:</b> {e(json.dumps(last, ensure_ascii=False, indent=2))}</p>
+        <p>Endpoints: <code>/health</code>, <code>/status</code>, <code>/scan</code></p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html_body)
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "version": APP_VERSION,
-        "active_signals": len(STATE.get("active_signals", [])),
-        "pending_setups": len(STATE.get("pending_setups", [])),
-        "last_error": STATE.get("last_error", ""),
-        "telegram_scan_reports_enabled": TELEGRAM_SCAN_REPORTS_ENABLED,
-        "telegram_scan_report_every_seconds": TELEGRAM_SCAN_REPORT_EVERY_SECONDS,
-        "last_scan_report_at": STATE.get("last_scan_report_at", 0),
-        "circuit": STATE.get("circuit", {}),
-        "circuit_paused": circuit_paused()[0],
-        "heartbeat_scan_age_s": round(now_ts() - float(HEARTBEAT.get("scan", now_ts())), 1),
-        "heartbeat_track_age_s": round(now_ts() - float(HEARTBEAT.get("track", now_ts())), 1),
-    }
+async def health():
+    return {"ok": True, "version": VERSION, "time": now_ts()}
 
+@app.get("/status")
+async def status(key: Optional[str] = Query(None)):
+    if not check_admin(key):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    return JSONResponse({
+        "ok": True,
+        "version": VERSION,
+        "anti_silence_mode": get_anti_silence_mode(STATE),
+        "silent_minutes": silent_minutes(STATE),
+        "state": STATE,
+    })
 
 @app.get("/scan")
-def scan_endpoint() -> str:
-    diag = run_scan()
-    return format_diag(diag)
+async def manual_scan(key: Optional[str] = Query(None)):
+    if not check_admin(key):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    summary = await scan_once(manual=True)
+    return JSONResponse({"ok": True, "summary": summary})
 
-
-@app.get("/auto-status")
-def auto_status() -> Dict[str, Any]:
-    return {
-        "version": APP_VERSION,
-        "auto_scan_enabled": AUTO_SCAN_ENABLED,
-        "auto_scan_seconds": AUTO_SCAN_SECONDS,
-        "auto_track_seconds": AUTO_TRACK_SECONDS,
-        "active_signals": STATE.get("active_signals", []),
-        "pending_setups_count": len(STATE.get("pending_setups", [])),
-        "last_scan": STATE.get("last_scan", {}),
-        "last_error": STATE.get("last_error", ""),
-    }
-
-
-@app.get("/stats")
-def stats_endpoint() -> Dict[str, Any]:
-    return STATE.get("stats", {})
-
-
-@app.get("/stats-text")
-def stats_text_endpoint() -> str:
-    return stats_summary_text()
-
-
-@app.get("/test-telegram")
-def test_telegram() -> Dict[str, Any]:
-    ok = send_telegram(f"✅ Test Telegram OK\n{APP_VERSION}\n{DEPLOY_MARKER}")
-    return {"ok": ok, "last_error": STATE.get("last_error", "")}
-
-
-
-@app.get("/circuit-reset")
-def circuit_reset_endpoint() -> Dict[str, Any]:
-    reset_circuit_breaker()
-    return {"ok": True, "circuit": STATE.get("circuit", {})}
-
-@app.get("/reset-state")
-def reset_state() -> Dict[str, Any]:
-    # Simple endpoint for tests. Remove if you do not want remote reset.
+@app.post("/reset")
+async def reset_state(key: Optional[str] = Query(None)):
+    if not check_admin(key):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     global STATE
     STATE = default_state()
-    save_state()
-    return {"ok": True, "version": APP_VERSION}
+    save_state_atomic(STATE)
+    return {"ok": True, "version": VERSION}
 
-# ============================================================
-# LOCAL RUN
-# ============================================================
+@app.get("/text-status", response_class=PlainTextResponse)
+async def text_status():
+    last = STATE.get("last_scan_summary", {})
+    return PlainTextResponse(json.dumps(last, ensure_ascii=False, indent=2))
 
-if __name__ == "__main__":
-    import uvicorn
-    port = env_int("PORT", 8000)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# For local run:
+# uvicorn app:app --host 0.0.0.0 --port 8000
