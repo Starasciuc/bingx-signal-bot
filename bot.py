@@ -59,15 +59,30 @@ SEND_SCANNER_ERRORS_TO_TELEGRAM = os.getenv("SEND_SCANNER_ERRORS_TO_TELEGRAM", "
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
 MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
-TOP_SYMBOLS_LIMIT = int(os.getenv("TOP_SYMBOLS_LIMIT", "90"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "72"))
-FALLBACK_SCORE = float(os.getenv("FALLBACK_SCORE", "66"))
+TOP_SYMBOLS_LIMIT = int(os.getenv("TOP_SYMBOLS_LIMIT", "120"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "78"))
+FALLBACK_SCORE = float(os.getenv("FALLBACK_SCORE", "74"))
 DAILY_MIN_SIGNALS = int(os.getenv("DAILY_MIN_SIGNALS", "1"))
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "6"))
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "240"))
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "180"))
 SYMBOL_COOLDOWN_MINUTES = int(os.getenv("SYMBOL_COOLDOWN_MINUTES", "360"))
 MAX_ACTIVE_TRADES = int(os.getenv("MAX_ACTIVE_TRADES", "8"))
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
+
+# Precise mode: the bot does NOT send a signal immediately after one scan.
+# It first finds a structural setup on a CLOSED candle, stores it as pending,
+# then sends only if the same symbol/side is confirmed again on the next scan.
+STRICT_CONFIRMATION = os.getenv("STRICT_CONFIRMATION", "true").lower() in ("1", "true", "yes", "y", "on")
+CONFIRMATION_SCANS = int(os.getenv("CONFIRMATION_SCANS", "2"))
+PENDING_EXPIRE_SECONDS = int(os.getenv("PENDING_EXPIRE_SECONDS", "1200"))
+MIN_VOLUME_RATIO_CONFIRM = float(os.getenv("MIN_VOLUME_RATIO_CONFIRM", "1.10"))
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.20"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "5.00"))
+MAX_ENTRY_DISTANCE_ATR = float(os.getenv("MAX_ENTRY_DISTANCE_ATR", "1.35"))
+MIN_REJECTION_WICK_RATIO = float(os.getenv("MIN_REJECTION_WICK_RATIO", "0.25"))
+MIN_CLOSE_LOCATION = float(os.getenv("MIN_CLOSE_LOCATION", "0.58"))
+ANTI_CHASE_8_CANDLE_MOVE = float(os.getenv("ANTI_CHASE_8_CANDLE_MOVE", "9.0"))
+SEND_PENDING_LOGS_TO_TELEGRAM = os.getenv("SEND_PENDING_LOGS_TO_TELEGRAM", "false").lower() in ("1", "true", "yes", "y", "on")
 
 # Example-like ladder: around 0.8% to 4.0% price movement.
 TP_PCTS = [0.008, 0.014, 0.020, 0.030, 0.040]
@@ -170,6 +185,8 @@ scanner_task: Optional[asyncio.Task] = None
 monitor_task: Optional[asyncio.Task] = None
 last_scanner_error_ts = 0.0
 last_scan_info: Dict[str, Any] = {}
+pending_candidates: Dict[str, Dict[str, Any]] = {}
+pending_lock = asyncio.Lock()
 
 # =============================================================================
 # FASTAPI APP
@@ -368,6 +385,7 @@ async def send_startup_message() -> None:
         f"Scanner: каждые <b>{SCAN_INTERVAL_SECONDS}</b> сек\n"
         f"Score: <b>{MIN_SCORE:.0f}</b> / fallback <b>{FALLBACK_SCORE:.0f}</b>\n"
         f"Плечо в расчетах: <b>x{LEVERAGE:.0f}</b>\n"
+        f"Режим: <b>точные отскоки/отбои + {CONFIRMATION_SCANS} проверки</b>\n"
         "Data: BingX public REST, <b>без ccxt</b>\n"
         f"Telegram getMe: <code>{get_me}</code>\n\n"
         "Если ты видишь это сообщение — Telegram подключен правильно."
@@ -683,6 +701,74 @@ def candle_body_pct(k: Dict[str, float]) -> float:
         return 0.0
     return abs(c - o) / o * 100.0
 
+
+
+def closed_klines(klines: List[Dict[str, float]], interval: str) -> List[Dict[str, float]]:
+    """Return only closed candles when timestamps allow detection.
+
+    BingX may include the currently forming candle as the last kline. For precise
+    scalp entries we do not want to judge a setup by an unfinished candle.
+    If timestamps are missing, the function returns the input unchanged.
+    """
+    if not klines:
+        return klines
+    last_ts = klines[-1].get("ts", 0) or 0
+    if last_ts <= 0:
+        return klines
+    if last_ts < 10_000_000_000:
+        last_ts *= 1000
+    now_ms = time.time() * 1000
+    ms = interval_to_ms(interval)
+    if now_ms - last_ts < ms * 0.92 and len(klines) > 1:
+        return klines[:-1]
+    return klines
+
+
+def candle_position(k: Dict[str, float]) -> Tuple[float, float, float, float]:
+    """Return lower wick ratio, upper wick ratio, close-location-high, close-location-low."""
+    o, h, l, c = k["open"], k["high"], k["low"], k["close"]
+    rng = max(h - l, c * 0.0001)
+    lower_wick = (min(o, c) - l) / rng
+    upper_wick = (h - max(o, c)) / rng
+    close_near_high = (c - l) / rng
+    close_near_low = (h - c) / rng
+    return lower_wick, upper_wick, close_near_high, close_near_low
+
+
+def local_levels(k15: List[Dict[str, float]]) -> Dict[str, float]:
+    """Compute recent support/resistance from closed 15m candles excluding signal candles."""
+    lookback = k15[-54:-4] if len(k15) >= 58 else k15[:-4]
+    if len(lookback) < 20:
+        lookback = k15[:-2]
+    highs = sorted([k["high"] for k in lookback])
+    lows = sorted([k["low"] for k in lookback])
+    if not highs or not lows:
+        price = k15[-1]["close"]
+        return {"support": price, "resistance": price, "hard_support": price, "hard_resistance": price}
+    support = lows[max(0, int(len(lows) * 0.10) - 1)]
+    resistance = highs[min(len(highs) - 1, int(len(highs) * 0.90))]
+    hard_support = min(lows)
+    hard_resistance = max(highs)
+    return {
+        "support": support,
+        "resistance": resistance,
+        "hard_support": hard_support,
+        "hard_resistance": hard_resistance,
+    }
+
+
+def is_5m_confirmed(side: str, k5: List[Dict[str, float]]) -> Tuple[bool, List[str]]:
+    if len(k5) < 12:
+        return False, ["5m мало свечей"]
+    closes = [k["close"] for k in k5]
+    e9 = ema(closes[-30:], 9)
+    last = k5[-1]
+    if side == "LONG":
+        ok = closes[-1] > closes[-2] >= closes[-3] and closes[-1] >= e9 and last["close"] > last["open"]
+        return ok, ["5m подтверждение вверх"] if ok else []
+    ok = closes[-1] < closes[-2] <= closes[-3] and closes[-1] <= e9 and last["close"] < last["open"]
+    return ok, ["5m подтверждение вниз"] if ok else []
+
 # =============================================================================
 # SIGNAL ANALYSIS
 # =============================================================================
@@ -699,14 +785,23 @@ class Candidate:
 
 
 def analyze_symbol(symbol: str, k15: List[Dict[str, float]], k5: List[Dict[str, float]], k1h: List[Dict[str, float]]) -> Optional[Candidate]:
-    if len(k15) < 40 or len(k5) < 20:
+    """Strict structural scanner.
+
+    Sends only setups that already touched a local support/resistance zone and
+    then CLOSED with rejection/confirmation. It avoids chasing candles that are
+    already too far from the level.
+    """
+    k15 = closed_klines(k15, "15m")
+    k5 = closed_klines(k5, "5m")
+    k1h = closed_klines(k1h, "1h")
+    if len(k15) < 58 or len(k5) < 20:
         return None
 
     closes15 = [k["close"] for k in k15]
     closes5 = [k["close"] for k in k5]
     closes1h = [k["close"] for k in k1h] if len(k1h) >= 20 else closes15
 
-    last = k15[-1]
+    last = k15[-1]       # last CLOSED 15m candle
     prev = k15[-2]
     entry = last["close"]
     if entry <= 0:
@@ -715,101 +810,146 @@ def analyze_symbol(symbol: str, k15: List[Dict[str, float]], k5: List[Dict[str, 
     rsi15 = rsi(closes15, 14)
     ema9 = ema(closes15[-40:], 9)
     ema21 = ema(closes15[-60:], 21)
-    ema50 = ema(closes15[-80:], 50)
     ema1h21 = ema(closes1h[-60:], 21)
     ema1h50 = ema(closes1h[-80:], 50)
     volr = volume_ratio(k15, 20)
     atr_val = atr(k15, 14)
     atr_pct = atr_val / entry * 100 if entry else 0.0
 
+    if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+        return None
+
     chg_3 = percent_change(closes15[-4], closes15[-1]) if len(closes15) >= 4 else 0.0
     chg_8 = percent_change(closes15[-9], closes15[-1]) if len(closes15) >= 9 else 0.0
     chg_16 = percent_change(closes15[-17], closes15[-1]) if len(closes15) >= 17 else 0.0
     chg_5m3 = percent_change(closes5[-4], closes5[-1]) if len(closes5) >= 4 else 0.0
 
-    high20 = max(k["high"] for k in k15[-22:-2])
-    low20 = min(k["low"] for k in k15[-22:-2])
-    high8 = max(k["high"] for k in k15[-10:-2])
-    low8 = min(k["low"] for k in k15[-10:-2])
+    # Anti-chase: no signals after vertical move away from the level.
+    if abs(chg_8) > ANTI_CHASE_8_CANDLE_MOVE:
+        return None
+    if candle_body_pct(last) > 5.0:
+        return None
 
+    levels = local_levels(k15)
+    support = levels["support"]
+    resistance = levels["resistance"]
+    hard_support = levels.get("hard_support", support)
+    hard_resistance = levels.get("hard_resistance", resistance)
+
+    lower_wick, upper_wick, close_near_high, close_near_low = candle_position(last)
     candle_green = last["close"] > last["open"]
     candle_red = last["close"] < last["open"]
-    body = candle_body_pct(last)
-    close_near_high = (last["close"] - last["low"]) / max(last["high"] - last["low"], entry * 0.0001)
-    close_near_low = (last["high"] - last["close"]) / max(last["high"] - last["low"], entry * 0.0001)
+
+    tol_pct = max(0.0015, min(0.008, (atr_val / entry) * 0.55))
+    dist_from_support_atr = (entry - support) / max(atr_val, entry * 0.0001)
+    dist_from_resistance_atr = (resistance - entry) / max(atr_val, entry * 0.0001)
 
     candidates: List[Candidate] = []
 
-    # LONG: bounce after dump / reclaim.
-    long_score = 42.0
-    long_reasons: List[str] = []
-    if candle_green:
-        long_score += 8; long_reasons.append("15m зеленая свеча")
-    if chg_5m3 > 0.10:
-        long_score += min(12, chg_5m3 * 5); long_reasons.append(f"5m импульс +{chg_5m3:.2f}%")
-    if -12 <= chg_16 <= -0.4:
-        long_score += 11; long_reasons.append(f"откат 16 свечей {chg_16:.2f}%")
-    if chg_3 > 0.15:
-        long_score += 9; long_reasons.append(f"локальный отскок +{chg_3:.2f}%")
-    if 28 <= rsi15 <= 58:
-        long_score += 9; long_reasons.append(f"RSI {rsi15:.1f}")
-    if volr >= 1.15:
-        long_score += min(13, (volr - 1) * 8); long_reasons.append(f"объем x{volr:.2f}")
-    if entry > low20 * 1.006:
-        long_score += 7; long_reasons.append("отскок от локальной поддержки")
-    if entry > high8 * 0.999 and volr >= 1.1:
-        long_score += 10; long_reasons.append("reclaim / мини-пробой")
-    if ema9 > ema21 or entry > ema21:
-        long_score += 5; long_reasons.append("цена выше EMA21/EMA9")
-    if ema1h21 >= ema1h50 * 0.985:
-        long_score += 4; long_reasons.append("1h не против входа")
-    if close_near_high > 0.62:
-        long_score += 4; long_reasons.append("закрытие ближе к хаю свечи")
-    if atr_pct < 0.18 or atr_pct > 7.0:
-        long_score -= 12
-    if chg_8 > 10:
-        long_score -= 20
-    if body > 6.5:
-        long_score -= 10
-    candidates.append(Candidate(symbol, "LONG", round(long_score, 1), "support bounce / reclaim", entry, long_reasons, {
-        "rsi15": rsi15, "volr": volr, "chg_3": chg_3, "chg_16": chg_16, "atr_pct": atr_pct
-    }))
+    # LONG: support touch / false breakdown / reclaim, then closed upward.
+    support_touched = (
+        last["low"] <= support * (1 + tol_pct)
+        or prev["low"] <= support * (1 + tol_pct)
+        or last["low"] <= hard_support * (1 + tol_pct)
+    )
+    support_reclaimed = last["close"] > support and last["close"] > prev["close"]
+    false_break_support = last["low"] < support * (1 - tol_pct * 0.35) and last["close"] > support
+    long_5m_ok, long_5m_reasons = is_5m_confirmed("LONG", k5)
+    one_hour_not_bearish = closes1h[-1] >= ema1h50 * 0.975 or ema1h21 >= ema1h50 * 0.985
 
-    # SHORT: rejection after pump / breakdown.
-    short_score = 42.0
-    short_reasons: List[str] = []
-    if candle_red:
-        short_score += 8; short_reasons.append("15m красная свеча")
-    if chg_5m3 < -0.10:
-        short_score += min(12, abs(chg_5m3) * 5); short_reasons.append(f"5m импульс {chg_5m3:.2f}%")
-    if 0.4 <= chg_16 <= 16:
-        short_score += 11; short_reasons.append(f"памп 16 свечей +{chg_16:.2f}%")
-    if chg_3 < -0.15:
-        short_score += 9; short_reasons.append(f"локальный разворот {chg_3:.2f}%")
-    if 42 <= rsi15 <= 78:
-        short_score += 9; short_reasons.append(f"RSI {rsi15:.1f}")
-    if volr >= 1.15:
-        short_score += min(13, (volr - 1) * 8); short_reasons.append(f"объем x{volr:.2f}")
-    if entry < high20 * 0.994:
-        short_score += 7; short_reasons.append("отбой от локального сопротивления")
-    if entry < low8 * 1.001 and volr >= 1.1:
-        short_score += 10; short_reasons.append("breakdown / мини-пробой вниз")
-    if ema9 < ema21 or entry < ema21:
-        short_score += 5; short_reasons.append("цена ниже EMA21/EMA9")
-    if ema1h21 <= ema1h50 * 1.015:
-        short_score += 4; short_reasons.append("1h не против входа")
-    if close_near_low > 0.62:
-        short_score += 4; short_reasons.append("закрытие ближе к лою свечи")
-    if atr_pct < 0.18 or atr_pct > 7.0:
-        short_score -= 12
-    if chg_8 < -10:
-        short_score -= 20
-    if body > 6.5:
-        short_score -= 10
-    candidates.append(Candidate(symbol, "SHORT", round(short_score, 1), "resistance rejection / breakdown", entry, short_reasons, {
-        "rsi15": rsi15, "volr": volr, "chg_3": chg_3, "chg_16": chg_16, "atr_pct": atr_pct
-    }))
+    long_ok = all([
+        support_touched,
+        support_reclaimed,
+        candle_green or close_near_high >= MIN_CLOSE_LOCATION,
+        lower_wick >= MIN_REJECTION_WICK_RATIO or false_break_support,
+        close_near_high >= MIN_CLOSE_LOCATION,
+        dist_from_support_atr <= MAX_ENTRY_DISTANCE_ATR,
+        30 <= rsi15 <= 64,
+        volr >= MIN_VOLUME_RATIO_CONFIRM,
+        long_5m_ok,
+        one_hour_not_bearish,
+        chg_5m3 > 0,
+    ])
 
+    if long_ok:
+        score = 78.0
+        reasons = [
+            "15m закрылась после отскока от поддержки",
+            f"поддержка ~{fmt_price(support)}",
+            f"вход недалеко от уровня: {dist_from_support_atr:.2f} ATR",
+            f"нижняя тень {lower_wick:.2f}",
+            f"объем x{volr:.2f}",
+            f"RSI {rsi15:.1f}",
+        ] + long_5m_reasons
+        if false_break_support:
+            score += 6; reasons.append("ложный прокол поддержки и возврат выше")
+        if ema9 > ema21 or entry > ema21:
+            score += 4; reasons.append("15m EMA не против")
+        if ema1h21 >= ema1h50 * 0.995:
+            score += 3; reasons.append("1h тренд нейтральный/выше")
+        if chg_3 > 0.20:
+            score += min(5, chg_3 * 3); reasons.append(f"локальный импульс +{chg_3:.2f}%")
+        if -10 <= chg_16 <= -0.35:
+            score += 3; reasons.append(f"был откат {chg_16:.2f}%")
+        candidates.append(Candidate(symbol, "LONG", round(min(score, 96), 1), "confirmed support bounce", entry, reasons, {
+            "support": support, "resistance": resistance, "rsi15": rsi15, "volr": volr,
+            "atr_pct": atr_pct, "dist_from_support_atr": dist_from_support_atr,
+            "close_near_high": close_near_high, "lower_wick": lower_wick,
+        }))
+
+    # SHORT: resistance touch / false breakout / rejection, then closed down.
+    resistance_touched = (
+        last["high"] >= resistance * (1 - tol_pct)
+        or prev["high"] >= resistance * (1 - tol_pct)
+        or last["high"] >= hard_resistance * (1 - tol_pct)
+    )
+    resistance_rejected = last["close"] < resistance and last["close"] < prev["close"]
+    false_break_resistance = last["high"] > resistance * (1 + tol_pct * 0.35) and last["close"] < resistance
+    short_5m_ok, short_5m_reasons = is_5m_confirmed("SHORT", k5)
+    one_hour_not_bullish = closes1h[-1] <= ema1h50 * 1.025 or ema1h21 <= ema1h50 * 1.015
+
+    short_ok = all([
+        resistance_touched,
+        resistance_rejected,
+        candle_red or close_near_low >= MIN_CLOSE_LOCATION,
+        upper_wick >= MIN_REJECTION_WICK_RATIO or false_break_resistance,
+        close_near_low >= MIN_CLOSE_LOCATION,
+        dist_from_resistance_atr <= MAX_ENTRY_DISTANCE_ATR,
+        36 <= rsi15 <= 76,
+        volr >= MIN_VOLUME_RATIO_CONFIRM,
+        short_5m_ok,
+        one_hour_not_bullish,
+        chg_5m3 < 0,
+    ])
+
+    if short_ok:
+        score = 78.0
+        reasons = [
+            "15m закрылась после отбоя от сопротивления",
+            f"сопротивление ~{fmt_price(resistance)}",
+            f"вход недалеко от уровня: {dist_from_resistance_atr:.2f} ATR",
+            f"верхняя тень {upper_wick:.2f}",
+            f"объем x{volr:.2f}",
+            f"RSI {rsi15:.1f}",
+        ] + short_5m_reasons
+        if false_break_resistance:
+            score += 7; reasons.append("ложный пробой сопротивления и возврат ниже")
+        if ema9 < ema21 or entry < ema21:
+            score += 4; reasons.append("15m EMA не против")
+        if ema1h21 <= ema1h50 * 1.005:
+            score += 3; reasons.append("1h тренд нейтральный/ниже")
+        if chg_3 < -0.20:
+            score += min(5, abs(chg_3) * 3); reasons.append(f"локальный разворот {chg_3:.2f}%")
+        if 0.35 <= chg_16 <= 14:
+            score += 3; reasons.append(f"был памп +{chg_16:.2f}%")
+        candidates.append(Candidate(symbol, "SHORT", round(min(score, 97), 1), "confirmed resistance rejection", entry, reasons, {
+            "support": support, "resistance": resistance, "rsi15": rsi15, "volr": volr,
+            "atr_pct": atr_pct, "dist_from_resistance_atr": dist_from_resistance_atr,
+            "close_near_low": close_near_low, "upper_wick": upper_wick,
+        }))
+
+    if not candidates:
+        return None
     best = max(candidates, key=lambda c: c.score)
     if best.score < FALLBACK_SCORE:
         return None
@@ -859,7 +999,7 @@ def format_signal_message(trade: Trade, reasons: Optional[List[str]] = None) -> 
         f"<code>{tp_lines}</code>\n\n"
         f"Лимитный ордер на усреднение: <code>{fmt_price(trade.averaging)}</code>\n"
         f"Защитный стоп: <code>{fmt_price(trade.stop)}</code>\n\n"
-        f"Score сетапа: <b>{trade.score:.0f}/100</b> · Плечо в расчете: <b>x{LEVERAGE:.0f}</b>\n"
+        f"Score сетапа: <b>{trade.score:.0f}/100</b> · Подтверждение: <b>15m закрытая + 5m</b> · Плечо: <b>x{LEVERAGE:.0f}</b>\n"
         + reason_text +
         "\n\nО любых действиях по открытой сделке буду сообщать в канале\n\n"
         "⚠️ Это сигнал, не финансовая рекомендация. Риск контролируй сам."
@@ -911,6 +1051,65 @@ async def scan_one_symbol(session: aiohttp.ClientSession, symbol: str, semaphore
         except Exception as e:
             logger.debug("scan_one_symbol failed %s: %s", symbol, e)
             return None
+
+
+async def confirmation_ready(candidate: Candidate) -> bool:
+    """Two-step confirmation: first scan stores setup, next scan must confirm it again."""
+    if not STRICT_CONFIRMATION or CONFIRMATION_SCANS <= 1:
+        return True
+    key = candidate.symbol
+    now_ts = time.time()
+    async with pending_lock:
+        expired = [k for k, v in pending_candidates.items() if now_ts - float(v.get("ts", 0)) > PENDING_EXPIRE_SECONDS]
+        for k in expired:
+            pending_candidates.pop(k, None)
+
+        old = pending_candidates.get(key)
+        if not old or old.get("side") != candidate.side:
+            pending_candidates[key] = {
+                "side": candidate.side,
+                "score": candidate.score,
+                "entry": candidate.entry,
+                "strategy": candidate.strategy,
+                "reasons": candidate.reasons,
+                "count": 1,
+                "ts": now_ts,
+            }
+            logger.info("pending setup stored: %s %s score=%s", candidate.symbol, candidate.side, candidate.score)
+            if SEND_PENDING_LOGS_TO_TELEGRAM:
+                await send_telegram(
+                    f"👀 <b>Сетап найден, жду подтверждение</b>\n"
+                    f"{display_symbol(candidate.symbol)} {candidate.side}\n"
+                    f"Score: <b>{candidate.score:.0f}</b>\n"
+                    f"Причина: {candidate.strategy}\n"
+                    f"Сигнал не отправлен, нужна повторная проверка."
+                )
+            return False
+
+        first_entry = float(old.get("entry", candidate.entry) or candidate.entry)
+        move_from_first = abs(candidate.entry - first_entry) / max(first_entry, 1e-12) * 100
+        if move_from_first > 1.20:
+            pending_candidates[key] = {
+                "side": candidate.side,
+                "score": candidate.score,
+                "entry": candidate.entry,
+                "strategy": candidate.strategy,
+                "reasons": candidate.reasons,
+                "count": 1,
+                "ts": now_ts,
+            }
+            logger.info("pending reset because price moved too far: %s %.2f%%", candidate.symbol, move_from_first)
+            return False
+
+        old["count"] = int(old.get("count", 1)) + 1
+        old["score"] = max(float(old.get("score", 0)), candidate.score)
+        old["entry"] = candidate.entry
+        old["ts"] = now_ts
+        if old["count"] >= CONFIRMATION_SCANS:
+            pending_candidates.pop(key, None)
+            logger.info("confirmed setup ready: %s %s score=%s checks=%s", candidate.symbol, candidate.side, candidate.score, old["count"])
+            return True
+        return False
 
 
 async def send_signal(candidate: Candidate) -> bool:
@@ -973,13 +1172,18 @@ async def scanner_loop() -> None:
                         threshold = FALLBACK_SCORE
 
                 sent = 0
+                pending_seen = 0
                 for c in candidates:
                     if c.score < threshold:
                         break
+                    ready = await confirmation_ready(c)
+                    if not ready:
+                        pending_seen += 1
+                        continue
                     ok = await send_signal(c)
                     if ok:
                         sent += 1
-                        # Usually one good signal per cycle is enough.
+                        # Usually one confirmed signal per cycle is enough.
                         if sent >= 1:
                             break
 
@@ -988,13 +1192,15 @@ async def scanner_loop() -> None:
                     "candidates": len(candidates),
                     "best": asdict(candidates[0]) if candidates else None,
                     "sent": sent,
+                    "pending_seen": pending_seen,
+                    "pending_total": len(pending_candidates),
                     "threshold": threshold,
                     "duration_sec": round(time.time() - started, 2),
                     "time": now_utc().isoformat(),
                 }
                 logger.info(
-                    "scan done: checked=%s candidates=%s sent=%s threshold=%s duration=%.1fs",
-                    len(symbols), len(candidates), sent, threshold, time.time() - started,
+                    "scan done: checked=%s candidates=%s pending=%s sent=%s threshold=%s duration=%.1fs",
+                    len(symbols), len(candidates), len(pending_candidates), sent, threshold, time.time() - started,
                 )
         except asyncio.CancelledError:
             raise
@@ -1162,6 +1368,8 @@ async def root() -> JSONResponse:
         "ok": True,
         "app": APP_NAME,
         "no_ccxt": True,
+        "strict_confirmation": STRICT_CONFIRMATION,
+        "pending_candidates": len(pending_candidates),
         "uptime_sec": round(time.time() - started_at, 1),
         "active_trades": len(state.active_trades),
         "stats": asdict(state.stats),
@@ -1194,7 +1402,7 @@ async def telegram_test() -> JSONResponse:
     mid = await send_telegram(
         "✅ <b>Тест Telegram успешный</b>\n"
         "Бот подключен к каналу/чату.\n"
-        "Версия: <b>без ccxt</b>."
+        "Версия: <b>точные отскоки/отбои без ccxt</b>."
     )
     return JSONResponse({"ok": bool(mid), "message_id": mid, "getMe": get_me})
 
@@ -1211,6 +1419,9 @@ async def debug_route() -> JSONResponse:
         "fallback_score": FALLBACK_SCORE,
         "leverage": LEVERAGE,
         "last_scan": last_scan_info,
+        "pending_candidates": pending_candidates,
+        "strict_confirmation": STRICT_CONFIRMATION,
+        "confirmation_scans": CONFIRMATION_SCANS,
         "state": state_to_json(),
     })
 
