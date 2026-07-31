@@ -9,6 +9,731 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
+
+
+# ============================================================
+# SAFE ADAPTIVE LEARNING LAYER
+# ============================================================
+
+"""
+adaptive_learning.py
+
+Safe adaptive layer for a futures signal bot.
+
+What it does:
+- Stores every closed signal and its feature snapshot in SQLite.
+- Retrains after MIN_TRAIN_TRADES closed trades and then every RETRAIN_EVERY trades.
+- Uses a simple logistic model implemented with the Python standard library.
+- Validates on the newest 30% of trades (walk-forward style).
+- Activates a new model only if it beats a constant base-rate model.
+- Learns a probability threshold that maximizes an expectancy-style objective.
+- Never changes leverage, stop-loss safety limits, API permissions, or source code.
+
+This module does NOT guarantee profit and must be used in paper/shadow mode first.
+"""
+
+import json
+import math
+import os
+import random
+import sqlite3
+import threading
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+DB_PATH = os.getenv("ADAPTIVE_DB_PATH", "adaptive_bot.sqlite3")
+MIN_TRAIN_TRADES = int(os.getenv("ADAPTIVE_MIN_TRAIN_TRADES", "50"))
+RETRAIN_EVERY = int(os.getenv("ADAPTIVE_RETRAIN_EVERY", "25"))
+MAX_TRAIN_ROWS = int(os.getenv("ADAPTIVE_MAX_TRAIN_ROWS", "1500"))
+VALIDATION_FRACTION = float(os.getenv("ADAPTIVE_VALIDATION_FRACTION", "0.30"))
+MIN_VALIDATION_ROWS = int(os.getenv("ADAPTIVE_MIN_VALIDATION_ROWS", "15"))
+MIN_POSITIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_POSITIVE_ROWS", "8"))
+MIN_NEGATIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_NEGATIVE_ROWS", "8"))
+MIN_MODEL_IMPROVEMENT = float(os.getenv("ADAPTIVE_MIN_MODEL_IMPROVEMENT", "0.015"))
+MIN_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MIN_SIGNAL_PROBABILITY", "0.60"))
+MAX_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MAX_SIGNAL_PROBABILITY", "0.82"))
+MIN_VALIDATION_COVERAGE = float(os.getenv("ADAPTIVE_MIN_VALIDATION_COVERAGE", "0.15"))
+MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
+SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "true").lower() == "true"
+
+# Never let learning touch these safety-critical settings.
+LOCKED_SAFETY_KEYS = {
+    "LEVERAGE",
+    "MAX_SL_MOVE",
+    "LOCAL_SCALP_MAX_SL_MOVE",
+    "MAX_ACTIVE_SIGNALS",
+    "MAX_SIGNALS_PER_SCAN",
+}
+
+FEATURE_NAMES: Tuple[str, ...] = (
+    "score",
+    "is_long",
+    "is_a_plus",
+    "ch3m_abs",
+    "ch15m_abs",
+    "ch30m_abs",
+    "vol1",
+    "vol5",
+    "range1",
+    "range5",
+    "rr_tp1",
+    "ladder_rr",
+    "final_rr",
+    "sl_price_move",
+    "btc_bull",
+    "btc_bear",
+    "is_reversal",
+    "is_dump",
+    "is_instant",
+    "is_aero",
+)
+
+
+@dataclass
+class ModelState:
+    version: int = 0
+    active: bool = False
+    threshold: float = MIN_SIGNAL_PROBABILITY
+    trained_rows: int = 0
+    validation_rows: int = 0
+    base_logloss: float = 999.0
+    model_logloss: float = 999.0
+    validation_win_rate: float = 0.0
+    validation_coverage: float = 0.0
+    validation_selected_wr: float = 0.0
+    validation_selected_count: int = 0
+    weights: List[float] = None
+    mean: List[float] = None
+    std: List[float] = None
+    last_trained_closed_count: int = 0
+    created_at: int = 0
+
+    def __post_init__(self) -> None:
+        if self.weights is None:
+            self.weights = [0.0] * (len(FEATURE_NAMES) + 1)
+        if self.mean is None:
+            self.mean = [0.0] * len(FEATURE_NAMES)
+        if self.std is None:
+            self.std = [1.0] * len(FEATURE_NAMES)
+
+
+_LOCK = threading.RLock()
+
+
+def _connect() -> sqlite3.Connection:
+    path = Path(DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def init_adaptive_db() -> None:
+    with _LOCK, _connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS adaptive_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT UNIQUE,
+                created_at INTEGER NOT NULL,
+                closed_at INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                grade TEXT NOT NULL,
+                result TEXT NOT NULL,
+                label INTEGER NOT NULL,
+                pnl_r REAL NOT NULL DEFAULT 0,
+                features_json TEXT NOT NULL,
+                model_version INTEGER NOT NULL DEFAULT 0,
+                model_probability REAL,
+                shadow_accepted INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_adaptive_trades_closed
+            ON adaptive_trades(closed_at);
+
+            CREATE TABLE IF NOT EXISTS adaptive_model_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS adaptive_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                payload_json TEXT
+            );
+            """
+        )
+        row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
+        if row is None:
+            state = ModelState(created_at=int(time.time()))
+            conn.execute(
+                "INSERT INTO adaptive_model_state(id, state_json) VALUES(1, ?)",
+                (json.dumps(asdict(state), ensure_ascii=False),),
+            )
+        conn.commit()
+
+
+def _clip(value: Any, low: float, high: float, default: float = 0.0) -> float:
+    try:
+        x = float(value)
+        if not math.isfinite(x):
+            return default
+        return min(high, max(low, x))
+    except Exception:
+        return default
+
+
+def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
+    side = str(trade.get("side", "")).upper()
+    grade = str(trade.get("grade", "")).upper()
+    mode = str(trade.get("setup_mode", "")).upper()
+    strategy = str(trade.get("strategy", "")).upper()
+    btc_text = str(trade.get("btc_text", "")).upper()
+
+    entry = _clip(trade.get("entry"), 1e-12, 1e18, 1.0)
+    sl = _clip(trade.get("sl"), 0.0, 1e18, entry)
+    sl_move = abs(entry - sl) / max(entry, 1e-12)
+
+    return {
+        "score": _clip(trade.get("score"), 0, 100) / 100.0,
+        "is_long": 1.0 if side == "LONG" else 0.0,
+        "is_a_plus": 1.0 if grade == "A+" else 0.0,
+        "ch3m_abs": _clip(abs(_clip(trade.get("ch3m_1m"), -1, 1)), 0, 0.25) / 0.25,
+        "ch15m_abs": _clip(abs(_clip(trade.get("ch15m"), -1, 1)), 0, 0.40) / 0.40,
+        "ch30m_abs": _clip(abs(_clip(trade.get("ch30m"), -1, 1)), 0, 0.60) / 0.60,
+        "vol1": _clip(trade.get("vol1"), 0, 8) / 8.0,
+        "vol5": _clip(trade.get("volume_ratio", trade.get("vol5", 1.0)), 0, 8) / 8.0,
+        "range1": _clip(trade.get("range1"), 0, 8) / 8.0,
+        "range5": _clip(trade.get("range_ratio", trade.get("range5", 1.0)), 0, 8) / 8.0,
+        "rr_tp1": _clip(trade.get("rr"), 0, 5) / 5.0,
+        "ladder_rr": _clip(trade.get("ladder_rr"), 0, 6) / 6.0,
+        "final_rr": _clip(trade.get("final_rr"), 0, 8) / 8.0,
+        "sl_price_move": _clip(sl_move, 0, 0.08) / 0.08,
+        "btc_bull": 1.0 if "BTC BULL" in btc_text else 0.0,
+        "btc_bear": 1.0 if "BTC BEAR" in btc_text else 0.0,
+        "is_reversal": 1.0 if "REVERSAL" in mode else 0.0,
+        "is_dump": 1.0 if "DUMP" in mode or "DUMP" in strategy else 0.0,
+        "is_instant": 1.0 if "INSTANT" in mode or "INSTANT" in strategy else 0.0,
+        "is_aero": 1.0 if "AERO" in mode or "AERO" in strategy else 0.0,
+    }
+
+
+def _vector_from_dict(features: Dict[str, float]) -> List[float]:
+    return [float(features.get(name, 0.0)) for name in FEATURE_NAMES]
+
+
+def get_model_state() -> ModelState:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
+        if row is None:
+            return ModelState()
+        raw = json.loads(row["state_json"])
+        return ModelState(**raw)
+
+
+def _save_model_state(state: ModelState) -> None:
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            "INSERT INTO adaptive_model_state(id, state_json) VALUES(1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json",
+            (json.dumps(asdict(state), ensure_ascii=False),),
+        )
+        conn.commit()
+
+
+def _event(event_type: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            "INSERT INTO adaptive_events(created_at, event_type, message, payload_json) VALUES(?,?,?,?)",
+            (
+                int(time.time()),
+                event_type,
+                message,
+                json.dumps(payload or {}, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+
+def predict_probability(trade: Dict[str, Any]) -> Tuple[Optional[float], ModelState]:
+    state = get_model_state()
+    if not MODEL_ENABLED or not state.active or state.trained_rows < MIN_TRAIN_TRADES:
+        return None, state
+
+    x = _vector_from_dict(build_feature_dict(trade))
+    z = state.weights[0]
+    for i, value in enumerate(x):
+        normalized = (value - state.mean[i]) / max(state.std[i], 1e-8)
+        z += state.weights[i + 1] * normalized
+    z = max(-35.0, min(35.0, z))
+    return 1.0 / (1.0 + math.exp(-z)), state
+
+
+def adaptive_gate(trade: Dict[str, Any]) -> Tuple[bool, str, Optional[float]]:
+    probability, state = predict_probability(trade)
+    if probability is None:
+        return True, f"adaptive warm-up: {state.trained_rows}/{MIN_TRAIN_TRADES}", None
+
+    accepted = probability >= state.threshold
+
+    if SHADOW_ONLY:
+        trade["adaptive_shadow_probability"] = probability
+        trade["adaptive_shadow_accepted"] = accepted
+        trade["adaptive_model_version"] = state.version
+        return True, (
+            f"adaptive shadow v{state.version}: p={probability:.3f}, "
+            f"threshold={state.threshold:.3f}, would_accept={accepted}"
+        ), probability
+
+    return accepted, (
+        f"adaptive v{state.version}: p={probability:.3f}, "
+        f"threshold={state.threshold:.3f}, accepted={accepted}"
+    ), probability
+
+
+def _estimate_pnl_r(signal: Dict[str, Any], result: str) -> float:
+    if result == "sl":
+        return -1.0
+    if result == "expired":
+        return -0.10
+
+    hit_count = sum(bool(signal.get(f"tp{i}_hit")) for i in range(1, 6))
+    if hit_count >= 5:
+        return max(0.5, float(signal.get("ladder_rr", 1.0) or 1.0))
+    if hit_count >= 3:
+        return 0.70
+    if hit_count >= 1:
+        return 0.25
+    return 0.10
+
+
+def record_closed_trade(signal: Dict[str, Any], result: str) -> Dict[str, Any]:
+    """
+    Call this exactly once when a signal closes.
+
+    result:
+      profit -> label 1
+      sl      -> label 0
+      expired -> label 0 (conservative)
+    """
+    if result not in {"profit", "sl", "expired"}:
+        raise ValueError(f"Unsupported result: {result}")
+
+    init_adaptive_db()
+
+    created_at = int(signal.get("created_at", int(time.time())))
+    closed_at = int(time.time())
+    signal_id = str(
+        signal.get("signal_id")
+        or f"{signal.get('symbol','?')}:{signal.get('side','?')}:{created_at}:{signal.get('strategy','?')}"
+    )
+    features = build_feature_dict(signal)
+    probability = signal.get("adaptive_shadow_probability")
+    model_version = int(signal.get("adaptive_model_version", 0) or 0)
+    shadow_accepted = signal.get("adaptive_shadow_accepted")
+    label = 1 if result == "profit" else 0
+    pnl_r = _estimate_pnl_r(signal, result)
+
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO adaptive_trades(
+                signal_id, created_at, closed_at, symbol, side, strategy, grade,
+                result, label, pnl_r, features_json, model_version,
+                model_probability, shadow_accepted
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                signal_id,
+                created_at,
+                closed_at,
+                str(signal.get("symbol", "?")),
+                str(signal.get("side", "?")),
+                str(signal.get("strategy", "?")),
+                str(signal.get("grade", "?")),
+                result,
+                label,
+                pnl_r,
+                json.dumps(features, ensure_ascii=False),
+                model_version,
+                float(probability) if probability is not None else None,
+                int(bool(shadow_accepted)) if shadow_accepted is not None else None,
+            ),
+        )
+        conn.commit()
+
+    report = maybe_retrain()
+    return report
+
+
+def _sigmoid(z: float) -> float:
+    z = max(-35.0, min(35.0, z))
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def _logloss(labels: Sequence[int], probabilities: Sequence[float]) -> float:
+    if not labels:
+        return 999.0
+    total = 0.0
+    for y, p in zip(labels, probabilities):
+        p = min(1.0 - 1e-7, max(1e-7, p))
+        total += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+    return total / len(labels)
+
+
+def _mean_std(rows: Sequence[Sequence[float]]) -> Tuple[List[float], List[float]]:
+    n_features = len(FEATURE_NAMES)
+    means = [0.0] * n_features
+    for row in rows:
+        for j, value in enumerate(row):
+            means[j] += value
+    count = max(len(rows), 1)
+    means = [x / count for x in means]
+
+    stds = [0.0] * n_features
+    for row in rows:
+        for j, value in enumerate(row):
+            stds[j] += (value - means[j]) ** 2
+    stds = [math.sqrt(x / count) if x > 1e-10 else 1.0 for x in stds]
+    return means, stds
+
+
+def _normalize(rows: Sequence[Sequence[float]], mean: Sequence[float], std: Sequence[float]) -> List[List[float]]:
+    return [
+        [(value - mean[j]) / max(std[j], 1e-8) for j, value in enumerate(row)]
+        for row in rows
+    ]
+
+
+def _train_logistic(
+    x_train: Sequence[Sequence[float]],
+    y_train: Sequence[int],
+    epochs: int = 600,
+    learning_rate: float = 0.035,
+    l2: float = 0.04,
+) -> List[float]:
+    random.seed(1337)
+    n_features = len(FEATURE_NAMES)
+    weights = [0.0] * (n_features + 1)
+
+    positives = sum(y_train)
+    negatives = len(y_train) - positives
+    pos_weight = len(y_train) / max(2.0 * positives, 1.0)
+    neg_weight = len(y_train) / max(2.0 * negatives, 1.0)
+
+    order = list(range(len(x_train)))
+    for epoch in range(epochs):
+        random.shuffle(order)
+        lr = learning_rate / (1.0 + epoch / 300.0)
+        grad = [0.0] * len(weights)
+
+        for idx in order:
+            x = x_train[idx]
+            y = y_train[idx]
+            z = weights[0] + sum(weights[j + 1] * x[j] for j in range(n_features))
+            p = _sigmoid(z)
+            sample_weight = pos_weight if y == 1 else neg_weight
+            error = (p - y) * sample_weight
+            grad[0] += error
+            for j in range(n_features):
+                grad[j + 1] += error * x[j]
+
+        n = max(len(x_train), 1)
+        weights[0] -= lr * grad[0] / n
+        for j in range(1, len(weights)):
+            regularized = grad[j] / n + l2 * weights[j]
+            weights[j] -= lr * regularized
+
+    return weights
+
+
+def _predict_matrix(weights: Sequence[float], rows: Sequence[Sequence[float]]) -> List[float]:
+    out: List[float] = []
+    for row in rows:
+        z = weights[0] + sum(weights[j + 1] * row[j] for j in range(len(row)))
+        out.append(_sigmoid(z))
+    return out
+
+
+def _choose_threshold(labels: Sequence[int], probabilities: Sequence[float], pnl_r: Sequence[float]) -> Tuple[float, Dict[str, float]]:
+    best_threshold = MIN_SIGNAL_PROBABILITY
+    best_score = -1e9
+    best_metrics: Dict[str, float] = {}
+
+    low = int(MIN_SIGNAL_PROBABILITY * 100)
+    high = int(MAX_SIGNAL_PROBABILITY * 100)
+
+    for raw in range(low, high + 1):
+        threshold = raw / 100.0
+        chosen = [i for i, p in enumerate(probabilities) if p >= threshold]
+        coverage = len(chosen) / max(len(labels), 1)
+        if len(chosen) < 5 or coverage < MIN_VALIDATION_COVERAGE:
+            continue
+
+        wins = sum(labels[i] for i in chosen)
+        wr = wins / len(chosen)
+        expectancy = sum(pnl_r[i] for i in chosen) / len(chosen)
+
+        # Prefer expectancy and stability, not win-rate alone.
+        score = expectancy * 2.0 + wr * 0.5 + coverage * 0.15
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+            best_metrics = {
+                "coverage": coverage,
+                "selected_wr": wr,
+                "selected_count": float(len(chosen)),
+                "expectancy_r": expectancy,
+                "objective": score,
+            }
+
+    if not best_metrics:
+        best_metrics = {
+            "coverage": 1.0,
+            "selected_wr": sum(labels) / max(len(labels), 1),
+            "selected_count": float(len(labels)),
+            "expectancy_r": sum(pnl_r) / max(len(pnl_r), 1),
+            "objective": -999.0,
+        }
+
+    return best_threshold, best_metrics
+
+
+def maybe_retrain(force: bool = False) -> Dict[str, Any]:
+    init_adaptive_db()
+    state = get_model_state()
+
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, label, pnl_r, features_json
+            FROM adaptive_trades
+            ORDER BY closed_at ASC, id ASC
+            """
+        ).fetchall()
+
+    closed_count = len(rows)
+    if closed_count < MIN_TRAIN_TRADES:
+        return {
+            "trained": False,
+            "reason": "warmup",
+            "closed_count": closed_count,
+            "needed": MIN_TRAIN_TRADES,
+        }
+
+    if (
+        not force
+        and state.last_trained_closed_count > 0
+        and closed_count - state.last_trained_closed_count < RETRAIN_EVERY
+    ):
+        return {
+            "trained": False,
+            "reason": "waiting_for_more_trades",
+            "closed_count": closed_count,
+            "next_at": state.last_trained_closed_count + RETRAIN_EVERY,
+        }
+
+    rows = rows[-MAX_TRAIN_ROWS:]
+    labels = [int(row["label"]) for row in rows]
+    pnl_r = [float(row["pnl_r"]) for row in rows]
+    vectors = [_vector_from_dict(json.loads(row["features_json"])) for row in rows]
+
+    positives = sum(labels)
+    negatives = len(labels) - positives
+    if positives < MIN_POSITIVE_ROWS or negatives < MIN_NEGATIVE_ROWS:
+        return {
+            "trained": False,
+            "reason": "class_imbalance",
+            "positives": positives,
+            "negatives": negatives,
+        }
+
+    validation_size = max(MIN_VALIDATION_ROWS, int(len(rows) * VALIDATION_FRACTION))
+    validation_size = min(validation_size, len(rows) // 2)
+    train_size = len(rows) - validation_size
+
+    x_train_raw = vectors[:train_size]
+    y_train = labels[:train_size]
+    x_val_raw = vectors[train_size:]
+    y_val = labels[train_size:]
+    pnl_val = pnl_r[train_size:]
+
+    if sum(y_train) < 4 or (len(y_train) - sum(y_train)) < 4:
+        return {"trained": False, "reason": "train_split_too_small"}
+
+    mean, std = _mean_std(x_train_raw)
+    x_train = _normalize(x_train_raw, mean, std)
+    x_val = _normalize(x_val_raw, mean, std)
+
+    weights = _train_logistic(x_train, y_train)
+    val_prob = _predict_matrix(weights, x_val)
+
+    train_base_rate = min(0.95, max(0.05, sum(y_train) / len(y_train)))
+    base_prob = [train_base_rate] * len(y_val)
+    base_loss = _logloss(y_val, base_prob)
+    model_loss = _logloss(y_val, val_prob)
+    improvement = base_loss - model_loss
+
+    threshold, threshold_metrics = _choose_threshold(y_val, val_prob, pnl_val)
+    activate = (
+        improvement >= MIN_MODEL_IMPROVEMENT
+        and threshold_metrics["selected_count"] >= 5
+        and threshold_metrics["coverage"] >= MIN_VALIDATION_COVERAGE
+        and threshold_metrics["expectancy_r"] > 0
+    )
+
+    new_state = ModelState(
+        version=state.version + 1,
+        active=bool(activate),
+        threshold=threshold,
+        trained_rows=len(rows),
+        validation_rows=len(y_val),
+        base_logloss=base_loss,
+        model_logloss=model_loss,
+        validation_win_rate=sum(y_val) / max(len(y_val), 1),
+        validation_coverage=threshold_metrics["coverage"],
+        validation_selected_wr=threshold_metrics["selected_wr"],
+        validation_selected_count=int(threshold_metrics["selected_count"]),
+        weights=list(weights),
+        mean=list(mean),
+        std=list(std),
+        last_trained_closed_count=closed_count,
+        created_at=int(time.time()),
+    )
+    _save_model_state(new_state)
+
+    payload = {
+        "version": new_state.version,
+        "active": new_state.active,
+        "closed_count": closed_count,
+        "trained_rows": new_state.trained_rows,
+        "validation_rows": new_state.validation_rows,
+        "base_logloss": round(base_loss, 6),
+        "model_logloss": round(model_loss, 6),
+        "improvement": round(improvement, 6),
+        "threshold": round(threshold, 3),
+        "coverage": round(threshold_metrics["coverage"], 3),
+        "selected_wr": round(threshold_metrics["selected_wr"], 3),
+        "selected_count": int(threshold_metrics["selected_count"]),
+        "expectancy_r": round(threshold_metrics["expectancy_r"], 4),
+        "shadow_only": SHADOW_ONLY,
+    }
+    _event(
+        "model_retrained",
+        "Adaptive model retrained and activated" if activate else "Adaptive model retrained but not activated",
+        payload,
+    )
+    return {"trained": True, **payload}
+
+
+def adaptive_report() -> str:
+    init_adaptive_db()
+    state = get_model_state()
+
+    with _LOCK, _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"]
+        wins = conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades WHERE label=1").fetchone()["n"]
+        losses = total - wins
+        by_strategy = conn.execute(
+            """
+            SELECT strategy,
+                   COUNT(*) AS n,
+                   SUM(label) AS wins,
+                   AVG(pnl_r) AS expectancy_r
+            FROM adaptive_trades
+            GROUP BY strategy
+            HAVING COUNT(*) >= 3
+            ORDER BY expectancy_r DESC, n DESC
+            LIMIT 10
+            """
+        ).fetchall()
+        shadow = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS n,
+                SUM(CASE WHEN shadow_accepted=1 THEN 1 ELSE 0 END) AS accepted,
+                SUM(CASE WHEN shadow_accepted=1 AND label=1 THEN 1 ELSE 0 END) AS accepted_wins
+            FROM adaptive_trades
+            WHERE shadow_accepted IS NOT NULL
+            """
+        ).fetchone()
+
+    wr = wins / total * 100 if total else 0.0
+    lines = [
+        "🧠 Adaptive Learning Report",
+        f"Closed trades: {total}",
+        f"Profit labels: {wins} · Non-profit labels: {losses} · WR: {wr:.1f}%",
+        f"Model version: {state.version}",
+        f"Active: {state.active}",
+        f"Shadow only: {SHADOW_ONLY}",
+        f"Threshold: {state.threshold:.3f}",
+        f"Train rows: {state.trained_rows} · Validation rows: {state.validation_rows}",
+        f"Validation logloss: model {state.model_logloss:.4f} vs base {state.base_logloss:.4f}",
+        f"Validation selected WR: {state.validation_selected_wr*100:.1f}%",
+        f"Validation coverage: {state.validation_coverage*100:.1f}%",
+    ]
+
+    if shadow and shadow["n"]:
+        accepted = int(shadow["accepted"] or 0)
+        accepted_wins = int(shadow["accepted_wins"] or 0)
+        shadow_wr = accepted_wins / accepted * 100 if accepted else 0.0
+        lines.append(
+            f"Shadow decisions: {int(shadow['n'])} · accepted {accepted} · accepted WR {shadow_wr:.1f}%"
+        )
+
+    if by_strategy:
+        lines.append("\nStrategies:")
+        for row in by_strategy:
+            n = int(row["n"])
+            w = int(row["wins"] or 0)
+            exp_r = float(row["expectancy_r"] or 0.0)
+            lines.append(
+                f"{row['strategy']}: {w}/{n} wins · WR {w/n*100:.1f}% · expectancy {exp_r:+.3f}R"
+            )
+
+    if total < MIN_TRAIN_TRADES:
+        lines.append(f"\nWarm-up: need {MIN_TRAIN_TRADES-total} more closed trades before first training.")
+    elif not state.active:
+        lines.append("\nModel is not allowed to block signals because validation improvement is not yet strong enough.")
+
+    return "\n".join(lines)
+
+
+def recent_adaptive_events(limit: int = 20) -> List[Dict[str, Any]]:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT created_at, event_type, message, payload_json
+            FROM adaptive_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 100)),),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "created_at": int(row["created_at"]),
+                "event_type": row["event_type"],
+                "message": row["message"],
+                "payload": json.loads(row["payload_json"] or "{}"),
+            }
+        )
+    return out
+
+
 # ============================================================
 # V13.28 — MARKET DUMP + AERO STYLE SCALPER
 # Professional goal:
@@ -25,8 +750,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V13.29 LOCAL STOP DUMP SCALPER"
-DEPLOY_MARKER = "V13_29_LOCAL_STOP_DUMP_SCALPER_2026_06_25"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V15 SHADOW LEARNING"
+DEPLOY_MARKER = "V15_SHADOW_LEARNING_2026_07_31"
 
 app = FastAPI(title=APP_NAME)
 
@@ -1920,6 +2645,22 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             continue
         trade["trader_pattern_reason"] = t_reason
 
+        # Adaptive model starts in shadow mode. During warm-up it never blocks signals.
+        try:
+            adaptive_ok, adaptive_reason, adaptive_probability = adaptive_gate(trade)
+            trade["adaptive_reason"] = adaptive_reason
+            if adaptive_probability is not None:
+                trade["adaptive_probability"] = adaptive_probability
+            if not adaptive_ok:
+                blocks["adaptive_model_block"] = blocks.get("adaptive_model_block", 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(f"{display_symbol(symbol)} {side}: {adaptive_reason}")
+                continue
+        except Exception as e:
+            # Learning failure must never stop the market scanner.
+            trade["adaptive_reason"] = f"adaptive error bypass: {repr(e)}"
+            STATE["last_error"] = trade["adaptive_reason"]
+
         candidates.append(trade)
 
     if not candidates:
@@ -1956,7 +2697,8 @@ def build_signal_message(s: Dict[str, Any]) -> str:
         f"TP5: {format_price(s['tp5'])}\n"
         f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
         f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
-        f"Риск: multiplier x{s['risk_mult']:.2f}\n\n"
+        f"Риск: multiplier x{s['risk_mult']:.2f}\n"
+        f"Adaptive: {s.get('adaptive_reason', 'warm-up')}\n\n"
         f"📌 Логика:\n{s['reason']}\n"
         f"15m: {s['ch15m']*100:+.2f}% · 30m: {s['ch30m']*100:+.2f}% · 1m3: {s['ch3m_1m']*100:+.2f}%\n"
         f"Volume15 x{s['volume_ratio']:.2f} · Range5 x{s['range_ratio']:.2f} · Vol1 x{s.get('vol1', 1.0):.2f} · Range1 x{s.get('range1', 1.0):.2f}\n"
@@ -2090,6 +2832,28 @@ def directional_progress_ratio(s: Dict[str, Any], p: float) -> Tuple[bool, float
     return directional, progress
 
 
+def safe_record_learning_result(signal: Dict[str, Any], result: str) -> None:
+    """Persist a closed trade and retrain safely without interrupting the bot."""
+    try:
+        report = record_closed_trade(signal, result)
+        if report.get("trained"):
+            send_telegram(
+                "🧠 Adaptive model retrained\n"
+                f"Version: {report.get('version')}\n"
+                f"Active: {report.get('active')}\n"
+                f"Closed trades: {report.get('closed_count')}\n"
+                f"Model logloss: {report.get('model_logloss')}\n"
+                f"Base logloss: {report.get('base_logloss')}\n"
+                f"Threshold: {report.get('threshold')}\n"
+                f"Selected WR: {float(report.get('selected_wr', 0))*100:.1f}%\n"
+                f"Coverage: {float(report.get('coverage', 0))*100:.1f}%\n"
+                f"Shadow only: {report.get('shadow_only')}"
+            )
+    except Exception as e:
+        STATE["last_error"] = f"adaptive record error: {repr(e)}"
+        save_state()
+
+
 def track_active_signals() -> None:
     active = STATE.setdefault("active_signals", [])
     if not active:
@@ -2109,6 +2873,7 @@ def track_active_signals() -> None:
 
         if sl_hit(side, p, s["sl"]):
             apply_result(s, "sl")
+            safe_record_learning_result(s, "sl")
             send_telegram(
                 f"❌ Stop Loss\n"
                 f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
@@ -2125,6 +2890,7 @@ def track_active_signals() -> None:
             directional, progress = directional_progress_ratio(s, p)
             if (not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP:
                 apply_result(s, "expired")
+                safe_record_learning_result(s, "expired")
                 send_telegram(
                     f"⏱ FAST TRADE EXPIRED\n"
                     f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
@@ -2141,6 +2907,7 @@ def track_active_signals() -> None:
 
         if age_minutes >= FAST_HARD_EXPIRE_MINUTES and not s.get("tp1_hit"):
             apply_result(s, "expired")
+            safe_record_learning_result(s, "expired")
             send_telegram(
                 f"⏱ HARD EXPIRE\n"
                 f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
@@ -2168,6 +2935,7 @@ def track_active_signals() -> None:
         if s.get("tp5") and target_hit(side, p, s["tp5"]):
             s["tp5_hit"] = True
             apply_result(s, "profit")
+            safe_record_learning_result(s, "profit")
             send_telegram(
                 f"✅ FULL LADDER TAKE PROFIT\n"
                 f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
@@ -2238,6 +3006,11 @@ async def track_loop():
 async def startup_event():
     global STATE
     STATE = load_state()
+    try:
+        init_adaptive_db()
+    except Exception as e:
+        STATE["last_error"] = f"adaptive DB init error: {repr(e)}"
+        save_state()
     asyncio.create_task(scan_loop())
     asyncio.create_task(track_loop())
 
@@ -2247,7 +3020,7 @@ def root():
     return HTMLResponse(
         f"<h3>{APP_NAME}</h3>"
         f"<p>{DEPLOY_MARKER}</p>"
-        f"<p>Use /health /version /scan /auto-status /stats /test-telegram</p>"
+        f"<p>Use /health /version /scan /auto-status /stats /adaptive-report /adaptive-retrain /adaptive-events /test-telegram</p>"
     )
 
 
@@ -2290,6 +3063,30 @@ def manual_scan(send: bool = Query(True)):
 @app.get("/stats")
 def stats():
     return HTMLResponse("<pre>" + build_stats_text() + "</pre>")
+
+
+@app.get("/adaptive-report")
+def adaptive_report_endpoint():
+    try:
+        return HTMLResponse("<pre>" + adaptive_report() + "</pre>")
+    except Exception as e:
+        return HTMLResponse("<pre>Adaptive report error: " + repr(e) + "</pre>", status_code=500)
+
+
+@app.get("/adaptive-retrain")
+def adaptive_retrain_endpoint():
+    try:
+        return JSONResponse(maybe_retrain(force=True))
+    except Exception as e:
+        return JSONResponse({"trained": False, "error": repr(e)}, status_code=500)
+
+
+@app.get("/adaptive-events")
+def adaptive_events_endpoint(limit: int = Query(20, ge=1, le=100)):
+    try:
+        return JSONResponse(recent_adaptive_events(limit))
+    except Exception as e:
+        return JSONResponse({"error": repr(e)}, status_code=500)
 
 
 @app.get("/test-telegram")
