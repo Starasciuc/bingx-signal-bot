@@ -1,1448 +1,2304 @@
-"""
-BingX Scalp Signal Bot for the user's EXISTING Render Background Worker.
-
-Render Start Command that this file supports:
-uvicorn bot:app --host 0.0.0.0 --port 1000
-
-Important:
-- This version DOES NOT use ccxt. It uses BingX public REST with aiohttp.
-- It sends Telegram startup notification.
-- It scans BingX USDT-M swap/futures markets.
-- It sends scalp setups in the style of the examples:
-  entry, 5 take-profit limit levels, averaging level, protective stop.
-- It tracks TP / averaging / SL and keeps profit/loss statistics.
-
-This is a signal bot only. It never opens trades.
-"""
-
-import asyncio
-import json
-import logging
-import math
 import os
-import random
 import time
-import traceback
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
+import json
+import random
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, PlainTextResponse
+import requests
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 
-# =============================================================================
-# CONFIG
-# =============================================================================
+# ============================================================
+# V13.28 — MARKET DUMP + AERO STYLE SCALPER
+# Professional goal:
+# Trade only short-lived market situations with immediate edge.
+# No trend prediction, no market phase guessing.
+#
+# Core idea:
+# hot coin -> fresh imbalance -> micro pullback/liquidity grab -> EMA/VWAP reclaim/reject
+# -> immediate continuation -> compact 5-target exit.
+#
+# If the trade does not start paying quickly, it is not the setup and gets expired.
+# Important: this bot sends signals/alerts. It does not guarantee profit.
+# V13.25 fix: adds a trader-pattern gate based on the user examples.
+# The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
+# ============================================================
 
-APP_NAME = "BingX Scalp Signal Bot"
-STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
-
-TELEGRAM_BOT_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("BOT_TOKEN")
-    or os.getenv("TG_BOT_TOKEN")
-    or ""
-).strip()
-
-TELEGRAM_CHAT_ID = (
-    os.getenv("TELEGRAM_CHAT_ID")
-    or os.getenv("CHAT_ID")
-    or os.getenv("TG_CHAT_ID")
-    or ""
-).strip()
-
-SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "true").lower() in ("1", "true", "yes", "y", "on")
-SEND_STATS_AFTER_CLOSE = os.getenv("SEND_STATS_AFTER_CLOSE", "true").lower() in ("1", "true", "yes", "y", "on")
-SEND_SCANNER_ERRORS_TO_TELEGRAM = os.getenv("SEND_SCANNER_ERRORS_TO_TELEGRAM", "true").lower() in ("1", "true", "yes", "y", "on")
-
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
-MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
-TOP_SYMBOLS_LIMIT = int(os.getenv("TOP_SYMBOLS_LIMIT", "120"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "78"))
-FALLBACK_SCORE = float(os.getenv("FALLBACK_SCORE", "74"))
-DAILY_MIN_SIGNALS = int(os.getenv("DAILY_MIN_SIGNALS", "1"))
-MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "6"))
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "180"))
-SYMBOL_COOLDOWN_MINUTES = int(os.getenv("SYMBOL_COOLDOWN_MINUTES", "360"))
-MAX_ACTIVE_TRADES = int(os.getenv("MAX_ACTIVE_TRADES", "8"))
-LEVERAGE = float(os.getenv("LEVERAGE", "20"))
-
-# Precise mode: the bot does NOT send a signal immediately after one scan.
-# It first finds a structural setup on a CLOSED candle, stores it as pending,
-# then sends only if the same symbol/side is confirmed again on the next scan.
-STRICT_CONFIRMATION = os.getenv("STRICT_CONFIRMATION", "true").lower() in ("1", "true", "yes", "y", "on")
-CONFIRMATION_SCANS = int(os.getenv("CONFIRMATION_SCANS", "2"))
-PENDING_EXPIRE_SECONDS = int(os.getenv("PENDING_EXPIRE_SECONDS", "1200"))
-MIN_VOLUME_RATIO_CONFIRM = float(os.getenv("MIN_VOLUME_RATIO_CONFIRM", "1.10"))
-MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.20"))
-MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "5.00"))
-MAX_ENTRY_DISTANCE_ATR = float(os.getenv("MAX_ENTRY_DISTANCE_ATR", "1.35"))
-MIN_REJECTION_WICK_RATIO = float(os.getenv("MIN_REJECTION_WICK_RATIO", "0.25"))
-MIN_CLOSE_LOCATION = float(os.getenv("MIN_CLOSE_LOCATION", "0.58"))
-ANTI_CHASE_8_CANDLE_MOVE = float(os.getenv("ANTI_CHASE_8_CANDLE_MOVE", "9.0"))
-SEND_PENDING_LOGS_TO_TELEGRAM = os.getenv("SEND_PENDING_LOGS_TO_TELEGRAM", "false").lower() in ("1", "true", "yes", "y", "on")
-
-# Example-like ladder: around 0.8% to 4.0% price movement.
-TP_PCTS = [0.008, 0.014, 0.020, 0.030, 0.040]
-AVERAGING_PCT = float(os.getenv("AVERAGING_PCT", "0.077"))
-STOP_PCT = float(os.getenv("STOP_PCT", "0.105"))
-
-MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "500000"))
-MAX_24H_MOVE_ABS = float(os.getenv("MAX_24H_MOVE_ABS", "45"))
-
-BINGX_BASES = [
-    "https://open-api.bingx.com",
-]
-
-BINGX_CONTRACTS_ENDPOINTS = [
-    "/openApi/swap/v2/quote/contracts",
-]
-
-BINGX_TICKER_ENDPOINTS = [
-    "/openApi/swap/v2/quote/ticker",
-]
-
-BINGX_KLINE_ENDPOINTS = [
-    "/openApi/swap/v3/quote/klines",
-    "/openApi/swap/v2/quote/klines",
-]
-
-DEFAULT_SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "DOGE-USDT",
-    "ADA-USDT", "AVAX-USDT", "LINK-USDT", "SUI-USDT", "APT-USDT", "ARB-USDT",
-    "OP-USDT", "NEAR-USDT", "INJ-USDT", "TIA-USDT", "SEI-USDT", "WIF-USDT",
-    "PEPE-USDT", "FET-USDT", "RNDR-USDT", "JUP-USDT", "ORDI-USDT", "UNI-USDT",
-    "AERO-USDT", "GRASS-USDT", "PUMP-USDT", "BEAT-USDT", "BLESS-USDT", "LAB-USDT",
-]
-
-EXCLUDED_WORDS = (
-    "USDC", "FDUSD", "TUSD", "DAI", "UST", "BUSD", "EUR", "TRY",
-)
-
-# =============================================================================
-# LOGGING
-# =============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger("bingx_bot")
-
-# =============================================================================
-# DATA MODELS
-# =============================================================================
-
-@dataclass
-class Trade:
-    id: str
-    symbol: str
-    side: str  # LONG / SHORT
-    entry: float
-    tps: List[float]
-    averaging: float
-    stop: float
-    score: float
-    strategy: str
-    created_ts: float
-    status: str = "active"
-    reached_tps: List[int] = field(default_factory=list)
-    averaged: bool = False
-    closed_ts: Optional[float] = None
-    close_reason: Optional[str] = None
-    best_roi_pct: float = 0.0
-    worst_roi_pct: float = 0.0
-    telegram_message_id: Optional[int] = None
-
-@dataclass
-class Stats:
-    total_signals: int = 0
-    closed: int = 0
-    profitable: int = 0
-    losing: int = 0
-    tp1_hits: int = 0
-    tp5_hits: int = 0
-    averaged_count: int = 0
-    stop_count: int = 0
-    best_roi_pct: float = 0.0
-    worst_roi_pct: float = 0.0
-    last_closed: List[Dict[str, Any]] = field(default_factory=list)
-
-@dataclass
-class State:
-    active_trades: Dict[str, Trade] = field(default_factory=dict)
-    stats: Stats = field(default_factory=Stats)
-    last_signal_ts_by_symbol: Dict[str, float] = field(default_factory=dict)
-    sent_today: int = 0
-    day_key: str = ""
-
-state = State()
-state_lock = asyncio.Lock()
-started_at = time.time()
-scanner_task: Optional[asyncio.Task] = None
-monitor_task: Optional[asyncio.Task] = None
-last_scanner_error_ts = 0.0
-last_scan_info: Dict[str, Any] = {}
-pending_candidates: Dict[str, Dict[str, Any]] = {}
-pending_lock = asyncio.Lock()
-
-# =============================================================================
-# FASTAPI APP
-# =============================================================================
+APP_NAME = "Professional Adaptive Futures Bot AUTO V13.29 LOCAL STOP DUMP SCALPER"
+DEPLOY_MARKER = "V13_29_LOCAL_STOP_DUMP_SCALPER_2026_06_25"
 
 app = FastAPI(title=APP_NAME)
 
-# =============================================================================
-# UTILS
-# =============================================================================
+BINGX_BASE_URL = "https://open-api.bingx.com"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_29_local_stop_dump_scalper.json")
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
+
+# --- Scan stability ---
+AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
+AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "15"))
+AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "3"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
+API_RETRIES = int(os.getenv("API_RETRIES", "3"))
+API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.04"))
+MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
+HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "60"))
+DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
+
+# --- Signal limits ---
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
+STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
+
+# --- Fast burst requirements ---
+FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
+FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.0045"))        # 1.0% in 15m
+FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.0070"))        # 1.6% in 30m
+FAST_MAX_30M_MOVE = float(os.getenv("FAST_MAX_30M_MOVE", "0.090"))        # avoid late vertical chase
+FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "0.82"))   # current 5m range expansion
+FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "0.35")) # current 15m volume expansion
+FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.00055"))   # 0.15% last 3m direction
+# V13.19: fast scalps can be either continuation OR blow-off reversal.
+# Example from diagnostics: 30m +16%, last 3m -1% can be a valid SHORT scalp, not a rejection.
+REVERSAL_ENABLED = os.getenv("REVERSAL_ENABLED", "true").lower() == "true"
+REVERSAL_MIN_30M_MOVE = float(os.getenv("REVERSAL_MIN_30M_MOVE", "0.018"))
+REVERSAL_MIN_LIVE_COUNTER_MOVE = float(os.getenv("REVERSAL_MIN_LIVE_COUNTER_MOVE", "0.0012"))
+LIVE_BYPASS_VOLUME_MOVE = float(os.getenv("LIVE_BYPASS_VOLUME_MOVE", "0.0035"))
+LIVE_BYPASS_RANGE_RATIO = float(os.getenv("LIVE_BYPASS_RANGE_RATIO", "1.35"))
+FAST_MAX_SPREAD_PROXY = float(os.getenv("FAST_MAX_SPREAD_PROXY", "0.030"))# current 5m candle too wide/chase block
+EDGE_MIN_PRIOR_COMPRESSION = float(os.getenv("EDGE_MIN_PRIOR_COMPRESSION", "99.0")) # prior 5m range should be smaller before expansion
+EDGE_MIN_BREAKOUT_DISTANCE = float(os.getenv("EDGE_MIN_BREAKOUT_DISTANCE", "0.00005")) # 0.12% micro break beyond prior 1m structure
+EDGE_REQUIRE_MICRO_SWEEP = os.getenv("EDGE_REQUIRE_MICRO_SWEEP", "false").lower() == "true"
+
+# --- Realtime pressure gate ---
+# Previous versions expired because they detected a pattern after the flow had already died.
+# These filters require live 1m pressure at the exact signal moment.
+HOT_MIN_SCORE = float(os.getenv("HOT_MIN_SCORE", "14"))
+HOT_MIN_LIVE_MOVE_3M = float(os.getenv("HOT_MIN_LIVE_MOVE_3M", "0.0006"))
+HOT_MIN_LIVE_RANGE_OR_VOLUME = float(os.getenv("HOT_MIN_LIVE_RANGE_OR_VOLUME", "0.70"))
+HOT_STALE_PENALTY_ENABLED = os.getenv("HOT_STALE_PENALTY_ENABLED", "true").lower() == "true"
+REALTIME_MIN_1M_RANGE_RATIO = float(os.getenv("REALTIME_MIN_1M_RANGE_RATIO", "0.45"))
+REALTIME_MIN_1M_VOLUME_RATIO = float(os.getenv("REALTIME_MIN_1M_VOLUME_RATIO", "0.20"))
+REALTIME_MIN_2M_MOVE = float(os.getenv("REALTIME_MIN_2M_MOVE", "0.00045"))
+REALTIME_CLOSE_LOCATION_LONG = float(os.getenv("REALTIME_CLOSE_LOCATION_LONG", "0.57"))
+REALTIME_CLOSE_LOCATION_SHORT = float(os.getenv("REALTIME_CLOSE_LOCATION_SHORT", "0.43"))
+REALTIME_REQUIRE_TWO_1M_CANDLES = os.getenv("REALTIME_REQUIRE_TWO_1M_CANDLES", "false").lower() == "true"
+EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.50")) # recent 15m move should cover most of TP5 distance
+
+# --- Pullback/retest requirements ---
+PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0015"))                 # 0.25%
+PULLBACK_MAX = float(os.getenv("PULLBACK_MAX", "0.0400"))                 # 3.0%
+RECLAIM_BUFFER = float(os.getenv("RECLAIM_BUFFER", "0.0005"))
+CLOSE_LOCATION_MIN_LONG = float(os.getenv("CLOSE_LOCATION_MIN_LONG", "0.52"))
+CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.48"))
+
+# --- Compact ladder TPs for fast 10-minute realization style ---
+# These are intentionally more compact than slow ladder targets.
+# Trader-example ladder: AERO/PORTAL/HOME/VELVET style targets are not tiny 0.3% scalps.
+# TP1 should be reachable quickly, but TP5 should represent a real 3-4% move when volatility allows.
+TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0065"))
+TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0120"))
+TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0185"))
+TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0260"))
+TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0350"))
+
+# --- Risk / stop ---
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
+MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0100"))                  # min 1.0% price risk
+MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # technical invalidation cap for example-style ladder
+
+# V13.29: for fast scalps we use a LOCAL execution stop, not the distant invalidation/averaging zone.
+# This keeps AERO-style / dump scalps alive while still blocking XMR-style wide-risk trades.
+LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
+LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0145"))  # 1.45% price risk cap; x20 ≈ 29% ROI
+LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0065"))  # keep stop not too tight
+LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG", "AERO_STYLE_SHORT", "AERO_STYLE_LONG"}
+FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
+A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
+
+# --- V13.22 professional quality gate ---
+# Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
+MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "32.0"))
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
+MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.62"))
+MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
+MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.50"))
+MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.30"))
+STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0050"))
+STRONG_RANGE1 = float(os.getenv("STRONG_RANGE1", "1.25"))
+HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.25"))
+HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "13.0"))
+HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.70"))
+HEAVY_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK", "AVAX",
+    "DOT", "LTC", "BCH", "XMR", "GMX", "AAVE", "UNI", "ATOM", "ETC", "FIL"
+}
+
+# --- V13.24 Instant Edge fallback ---
+# This mode catches the examples-style micro-moment when the coin is moving NOW,
+# but the older pullback/EMA/VWAP setup is too slow and returns no_fast.
+# It is not a loose mode: final RR/SL/live-volume quality gate still applies after trade construction.
+INSTANT_EDGE_ENABLED = os.getenv("INSTANT_EDGE_ENABLED", "true").lower() == "true"
+INSTANT_MIN_1M3_MOVE = float(os.getenv("INSTANT_MIN_1M3_MOVE", "0.0055"))
+INSTANT_MIN_15M_MOVE = float(os.getenv("INSTANT_MIN_15M_MOVE", "0.0040"))
+INSTANT_MIN_VOL1 = float(os.getenv("INSTANT_MIN_VOL1", "0.45"))
+INSTANT_MIN_RANGE1 = float(os.getenv("INSTANT_MIN_RANGE1", "0.85"))
+INSTANT_MIN_VOL5 = float(os.getenv("INSTANT_MIN_VOL5", "0.55"))
+INSTANT_MIN_RANGE5 = float(os.getenv("INSTANT_MIN_RANGE5", "0.70"))
+INSTANT_CLOSE_LONG = float(os.getenv("INSTANT_CLOSE_LONG", "0.60"))
+INSTANT_CLOSE_SHORT = float(os.getenv("INSTANT_CLOSE_SHORT", "0.40"))
+INSTANT_MIN_BODY = float(os.getenv("INSTANT_MIN_BODY", "0.34"))
+INSTANT_MAX_30M_CHASE = float(os.getenv("INSTANT_MAX_30M_CHASE", "0.065"))
+INSTANT_ALLOW_STRONG_1M_EXCEPTION = os.getenv("INSTANT_ALLOW_STRONG_1M_EXCEPTION", "true").lower() == "true"
+
+# --- V13.25 trader-pattern quality gate ---
+# Built from the examples: AERO/PORTAL/HOME/WLD/VELVET are not random hot ticks.
+# They are either continuation after a controlled pullback/reject, or a leader/laggard relative-strength exception.
+TRADER_PATTERN_GATE_ENABLED = os.getenv("TRADER_PATTERN_GATE_ENABLED", "true").lower() == "true"
+TRADER_MIN_SCORE = int(os.getenv("TRADER_MIN_SCORE", "82"))
+TRADER_ALLOW_B_SCORE = os.getenv("TRADER_ALLOW_B_SCORE", "true").lower() == "true"
+TRADER_MIN_ABS_1M3 = float(os.getenv("TRADER_MIN_ABS_1M3", "0.0048"))
+TRADER_MIN_ABS_15M = float(os.getenv("TRADER_MIN_ABS_15M", "0.0055"))
+TRADER_MIN_ABS_30M = float(os.getenv("TRADER_MIN_ABS_30M", "0.0080"))
+TRADER_MIN_VOL1 = float(os.getenv("TRADER_MIN_VOL1", "0.52"))
+TRADER_MIN_VOL5 = float(os.getenv("TRADER_MIN_VOL5", "0.52"))
+TRADER_MIN_RANGE1 = float(os.getenv("TRADER_MIN_RANGE1", "0.85"))
+TRADER_MIN_RANGE5 = float(os.getenv("TRADER_MIN_RANGE5", "0.75"))
+TRADER_MIN_TP5_FEASIBILITY = float(os.getenv("TRADER_MIN_TP5_FEASIBILITY", "0.50"))
+TRADER_NEED_5M_DIRECTION = os.getenv("TRADER_NEED_5M_DIRECTION", "false").lower() == "true"
+TRADER_BLOCK_WEAK_CONTINUATION = os.getenv("TRADER_BLOCK_WEAK_CONTINUATION", "true").lower() == "true"
+TRADER_MAX_COUNTER_30M = float(os.getenv("TRADER_MAX_COUNTER_30M", "0.0100"))
+TRADER_REQUIRE_MICRO_BREAK = os.getenv("TRADER_REQUIRE_MICRO_BREAK", "true").lower() == "true"
+TRADER_CLOSE_LONG = float(os.getenv("TRADER_CLOSE_LONG", "0.57"))
+TRADER_CLOSE_SHORT = float(os.getenv("TRADER_CLOSE_SHORT", "0.43"))
+TRADER_HEAVY_ONLY_A_PLUS = os.getenv("TRADER_HEAVY_ONLY_A_PLUS", "true").lower() == "true"
+
+# --- V13.27 AERO-style trader gate ---
+# This is built from the user's AERO example: short after a controlled upper pullback/reject,
+# not a random late short at the bottom. It allows quality B+ trades if the tape shows a true
+# pullback -> rejection -> breakdown structure, while keeping RR/SL quality gate active.
+AERO_STYLE_GATE_ENABLED = os.getenv("AERO_STYLE_GATE_ENABLED", "true").lower() == "true"
+AERO_SHORT_ENABLED = os.getenv("AERO_SHORT_ENABLED", "true").lower() == "true"
+AERO_LONG_ENABLED = os.getenv("AERO_LONG_ENABLED", "true").lower() == "true"
+AERO_MIN_PULLBACK = float(os.getenv("AERO_MIN_PULLBACK", "0.0045"))       # recent high/low must be away from entry
+AERO_MAX_PULLBACK = float(os.getenv("AERO_MAX_PULLBACK", "0.0850"))       # avoid extreme manipulated spikes
+AERO_MIN_1M3 = float(os.getenv("AERO_MIN_1M3", "0.0038"))                 # current 3m pressure
+AERO_MIN_RECENT_RANGE = float(os.getenv("AERO_MIN_RECENT_RANGE", "0.0140")) # recent 30m range expansion
+AERO_MIN_VOL1 = float(os.getenv("AERO_MIN_VOL1", "0.35"))
+AERO_MIN_VOL5 = float(os.getenv("AERO_MIN_VOL5", "0.45"))
+AERO_MIN_RANGE1 = float(os.getenv("AERO_MIN_RANGE1", "0.60"))
+AERO_MIN_RANGE5 = float(os.getenv("AERO_MIN_RANGE5", "0.65"))
+AERO_CLOSE_SHORT = float(os.getenv("AERO_CLOSE_SHORT", "0.48"))
+AERO_CLOSE_LONG = float(os.getenv("AERO_CLOSE_LONG", "0.52"))
+AERO_REQUIRE_EMA_REJECT = os.getenv("AERO_REQUIRE_EMA_REJECT", "true").lower() == "true"
+AERO_ALLOW_B_SCORE = os.getenv("AERO_ALLOW_B_SCORE", "true").lower() == "true"
+
+# --- V13.28 Market Dump SHORT fallback ---
+# Used when BTC/ETH/alt market is actively selling off and old fast/aero gates are too
+# selective. This catches dump continuation, but still avoids shorting a dead bottom:
+# it needs live 1m pressure, 5m participation and fresh continuation/reject evidence.
+MARKET_DUMP_SHORT_ENABLED = os.getenv("MARKET_DUMP_SHORT_ENABLED", "true").lower() == "true"
+DUMP_MIN_1M3 = float(os.getenv("DUMP_MIN_1M3", "0.0048"))
+DUMP_MIN_15M = float(os.getenv("DUMP_MIN_15M", "0.0035"))
+DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.35"))
+DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.48"))
+DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.40"))
+DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.60"))
+DUMP_CLOSE_SHORT = float(os.getenv("DUMP_CLOSE_SHORT", "0.58"))
+DUMP_MIN_RECENT_RANGE = float(os.getenv("DUMP_MIN_RECENT_RANGE", "0.0100"))
+DUMP_MAX_LATE_30M = float(os.getenv("DUMP_MAX_LATE_30M", "0.095"))
+DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "false").lower() == "true"
 
 
-def today_key() -> str:
-    return now_utc().strftime("%Y-%m-%d")
+# --- Time stop / no-stall logic ---
+FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
+FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "11"))
+FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.25"))
+FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").lower() == "true"
+
+# --- Market shock context ---
+# We do not trade market phase/trend. BTC is used only as a shock filter.
+BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.020")) # avoid alt scalp during violent BTC shock
+
+# --- Side control / professional LONG repair ---
+# SHORT is already working in live stats. LONG is now stricter and must look like a real reclaim,
+# not a late buy at the end of a pump.
+ALLOW_LONG = os.getenv("ALLOW_LONG", "true").lower() == "true"
+ALLOW_SHORT = os.getenv("ALLOW_SHORT", "true").lower() == "true"
+LONG_BLOCK_BTC_BEAR = os.getenv("LONG_BLOCK_BTC_BEAR", "false").lower() == "true"
+LONG_MIN_1M_VOLUME_RATIO = float(os.getenv("LONG_MIN_1M_VOLUME_RATIO", "0.75"))
+LONG_MIN_1M_RANGE_RATIO = float(os.getenv("LONG_MIN_1M_RANGE_RATIO", "0.80"))
+LONG_MIN_3M_CONFIRM = float(os.getenv("LONG_MIN_3M_CONFIRM", "0.0012"))     # 0.12% in 3m
+LONG_MIN_CLOSE_LOCATION = float(os.getenv("LONG_MIN_CLOSE_LOCATION", "0.72"))
+LONG_MAX_15M_CHASE = float(os.getenv("LONG_MAX_15M_CHASE", "0.040"))        # above this needs pullback/sweep
+LONG_MAX_30M_CHASE = float(os.getenv("LONG_MAX_30M_CHASE", "0.070"))
+LONG_MIN_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MIN_PULLBACK_AFTER_PUMP", "0.0055"))
+LONG_MAX_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MAX_PULLBACK_AFTER_PUMP", "0.038"))
+LONG_REQUIRE_SWEEP_OR_RECLAIM = os.getenv("LONG_REQUIRE_SWEEP_OR_RECLAIM", "true").lower() == "true"
+LONG_REQUIRE_HIGHER_LOW = os.getenv("LONG_REQUIRE_HIGHER_LOW", "true").lower() == "true"
+LONG_STATS_PROTECTION = os.getenv("LONG_STATS_PROTECTION", "true").lower() == "true"
+LONG_STATS_MIN_CLOSED = int(os.getenv("LONG_STATS_MIN_CLOSED", "4"))
+LONG_STATS_MIN_WR = float(os.getenv("LONG_STATS_MIN_WR", "40"))
+
+# --- V13.21 context-adaptive rules ---
+# Professional idea: BTC direction is not a simple long/short switch.
+# LONG is allowed in a bearish market only if the coin is showing clear relative strength
+# and live reclaim pressure. SHORT is prioritized during BTC dump, but not chased without
+# a bounce/reject structure.
+CONTEXT_ADAPTIVE_ENABLED = os.getenv("CONTEXT_ADAPTIVE_ENABLED", "true").lower() == "true"
+BTC_DUMP_SHORT_BIAS_ENABLED = os.getenv("BTC_DUMP_SHORT_BIAS_ENABLED", "true").lower() == "true"
+BTC_DUMP_1H = float(os.getenv("BTC_DUMP_1H", "-0.012"))
+BTC_DUMP_6H = float(os.getenv("BTC_DUMP_6H", "-0.025"))
+LONG_ALLOW_BEAR_RELATIVE_STRENGTH = os.getenv("LONG_ALLOW_BEAR_RELATIVE_STRENGTH", "true").lower() == "true"
+LONG_BEAR_MIN_ALT_15M = float(os.getenv("LONG_BEAR_MIN_ALT_15M", "0.0065"))
+LONG_BEAR_MIN_ALT_30M = float(os.getenv("LONG_BEAR_MIN_ALT_30M", "0.0100"))
+LONG_BEAR_MIN_1M3 = float(os.getenv("LONG_BEAR_MIN_1M3", "0.0020"))
+LONG_BEAR_MIN_REL_STRENGTH_1H = float(os.getenv("LONG_BEAR_MIN_REL_STRENGTH_1H", "0.010"))
+LONG_BEAR_MIN_VOL1 = float(os.getenv("LONG_BEAR_MIN_VOL1", "0.90"))
+LONG_BEAR_MIN_RANGE1 = float(os.getenv("LONG_BEAR_MIN_RANGE1", "0.95"))
+LONG_BEAR_MIN_CLOSE_LOCATION = float(os.getenv("LONG_BEAR_MIN_CLOSE_LOCATION", "0.76"))
+SHORT_DUMP_ALLOW_EXTENDED_30M = float(os.getenv("SHORT_DUMP_ALLOW_EXTENDED_30M", "0.145"))
+SHORT_DUMP_MIN_LIVE_1M3 = float(os.getenv("SHORT_DUMP_MIN_LIVE_1M3", "-0.0014"))
+SHORT_DUMP_MIN_BOUNCE = float(os.getenv("SHORT_DUMP_MIN_BOUNCE", "0.0025"))
 
 
-def fmt_price(x: float) -> str:
-    if x >= 100:
-        return f"{x:.2f}"
-    if x >= 10:
-        return f"{x:.3f}"
-    if x >= 1:
-        return f"{x:.4f}"
-    if x >= 0.1:
-        return f"{x:.5f}"
-    if x >= 0.01:
-        return f"{x:.6f}"
-    return f"{x:.8f}".rstrip("0").rstrip(".")
+# --- Ultra-risk blocks ---
+ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.095"))
+ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.140"))
+
+SCALP_STRATEGIES = {"PRO_SCALPING_EDGE_LONG", "PRO_SCALPING_EDGE_SHORT"}
+
+QUALITY_BASES = {
+    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
+    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "MATIC", "TON", "LTC", "BCH", "ETC", "FIL", "ATOM",
+    "UNI", "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI",
+    "PORTAL", "HOME", "TAC", "VELVET", "BEAT", "BLESS"
+}
+
+# Do not include VELVET here; user gave a successful VELVET long example.
+ULTRA_RISK_KEYWORDS = {
+    "1000", "PEPE", "BONK", "WIF", "MEME", "DOGS", "CATI", "HMSTR", "GOBLIN", "MOG", "TURBO",
+    "BOME", "NEIRO", "PNUT", "MOODENG", "ACT", "GOAT", "FIGHT", "BLEND", "MAGMA"
+}
+
+FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
+    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "LTC", "BCH", "ETC", "FIL", "ATOM", "UNI",
+    "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI", "BEAT", "BLESS",
+    "KAITO", "XLM", "WLFI", "PUMP", "PORTAL", "HOME", "TAC", "VELVET"
+]]
+
+STATE: Dict[str, Any] = {}
+KLINE_CACHE: Dict[str, Tuple[float, Optional[List[Dict[str, float]]]]] = {}
+TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
+
+# ============================================================
+# State / utilities
+# ============================================================
+
+def now_ts() -> int:
+    return int(time.time())
 
 
-def display_symbol(symbol: str) -> str:
-    return symbol.replace("-", "").replace("/", "")
-
-
-def percent_change(a: float, b: float) -> float:
-    if a == 0:
-        return 0.0
-    return (b - a) / a * 100.0
-
-
-def side_profit_pct(side: str, entry: float, price: float) -> float:
-    if entry <= 0:
-        return 0.0
-    if side == "LONG":
-        return (price - entry) / entry * 100.0
-    return (entry - price) / entry * 100.0
-
-
-def roi_pct(side: str, entry: float, price: float) -> float:
-    return side_profit_pct(side, entry, price) * LEVERAGE
-
-
-def is_usdt_symbol(symbol: str) -> bool:
-    s = symbol.upper()
-    if not (s.endswith("-USDT") or s.endswith("/USDT") or s.endswith("USDT")):
-        return False
-    return not any(w in s.replace("USDT", "") for w in EXCLUDED_WORDS)
-
-
-def normalize_symbol(s: str) -> str:
-    s = str(s).upper().strip()
-    s = s.replace("/", "-")
+def normalize_symbol(symbol: str) -> str:
+    s = symbol.replace("/", "-").upper()
     if s.endswith("USDT") and "-" not in s:
-        s = s[:-4] + "-USDT"
+        s = s.replace("USDT", "-USDT")
     return s
 
 
-def interval_to_ms(interval: str) -> int:
-    table = {
-        "1m": 60_000,
-        "3m": 180_000,
-        "5m": 300_000,
-        "15m": 900_000,
-        "30m": 1_800_000,
-        "1h": 3_600_000,
-        "4h": 14_400_000,
-        "1d": 86_400_000,
-    }
-    return table.get(interval, 60_000)
+def display_symbol(symbol: str) -> str:
+    return normalize_symbol(symbol).replace("-", "/")
 
-# =============================================================================
-# STATE
-# =============================================================================
 
-def state_to_json() -> Dict[str, Any]:
+def base_asset(symbol: str) -> str:
+    return normalize_symbol(symbol).split("-")[0]
+
+
+def default_state() -> Dict[str, Any]:
     return {
-        "active_trades": {k: asdict(v) for k, v in state.active_trades.items()},
-        "stats": asdict(state.stats),
-        "last_signal_ts_by_symbol": state.last_signal_ts_by_symbol,
-        "sent_today": state.sent_today,
-        "day_key": state.day_key,
+        "active_signals": [],
+        "stats": {
+            "total": {"profit": 0, "sl": 0, "expired": 0},
+            "side": {},
+            "grade": {},
+            "strategy": {},
+            "symbol": {},
+            "type": {},
+        },
+        "pair_cooldown": {},
+        "strategy_cooldown": {},
+        "last_scan": {},
+        "last_diag_ts": 0,
+        "last_error": "",
     }
 
 
-def load_state() -> None:
-    global state
-    p = Path(STATE_FILE)
-    if not p.exists():
-        state = State(day_key=today_key())
-        return
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_FILE):
+        return default_state()
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-        active = {
-            k: Trade(**v) for k, v in raw.get("active_trades", {}).items()
-        }
-        stats = Stats(**raw.get("stats", {}))
-        state = State(
-            active_trades=active,
-            stats=stats,
-            last_signal_ts_by_symbol=raw.get("last_signal_ts_by_symbol", {}),
-            sent_today=int(raw.get("sent_today", 0)),
-            day_key=raw.get("day_key") or today_key(),
-        )
-        if state.day_key != today_key():
-            state.day_key = today_key()
-            state.sent_today = 0
-        logger.info("State loaded: active=%s closed=%s", len(state.active_trades), state.stats.closed)
-    except Exception as e:
-        logger.exception("Failed to load state: %s", e)
-        state = State(day_key=today_key())
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        base = default_state()
+        if isinstance(data, dict):
+            base.update(data)
+        return base
+    except Exception:
+        return default_state()
 
 
 def save_state() -> None:
     try:
-        Path(STATE_FILE).write_text(json.dumps(state_to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        logger.exception("Failed to save state: %s", e)
-
-# =============================================================================
-# TELEGRAM
-# =============================================================================
-
-async def telegram_request(method: str, payload: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            text = await resp.text()
-            try:
-                data = json.loads(text)
-            except Exception:
-                data = {"ok": False, "raw": text}
-            if resp.status >= 400 or not data.get("ok", False):
-                description = data.get("description") or text
-                raise RuntimeError(f"Telegram {method} failed: HTTP {resp.status}: {description}")
-            return data
-
-
-async def send_telegram(text: str, disable_web_page_preview: bool = True) -> Optional[int]:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error(
-            "Telegram is not configured: token_present=%s chat_present=%s",
-            bool(TELEGRAM_BOT_TOKEN),
-            bool(TELEGRAM_CHAT_ID),
-        )
-        return None
-    try:
-        data = await telegram_request(
-            "sendMessage",
-            {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": disable_web_page_preview,
-            },
-        )
-        message_id = data.get("result", {}).get("message_id")
-        logger.info("Telegram message sent successfully: message_id=%s", message_id)
-        return message_id
-    except Exception as e:
-        logger.error("Telegram send failed: %s", e)
-        return None
-
-
-async def telegram_get_me() -> str:
-    try:
-        data = await telegram_request("getMe", {})
-        user = data.get("result", {})
-        return f"OK @{user.get('username')} id={user.get('id')}"
-    except Exception as e:
-        return f"ERROR {e}"
-
-
-async def send_startup_message() -> None:
-    if not SEND_STARTUP_MESSAGE:
-        return
-    get_me = await telegram_get_me()
-    msg = (
-        "🚀 <b>BingX scalp signal bot запущен на Render</b>\n\n"
-        "Service: <b>Background Worker</b>\n"
-        "Start command: <code>uvicorn bot:app --host 0.0.0.0 --port 1000</code>\n"
-        f"Scanner: каждые <b>{SCAN_INTERVAL_SECONDS}</b> сек\n"
-        f"Score: <b>{MIN_SCORE:.0f}</b> / fallback <b>{FALLBACK_SCORE:.0f}</b>\n"
-        f"Плечо в расчетах: <b>x{LEVERAGE:.0f}</b>\n"
-        f"Режим: <b>точные отскоки/отбои + {CONFIRMATION_SCANS} проверки</b>\n"
-        "Data: BingX public REST, <b>без ccxt</b>\n"
-        f"Telegram getMe: <code>{get_me}</code>\n\n"
-        "Если ты видишь это сообщение — Telegram подключен правильно."
-    )
-    await send_telegram(msg)
-
-# =============================================================================
-# BINGX HTTP
-# =============================================================================
-
-async def http_get_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 12) -> Dict[str, Any]:
-    async with session.get(url, params=params or {}, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-        text = await resp.text()
-        try:
-            data = json.loads(text)
-        except Exception as e:
-            raise RuntimeError(f"JSON parse failed: status={resp.status}, text={text[:300]}") from e
-        if resp.status >= 400:
-            raise RuntimeError(f"HTTP {resp.status}: {text[:300]}")
-        return data
-
-
-async def bingx_get(session: aiohttp.ClientSession, endpoints: List[str], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    last_error = None
-    for base in BINGX_BASES:
-        for endpoint in endpoints:
-            url = base + endpoint
-            try:
-                data = await http_get_json(session, url, params=params)
-                # BingX normally returns code=0. Some endpoints may return data directly.
-                code = data.get("code") if isinstance(data, dict) else None
-                if code in (0, "0", None):
-                    return data
-                last_error = RuntimeError(f"BingX code={code}: {data}")
-            except Exception as e:
-                last_error = e
-                continue
-    raise RuntimeError(f"All BingX endpoints failed. Last error: {last_error}")
-
-
-def extract_data(payload: Any) -> Any:
-    if isinstance(payload, dict):
-        if "data" in payload:
-            return payload["data"]
-        return payload
-    return payload
-
-
-async def fetch_contract_symbols(session: aiohttp.ClientSession) -> List[str]:
-    try:
-        payload = await bingx_get(session, BINGX_CONTRACTS_ENDPOINTS)
-        data = extract_data(payload)
-        symbols: List[str] = []
-        if isinstance(data, dict):
-            data = data.get("contracts") or data.get("symbols") or data.get("list") or []
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    raw = item.get("symbol") or item.get("contractId") or item.get("name")
-                    if not raw:
-                        continue
-                    sym = normalize_symbol(raw)
-                    # Prefer currently tradeable contracts if status field exists.
-                    status = str(item.get("status", item.get("state", ""))).lower()
-                    if status and any(bad in status for bad in ("offline", "suspend", "delist")):
-                        continue
-                    if is_usdt_symbol(sym):
-                        symbols.append(sym)
-                elif isinstance(item, str):
-                    sym = normalize_symbol(item)
-                    if is_usdt_symbol(sym):
-                        symbols.append(sym)
-        symbols = sorted(set(symbols))
-        return symbols or DEFAULT_SYMBOLS
-    except Exception as e:
-        logger.warning("fetch_contract_symbols failed, using DEFAULT_SYMBOLS: %s", e)
-        return DEFAULT_SYMBOLS
-
-
-async def fetch_tickers(session: aiohttp.ClientSession) -> Dict[str, Dict[str, Any]]:
-    try:
-        payload = await bingx_get(session, BINGX_TICKER_ENDPOINTS)
-        data = extract_data(payload)
-        if isinstance(data, dict):
-            data = data.get("tickers") or data.get("ticker") or data.get("list") or data.get("data") or []
-        result: Dict[str, Dict[str, Any]] = {}
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                raw_symbol = item.get("symbol") or item.get("s")
-                if not raw_symbol:
-                    continue
-                sym = normalize_symbol(raw_symbol)
-                if not is_usdt_symbol(sym):
-                    continue
-                result[sym] = item
-        return result
-    except Exception as e:
-        logger.warning("fetch_tickers failed: %s", e)
-        return {}
-
-
-def parse_quote_volume(t: Dict[str, Any]) -> float:
-    keys = [
-        "quoteVolume", "quoteVol", "amount", "turnover", "volumeUsd", "volumeUSDT",
-        "quoteVolume24h", "quoteVolume24H", "volUsd", "q",
-    ]
-    for k in keys:
-        try:
-            if k in t and t[k] not in (None, ""):
-                return float(t[k])
-        except Exception:
-            pass
-    # If only base volume and last price are available.
-    vol = 0.0
-    price = 0.0
-    for k in ("volume", "baseVolume", "vol", "v"):
-        try:
-            if k in t and t[k] not in (None, ""):
-                vol = float(t[k])
-                break
-        except Exception:
-            pass
-    for k in ("lastPrice", "last", "price", "close", "c"):
-        try:
-            if k in t and t[k] not in (None, ""):
-                price = float(t[k])
-                break
-        except Exception:
-            pass
-    return vol * price
-
-
-def parse_price_change_24h(t: Dict[str, Any]) -> float:
-    for k in ("priceChangePercent", "priceChangeRate", "change", "changePercent", "priceChangePcnt"):
-        try:
-            if k in t and t[k] not in (None, ""):
-                x = float(t[k])
-                # Some APIs return rate 0.05 instead of 5%.
-                if abs(x) < 1.0:
-                    return x * 100.0
-                return x
-        except Exception:
-            pass
-    return 0.0
-
-
-async def get_top_symbols(session: aiohttp.ClientSession) -> List[str]:
-    symbols = await fetch_contract_symbols(session)
-    tickers = await fetch_tickers(session)
-    ranked: List[Tuple[str, float, float]] = []
-    for sym in symbols:
-        t = tickers.get(sym, {})
-        qv = parse_quote_volume(t) if t else 0.0
-        ch = parse_price_change_24h(t) if t else 0.0
-        if qv and qv < MIN_QUOTE_VOLUME_USDT:
-            continue
-        if abs(ch) > MAX_24H_MOVE_ABS:
-            continue
-        ranked.append((sym, qv, abs(ch)))
-    if not ranked:
-        ranked = [(s, 0.0, 0.0) for s in symbols]
-    ranked.sort(key=lambda x: (x[1], x[2]), reverse=True)
-    selected = [x[0] for x in ranked[:TOP_SYMBOLS_LIMIT]]
-    # Always include example-like / hot symbols if available.
-    for s in DEFAULT_SYMBOLS:
-        if s not in selected and s in symbols and len(selected) < TOP_SYMBOLS_LIMIT:
-            selected.append(s)
-    return selected[:TOP_SYMBOLS_LIMIT]
-
-
-def parse_kline_item(item: Any) -> Optional[Dict[str, float]]:
-    try:
-        if isinstance(item, dict):
-            ts = item.get("time") or item.get("openTime") or item.get("t") or item.get("T") or item.get("id") or 0
-            o = item.get("open") or item.get("o")
-            h = item.get("high") or item.get("h")
-            l = item.get("low") or item.get("l")
-            c = item.get("close") or item.get("c")
-            v = item.get("volume") or item.get("vol") or item.get("v") or item.get("amount") or 0
-            if o is None or h is None or l is None or c is None:
-                return None
-            return {"ts": float(ts), "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v)}
-        if isinstance(item, (list, tuple)) and len(item) >= 5:
-            # Common order: [time, open, high, low, close, volume]
-            # Some APIs use [open, close, high, low, volume, time]. Try to detect timestamp.
-            vals = list(item)
-            first = float(vals[0])
-            if first > 1_000_000_000:  # timestamp first
-                ts = first
-                o, h, l, c = float(vals[1]), float(vals[2]), float(vals[3]), float(vals[4])
-                v = float(vals[5]) if len(vals) > 5 else 0.0
-            else:
-                # Fallback guess.
-                ts = float(vals[5]) if len(vals) > 5 and float(vals[5]) > 1_000_000_000 else 0.0
-                o, h, l, c = float(vals[0]), float(vals[2]), float(vals[3]), float(vals[1])
-                v = float(vals[4]) if len(vals) > 4 else 0.0
-            return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False, indent=2)
     except Exception:
-        return None
+        pass
+
+
+def inc_stat(bucket: str, key: str, result: str) -> None:
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    d = stats.setdefault(bucket, {})
+    item = d.setdefault(key, {"profit": 0, "sl": 0, "expired": 0})
+    item[result] = item.get(result, 0) + 1
+
+
+def apply_result(signal: Dict[str, Any], result: str) -> None:
+    if result not in ("profit", "sl", "expired"):
+        return
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    stats.setdefault("total", {"profit": 0, "sl": 0, "expired": 0})[result] += 1
+    inc_stat("side", signal.get("side", "?"), result)
+    inc_stat("grade", signal.get("grade", "?"), result)
+    inc_stat("strategy", signal.get("strategy", "?"), result)
+    inc_stat("symbol", signal.get("symbol", "?"), result)
+    inc_stat("type", signal.get("trade_type", "?"), result)
+    save_state()
+
+
+def wr_text(item: Dict[str, int]) -> str:
+    p = int(item.get("profit", 0))
+    sl = int(item.get("sl", 0))
+    exp = int(item.get("expired", 0))
+    closed = p + sl + exp
+    wr = p / closed * 100 if closed else 0.0
+    return f"{p} профит / {sl} SL / {exp} expired / WR {wr:.1f}%"
+
+
+def build_stats_text() -> str:
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    lines = ["📊 Статистика", f"Итого: {wr_text(stats.get('total', {}))}"]
+    for title, key in [("Стороны", "side"), ("Классы", "grade"), ("Стратегии", "strategy"), ("Типы", "type")]:
+        data = stats.get(key, {})
+        if data:
+            lines.append(f"\n{title}:")
+            for k, v in sorted(data.items(), key=lambda kv: -(kv[1].get("profit", 0) + kv[1].get("sl", 0) + kv[1].get("expired", 0)))[:12]:
+                lines.append(f"{k}: {wr_text(v)}")
+    return "\n".join(lines)
+
+# ============================================================
+# Telegram / API
+# ============================================================
+
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        STATE["last_error"] = "Telegram env missing: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+        save_state()
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]}, timeout=10)
+        if not r.ok:
+            STATE["last_error"] = f"Telegram error {r.status_code}: {r.text[:250]}"
+            save_state()
+            return False
+        return True
+    except Exception as e:
+        STATE["last_error"] = f"Telegram exception: {repr(e)}"
+        save_state()
+        return False
+
+
+def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    url = BINGX_BASE_URL + path
+    last_err = None
+    for attempt in range(API_RETRIES):
+        try:
+            time.sleep(API_THROTTLE_SECONDS)
+            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code} {path}"
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            return r.json()
+        except Exception as e:
+            last_err = f"get_json {path}: {repr(e)}"
+            time.sleep(0.35 * (attempt + 1))
+    STATE["last_error"] = last_err or "unknown API error"
+    save_state()
     return None
 
 
-def parse_klines(payload: Any) -> List[Dict[str, float]]:
-    data = extract_data(payload)
-    if isinstance(data, dict):
-        data = data.get("klines") or data.get("kline") or data.get("list") or data.get("candles") or []
-    out: List[Dict[str, float]] = []
-    if isinstance(data, list):
-        for item in data:
-            k = parse_kline_item(item)
-            if k and k["open"] > 0 and k["high"] > 0 and k["low"] > 0 and k["close"] > 0:
-                out.append(k)
-    # Remove duplicates and sort by ts when possible.
-    if out and any(k["ts"] for k in out):
-        out.sort(key=lambda x: x["ts"])
-    return out
-
-
-async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str = "15m", limit: int = 120) -> List[Dict[str, float]]:
-    sym = normalize_symbol(symbol)
-    params_variants = [
-        {"symbol": sym, "interval": interval, "limit": limit},
-        {"symbol": sym.replace("-", ""), "interval": interval, "limit": limit},
-    ]
-    last_error = None
-    for params in params_variants:
+def parse_klines(raw: Any) -> Optional[List[Dict[str, float]]]:
+    if not raw:
+        return None
+    candles: List[Dict[str, float]] = []
+    for c in raw:
         try:
-            payload = await bingx_get(session, BINGX_KLINE_ENDPOINTS, params=params)
-            klines = parse_klines(payload)
-            if len(klines) >= 20:
-                return klines[-limit:]
-            last_error = RuntimeError(f"Not enough klines: {len(klines)}")
-        except Exception as e:
-            last_error = e
+            if isinstance(c, dict):
+                candles.append({
+                    "time": int(c.get("time") or c.get("openTime") or c.get("T") or 0),
+                    "open": float(c.get("open")),
+                    "high": float(c.get("high")),
+                    "low": float(c.get("low")),
+                    "close": float(c.get("close")),
+                    "volume": float(c.get("volume") or c.get("vol") or 0),
+                })
+            elif isinstance(c, (list, tuple)) and len(c) >= 6:
+                candles.append({
+                    "time": int(c[0]),
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "volume": float(c[5]),
+                })
+        except Exception:
             continue
-    raise RuntimeError(f"fetch_klines failed for {symbol} {interval}: {last_error}")
+    candles = [x for x in candles if x["open"] > 0 and x["high"] > 0 and x["low"] > 0 and x["close"] > 0]
+    candles.sort(key=lambda x: x["time"])
+    return candles if len(candles) >= 30 else None
 
-# =============================================================================
-# INDICATORS
-# =============================================================================
 
-def sma(values: List[float], period: int) -> float:
-    if not values:
-        return 0.0
-    if len(values) < period:
-        return sum(values) / len(values)
-    return sum(values[-period:]) / period
+def get_klines(symbol: str, interval: str, limit: int = 180, cache_seconds: int = 20) -> Optional[List[Dict[str, float]]]:
+    symbol = normalize_symbol(symbol)
+    key = f"{symbol}:{interval}:{limit}"
+    cached = KLINE_CACHE.get(key)
+    if cached and time.time() - cached[0] < cache_seconds:
+        return cached[1]
+    for ep in ["/openApi/swap/v3/quote/klines", "/openApi/swap/v2/quote/klines"]:
+        data = get_json(ep, {"symbol": symbol, "interval": interval, "limit": limit})
+        if not data:
+            continue
+        candles = parse_klines(data.get("data"))
+        if candles:
+            KLINE_CACHE[key] = (time.time(), candles)
+            return candles
+    KLINE_CACHE[key] = (time.time(), None)
+    return None
+
+
+def is_good_contract_symbol(symbol: str) -> bool:
+    s = normalize_symbol(symbol)
+    if not s.endswith("-USDT"):
+        return False
+    b = base_asset(s)
+    if any(x in b for x in ["USD", "USDC", "BULL", "BEAR"]):
+        return False
+    return True
+
+
+def get_symbols() -> List[str]:
+    cached = TICKER_CACHE.get("symbols")
+    if cached and time.time() - cached[0] < 600:
+        return cached[1] or FALLBACK_SYMBOLS
+    data = get_json("/openApi/swap/v2/quote/contracts")
+    out: List[str] = []
+    if data and isinstance(data.get("data"), list):
+        for item in data.get("data", []):
+            s = item.get("symbol")
+            if s and is_good_contract_symbol(s):
+                out.append(normalize_symbol(s))
+    if not out:
+        out = FALLBACK_SYMBOLS[:]
+    # Ensure important user examples are always included if contracts exist/fallback is needed.
+    for s in FALLBACK_SYMBOLS:
+        if s not in out:
+            out.append(s)
+    random.shuffle(out)
+    quality = [s for s in out if base_asset(s) in QUALITY_BASES]
+    rest = [s for s in out if base_asset(s) not in QUALITY_BASES]
+    result = (quality + rest)[:MAX_CONTRACTS]
+    TICKER_CACHE["symbols"] = (time.time(), result)
+    return result
+
+# ============================================================
+# Indicators
+# ============================================================
+
+def closes(c: List[Dict[str, float]]) -> List[float]:
+    return [x["close"] for x in c]
 
 
 def ema(values: List[float], period: int) -> float:
     if not values:
         return 0.0
+    if len(values) < period:
+        return sum(values) / len(values)
     k = 2 / (period + 1)
-    e = values[0]
-    for x in values[1:]:
-        e = x * k + e * (1 - k)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
     return e
 
 
-def rsi(values: List[float], period: int = 14) -> float:
-    if len(values) <= period:
-        return 50.0
-    gains = []
-    losses = []
-    for i in range(-period, 0):
-        delta = values[i] - values[i - 1]
-        if delta >= 0:
-            gains.append(delta)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(abs(delta))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+def vwap(candles: List[Dict[str, float]], n: int = 48) -> float:
+    part = candles[-n:] if len(candles) >= n else candles
+    pv = sum(((x["high"] + x["low"] + x["close"]) / 3) * max(x["volume"], 0) for x in part)
+    vv = sum(max(x["volume"], 0) for x in part)
+    return pv / vv if vv > 0 else (part[-1]["close"] if part else 0.0)
 
 
-def atr(klines: List[Dict[str, float]], period: int = 14) -> float:
-    if len(klines) < 2:
+def atr(candles: List[Dict[str, float]], n: int = 14) -> float:
+    if len(candles) < 2:
         return 0.0
     trs = []
-    for i in range(1, len(klines)):
-        h = klines[i]["high"]
-        l = klines[i]["low"]
-        pc = klines[i - 1]["close"]
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if not trs:
+    part = trs[-n:] if len(trs) >= n else trs
+    return sum(part) / len(part) if part else 0.0
+
+
+def percent_change(candles: List[Dict[str, float]], bars: int) -> float:
+    if len(candles) <= bars:
         return 0.0
-    if len(trs) < period:
-        return sum(trs) / len(trs)
-    return sum(trs[-period:]) / period
+    a = candles[-bars]["close"]
+    b = candles[-1]["close"]
+    return (b - a) / a if a else 0.0
 
 
-def volume_ratio(klines: List[Dict[str, float]], period: int = 20) -> float:
-    vols = [k["volume"] for k in klines if k.get("volume", 0) >= 0]
-    if len(vols) < 3:
+def volume_ratio(candles: List[Dict[str, float]], n: int = 30) -> float:
+    if len(candles) < n + 2:
         return 1.0
-    base = vols[-period - 1:-1] if len(vols) > period + 1 else vols[:-1]
-    avg = sum(base) / len(base) if base else 0.0
-    if avg <= 0:
+    cur = candles[-1]["volume"]
+    avg = sum(x["volume"] for x in candles[-n - 1:-1]) / n
+    return cur / avg if avg > 0 else 1.0
+
+
+def candle_range(c: Dict[str, float]) -> float:
+    return max(c["high"] - c["low"], 0.0)
+
+
+def candle_range_ratio(candles: List[Dict[str, float]], n: int = 20) -> float:
+    if len(candles) < n + 2:
         return 1.0
-    return vols[-1] / avg
+    cur = candle_range(candles[-1])
+    avg = sum(candle_range(x) for x in candles[-n - 1:-1]) / n
+    return cur / avg if avg > 0 else 1.0
 
 
-def candle_body_pct(k: Dict[str, float]) -> float:
-    o, c = k["open"], k["close"]
-    if o <= 0:
-        return 0.0
-    return abs(c - o) / o * 100.0
+def close_location(c: Dict[str, float]) -> float:
+    rng = max(c["high"] - c["low"], 1e-12)
+    return (c["close"] - c["low"]) / rng
 
 
-
-def closed_klines(klines: List[Dict[str, float]], interval: str) -> List[Dict[str, float]]:
-    """Return only closed candles when timestamps allow detection.
-
-    BingX may include the currently forming candle as the last kline. For precise
-    scalp entries we do not want to judge a setup by an unfinished candle.
-    If timestamps are missing, the function returns the input unchanged.
+def prior_compression_ratio(c5: List[Dict[str, float]], n: int = 6) -> float:
+    """Lower values mean the market compressed before the impulse.
+    A good scalp often comes after short compression then range expansion.
     """
-    if not klines:
-        return klines
-    last_ts = klines[-1].get("ts", 0) or 0
-    if last_ts <= 0:
-        return klines
-    if last_ts < 10_000_000_000:
-        last_ts *= 1000
-    now_ms = time.time() * 1000
-    ms = interval_to_ms(interval)
-    if now_ms - last_ts < ms * 0.92 and len(klines) > 1:
-        return klines[:-1]
-    return klines
+    if len(c5) < n + 8:
+        return 1.0
+    prior = c5[-n-1:-1]
+    older = c5[-n-8:-n-1]
+    prior_avg = sum(candle_range(x) for x in prior) / max(len(prior), 1)
+    older_avg = sum(candle_range(x) for x in older) / max(len(older), 1)
+    return prior_avg / older_avg if older_avg > 0 else 1.0
 
 
-def candle_position(k: Dict[str, float]) -> Tuple[float, float, float, float]:
-    """Return lower wick ratio, upper wick ratio, close-location-high, close-location-low."""
-    o, h, l, c = k["open"], k["high"], k["low"], k["close"]
-    rng = max(h - l, c * 0.0001)
-    lower_wick = (min(o, c) - l) / rng
-    upper_wick = (h - max(o, c)) / rng
-    close_near_high = (c - l) / rng
-    close_near_low = (h - c) / rng
-    return lower_wick, upper_wick, close_near_high, close_near_low
+def micro_structure_break(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
+    """Require immediate 1m continuation, not a slow/stuck drift.
+    LONG: latest close must break above recent 1m highs.
+    SHORT: latest close must break below recent 1m lows.
+    """
+    if len(c1) < 12:
+        return False, "not enough 1m structure"
+    last = c1[-1]
+    prev_window = c1[-9:-1]
+    if side == "LONG":
+        ref = max(x["high"] for x in prev_window)
+        distance = (last["close"] - ref) / max(ref, 1e-12)
+        ok = last["close"] > ref * (1 + EDGE_MIN_BREAKOUT_DISTANCE) and last["close"] > last["open"]
+        return ok, f"1m break LONG {distance*100:+.2f}%"
+    ref = min(x["low"] for x in prev_window)
+    distance = (ref - last["close"]) / max(ref, 1e-12)
+    ok = last["close"] < ref * (1 - EDGE_MIN_BREAKOUT_DISTANCE) and last["close"] < last["open"]
+    return ok, f"1m break SHORT {distance*100:+.2f}%"
 
 
-def local_levels(k15: List[Dict[str, float]]) -> Dict[str, float]:
-    """Compute recent support/resistance from closed 15m candles excluding signal candles."""
-    lookback = k15[-54:-4] if len(k15) >= 58 else k15[:-4]
-    if len(lookback) < 20:
-        lookback = k15[:-2]
-    highs = sorted([k["high"] for k in lookback])
-    lows = sorted([k["low"] for k in lookback])
-    if not highs or not lows:
-        price = k15[-1]["close"]
-        return {"support": price, "resistance": price, "hard_support": price, "hard_resistance": price}
-    support = lows[max(0, int(len(lows) * 0.10) - 1)]
-    resistance = highs[min(len(highs) - 1, int(len(highs) * 0.90))]
-    hard_support = min(lows)
-    hard_resistance = max(highs)
+def micro_sweep_reclaim(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
+    """Liquidity-grab filter. We want a tiny stop-hunt / failed micro move, then reclaim/reject.
+    This is optional but enabled by default because it matches discretionary scalping better.
+    """
+    if not EDGE_REQUIRE_MICRO_SWEEP:
+        return True, "micro sweep disabled"
+    if len(c1) < 16:
+        return False, "not enough 1m for sweep"
+    last = c1[-1]
+    recent = c1[-13:-1]
+    if side == "LONG":
+        swept = min(x["low"] for x in c1[-6:-1]) <= min(x["low"] for x in recent) * 1.001
+        reclaimed = last["close"] > last["open"] and close_location(last) >= 0.62
+        return swept and reclaimed, "micro sweep/reclaim LONG" if swept and reclaimed else "no micro sweep/reclaim LONG"
+    swept = max(x["high"] for x in c1[-6:-1]) >= max(x["high"] for x in recent) * 0.999
+    rejected = last["close"] < last["open"] and close_location(last) <= 0.38
+    return swept and rejected, "micro sweep/reject SHORT" if swept and rejected else "no micro sweep/reject SHORT"
+
+
+def tp5_feasible(c5: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
+    """If recent velocity cannot realistically cover TP5, skip.
+    The examples reached all takes quickly; this blocks slow setups.
+    """
+    if len(c5) < 8:
+        return False, "not enough candles for TP5 feasibility"
+    recent_abs_15m = abs(percent_change(c5, 3))
+    needed = TP5_MOVE * EDGE_MIN_TP5_FEASIBILITY
+    return recent_abs_15m >= needed, f"TP5 feasibility recent15m {recent_abs_15m*100:.2f}% / need {needed*100:.2f}%"
+
+
+def upper_wick_ratio(c: Dict[str, float]) -> float:
+    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+    rng = max(h - l, 1e-12)
+    return (h - max(o, cl)) / rng
+
+
+def lower_wick_ratio(c: Dict[str, float]) -> float:
+    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+    rng = max(h - l, 1e-12)
+    return (min(o, cl) - l) / rng
+
+
+def trend_state(candles: List[Dict[str, float]]) -> str:
+    cs = closes(candles)
+    if len(cs) < 60:
+        return "UNKNOWN"
+    e21 = ema(cs, 21)
+    e55 = ema(cs, 55)
+    price = cs[-1]
+    ch = percent_change(candles, min(20, len(candles) - 1))
+    if price > e21 > e55 and ch > 0.003:
+        return "UP"
+    if price < e21 < e55 and ch < -0.003:
+        return "DOWN"
+    return "RANGE"
+
+
+def btc_context() -> Dict[str, Any]:
+    c15 = get_klines("BTC-USDT", "15m", 120, cache_seconds=45)
+    c1h = get_klines("BTC-USDT", "1h", 120, cache_seconds=120)
+    if not c15 or not c1h:
+        return {"ok": False, "direction": "UNKNOWN", "text": "BTC data unavailable", "ch1h": 0.0}
+    ch1h = percent_change(c15, 4)
+    ch6h = percent_change(c15, 24)
+    t1h = trend_state(c1h)
+    direction = "RANGE"
+    if ch1h < -0.004 or ch6h < -0.018 or t1h == "DOWN":
+        direction = "BEAR"
+    elif ch1h > 0.004 or ch6h > 0.018 or t1h == "UP":
+        direction = "BULL"
     return {
-        "support": support,
-        "resistance": resistance,
-        "hard_support": hard_support,
-        "hard_resistance": hard_resistance,
+        "ok": True,
+        "direction": direction,
+        "ch1h": ch1h,
+        "ch6h": ch6h,
+        "t1h": t1h,
+        "text": f"BTC {direction}: 1h {ch1h*100:+.2f}%, 6h {ch6h*100:+.2f}%, 1H {t1h}",
+    }
+
+# ============================================================
+# Hot symbol selection
+# ============================================================
+
+def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> bool:
+    b = base_asset(symbol)
+    if any(k in b for k in ULTRA_RISK_KEYWORDS):
+        return True
+    for c in c5[-18:]:
+        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_5M_CANDLE:
+            return True
+    for c in c15[-10:]:
+        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_15M_CANDLE:
+            return True
+    return False
+
+
+def hot_score(symbol: str) -> Tuple[float, str]:
+    """Live-first hot score.
+    V13.19 intentionally avoids using 15m candles here to keep scans fast.
+    Deep analysis still loads 15m/1h only for selected candidates.
+    """
+    c1 = get_klines(symbol, "1m", 60, cache_seconds=8)
+    c5 = get_klines(symbol, "5m", 80, cache_seconds=18)
+    if not c1 or not c5:
+        return 0.0, "no candles"
+
+    ch3m_signed = percent_change(c1, 3)
+    ch3m = abs(ch3m_signed)
+    ch15m_signed = percent_change(c5, 3)
+    ch30m_signed = percent_change(c5, 6)
+    ch15m = abs(ch15m_signed)
+    ch30m = abs(ch30m_signed)
+    vr1 = volume_ratio(c1, 20)
+    vr5 = volume_ratio(c5, 20)
+    rr1 = candle_range_ratio(c1, 20)
+    rr5 = candle_range_ratio(c5, 20)
+
+    # Real-time pressure matters more than old 30m movement.
+    live_score = ch3m * 14000 + min(rr1, 5.0) * 14 + min(vr1, 5.0) * 7
+    recent_score = ch15m * 700 + ch30m * 320 + min(rr5, 5.0) * 7 + min(vr5, 5.0) * 4
+
+    # Reversal bonus: coin was stretched one way, but 1m flow is now counter-moving.
+    reversal_bonus = 0.0
+    if REVERSAL_ENABLED:
+        if ch30m_signed > REVERSAL_MIN_30M_MOVE and ch3m_signed < -REVERSAL_MIN_LIVE_COUNTER_MOVE:
+            reversal_bonus = 35 + abs(ch3m_signed) * 7000
+        elif ch30m_signed < -REVERSAL_MIN_30M_MOVE and ch3m_signed > REVERSAL_MIN_LIVE_COUNTER_MOVE:
+            reversal_bonus = 35 + abs(ch3m_signed) * 7000
+
+    score = live_score + recent_score + reversal_bonus
+
+    # Penalize coins that moved earlier but are dead right now.
+    dead_now = ch3m < HOT_MIN_LIVE_MOVE_3M and rr1 < 0.35 and vr1 < 0.45
+    stale = ch30m >= 0.012 and ch3m < HOT_MIN_LIVE_MOVE_3M and rr1 < HOT_MIN_LIVE_RANGE_OR_VOLUME and vr1 < HOT_MIN_LIVE_RANGE_OR_VOLUME
+    if HOT_STALE_PENALTY_ENABLED and stale and reversal_bonus <= 0:
+        score *= 0.25
+    if dead_now and reversal_bonus <= 0:
+        score *= 0.12
+
+    # Huge volume without range/movement is absorption, not immediate scalp flow.
+    if vr1 > 20 and ch3m < 0.0005 and rr1 < 0.5:
+        score *= 0.20
+
+    if base_asset(symbol) in QUALITY_BASES:
+        score += 2
+
+    live_tag = "LIVE" if not dead_now and (ch3m >= HOT_MIN_LIVE_MOVE_3M or rr1 >= 0.8 or vr1 >= 0.8 or reversal_bonus > 0) else "STALE"
+    mode_tag = "REV" if reversal_bonus > 0 else "MOM"
+    note = (
+        f"{live_tag}/{mode_tag}: 1m3 {ch3m_signed*100:+.2f}%, "
+        f"15m {ch15m_signed*100:+.2f}%, 30m {ch30m_signed*100:+.2f}%, "
+        f"vol1 x{vr1:.2f}, vol5 x{vr5:.2f}, range1 x{rr1:.2f}, range5 x{rr5:.2f}"
+    )
+    return score, note
+
+def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
+    scored: List[Tuple[float, str, str]] = []
+    notes: List[str] = []
+    for sym in symbols[:MAX_ANALYZE_SYMBOLS]:
+        try:
+            sc, note = hot_score(sym)
+            if sc > 0:
+                scored.append((sc, sym, note))
+        except Exception as e:
+            STATE["last_error"] = f"hot_score {sym}: {repr(e)}"
+    scored.sort(reverse=True, key=lambda x: x[0])
+
+    for sc, sym, note in scored[:12]:
+        notes.append(f"{display_symbol(sym)} hot {sc:.1f}: {note}")
+
+    selected = [sym for sc, sym, _ in scored if sc >= HOT_MIN_SCORE][:HOT_SYMBOLS_TO_ANALYZE]
+
+    # Keep the bot alive: if the market is quiet and strict hot score returns too few,
+    # still analyze the best live-ranked names. The deeper fast filters remain in place.
+    min_live_candidates = min(HOT_SYMBOLS_TO_ANALYZE, 50)
+    if len(selected) < min_live_candidates:
+        seen = set(selected)
+        for sc, sym, _ in scored:
+            if sym not in seen:
+                selected.append(sym)
+                seen.add(sym)
+            if len(selected) >= min_live_candidates:
+                break
+
+    return selected[:MAX_ANALYZE_SYMBOLS], notes
+
+# ============================================================
+# Setup logic
+# ============================================================
+
+def realtime_pressure_ok(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str, Dict[str, float]]:
+    """Live 1m pressure gate.
+    This is the key V13.18 fix: a signal is allowed only if the coin is moving right now.
+    Expired signals usually came from patterns where the flow had already stopped.
+    """
+    if len(c1) < 30:
+        return False, "not enough 1m pressure data", {}
+
+    last = c1[-1]
+    prev = c1[-2]
+    ch2m = (last["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12)
+    ch3m = percent_change(c1, 3)
+    rr1 = candle_range_ratio(c1, 20)
+    vr1 = volume_ratio(c1, 20)
+    loc = close_location(last)
+    body = abs(last["close"] - last["open"]) / max(last["high"] - last["low"], 1e-12)
+
+    same_two_long = last["close"] > last["open"] and prev["close"] >= prev["open"]
+    same_two_short = last["close"] < last["open"] and prev["close"] <= prev["open"]
+
+    metrics = {"ch2m": ch2m, "ch3m": ch3m, "range1": rr1, "vol1": vr1, "loc": loc, "body": body}
+
+    if rr1 < REALTIME_MIN_1M_RANGE_RATIO:
+        return False, f"1m range not live x{rr1:.2f}", metrics
+    if vr1 < REALTIME_MIN_1M_VOLUME_RATIO:
+        return False, f"1m volume not live x{vr1:.2f}", metrics
+    if body < 0.35:
+        return False, f"1m body weak {body:.2f}", metrics
+
+    if side == "LONG":
+        if ch2m < REALTIME_MIN_2M_MOVE:
+            return False, f"LONG 2m pressure weak {ch2m*100:.2f}%", metrics
+        if loc < REALTIME_CLOSE_LOCATION_LONG:
+            return False, f"LONG 1m close not near high {loc:.2f}", metrics
+        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_long:
+            return False, "LONG lacks two 1m bullish candles", metrics
+    else:
+        if ch2m > -REALTIME_MIN_2M_MOVE:
+            return False, f"SHORT 2m pressure weak {ch2m*100:.2f}%", metrics
+        if loc > REALTIME_CLOSE_LOCATION_SHORT:
+            return False, f"SHORT 1m close not near low {loc:.2f}", metrics
+        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_short:
+            return False, "SHORT lacks two 1m bearish candles", metrics
+
+    return True, f"live pressure ok: 2m {ch2m*100:+.2f}%, 3m {ch3m*100:+.2f}%, range1 x{rr1:.2f}, vol1 x{vr1:.2f}", metrics
+
+
+def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, vol: float) -> Tuple[bool, str, Dict[str, float]]:
+    """V13.19 fast context.
+    Allows two professional scalp types:
+    1) continuation: 15m/30m and 1m pressure agree;
+    2) blow-off reversal: 30m is stretched one way, but live 1m pressure flips hard the other way.
+    This fixes the prior issue where TIMI-like +16% 30m then -1% 1m dump was rejected as no_fast_short.
+    """
+    if len(c1) < 20 or len(c5) < 36 or len(c15) < 24:
+        return False, "not enough candles", {}
+
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    ch3m_1m = percent_change(c1, 3)
+    rr = candle_range_ratio(c5, 20)
+    compression = prior_compression_ratio(c5, 6)
+    last = c5[-1]
+    candle_move = (last["high"] - last["low"]) / max(last["open"], 1e-12)
+
+    metrics = {
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m_1m,
+        "range_ratio": rr,
+        "compression": compression,
+        "candle_move": candle_move,
+        "vol": vol,
+        "setup_mode": "unknown",
+    }
+
+    if candle_move > FAST_MAX_SPREAD_PROXY:
+        return False, f"last 5m candle too wide/chase risk {candle_move*100:.2f}%", metrics
+
+    if compression > EDGE_MIN_PRIOR_COMPRESSION and rr < 1.75:
+        return False, f"no compression-to-expansion edge: compression x{compression:.2f}, range x{rr:.2f}", metrics
+
+    micro_ok, micro_reason = micro_structure_break(c1, side)
+    if not micro_ok:
+        return False, micro_reason, metrics
+
+    pressure_ok, pressure_reason, pressure_metrics = realtime_pressure_ok(c1, side)
+    metrics.update(pressure_metrics)
+    if not pressure_ok:
+        return False, pressure_reason, metrics
+
+    sweep_ok, sweep_reason = micro_sweep_reclaim(c1, side)
+    if not sweep_ok:
+        return False, sweep_reason, metrics
+
+    feasible_ok, feasible_reason = tp5_feasible(c5, side)
+    if not feasible_ok:
+        return False, feasible_reason, metrics
+
+    # continuation vs blow-off reversal classification
+    if side == "LONG":
+        continuation = ch15m >= FAST_MIN_15M_MOVE and ch30m >= FAST_MIN_30M_MOVE and ch3m_1m >= FAST_MIN_1M_CONFIRM
+        reversal = REVERSAL_ENABLED and ch30m <= -REVERSAL_MIN_30M_MOVE and ch3m_1m >= REVERSAL_MIN_LIVE_COUNTER_MOVE
+        if not (continuation or reversal):
+            return False, f"no LONG edge: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%", metrics
+        if ch30m > FAST_MAX_30M_MOVE:
+            return False, f"late LONG chase 30m {ch30m*100:.2f}%", metrics
+        if last["close"] <= last["open"] and not reversal:
+            return False, "last 5m not bullish for continuation", metrics
+        if close_location(last) < CLOSE_LOCATION_MIN_LONG and not reversal:
+            return False, f"LONG close location weak {close_location(last):.2f}", metrics
+        metrics["setup_mode"] = "REVERSAL_LONG" if reversal else "CONTINUATION_LONG"
+    else:
+        btc_dump_context = BTC_DUMP_SHORT_BIAS_ENABLED and ch15m <= -FAST_MIN_15M_MOVE * 0.70 and ch3m_1m <= -FAST_MIN_1M_CONFIRM
+        continuation = (ch15m <= -FAST_MIN_15M_MOVE and ch30m <= -FAST_MIN_30M_MOVE and ch3m_1m <= -FAST_MIN_1M_CONFIRM) or btc_dump_context
+        reversal = REVERSAL_ENABLED and ch30m >= REVERSAL_MIN_30M_MOVE and ch3m_1m <= -REVERSAL_MIN_LIVE_COUNTER_MOVE
+        if not (continuation or reversal):
+            return False, f"no SHORT edge: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%", metrics
+        if ch30m < -FAST_MAX_30M_MOVE:
+            # During market-wide dumps many examples realize quickly to the downside.
+            # Still avoid blind chasing: require a small bounce/reject structure before continuing.
+            recent_low = min(x["low"] for x in c5[-8:])
+            bounce = (max(x["high"] for x in c5[-5:]) - recent_low) / max(recent_low, 1e-12)
+            if not (BTC_DUMP_SHORT_BIAS_ENABLED and ch30m >= -SHORT_DUMP_ALLOW_EXTENDED_30M and ch3m_1m <= SHORT_DUMP_MIN_LIVE_1M3 and bounce >= SHORT_DUMP_MIN_BOUNCE):
+                return False, f"late SHORT chase 30m {ch30m*100:.2f}%", metrics
+            metrics["dump_bounce"] = bounce
+        if last["close"] >= last["open"] and not reversal:
+            return False, "last 5m not bearish for continuation", metrics
+        if close_location(last) > CLOSE_LOCATION_MAX_SHORT and not reversal:
+            return False, f"SHORT close location weak {close_location(last):.2f}", metrics
+        metrics["setup_mode"] = "REVERSAL_SHORT" if reversal else "CONTINUATION_SHORT"
+
+    # For fast scalps, live velocity/range can bypass weak 15m volume.
+    live_bypass = abs(ch3m_1m) >= LIVE_BYPASS_VOLUME_MOVE or metrics.get("range1", 1.0) >= LIVE_BYPASS_RANGE_RATIO
+
+    if rr < FAST_MIN_RANGE_RATIO and not live_bypass:
+        return False, f"range expansion weak x{rr:.2f}", metrics
+    if vol < FAST_MIN_VOLUME_RATIO and not live_bypass:
+        return False, f"volume weak x{vol:.2f}", metrics
+
+    return True, (
+        f"{metrics['setup_mode']} edge ok: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, "
+        f"1m3 {ch3m_1m*100:+.2f}%, range5 x{rr:.2f}, vol15 x{vol:.2f}, "
+        f"range1 x{metrics.get('range1', 1.0):.2f}, vol1 x{metrics.get('vol1', 1.0):.2f}; "
+        f"{micro_reason}; {pressure_reason}; {sweep_reason}; {feasible_reason}"
+    ), metrics
+
+
+def long_live_stats_ok() -> Tuple[bool, str]:
+    """Protect the bot from repeatedly taking bad LONGs while still allowing recovery later.
+    If live LONG stats are poor, allow only very high-quality LONGs by blocking B-class setups upstream.
+    """
+    if not LONG_STATS_PROTECTION:
+        return True, "long stats protection disabled"
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    item = stats.get("side", {}).get("LONG", {})
+    closed = int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0))
+    if closed < LONG_STATS_MIN_CLOSED:
+        return True, "not enough LONG stats"
+    wr = int(item.get("profit", 0)) / max(closed, 1) * 100.0
+    if wr < LONG_STATS_MIN_WR:
+        return False, f"LONG stats weak: WR {wr:.1f}% after {closed}"
+    return True, "LONG stats ok"
+
+
+def professional_long_reclaim_gate(
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    btc: Dict[str, Any],
+    metrics: Dict[str, float],
+    setup_mode: str,
+    e1: float,
+    e5: float,
+    vw5: float,
+) -> Tuple[bool, str]:
+    """Strict LONG-only repair.
+
+    Live results showed LONG was buying weak bounces / late pumps.
+    A valid LONG now needs a real reclaim pattern:
+    - BTC must not be BEAR by default;
+    - strong 1m pressure, close near high, volume/range alive;
+    - price must reclaim 1m EMA and be near/above 5m EMA/VWAP;
+    - no buying vertical 15m/30m extension unless there was a controlled pullback;
+    - prefer liquidity sweep / higher-low reclaim.
+    """
+    if len(c1) < 24 or len(c5) < 24 or len(c15) < 10:
+        return False, "LONG gate: not enough candles"
+
+    btc_dir = str(btc.get("direction", "UNKNOWN"))
+    btc_ch1h = float(btc.get("ch1h", 0.0))
+    btc_ch6h = float(btc.get("ch6h", 0.0))
+
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    price = last1["close"]
+    ch3m = percent_change(c1, 3)
+    ch15m = metrics.get("ch15m", percent_change(c5, 3))
+    ch30m = metrics.get("ch30m", percent_change(c5, 6))
+    vol1 = metrics.get("vol1", volume_ratio(c1, 20))
+    range1 = metrics.get("range1", candle_range_ratio(c1, 20))
+    loc1 = close_location(last1)
+
+    # BTC bearish does not automatically forbid LONG. But a LONG against a bearish BTC
+    # must be a leader/relative-strength coin, not a weak bounce. This is how coins like
+    # VELVET can still be traded LONG while the general market is heavy.
+    bear_rs_long = False
+    if btc_dir == "BEAR":
+        rel_strength_1h = ch15m - btc_ch1h
+        bear_rs_long = (
+            LONG_ALLOW_BEAR_RELATIVE_STRENGTH
+            and ch15m >= LONG_BEAR_MIN_ALT_15M
+            and ch30m >= LONG_BEAR_MIN_ALT_30M
+            and ch3m >= LONG_BEAR_MIN_1M3
+            and rel_strength_1h >= LONG_BEAR_MIN_REL_STRENGTH_1H
+            and vol1 >= LONG_BEAR_MIN_VOL1
+            and range1 >= LONG_BEAR_MIN_RANGE1
+            and loc1 >= LONG_BEAR_MIN_CLOSE_LOCATION
+        )
+        if LONG_BLOCK_BTC_BEAR and not bear_rs_long:
+            return False, (
+                f"LONG gate: BTC BEAR and coin has no relative strength: "
+                f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, "
+                f"1m3 {ch3m*100:+.2f}%, rel1h {rel_strength_1h*100:+.2f}%"
+            )
+
+    if ch3m < LONG_MIN_3M_CONFIRM:
+        return False, f"LONG gate: weak 3m confirm {ch3m*100:.2f}%"
+    if btc_dir == "BEAR" and LONG_ALLOW_BEAR_RELATIVE_STRENGTH and not bear_rs_long:
+        return False, (
+            f"LONG gate: BTC BEAR, only relative-strength longs allowed; "
+            f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, 1m3 {ch3m*100:+.2f}%"
+        )
+    if vol1 < LONG_MIN_1M_VOLUME_RATIO:
+        return False, f"LONG gate: weak 1m volume x{vol1:.2f}"
+    if range1 < LONG_MIN_1M_RANGE_RATIO:
+        return False, f"LONG gate: weak 1m range x{range1:.2f}"
+    if loc1 < LONG_MIN_CLOSE_LOCATION:
+        return False, f"LONG gate: 1m close not strong {loc1:.2f}"
+    if last1["close"] <= last1["open"]:
+        return False, "LONG gate: last 1m not bullish"
+    if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
+        return False, "LONG gate: did not reclaim prior red candle"
+
+    # Must reclaim micro trend. For continuation LONG, also avoid being below 5m EMA/VWAP.
+    if price < e1 * (1 + RECLAIM_BUFFER):
+        return False, "LONG gate: no 1m EMA reclaim"
+    if setup_mode == "CONTINUATION_LONG" and (price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER)):
+        return False, "LONG gate: no 5m EMA/VWAP reclaim"
+
+    # Liquidity sweep / higher-low reclaim. This avoids buying a random bounce with no trap.
+    recent = c1[-16:-4]
+    last_zone = c1[-5:]
+    swept_low = min(x["low"] for x in last_zone[:-1]) <= min(x["low"] for x in recent) * 1.0015 if recent else False
+    reclaimed = last1["close"] > max(x["close"] for x in c1[-5:-1]) and loc1 >= LONG_MIN_CLOSE_LOCATION
+    higher_low = min(x["low"] for x in c1[-4:]) > min(x["low"] for x in c1[-10:-4]) * 0.998 if len(c1) >= 12 else False
+
+    if LONG_REQUIRE_SWEEP_OR_RECLAIM and not (swept_low or reclaimed):
+        return False, "LONG gate: no sweep/reclaim trigger"
+    if LONG_REQUIRE_HIGHER_LOW and not (higher_low or swept_low):
+        return False, "LONG gate: no higher-low/sweep structure"
+
+    # Anti-chase: after a big pump, only buy if there was a real controlled pullback first.
+    recent_high = max(x["high"] for x in c5[-18:])
+    recent_low = min(x["low"] for x in c5[-10:])
+    pullback = (recent_high - recent_low) / max(recent_high, 1e-12)
+    if ch15m > LONG_MAX_15M_CHASE or ch30m > LONG_MAX_30M_CHASE:
+        if not (LONG_MIN_PULLBACK_AFTER_PUMP <= pullback <= LONG_MAX_PULLBACK_AFTER_PUMP and (swept_low or reclaimed)):
+            return False, f"LONG gate: late pump chase blocked 15m {ch15m*100:.2f}%, 30m {ch30m*100:.2f}%, pullback {pullback*100:.2f}%"
+
+    # Avoid buying into a distribution wick.
+    last5 = c5[-1]
+    if upper_wick_ratio(last5) > 0.48 and close_location(last5) < 0.68:
+        return False, "LONG gate: 5m upper wick/distribution"
+
+    return True, (
+        f"LONG professional gate ok: BTC {btc_dir}, 3m {ch3m*100:+.2f}%, "
+        f"vol1 x{vol1:.2f}, range1 x{range1:.2f}, closeLoc {loc1:.2f}, "
+        f"bearRS {bear_rs_long}, sweep {swept_low}, reclaim {reclaimed}, higherLow {higher_low}"
+    )
+
+def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    """Scalping Edge setup: no trend prediction.
+    We only require a tradable micro-event: fresh imbalance + micro sweep/reclaim + immediate continuation.
+    BTC/1H are informational, not directional gates, except violent BTC shock.
+    """
+    if not FAST_BURST_ENABLED:
+        return None
+    if len(c1) < 30 or len(c5) < 48 or len(c15) < 40 or len(c1h) < 60:
+        return None
+
+    price = c1[-1]["close"]
+    e5 = ema(closes(c5), 21)
+    e1 = ema(closes(c1), 9)
+    vw5 = vwap(c5, 36)
+    vol = volume_ratio(c15, 24)
+    t1h = trend_state(c1h)
+
+    # Market phase is not traded as a prediction. BTC is a context filter:
+    # - during BTC shock down, avoid LONG unless the coin later passes relative-strength LONG gate;
+    # - allow SHORT during dump because that is exactly when many alts realize quickly.
+    btc_ch1h = float(btc.get("ch1h", 0.0))
+    if abs(btc_ch1h) >= BTC_SHOCK_15M_BLOCK and side == "LONG":
+        # Do not hard-block here; professional_long_reclaim_gate can still allow an exceptional RS long.
+        pass
+
+    fast_ok, fast_reason, metrics = fast_context_ok(c1, c5, c15, side, vol)
+    if not fast_ok:
+        return None
+    setup_mode = str(metrics.get("setup_mode", ""))
+    is_reversal = setup_mode.startswith("REVERSAL")
+
+    if side == "LONG":
+        long_gate_ok, long_gate_reason = professional_long_reclaim_gate(symbol, c1, c5, c15, btc, metrics, setup_mode, e1, e5, vw5)
+        if not long_gate_ok:
+            return None
+        metrics["long_gate_reason"] = long_gate_reason
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+
+    if side == "LONG":
+        recent_high = max(x["high"] for x in c5[-18:])
+        pullback_low = min(x["low"] for x in c5[-10:])
+        pullback = (recent_high - pullback_low) / max(recent_high, 1e-12)
+        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
+            return None
+        if is_reversal:
+            # Blow-off reversal LONG: do not wait for 5m EMA/VWAP reclaim; that is often too late.
+            # Require live 1m reclaim only; fast_context already confirmed pressure and micro break.
+            if price < e1:
+                return None
+        else:
+            if price < e1 or price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER):
+                return None
+            # Entry must be continuation, not a mid-range hesitation.
+            if last5["close"] <= prev5["high"] * 0.999 and last5["close"] <= prev5["close"]:
+                return None
+            if upper_wick_ratio(last5) > 0.42 and close_location(last5) < 0.72:
+                return None
+        level = min(pullback_low, min(x["low"] for x in c1[-12:]))
+        strategy = "PRO_SCALPING_EDGE_LONG"
+        trade_type = "SCALPING EDGE LONG"
+        reason = (
+            f"SCALPING EDGE LONG: не прогноз рынка, а короткая ситуация. "
+            f"Режим {setup_mode}: свежий дисбаланс вверх, микро-откат/перехват {pullback*100:.2f}%, "
+            f"live 1m pressure, sweep/reclaim и немедленное продолжение. {fast_reason}. "
+            f"{metrics.get('long_gate_reason', '')}."
+        )
+    else:
+        recent_low = min(x["low"] for x in c5[-18:])
+        bounce_high = max(x["high"] for x in c5[-10:])
+        pullback = (bounce_high - recent_low) / max(recent_low, 1e-12)
+        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
+            return None
+        if is_reversal:
+            # Blow-off reversal SHORT: do not wait for 5m EMA/VWAP loss; that is often too late.
+            # Require live 1m reject only; fast_context already confirmed pressure and micro break.
+            if price > e1:
+                return None
+        else:
+            if price > e1 or price > e5 * (1 - RECLAIM_BUFFER) or price > vw5 * (1 - RECLAIM_BUFFER):
+                return None
+            if last5["close"] >= prev5["low"] * 1.001 and last5["close"] >= prev5["close"]:
+                return None
+            if lower_wick_ratio(last5) > 0.42 and close_location(last5) > 0.28:
+                return None
+        level = max(bounce_high, max(x["high"] for x in c1[-12:]))
+        strategy = "PRO_SCALPING_EDGE_SHORT"
+        trade_type = "SCALPING EDGE SHORT"
+        reason = (
+            f"SCALPING EDGE SHORT: не прогноз рынка, а короткая ситуация. "
+            f"Режим {setup_mode}: свежий дисбаланс вниз, микро-отскок/перехват {pullback*100:.2f}%, "
+            f"live 1m pressure и немедленное продолжение. {fast_reason}."
+        )
+
+    strong = vol >= 1.55 and metrics.get("range_ratio", 1.0) >= 1.55 and abs(metrics.get("ch3m_1m", 0)) >= FAST_MIN_1M_CONFIRM * 1.4
+    score = 74
+    score += min(12, int(abs(metrics.get("ch15m", 0)) * 650))
+    score += min(10, int(abs(metrics.get("ch30m", 0)) * 430))
+    score += min(8, int((vol - 1.0) * 7))
+    score += min(8, int((metrics.get("range_ratio", 1.0) - 1.0) * 7))
+    score += min(8, int((metrics.get("vol1", 1.0) - 1.0) * 7))
+    score += min(8, int((metrics.get("range1", 1.0) - 1.0) * 7))
+    # Market phase does not add or subtract. Only actual speed/liquidity edge matters.
+    if strong:
+        score += 7
+    if base_asset(symbol) in QUALITY_BASES:
+        score += 1
+    score = max(0, min(100, score))
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "trade_type": trade_type,
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol >= 1.45 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": pullback,
+        "volume_ratio": vol,
+        "range_ratio": metrics.get("range_ratio", 1.0),
+        "compression": metrics.get("compression", 1.0),
+        "ch15m": metrics.get("ch15m", 0.0),
+        "ch30m": metrics.get("ch30m", 0.0),
+        "ch3m_1m": metrics.get("ch3m_1m", 0.0),
+        "vol1": metrics.get("vol1", 1.0),
+        "range1": metrics.get("range1", 1.0),
+        "ch2m": metrics.get("ch2m", 0.0),
+        "setup_mode": setup_mode,
+        "t1h": t1h,
+        "btc_text": btc.get("text", ""),
     }
 
 
-def is_5m_confirmed(side: str, k5: List[Dict[str, float]]) -> Tuple[bool, List[str]]:
-    if len(k5) < 12:
-        return False, ["5m мало свечей"]
-    closes = [k["close"] for k in k5]
-    e9 = ema(closes[-30:], 9)
-    last = k5[-1]
-    if side == "LONG":
-        ok = closes[-1] > closes[-2] >= closes[-3] and closes[-1] >= e9 and last["close"] > last["open"]
-        return ok, ["5m подтверждение вверх"] if ok else []
-    ok = closes[-1] < closes[-2] <= closes[-3] and closes[-1] <= e9 and last["close"] < last["open"]
-    return ok, ["5m подтверждение вниз"] if ok else []
 
-# =============================================================================
-# SIGNAL ANALYSIS
-# =============================================================================
+def instant_edge_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    """V13.24 fallback: instant momentum/reclaim scalp.
 
-@dataclass
-class Candidate:
-    symbol: str
-    side: str
-    score: float
-    strategy: str
-    entry: float
-    reasons: List[str]
-    debug: Dict[str, Any] = field(default_factory=dict)
-
-
-def analyze_symbol(symbol: str, k15: List[Dict[str, float]], k5: List[Dict[str, float]], k1h: List[Dict[str, float]]) -> Optional[Candidate]:
-    """Strict structural scanner.
-
-    Sends only setups that already touched a local support/resistance zone and
-    then CLOSED with rejection/confirmation. It avoids chasing candles that are
-    already too far from the level.
+    This is for situations visible in diagnostics such as SYRUP/FOLKS:
+    live 1m impulse is present, but the older fast_burst setup rejects the trade because it
+    waits for a perfect 5m pullback/reclaim. We still keep strict quality filters after this.
     """
-    k15 = closed_klines(k15, "15m")
-    k5 = closed_klines(k5, "5m")
-    k1h = closed_klines(k1h, "1h")
-    if len(k15) < 58 or len(k5) < 20:
+    if not INSTANT_EDGE_ENABLED:
+        return None
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
         return None
 
-    closes15 = [k["close"] for k in k15]
-    closes5 = [k["close"] for k in k5]
-    closes1h = [k["close"] for k in k1h] if len(k1h) >= 20 else closes15
+    price = c1[-1]["close"]
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    ch3m = percent_change(c1, 3)
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol1 = volume_ratio(c1, 20)
+    range1 = candle_range_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range5 = candle_range_ratio(c5, 20)
+    loc = close_location(last1)
+    body = abs(last1["close"] - last1["open"]) / max(last1["high"] - last1["low"], 1e-12)
+    t1h = trend_state(c1h)
 
-    last = k15[-1]       # last CLOSED 15m candle
-    prev = k15[-2]
-    entry = last["close"]
+    # Live impulse must be real, not a dead hot-list artifact.
+    if side == "LONG":
+        if ch3m < INSTANT_MIN_1M3_MOVE:
+            return None
+        if ch15m < INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and ch3m >= INSTANT_MIN_1M3_MOVE * 1.45):
+            return None
+        if ch30m > INSTANT_MAX_30M_CHASE and ch3m < INSTANT_MIN_1M3_MOVE * 1.35:
+            return None
+        if loc < INSTANT_CLOSE_LONG or last1["close"] <= last1["open"]:
+            return None
+        if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
+            return None
+        # Avoid buying after multiple vertical green candles without any micro reset.
+        had_reset = any(x["close"] < x["open"] for x in c1[-7:-1]) or min(x["low"] for x in c1[-5:]) <= min(x["low"] for x in c1[-14:-5]) * 1.002
+        if not had_reset and ch30m > 0.025:
+            return None
+        level = min(x["low"] for x in c1[-10:])
+        strategy = "PRO_INSTANT_EDGE_LONG"
+        trade_type = "INSTANT EDGE LONG"
+        setup_mode = "INSTANT_MOMENTUM_LONG"
+        direction_text = "вверх"
+    else:
+        if ch3m > -INSTANT_MIN_1M3_MOVE:
+            return None
+        if ch15m > -INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.45):
+            return None
+        if ch30m < -INSTANT_MAX_30M_CHASE and abs(ch3m) < INSTANT_MIN_1M3_MOVE * 1.35:
+            return None
+        if loc > INSTANT_CLOSE_SHORT or last1["close"] >= last1["open"]:
+            return None
+        if prev1["close"] > prev1["open"] and last1["close"] >= prev1["open"]:
+            return None
+        had_reset = any(x["close"] > x["open"] for x in c1[-7:-1]) or max(x["high"] for x in c1[-5:]) >= max(x["high"] for x in c1[-14:-5]) * 0.998
+        if not had_reset and ch30m < -0.025:
+            return None
+        level = max(x["high"] for x in c1[-10:])
+        strategy = "PRO_INSTANT_EDGE_SHORT"
+        trade_type = "INSTANT EDGE SHORT"
+        setup_mode = "INSTANT_MOMENTUM_SHORT"
+        direction_text = "вниз"
+
+    if body < INSTANT_MIN_BODY:
+        return None
+    if range1 < INSTANT_MIN_RANGE1:
+        return None
+    if vol1 < INSTANT_MIN_VOL1 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and range1 >= 1.15):
+        return None
+    if range5 < INSTANT_MIN_RANGE5:
+        return None
+    if vol5 < INSTANT_MIN_VOL5 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.60):
+        return None
+
+    # Keep a micro structure break; this prevents entering the middle of a random candle.
+    micro_ok, micro_reason = micro_structure_break(c1, side)
+    if not micro_ok:
+        return None
+
+    # BTC is context, not a hard phase filter. Against BTC pressure, demand stronger live impulse.
+    btc_dir = str(btc.get("direction", "UNKNOWN"))
+    if side == "LONG" and btc_dir == "BEAR" and not (ch3m >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m >= INSTANT_MIN_15M_MOVE * 1.2):
+        return None
+    if side == "SHORT" and btc_dir == "BULL" and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m <= -INSTANT_MIN_15M_MOVE * 1.2):
+        return None
+
+    score = 78
+    score += min(10, int(abs(ch3m) * 1000))
+    score += min(8, int(abs(ch15m) * 700))
+    score += min(6, int(max(0.0, vol1 - 0.8) * 6))
+    score += min(6, int(max(0.0, range1 - 1.0) * 6))
+    score += min(5, int(max(0.0, range5 - 1.0) * 4))
+    score = max(0, min(100, score))
+
+    reason = (
+        f"INSTANT EDGE {side}: профессиональный fallback для живого импульса. "
+        f"Цена движется {direction_text} сейчас: 1m3 {ch3m*100:+.2f}%, 15m {ch15m*100:+.2f}%, "
+        f"30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
+        f"Vol5 x{vol5:.2f}, Range5 x{range5:.2f}, closeLoc {loc:.2f}. "
+        f"{micro_reason}. Сделка всё равно проходит RR/SL/live-volume quality gate."
+    )
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "trade_type": trade_type,
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 1.20 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": setup_mode,
+        "t1h": t1h,
+        "btc_text": btc.get("text", ""),
+    }
+
+def market_dump_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """V13.28 fallback: market-dump continuation SHORT.
+
+    This is for active market selloff sessions when BTC/ETH and many alts are falling.
+    The old setup logic often waits for a perfect AERO pullback/reject and returns no_fast,
+    while the tape is already giving a clean dump continuation. We still pass the final
+    RR/SL/live-volume and trader-pattern gates after this setup is constructed.
+    """
+    if not MARKET_DUMP_SHORT_ENABLED or not ALLOW_SHORT:
+        return None
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
+        return None
+
+    side = "SHORT"
+    price = c1[-1]["close"]
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    ch3m = percent_change(c1, 3)
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol1 = volume_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range1 = candle_range_ratio(c1, 20)
+    range5 = candle_range_ratio(c5, 20)
+    loc = close_location(last1)
+    recent_range = (max(x["high"] for x in c5[-6:]) - min(x["low"] for x in c5[-6:])) / max(price, 1e-12)
+    btc_1h = float(btc.get("ch1h", 0.0) or 0.0)
+    btc_6h = float(btc.get("ch6h", 0.0) or 0.0)
+
+    # Must be real downside pressure now.
+    if ch3m > -DUMP_MIN_1M3:
+        return None
+
+    # Either the alt itself is already selling on 15m, or BTC has a clear dump context.
+    market_dump_context = btc_1h <= -0.0025 or btc_6h <= -0.0100 or str(btc.get("direction", "")) == "BEAR"
+    alt_dump_context = ch15m <= -DUMP_MIN_15M or ch30m <= -DUMP_MIN_15M * 1.25
+    if not (market_dump_context or alt_dump_context):
+        return None
+
+    # Avoid very late shorts after an extreme 30m collapse unless the live tape is still exceptional.
+    if ch30m < -DUMP_MAX_LATE_30M and not (abs(ch3m) >= DUMP_MIN_1M3 * 2.0 and range1 >= 1.35):
+        return None
+
+    if vol1 < DUMP_MIN_VOL1:
+        return None
+    if vol5 < DUMP_MIN_VOL5 and not (abs(ch3m) >= DUMP_MIN_1M3 * 1.65):
+        return None
+    if range1 < DUMP_MIN_RANGE1:
+        return None
+    if range5 < DUMP_MIN_RANGE5:
+        return None
+    if recent_range < DUMP_MIN_RECENT_RANGE:
+        return None
+
+    # Do not short a weak doji. In a dump, close below mid/low half is enough; exact low-close is too strict.
+    if loc > DUMP_CLOSE_SHORT or last1["close"] >= last1["open"]:
+        return None
+
+    fresh_low_break = last1["close"] < min(x["low"] for x in c1[-7:-1])
+    failed_bounce = any(x["close"] > x["open"] for x in c1[-8:-1]) and last1["close"] < prev1["close"]
+    lower_high_reject = max(x["high"] for x in c1[-4:]) < max(x["high"] for x in c1[-14:-4]) and last1["close"] < prev1["close"]
+    if DUMP_REQUIRE_REJECT_OR_BREAK and not (fresh_low_break or failed_bounce or lower_high_reject):
+        return None
+
+    level = max(x["high"] for x in c1[-10:])
+    score = 80
+    score += min(10, int(abs(ch3m) * 1100))
+    score += min(8, int(abs(min(ch15m, 0.0)) * 700))
+    score += min(6, int(max(0.0, vol1 - 0.60) * 6))
+    score += min(7, int(max(0.0, range1 - 0.80) * 5))
+    score += min(6, int(max(0.0, range5 - 1.00) * 4))
+    if market_dump_context:
+        score += 3
+    if fresh_low_break:
+        score += 3
+    score = max(0, min(100, score))
+
+    reason = (
+        f"MARKET DUMP SHORT: активный рыночный слив, не прогноз, а dump-continuation. "
+        f"BTC context {btc.get('text', '')}; alt pressure 1m3 {ch3m*100:+.2f}%, "
+        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, "
+        f"Vol5 x{vol5:.2f}, Range1 x{range1:.2f}, Range5 x{range5:.2f}. "
+        f"Break/reject: freshLow {fresh_low_break}, failedBounce {failed_bounce}, lowerHighReject {lower_high_reject}. "
+        f"Дальше сделка обязана пройти RR/SL/live-volume/trader quality gates."
+    )
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": "PRO_MARKET_DUMP_SHORT",
+        "trade_type": "MARKET DUMP SHORT",
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 0.85 and range1 >= 1.15 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": "MARKET_DUMP_SHORT",
+        "t1h": trend_state(c1h),
+        "btc_text": btc.get("text", ""),
+    }
+
+
+def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
+    side = setup["side"]
+    entry = setup["entry"]
+    level = setup["level"]
+    a = atr(c5, 14)
+    instant = str(setup.get("setup_mode", "")).startswith("INSTANT")
+    buffer = max(entry * (0.0016 if instant else 0.0022), a * (0.55 if instant else SL_ATR_MULT))
+
+    if side == "LONG":
+        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
+        recent_low = min(x["low"] for x in recent_source)
+        sl = min(level, recent_low) - buffer
+        sl = min(sl, entry * (1 - MIN_SL_MOVE))
+        tp1 = entry * (1 + TP1_MOVE)
+        tp2 = entry * (1 + TP2_MOVE)
+        tp3 = entry * (1 + TP3_MOVE)
+        tp4 = entry * (1 + TP4_MOVE)
+        tp5 = entry * (1 + TP5_MOVE)
+    else:
+        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
+        recent_high = max(x["high"] for x in recent_source)
+        sl = max(level, recent_high) + buffer
+        sl = max(sl, entry * (1 + MIN_SL_MOVE))
+        tp1 = entry * (1 - TP1_MOVE)
+        tp2 = entry * (1 - TP2_MOVE)
+        tp3 = entry * (1 - TP3_MOVE)
+        tp4 = entry * (1 - TP4_MOVE)
+        tp5 = entry * (1 - TP5_MOVE)
+
+    risk = abs(entry - sl)
+    risk_move = risk / max(entry, 1e-12)
+
+    # V13.29 professional scalp rule:
+    # The public trader examples use a far invalidation/averaging zone, but the signal itself
+    # must be managed by a local scalp stop. If the structural stop is too far, compress it
+    # to a local stop for fast execution instead of discarding every live dump candidate.
+    setup_mode = str(setup.get("setup_mode", ""))
+    if LOCAL_SCALP_STOP_ENABLED and risk_move > LOCAL_SCALP_MAX_SL_MOVE and setup_mode in LOCAL_STOP_MODES:
+        local_move = max(LOCAL_SCALP_MIN_SL_MOVE, min(LOCAL_SCALP_MAX_SL_MOVE, max(TP1_MOVE * 1.20, abs(float(setup.get("ch3m_1m", 0.0) or 0.0)) * 1.10)))
+        if side == "LONG":
+            sl = entry * (1 - local_move)
+        else:
+            sl = entry * (1 + local_move)
+        setup["local_stop_used"] = True
+        setup["original_sl_move"] = risk_move
+        risk = abs(entry - sl)
+        risk_move = risk / max(entry, 1e-12)
+
+    if risk_move > MAX_SL_MOVE:
+        return None
+
+    rewards = [abs(tp1 - entry), abs(tp2 - entry), abs(tp3 - entry), abs(tp4 - entry), abs(tp5 - entry)]
+    rr = rewards[0] / risk if risk > 0 else 0.0
+    ladder_rr = (sum(rewards) / len(rewards)) / risk if risk > 0 else 0.0
+    final_rr = rewards[-1] / risk if risk > 0 else 0.0
+    roi_tp1 = rewards[0] / entry * LEVERAGE * 100
+    roi_sl = risk / entry * LEVERAGE * 100
+
+    return {
+        **setup,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "tp4": tp4,
+        "tp5": tp5,
+        "rr": rr,
+        "ladder_rr": ladder_rr,
+        "final_rr": final_rr,
+        "roi_tp1": roi_tp1,
+        "roi_sl": roi_sl,
+        "risk_mult": A_RISK_MULT if setup["grade"] == "A+" else FAST_RISK_MULT,
+        "local_stop_used": bool(setup.get("local_stop_used", False)),
+        "original_sl_move": float(setup.get("original_sl_move", 0.0) or 0.0),
+        "created_at": now_ts(),
+        "status": "active",
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "tp4_hit": False,
+        "tp5_hit": False,
+    }
+
+
+
+def professional_quality_gate(trade: Dict[str, Any], symbol: str) -> Tuple[bool, str, str]:
+    """Final professional quality filter.
+
+    This is intentionally hard. A fast scalp is not allowed when:
+    - stop risk is much larger than the reward ladder;
+    - TP5 does not at least compensate risk;
+    - live 1m volume is weak without a strong price/range exception;
+    - heavy/slow coins have wide SL and weak RR.
+    """
+    side = trade.get("side", "?")
+    base = base_asset(symbol)
+    rr = float(trade.get("rr", 0.0) or 0.0)
+    ladder_rr = float(trade.get("ladder_rr", 0.0) or 0.0)
+    final_rr = float(trade.get("final_rr", 0.0) or 0.0)
+    roi_sl = float(trade.get("roi_sl", 999.0) or 999.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    ch3m = abs(float(trade.get("ch3m_1m", 0.0) or 0.0))
+
+    # Hard stop check is price-based first, because ROI depends on chosen leverage.
+    # At x20 a normal 1.1% local scalp stop looks like 22% ROI, which should not be blocked
+    # if final RR and ladder RR are healthy.
+    sl_price_move = roi_sl / max(LEVERAGE * 100.0, 1e-12)
+    if sl_price_move > LOCAL_SCALP_MAX_SL_MOVE * 1.10:
+        return False, "sl_price_too_high_block", f"{display_symbol(symbol)} {side}: SL price risk too high {sl_price_move*100:.2f}%"
+
+    if roi_sl > MAX_SCALP_SL_ROI:
+        return False, "sl_roi_too_high_block", f"{display_symbol(symbol)} {side}: SL risk too high {roi_sl:.1f}% ROI"
+
+    if rr < MIN_TP1_RR:
+        return False, "tp1_rr_hard_block", f"{display_symbol(symbol)} {side}: TP1 RR too weak {rr:.2f}"
+
+    if ladder_rr < MIN_LADDER_RR_HARD:
+        return False, "ladder_rr_hard_block", f"{display_symbol(symbol)} {side}: ladder RR too weak {ladder_rr:.2f}"
+
+    if final_rr < MIN_FINAL_RR_HARD:
+        return False, "final_rr_hard_block", f"{display_symbol(symbol)} {side}: final RR too weak {final_rr:.2f}"
+
+    if vol1 < MIN_LIVE_VOL_NORMAL:
+        strong_price_exception = (
+            vol1 >= MIN_LIVE_VOL_STRONG_PRICE
+            and ch3m >= STRONG_1M3_MOVE
+            and range1 >= STRONG_RANGE1
+        )
+        if not strong_price_exception:
+            return (
+                False,
+                "weak_live_volume_block",
+                f"{display_symbol(symbol)} {side}: weak live volume x{vol1:.2f}, 1m3 {ch3m*100:.2f}%, range1 x{range1:.2f}"
+            )
+
+    if base in HEAVY_BASES:
+        if roi_sl > HEAVY_MAX_SL_ROI:
+            return False, "heavy_coin_sl_block", f"{display_symbol(symbol)} {side}: heavy coin SL too wide {roi_sl:.1f}% ROI"
+        if final_rr < HEAVY_MIN_FINAL_RR:
+            return False, "heavy_coin_rr_block", f"{display_symbol(symbol)} {side}: heavy coin final RR too weak {final_rr:.2f}"
+        if vol1 < HEAVY_MIN_LIVE_VOL:
+            return False, "heavy_coin_volume_block", f"{display_symbol(symbol)} {side}: heavy coin live volume weak x{vol1:.2f}"
+
+    return True, "ok", "quality ok"
+
+
+
+def aero_style_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """V13.27 AERO/PORTAL-style gate.
+
+    Looks for the specific trader structure:
+    - SHORT: recent upper pullback/stop-hunt -> loss of momentum -> 1m breakdown.
+    - LONG: recent lower sweep -> reclaim -> 1m breakout.
+
+    This does not replace RR/SL filters. It is a structure-quality exception so the bot
+    can catch examples-style trades without accepting random weak B signals.
+    """
+    if not AERO_STYLE_GATE_ENABLED:
+        return False, "aero_disabled", "aero-style disabled"
+    if len(c1) < 35 or len(c5) < 20:
+        return False, "aero_no_candles", f"{display_symbol(symbol)}: not enough candles for AERO-style gate"
+
+    side = str(trade.get("side", ""))
+    if side == "SHORT" and not AERO_SHORT_ENABLED:
+        return False, "aero_short_disabled", f"{display_symbol(symbol)} SHORT: AERO short disabled"
+    if side == "LONG" and not AERO_LONG_ENABLED:
+        return False, "aero_long_disabled", f"{display_symbol(symbol)} LONG: AERO long disabled"
+
+    entry = float(trade.get("entry", 0.0) or 0.0)
     if entry <= 0:
-        return None
+        return False, "aero_bad_entry", f"{display_symbol(symbol)} {side}: bad entry"
 
-    rsi15 = rsi(closes15, 14)
-    ema9 = ema(closes15[-40:], 9)
-    ema21 = ema(closes15[-60:], 21)
-    ema1h21 = ema(closes1h[-60:], 21)
-    ema1h50 = ema(closes1h[-80:], 50)
-    volr = volume_ratio(k15, 20)
-    atr_val = atr(k15, 14)
-    atr_pct = atr_val / entry * 100 if entry else 0.0
+    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
+    loc = close_location(c1[-1])
+    e1 = ema([x["close"] for x in c1[-25:]], 9)
+    e5 = ema([x["close"] for x in c5[-30:]], 9)
+    recent_1m = c1[-18:]
+    recent_5m = c5[-8:]
+    recent_high = max(x["high"] for x in recent_1m + recent_5m[-3:])
+    recent_low = min(x["low"] for x in recent_1m + recent_5m[-3:])
+    recent_range = (recent_high - recent_low) / max(entry, 1e-12)
 
-    if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
-        return None
+    if recent_range < AERO_MIN_RECENT_RANGE:
+        return False, "aero_recent_range_block", f"{display_symbol(symbol)} {side}: recent range too small {recent_range*100:.2f}%"
+    if vol1 < AERO_MIN_VOL1:
+        return False, "aero_vol1_block", f"{display_symbol(symbol)} {side}: vol1 too weak x{vol1:.2f}"
+    if vol5 < AERO_MIN_VOL5:
+        return False, "aero_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
+    if range1 < AERO_MIN_RANGE1:
+        return False, "aero_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
+    if range5 < AERO_MIN_RANGE5:
+        return False, "aero_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
 
-    chg_3 = percent_change(closes15[-4], closes15[-1]) if len(closes15) >= 4 else 0.0
-    chg_8 = percent_change(closes15[-9], closes15[-1]) if len(closes15) >= 9 else 0.0
-    chg_16 = percent_change(closes15[-17], closes15[-1]) if len(closes15) >= 17 else 0.0
-    chg_5m3 = percent_change(closes5[-4], closes5[-1]) if len(closes5) >= 4 else 0.0
+    if side == "SHORT":
+        pullback = (recent_high - entry) / max(entry, 1e-12)
+        if pullback < AERO_MIN_PULLBACK:
+            return False, "aero_pullback_block", f"{display_symbol(symbol)} SHORT: no upper pullback/reject; pullback {pullback*100:.2f}%"
+        if pullback > AERO_MAX_PULLBACK:
+            return False, "aero_spike_block", f"{display_symbol(symbol)} SHORT: spike too extreme {pullback*100:.2f}%"
+        if ch3m > -AERO_MIN_1M3:
+            return False, "aero_pressure_block", f"{display_symbol(symbol)} SHORT: no live breakdown 1m3 {ch3m*100:+.2f}%"
+        if loc > AERO_CLOSE_SHORT or c1[-1]["close"] >= c1[-1]["open"]:
+            return False, "aero_reject_close_block", f"{display_symbol(symbol)} SHORT: last 1m not rejected near low"
+        if c1[-1]["close"] >= min(x["low"] for x in c1[-7:-1]):
+            return False, "aero_breakdown_block", f"{display_symbol(symbol)} SHORT: no fresh local breakdown"
+        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] < e1 or c1[-1]["close"] < e5):
+            return False, "aero_ema_reject_block", f"{display_symbol(symbol)} SHORT: no EMA/VWAP-style rejection"
+        return True, "aero_style_short_ok", (
+            f"AERO-style SHORT ok: upper pullback/reject {pullback*100:.2f}%, "
+            f"live breakdown 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
+            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+        )
 
-    # Anti-chase: no signals after vertical move away from the level.
-    if abs(chg_8) > ANTI_CHASE_8_CANDLE_MOVE:
-        return None
-    if candle_body_pct(last) > 5.0:
-        return None
+    if side == "LONG":
+        sweep = (entry - recent_low) / max(entry, 1e-12)
+        if sweep < AERO_MIN_PULLBACK:
+            return False, "aero_sweep_block", f"{display_symbol(symbol)} LONG: no lower sweep/reclaim; sweep {sweep*100:.2f}%"
+        if sweep > AERO_MAX_PULLBACK:
+            return False, "aero_spike_block", f"{display_symbol(symbol)} LONG: spike too extreme {sweep*100:.2f}%"
+        if ch3m < AERO_MIN_1M3:
+            return False, "aero_pressure_block", f"{display_symbol(symbol)} LONG: no live reclaim 1m3 {ch3m*100:+.2f}%"
+        if loc < AERO_CLOSE_LONG or c1[-1]["close"] <= c1[-1]["open"]:
+            return False, "aero_reclaim_close_block", f"{display_symbol(symbol)} LONG: last 1m not reclaimed near high"
+        if c1[-1]["close"] <= max(x["high"] for x in c1[-7:-1]):
+            return False, "aero_breakout_block", f"{display_symbol(symbol)} LONG: no fresh local breakout"
+        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] > e1 or c1[-1]["close"] > e5):
+            return False, "aero_ema_reclaim_block", f"{display_symbol(symbol)} LONG: no EMA/VWAP-style reclaim"
+        return True, "aero_style_long_ok", (
+            f"AERO-style LONG ok: lower sweep/reclaim {sweep*100:.2f}%, "
+            f"live reclaim 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
+            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+        )
 
-    levels = local_levels(k15)
-    support = levels["support"]
-    resistance = levels["resistance"]
-    hard_support = levels.get("hard_support", support)
-    hard_resistance = levels.get("hard_resistance", resistance)
+    return False, "aero_side_block", f"{display_symbol(symbol)}: unknown side {side}"
 
-    lower_wick, upper_wick, close_near_high, close_near_low = candle_position(last)
-    candle_green = last["close"] > last["open"]
-    candle_red = last["close"] < last["open"]
+def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """Example-style final gate.
 
-    tol_pct = max(0.0015, min(0.008, (atr_val / entry) * 0.55))
-    dist_from_support_atr = (entry - support) / max(atr_val, entry * 0.0001)
-    dist_from_resistance_atr = (resistance - entry) / max(atr_val, entry * 0.0001)
+    The goal is to block signals that are technically valid but not trader-quality:
+    - weak B-class entries with no live volume;
+    - tiny or stale continuation;
+    - counter-direction entries without true reversal strength;
+    - target ladders that require more movement than the recent market has shown;
+    - heavy coins unless the setup is genuinely A+.
+    """
+    if not TRADER_PATTERN_GATE_ENABLED:
+        return True, "ok", "trader pattern gate disabled"
 
-    candidates: List[Candidate] = []
+    side = str(trade.get("side", ""))
+    base = base_asset(symbol)
+    score = int(trade.get("score", 0) or 0)
+    grade = str(trade.get("grade", "B"))
+    setup_mode = str(trade.get("setup_mode", ""))
+    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
+    ch15m = float(trade.get("ch15m", 0.0) or 0.0)
+    ch30m = float(trade.get("ch30m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    tp5 = float(trade.get("tp5", 0.0) or 0.0)
 
-    # LONG: support touch / false breakdown / reclaim, then closed upward.
-    support_touched = (
-        last["low"] <= support * (1 + tol_pct)
-        or prev["low"] <= support * (1 + tol_pct)
-        or last["low"] <= hard_support * (1 + tol_pct)
+    aero_ok, aero_block, aero_reason = aero_style_gate(trade, symbol, c1, c5, c15, btc)
+
+    if grade != "A+" and not TRADER_ALLOW_B_SCORE:
+        return False, "trader_grade_block", f"{display_symbol(symbol)} {side}: B-class skipped by env; set TRADER_ALLOW_B_SCORE=true to allow B+"
+
+    if score < TRADER_MIN_SCORE:
+        if not (aero_ok and AERO_ALLOW_B_SCORE and score >= max(72, TRADER_MIN_SCORE - 10)):
+            return False, "trader_score_block", f"{display_symbol(symbol)} {side}: trader score too low {score} < {TRADER_MIN_SCORE}"
+
+    # Balanced B+ mode: B setups are allowed, but only if the current tape is alive.
+    # This keeps the bot from going silent while still blocking random weak B entries.
+    if grade != "A+":
+        if abs(ch3m) < TRADER_MIN_ABS_1M3 * 1.20 and vol1 < TRADER_MIN_VOL1 * 1.20 and range1 < TRADER_MIN_RANGE1 * 1.15:
+            if not aero_ok:
+                return False, "trader_bplus_quality_block", (
+                    f"{display_symbol(symbol)} {side}: B+ not strong enough; 1m3 {ch3m*100:+.2f}%, "
+                    f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+                )
+
+    if base in HEAVY_BASES and TRADER_HEAVY_ONLY_A_PLUS and grade != "A+":
+        return False, "trader_heavy_grade_block", f"{display_symbol(symbol)} {side}: heavy coin requires A+"
+
+    # Directional pressure must exist now. Examples are not slow predictions.
+    if side == "LONG":
+        if ch3m < TRADER_MIN_ABS_1M3:
+            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} LONG: weak live pressure 1m3 {ch3m*100:+.2f}%"
+        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] <= c5[-2]["close"]:
+            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} LONG: last 5m not confirming up"
+        if close_location(c1[-1]) < TRADER_CLOSE_LONG:
+            return False, "trader_close_location_block", f"{display_symbol(symbol)} LONG: 1m close not near high"
+        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] <= max(x["high"] for x in c1[-6:-1]):
+            return False, "trader_micro_break_block", f"{display_symbol(symbol)} LONG: no fresh 1m high break"
+        aligned = ch15m >= TRADER_MIN_ABS_15M and ch30m >= -TRADER_MAX_COUNTER_30M
+        reversal_exception = setup_mode.startswith("REVERSAL") and ch3m >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
+    else:
+        if ch3m > -TRADER_MIN_ABS_1M3:
+            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} SHORT: weak live pressure 1m3 {ch3m*100:+.2f}%"
+        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] >= c5[-2]["close"]:
+            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} SHORT: last 5m not confirming down"
+        if close_location(c1[-1]) > TRADER_CLOSE_SHORT:
+            return False, "trader_close_location_block", f"{display_symbol(symbol)} SHORT: 1m close not near low"
+        dump_exception = setup_mode.startswith("MARKET_DUMP") and ch3m <= -TRADER_MIN_ABS_1M3 * 1.10 and range1 >= max(0.45, TRADER_MIN_RANGE1 * 0.60)
+        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] >= min(x["low"] for x in c1[-6:-1]) and not dump_exception:
+            return False, "trader_micro_break_block", f"{display_symbol(symbol)} SHORT: no fresh 1m low break"
+        aligned = ch15m <= -TRADER_MIN_ABS_15M and ch30m <= TRADER_MAX_COUNTER_30M
+        reversal_exception = setup_mode.startswith("REVERSAL") and abs(ch3m) >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
+
+    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok or setup_mode.startswith("MARKET_DUMP")):
+        return False, "trader_structure_block", (
+            f"{display_symbol(symbol)} {side}: weak structure; 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, mode {setup_mode}"
+        )
+
+    if vol1 < TRADER_MIN_VOL1 and not aero_ok:
+        return False, "trader_vol1_block", f"{display_symbol(symbol)} {side}: live vol1 too weak x{vol1:.2f}"
+    if vol5 < TRADER_MIN_VOL5 and not aero_ok:
+        return False, "trader_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
+    if range1 < TRADER_MIN_RANGE1 and not aero_ok:
+        return False, "trader_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
+    if range5 < TRADER_MIN_RANGE5 and not aero_ok:
+        return False, "trader_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
+
+    # TP5 should be plausible from current market expansion, not a fantasy target.
+    if entry > 0 and tp5 > 0:
+        need = abs(entry - tp5) / entry
+        recent_move = max(abs(ch15m), abs(ch30m), abs(percent_change(c5, 6)))
+        if recent_move < need * TRADER_MIN_TP5_FEASIBILITY:
+            return False, "trader_tp5_feasibility_block", (
+                f"{display_symbol(symbol)} {side}: TP5 move {need*100:.2f}% not feasible vs recent {recent_move*100:.2f}%"
+            )
+
+    style_note = aero_reason if aero_ok else "standard trader-pattern ok"
+    return True, "ok", (
+        f"{style_note}; score {score}, grade {grade}, 1m3 {ch3m*100:+.2f}%, "
+        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, vol1 x{vol1:.2f}, range1 x{range1:.2f}"
     )
-    support_reclaimed = last["close"] > support and last["close"] > prev["close"]
-    false_break_support = last["low"] < support * (1 - tol_pct * 0.35) and last["close"] > support
-    long_5m_ok, long_5m_reasons = is_5m_confirmed("LONG", k5)
-    one_hour_not_bearish = closes1h[-1] >= ema1h50 * 0.975 or ema1h21 >= ema1h50 * 0.985
 
-    long_ok = all([
-        support_touched,
-        support_reclaimed,
-        candle_green or close_near_high >= MIN_CLOSE_LOCATION,
-        lower_wick >= MIN_REJECTION_WICK_RATIO or false_break_support,
-        close_near_high >= MIN_CLOSE_LOCATION,
-        dist_from_support_atr <= MAX_ENTRY_DISTANCE_ATR,
-        30 <= rsi15 <= 64,
-        volr >= MIN_VOLUME_RATIO_CONFIRM,
-        long_5m_ok,
-        one_hour_not_bearish,
-        chg_5m3 > 0,
-    ])
+def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
+    t = now_ts()
+    if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
+        return False, "pair cooldown"
+    if t < STATE.setdefault("strategy_cooldown", {}).get(strategy, 0):
+        return False, "strategy cooldown"
+    return True, "ok"
 
-    if long_ok:
-        score = 78.0
-        reasons = [
-            "15m закрылась после отскока от поддержки",
-            f"поддержка ~{fmt_price(support)}",
-            f"вход недалеко от уровня: {dist_from_support_atr:.2f} ATR",
-            f"нижняя тень {lower_wick:.2f}",
-            f"объем x{volr:.2f}",
-            f"RSI {rsi15:.1f}",
-        ] + long_5m_reasons
-        if false_break_support:
-            score += 6; reasons.append("ложный прокол поддержки и возврат выше")
-        if ema9 > ema21 or entry > ema21:
-            score += 4; reasons.append("15m EMA не против")
-        if ema1h21 >= ema1h50 * 0.995:
-            score += 3; reasons.append("1h тренд нейтральный/выше")
-        if chg_3 > 0.20:
-            score += min(5, chg_3 * 3); reasons.append(f"локальный импульс +{chg_3:.2f}%")
-        if -10 <= chg_16 <= -0.35:
-            score += 3; reasons.append(f"был откат {chg_16:.2f}%")
-        candidates.append(Candidate(symbol, "LONG", round(min(score, 96), 1), "confirmed support bounce", entry, reasons, {
-            "support": support, "resistance": resistance, "rsi15": rsi15, "volr": volr,
-            "atr_pct": atr_pct, "dist_from_support_atr": dist_from_support_atr,
-            "close_near_high": close_near_high, "lower_wick": lower_wick,
-        }))
 
-    # SHORT: resistance touch / false breakout / rejection, then closed down.
-    resistance_touched = (
-        last["high"] >= resistance * (1 - tol_pct)
-        or prev["high"] >= resistance * (1 - tol_pct)
-        or last["high"] >= hard_resistance * (1 - tol_pct)
-    )
-    resistance_rejected = last["close"] < resistance and last["close"] < prev["close"]
-    false_break_resistance = last["high"] > resistance * (1 + tol_pct * 0.35) and last["close"] < resistance
-    short_5m_ok, short_5m_reasons = is_5m_confirmed("SHORT", k5)
-    one_hour_not_bullish = closes1h[-1] <= ema1h50 * 1.025 or ema1h21 <= ema1h50 * 1.015
+def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], near_miss: List[str]) -> Optional[Dict[str, Any]]:
+    symbol = normalize_symbol(symbol)
+    c1 = get_klines(symbol, "1m", 120, cache_seconds=6)
+    c5 = get_klines(symbol, "5m", 120, cache_seconds=15)
+    c15 = get_klines(symbol, "15m", 120, cache_seconds=30)
+    c1h = get_klines(symbol, "1h", 120, cache_seconds=90)
 
-    short_ok = all([
-        resistance_touched,
-        resistance_rejected,
-        candle_red or close_near_low >= MIN_CLOSE_LOCATION,
-        upper_wick >= MIN_REJECTION_WICK_RATIO or false_break_resistance,
-        close_near_low >= MIN_CLOSE_LOCATION,
-        dist_from_resistance_atr <= MAX_ENTRY_DISTANCE_ATR,
-        36 <= rsi15 <= 76,
-        volr >= MIN_VOLUME_RATIO_CONFIRM,
-        short_5m_ok,
-        one_hour_not_bullish,
-        chg_5m3 < 0,
-    ])
+    if not c1 or not c5 or not c15 or not c1h:
+        blocks["no_candles"] = blocks.get("no_candles", 0) + 1
+        return None
 
-    if short_ok:
-        score = 78.0
-        reasons = [
-            "15m закрылась после отбоя от сопротивления",
-            f"сопротивление ~{fmt_price(resistance)}",
-            f"вход недалеко от уровня: {dist_from_resistance_atr:.2f} ATR",
-            f"верхняя тень {upper_wick:.2f}",
-            f"объем x{volr:.2f}",
-            f"RSI {rsi15:.1f}",
-        ] + short_5m_reasons
-        if false_break_resistance:
-            score += 7; reasons.append("ложный пробой сопротивления и возврат ниже")
-        if ema9 < ema21 or entry < ema21:
-            score += 4; reasons.append("15m EMA не против")
-        if ema1h21 <= ema1h50 * 1.005:
-            score += 3; reasons.append("1h тренд нейтральный/ниже")
-        if chg_3 < -0.20:
-            score += min(5, abs(chg_3) * 3); reasons.append(f"локальный разворот {chg_3:.2f}%")
-        if 0.35 <= chg_16 <= 14:
-            score += 3; reasons.append(f"был памп +{chg_16:.2f}%")
-        candidates.append(Candidate(symbol, "SHORT", round(min(score, 97), 1), "confirmed resistance rejection", entry, reasons, {
-            "support": support, "resistance": resistance, "rsi15": rsi15, "volr": volr,
-            "atr_pct": atr_pct, "dist_from_resistance_atr": dist_from_resistance_atr,
-            "close_near_low": close_near_low, "upper_wick": upper_wick,
-        }))
+    if ultra_risk_symbol(symbol, c5, c15):
+        blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+    for side in ("LONG", "SHORT"):
+        if side == "LONG" and not ALLOW_LONG:
+            blocks["long_disabled"] = blocks.get("long_disabled", 0) + 1
+            continue
+        if side == "SHORT" and not ALLOW_SHORT:
+            blocks["short_disabled"] = blocks.get("short_disabled", 0) + 1
+            continue
+        setup = fast_burst_setup(symbol, c1, c5, c15, c1h, btc, side)
+        if not setup:
+            setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
+            if setup:
+                blocks[f"instant_edge_{side.lower()}"] = blocks.get(f"instant_edge_{side.lower()}", 0) + 1
+        if not setup and side == "SHORT":
+            setup = market_dump_short_setup(symbol, c1, c5, c15, c1h, btc)
+            if setup:
+                blocks["market_dump_short"] = blocks.get("market_dump_short", 0) + 1
+        if not setup:
+            blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
+            continue
+
+        if side == "LONG":
+            long_stats_ok, long_stats_reason = long_live_stats_ok()
+            if not long_stats_ok and setup.get("grade") != "A+":
+                blocks["long_stats_protection_block"] = blocks.get("long_stats_protection_block", 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(f"{display_symbol(symbol)} LONG: {long_stats_reason}; B-class long skipped")
+                continue
+
+        co, reason = cooldown_ok(symbol, setup["strategy"])
+        if not co:
+            blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
+            continue
+
+        trade = calculate_fast_trade(setup, c1, c5)
+        if not trade:
+            blocks["sl_too_far_block"] = blocks.get("sl_too_far_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side}: SL too far")
+            continue
+
+        if trade["score"] < B_MIN_SCORE:
+            blocks["score_block"] = blocks.get("score_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side}: score {trade['score']}, vol x{trade['volume_ratio']:.2f}, range x{trade['range_ratio']:.2f}")
+            continue
+
+        # V13.23 balanced professional quality gate.
+        # Still blocks XMR-style bad scalps: huge SL, weak RR, weak live volume.
+        # But thresholds are not over-tight, so the bot can remain alive during the day.
+        q_ok, q_block, q_reason = professional_quality_gate(trade, symbol)
+        if not q_ok:
+            blocks[q_block] = blocks.get(q_block, 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(q_reason)
+            continue
+
+        t_ok, t_block, t_reason = trader_pattern_gate(trade, symbol, c1, c5, c15, btc)
+        if not t_ok:
+            blocks[t_block] = blocks.get(t_block, 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(t_reason)
+            continue
+        trade["trader_pattern_reason"] = t_reason
+
+        candidates.append(trade)
 
     if not candidates:
         return None
-    best = max(candidates, key=lambda c: c.score)
-    if best.score < FALLBACK_SCORE:
-        return None
-    return best
+
+    candidates.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
+    return candidates[0]
+
+# ============================================================
+# Formatting / scanning / tracking
+# ============================================================
+
+def format_price(x: Optional[float]) -> str:
+    if x is None:
+        return "-"
+    if x >= 100:
+        return f"{x:.2f}"
+    if x >= 1:
+        return f"{x:.5f}".rstrip("0").rstrip(".")
+    return f"{x:.8f}".rstrip("0").rstrip(".")
 
 
-def build_trade_from_candidate(c: Candidate) -> Trade:
-    entry = c.entry
-    if c.side == "LONG":
-        tps = [entry * (1 + p) for p in TP_PCTS]
-        averaging = entry * (1 - AVERAGING_PCT)
-        stop = entry * (1 - STOP_PCT)
-    else:
-        tps = [entry * (1 - p) for p in TP_PCTS]
-        averaging = entry * (1 + AVERAGING_PCT)
-        stop = entry * (1 + STOP_PCT)
-    tid = f"{display_symbol(c.symbol)}-{c.side}-{int(time.time())}-{random.randint(100,999)}"
-    return Trade(
-        id=tid,
-        symbol=c.symbol,
-        side=c.side,
-        entry=entry,
-        tps=tps,
-        averaging=averaging,
-        stop=stop,
-        score=c.score,
-        strategy=c.strategy,
-        created_ts=time.time(),
-    )
-
-
-def format_signal_message(trade: Trade, reasons: Optional[List[str]] = None) -> str:
-    coin = display_symbol(trade.symbol).replace("USDT", "")
-    head = f"Скальп-позиция - <b>{coin} {trade.side}</b>"
-    tp_lines = "\n".join(fmt_price(x) for x in trade.tps)
-    roi_lines = []
-    for i, tp in enumerate(trade.tps, 1):
-        roi_lines.append(f"TP{i}: ~{roi_pct(trade.side, trade.entry, tp):.1f}% ROI x{LEVERAGE:.0f}")
-    reason_text = ""
-    if reasons:
-        reason_text = "\n\nФильтры: " + "; ".join(reasons[:5])
+def build_signal_message(s: Dict[str, Any]) -> str:
+    arrow = "🟢" if s["side"] == "LONG" else "🔴"
     return (
-        f"{head}\n\n"
-        f"Моя точка входа - <code>{fmt_price(trade.entry)}</code>\n\n"
-        "Пока заходите, следующим постом пришлю параметры сделки!\n\n"
-        "Лимитные ордера на фиксацию выставил на значениях:\n\n"
-        f"<code>{tp_lines}</code>\n\n"
-        f"Лимитный ордер на усреднение: <code>{fmt_price(trade.averaging)}</code>\n"
-        f"Защитный стоп: <code>{fmt_price(trade.stop)}</code>\n\n"
-        f"Score сетапа: <b>{trade.score:.0f}/100</b> · Подтверждение: <b>15m закрытая + 5m</b> · Плечо: <b>x{LEVERAGE:.0f}</b>\n"
-        + reason_text +
-        "\n\nО любых действиях по открытой сделке буду сообщать в канале\n\n"
-        "⚠️ Это сигнал, не финансовая рекомендация. Риск контролируй сам."
+        f"{arrow} {s['side']} {display_symbol(s['symbol'])}\n"
+        f"Класс: {s['grade']} · Score {s['score']} · {s['trade_type']}\n"
+        f"Стратегия: {s['strategy']}\n\n"
+        f"Вход: {format_price(s['entry'])}\n"
+        f"TP1: {format_price(s['tp1'])} · ≈ {s['roi_tp1']:.1f}% ROI x{LEVERAGE}\n"
+        f"TP2: {format_price(s['tp2'])}\n"
+        f"TP3: {format_price(s['tp3'])}\n"
+        f"TP4: {format_price(s['tp4'])}\n"
+        f"TP5: {format_price(s['tp5'])}\n"
+        f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
+        f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
+        f"Риск: multiplier x{s['risk_mult']:.2f}\n\n"
+        f"📌 Логика:\n{s['reason']}\n"
+        f"15m: {s['ch15m']*100:+.2f}% · 30m: {s['ch30m']*100:+.2f}% · 1m3: {s['ch3m_1m']*100:+.2f}%\n"
+        f"Volume15 x{s['volume_ratio']:.2f} · Range5 x{s['range_ratio']:.2f} · Vol1 x{s.get('vol1', 1.0):.2f} · Range1 x{s.get('range1', 1.0):.2f}\n"
+        f"BTC: {s['btc_text']}\n\n"
+        f"⏱ Scalping rule: если за {FAST_MAX_MINUTES_TO_TP1} минут нет движения к TP1 — сигнал expired. Фаза рынка не важна; важна быстрая реализация."
     )
 
 
-def format_stats() -> str:
-    s = state.stats
-    wr = (s.profitable / s.closed * 100.0) if s.closed else 0.0
-    active = len(state.active_trades)
-    lines = [
-        "📊 <b>Обновление статистики</b>",
-        "",
-        f"Всего сигналов: <b>{s.total_signals}</b>",
-        f"Активные сделки: <b>{active}</b>",
-        f"Закрытые сделки: <b>{s.closed}</b>",
-        f"✅ Прибыльные: <b>{s.profitable}</b>",
-        f"🛑 Убыточные: <b>{s.losing}</b>",
-        f"Win rate: <b>{wr:.1f}%</b>",
-        "",
-        f"TP1 достигнут: <b>{s.tp1_hits}</b>",
-        f"Все 5 целей: <b>{s.tp5_hits}</b>",
-        f"Усреднений: <b>{s.averaged_count}</b>",
-        f"Стопов: <b>{s.stop_count}</b>",
-        f"Лучший ROI: <b>{s.best_roi_pct:.2f}%</b>",
-        f"Худший ROI: <b>{s.worst_roi_pct:.2f}%</b>",
-    ]
-    if s.last_closed:
-        lines.append("\nПоследние закрытые:")
-        for item in s.last_closed[-8:][::-1]:
-            lines.append(
-                f"{item.get('symbol')} {item.get('side')} — {item.get('reason')} · ROI {item.get('roi_pct', 0):.2f}%"
-            )
-    return "\n".join(lines)
-
-# =============================================================================
-# SCANNER AND MONITOR
-# =============================================================================
-
-async def scan_one_symbol(session: aiohttp.ClientSession, symbol: str, semaphore: asyncio.Semaphore) -> Optional[Candidate]:
-    async with semaphore:
-        try:
-            k15, k5, k1h = await asyncio.gather(
-                fetch_klines(session, symbol, "15m", 100),
-                fetch_klines(session, symbol, "5m", 80),
-                fetch_klines(session, symbol, "1h", 80),
-            )
-            return analyze_symbol(symbol, k15, k5, k1h)
-        except Exception as e:
-            logger.debug("scan_one_symbol failed %s: %s", symbol, e)
-            return None
+def build_diagnostic(scan: Dict[str, Any]) -> str:
+    blocks = scan.get("blocks", {})
+    block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:12]]
+    hot = scan.get("hot_notes", [])[:8]
+    near = scan.get("near_miss", [])[:8]
+    return (
+        f"🧪 Диагностика V13.29 Local Stop Dump Scalper\n"
+        f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
+        f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
+        f"BTC: {scan.get('btc', 'unknown')}\n"
+        f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
+        f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
+        f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
+        ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
+        f"\n\nLast error: {STATE.get('last_error', '')}"
+    )
 
 
-async def confirmation_ready(candidate: Candidate) -> bool:
-    """Two-step confirmation: first scan stores setup, next scan must confirm it again."""
-    if not STRICT_CONFIRMATION or CONFIRMATION_SCANS <= 1:
-        return True
-    key = candidate.symbol
-    now_ts = time.time()
-    async with pending_lock:
-        expired = [k for k, v in pending_candidates.items() if now_ts - float(v.get("ts", 0)) > PENDING_EXPIRE_SECONDS]
-        for k in expired:
-            pending_candidates.pop(k, None)
-
-        old = pending_candidates.get(key)
-        if not old or old.get("side") != candidate.side:
-            pending_candidates[key] = {
-                "side": candidate.side,
-                "score": candidate.score,
-                "entry": candidate.entry,
-                "strategy": candidate.strategy,
-                "reasons": candidate.reasons,
-                "count": 1,
-                "ts": now_ts,
-            }
-            logger.info("pending setup stored: %s %s score=%s", candidate.symbol, candidate.side, candidate.score)
-            if SEND_PENDING_LOGS_TO_TELEGRAM:
-                await send_telegram(
-                    f"👀 <b>Сетап найден, жду подтверждение</b>\n"
-                    f"{display_symbol(candidate.symbol)} {candidate.side}\n"
-                    f"Score: <b>{candidate.score:.0f}</b>\n"
-                    f"Причина: {candidate.strategy}\n"
-                    f"Сигнал не отправлен, нужна повторная проверка."
-                )
-            return False
-
-        first_entry = float(old.get("entry", candidate.entry) or candidate.entry)
-        move_from_first = abs(candidate.entry - first_entry) / max(first_entry, 1e-12) * 100
-        if move_from_first > 1.20:
-            pending_candidates[key] = {
-                "side": candidate.side,
-                "score": candidate.score,
-                "entry": candidate.entry,
-                "strategy": candidate.strategy,
-                "reasons": candidate.reasons,
-                "count": 1,
-                "ts": now_ts,
-            }
-            logger.info("pending reset because price moved too far: %s %.2f%%", candidate.symbol, move_from_first)
-            return False
-
-        old["count"] = int(old.get("count", 1)) + 1
-        old["score"] = max(float(old.get("score", 0)), candidate.score)
-        old["entry"] = candidate.entry
-        old["ts"] = now_ts
-        if old["count"] >= CONFIRMATION_SCANS:
-            pending_candidates.pop(key, None)
-            logger.info("confirmed setup ready: %s %s score=%s checks=%s", candidate.symbol, candidate.side, candidate.score, old["count"])
-            return True
-        return False
-
-
-async def send_signal(candidate: Candidate) -> bool:
-    async with state_lock:
-        if state.day_key != today_key():
-            state.day_key = today_key()
-            state.sent_today = 0
-
-        if state.sent_today >= MAX_SIGNALS_PER_DAY:
-            return False
-        if len(state.active_trades) >= MAX_ACTIVE_TRADES:
-            return False
-
-        now_ts = time.time()
-        last_ts = state.last_signal_ts_by_symbol.get(candidate.symbol, 0)
-        if now_ts - last_ts < SYMBOL_COOLDOWN_MINUTES * 60:
-            return False
-
-        # Avoid two trades on same symbol.
-        for t in state.active_trades.values():
-            if t.symbol == candidate.symbol and t.status == "active":
-                return False
-
-        trade = build_trade_from_candidate(candidate)
-        msg = format_signal_message(trade, candidate.reasons)
-        message_id = await send_telegram(msg)
-        trade.telegram_message_id = message_id
-
-        state.active_trades[trade.id] = trade
-        state.last_signal_ts_by_symbol[candidate.symbol] = now_ts
-        state.sent_today += 1
-        state.stats.total_signals += 1
-        save_state()
-        logger.info("Signal sent: %s %s score=%s", trade.symbol, trade.side, trade.score)
-        return True
-
-
-async def scanner_loop() -> None:
-    global last_scanner_error_ts, last_scan_info
-    await asyncio.sleep(3)
-    while True:
-        started = time.time()
-        try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0 BingXSignalBot/1.0"}) as session:
-                symbols = await get_top_symbols(session)
-                semaphore = asyncio.Semaphore(8)
-                tasks = [scan_one_symbol(session, sym, semaphore) for sym in symbols]
-                raw_candidates = await asyncio.gather(*tasks)
-                candidates = [c for c in raw_candidates if c is not None]
-                candidates.sort(key=lambda x: x.score, reverse=True)
-
-                threshold = MIN_SCORE
-                async with state_lock:
-                    if state.day_key != today_key():
-                        state.day_key = today_key()
-                        state.sent_today = 0
-                        save_state()
-                    # If bot has sent nothing today, allow fallback threshold.
-                    if state.sent_today < DAILY_MIN_SIGNALS:
-                        threshold = FALLBACK_SCORE
-
-                sent = 0
-                pending_seen = 0
-                for c in candidates:
-                    if c.score < threshold:
-                        break
-                    ready = await confirmation_ready(c)
-                    if not ready:
-                        pending_seen += 1
-                        continue
-                    ok = await send_signal(c)
-                    if ok:
-                        sent += 1
-                        # Usually one confirmed signal per cycle is enough.
-                        if sent >= 1:
-                            break
-
-                last_scan_info = {
-                    "symbols_checked": len(symbols),
-                    "candidates": len(candidates),
-                    "best": asdict(candidates[0]) if candidates else None,
-                    "sent": sent,
-                    "pending_seen": pending_seen,
-                    "pending_total": len(pending_candidates),
-                    "threshold": threshold,
-                    "duration_sec": round(time.time() - started, 2),
-                    "time": now_utc().isoformat(),
-                }
-                logger.info(
-                    "scan done: checked=%s candidates=%s pending=%s sent=%s threshold=%s duration=%.1fs",
-                    len(symbols), len(candidates), len(pending_candidates), sent, threshold, time.time() - started,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            logger.error("Scanner error: %s\n%s", err, traceback.format_exc())
-            now_ts = time.time()
-            # Send not more than once every 10 minutes.
-            if SEND_SCANNER_ERRORS_TO_TELEGRAM and now_ts - last_scanner_error_ts > 600:
-                last_scanner_error_ts = now_ts
-                await send_telegram(f"⚠️ <b>Ошибка сканера Render:</b>\n<code>{err}</code>\n\nБот не остановлен, следующая попытка через {SCAN_INTERVAL_SECONDS} сек.")
-
-        await asyncio.sleep(max(10, SCAN_INTERVAL_SECONDS))
-
-
-async def monitor_loop() -> None:
-    await asyncio.sleep(8)
-    while True:
-        try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0 BingXSignalBot/1.0"}) as session:
-                async with state_lock:
-                    trades_snapshot = list(state.active_trades.values())
-                for trade in trades_snapshot:
-                    if trade.status != "active":
-                        continue
-                    try:
-                        klines = await fetch_klines(session, trade.symbol, "1m", 5)
-                        if not klines:
-                            continue
-                        price = klines[-1]["close"]
-                        await update_trade_by_price(trade.id, price)
-                    except Exception as e:
-                        logger.debug("monitor trade failed %s: %s", trade.symbol, e)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error("Monitor loop error: %s", e)
-        await asyncio.sleep(max(10, MONITOR_INTERVAL_SECONDS))
-
-
-async def update_trade_by_price(trade_id: str, price: float) -> None:
-    messages: List[str] = []
-    stats_to_send = False
-    async with state_lock:
-        trade = state.active_trades.get(trade_id)
-        if not trade or trade.status != "active":
-            return
-
-        current_roi = roi_pct(trade.side, trade.entry, price)
-        trade.best_roi_pct = max(trade.best_roi_pct, current_roi)
-        trade.worst_roi_pct = min(trade.worst_roi_pct, current_roi)
-
-        # Averaging touch.
-        if not trade.averaged:
-            if (trade.side == "LONG" and price <= trade.averaging) or (trade.side == "SHORT" and price >= trade.averaging):
-                trade.averaged = True
-                state.stats.averaged_count += 1
-                messages.append(
-                    f"🔄 <b>Усреднение активировано</b>\n{display_symbol(trade.symbol)} {trade.side}\nЦена: <code>{fmt_price(price)}</code>\nУровень: <code>{fmt_price(trade.averaging)}</code>"
-                )
-
-        # TP hits.
-        for idx, tp in enumerate(trade.tps, 1):
-            if idx in trade.reached_tps:
-                continue
-            hit = (trade.side == "LONG" and price >= tp) or (trade.side == "SHORT" and price <= tp)
-            if hit:
-                trade.reached_tps.append(idx)
-                r = roi_pct(trade.side, trade.entry, tp)
-                if idx == 1:
-                    state.stats.tp1_hits += 1
-                messages.append(
-                    f"✅ <b>TP{idx} достигнут</b>\n{display_symbol(trade.symbol)} {trade.side}\nЦена: <code>{fmt_price(tp)}</code>\nROI примерно: <b>+{r:.2f}%</b> x{LEVERAGE:.0f}"
-                )
-
-        # Close at TP5.
-        if 5 in trade.reached_tps:
-            close_trade_locked(trade, "TP5", trade.tps[-1])
-            state.stats.tp5_hits += 1
-            stats_to_send = True
-            messages.append(
-                f"🔥 <b>Все 5 целей были достигнуты</b>\n{display_symbol(trade.symbol)} {trade.side}\nИтог ROI примерно: <b>+{roi_pct(trade.side, trade.entry, trade.tps[-1]):.2f}%</b>"
-            )
-
-        # Stop.
-        if trade.status == "active":
-            stopped = (trade.side == "LONG" and price <= trade.stop) or (trade.side == "SHORT" and price >= trade.stop)
-            if stopped:
-                had_tp = len(trade.reached_tps) > 0
-                close_trade_locked(trade, "SL_AFTER_TP" if had_tp else "SL", price)
-                state.stats.stop_count += 1
-                stats_to_send = True
-                if had_tp:
-                    messages.append(
-                        f"🟡 <b>Стоп после фиксации части целей</b>\n{display_symbol(trade.symbol)} {trade.side}\nЦена: <code>{fmt_price(price)}</code>\nСделка учтена как прибыльная, потому что был TP1."
-                    )
-                else:
-                    messages.append(
-                        f"🛑 <b>Stop Loss</b>\n{display_symbol(trade.symbol)} {trade.side}\nЦена: <code>{fmt_price(price)}</code>\nROI примерно: <b>{roi_pct(trade.side, trade.entry, price):.2f}%</b>"
-                    )
-
-        save_state()
-
-    for m in messages:
-        await send_telegram(m)
-    if stats_to_send and SEND_STATS_AFTER_CLOSE:
-        async with state_lock:
-            msg = format_stats()
-        await send_telegram(msg)
-
-
-def close_trade_locked(trade: Trade, reason: str, close_price: float) -> None:
-    trade.status = "closed"
-    trade.closed_ts = time.time()
-    trade.close_reason = reason
-    final_roi = roi_pct(trade.side, trade.entry, close_price)
-    trade.best_roi_pct = max(trade.best_roi_pct, final_roi)
-    trade.worst_roi_pct = min(trade.worst_roi_pct, final_roi)
-
-    state.stats.closed += 1
-    if len(trade.reached_tps) > 0:
-        state.stats.profitable += 1
-    else:
-        state.stats.losing += 1
-
-    state.stats.best_roi_pct = max(state.stats.best_roi_pct, trade.best_roi_pct)
-    state.stats.worst_roi_pct = min(state.stats.worst_roi_pct, trade.worst_roi_pct)
-    state.stats.last_closed.append({
-        "symbol": display_symbol(trade.symbol),
-        "side": trade.side,
-        "reason": reason,
-        "roi_pct": final_roi,
-        "closed_at": now_utc().isoformat(),
-        "tp_count": len(trade.reached_tps),
-    })
-    state.stats.last_closed = state.stats.last_closed[-30:]
-    state.active_trades.pop(trade.id, None)
-
-# =============================================================================
-# APP ROUTES
-# =============================================================================
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    global scanner_task, monitor_task
-    load_state()
-    logger.info("%s starting. No ccxt dependency. Start command expected: uvicorn bot:app --host 0.0.0.0 --port 1000", APP_NAME)
-    logger.info("Telegram config: token_present=%s chat_id_present=%s chat_id=%s", bool(TELEGRAM_BOT_TOKEN), bool(TELEGRAM_CHAT_ID), TELEGRAM_CHAT_ID[:6] + "..." if TELEGRAM_CHAT_ID else "")
-    await send_startup_message()
-    scanner_task = asyncio.create_task(scanner_loop())
-    monitor_task = asyncio.create_task(monitor_loop())
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    for task in (scanner_task, monitor_task):
-        if task:
-            task.cancel()
+def add_active_signal(s: Dict[str, Any]) -> None:
+    STATE.setdefault("active_signals", []).append(s)
+    STATE.setdefault("pair_cooldown", {})[s["symbol"]] = now_ts() + PAIR_COOLDOWN_SECONDS
+    STATE.setdefault("strategy_cooldown", {})[s["strategy"]] = now_ts() + STRATEGY_COOLDOWN_SECONDS
     save_state()
 
 
+def run_scan(manual: bool = False) -> Dict[str, Any]:
+    start = time.time()
+    blocks: Dict[str, int] = {}
+    near_miss: List[str] = []
+    btc = btc_context()
+    symbols = get_symbols()
+    selected, hot_notes = select_hot_symbols(symbols)
+
+    scan = {
+        "checked": 0,
+        "universe": len(symbols),
+        "candidates": 0,
+        "sent": 0,
+        "blocks": blocks,
+        "near_miss": near_miss,
+        "hot_notes": hot_notes,
+        "btc": btc.get("text", "BTC unknown"),
+        "elapsed": 0,
+    }
+
+    if not btc.get("ok"):
+        blocks["btc_data_problem"] = 1
+        STATE["last_scan"] = scan
+        save_state()
+        return scan
+
+    # Before scanning, refresh old active signals so expired/TP/SL positions do not block the market scan.
+    try:
+        track_active_signals()
+    except Exception as e:
+        STATE["last_error"] = f"pre-scan track_active_signals: {repr(e)}"
+        save_state()
+
+    found: List[Dict[str, Any]] = []
+    for sym in selected:
+        try:
+            s = analyze_symbol(sym, btc, blocks, near_miss)
+            scan["checked"] += 1
+            if s:
+                found.append(s)
+        except Exception as e:
+            blocks["analyze_exception"] = blocks.get("analyze_exception", 0) + 1
+            STATE["last_error"] = f"analyze {sym}: {repr(e)}"
+
+    found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
+    scan["candidates"] = len(found)
+
+    sent = 0
+    free_slots = max(0, MAX_ACTIVE_SIGNALS - len(STATE.get("active_signals", [])))
+    send_limit = min(MAX_SIGNALS_PER_SCAN, free_slots)
+    if send_limit <= 0 and found:
+        blocks["active_slots_full_send_block"] = blocks.get("active_slots_full_send_block", 0) + 1
+        if len(near_miss) < 8:
+            near_miss.append(f"found {len(found)} candidate(s), but active slots are full")
+    for s in found[:send_limit]:
+        add_active_signal(s)
+        send_telegram(build_signal_message(s))
+        sent += 1
+
+    scan["sent"] = sent
+    scan["elapsed"] = time.time() - start
+    STATE["last_scan"] = scan
+    save_state()
+
+    if manual or (sent == 0 and now_ts() - STATE.get("last_diag_ts", 0) >= DIAG_SECONDS):
+        send_telegram(build_diagnostic(scan))
+        STATE["last_diag_ts"] = now_ts()
+        save_state()
+
+    return scan
+
+
+def current_price(symbol: str) -> Optional[float]:
+    c = get_klines(symbol, "1m", 80, cache_seconds=4)
+    return c[-1]["close"] if c else None
+
+
+def target_hit(side: str, price: float, target: float) -> bool:
+    return price >= target if side == "LONG" else price <= target
+
+
+def sl_hit(side: str, price: float, sl: float) -> bool:
+    return price <= sl if side == "LONG" else price >= sl
+
+
+def directional_progress_ratio(s: Dict[str, Any], p: float) -> Tuple[bool, float]:
+    entry = s["entry"]
+    tp1 = s["tp1"]
+    full = abs(tp1 - entry)
+    if full <= 0:
+        return False, 0.0
+    if s["side"] == "LONG":
+        directional = p > entry
+        progress = max(0.0, p - entry) / full
+    else:
+        directional = p < entry
+        progress = max(0.0, entry - p) / full
+    return directional, progress
+
+
+def track_active_signals() -> None:
+    active = STATE.setdefault("active_signals", [])
+    if not active:
+        return
+
+    remaining = []
+    changed = False
+
+    for s in active:
+        p = current_price(s["symbol"])
+        if p is None:
+            remaining.append(s)
+            continue
+
+        side = s["side"]
+        age_minutes = (now_ts() - int(s.get("created_at", now_ts()))) / 60.0
+
+        if sl_hit(side, p, s["sl"]):
+            apply_result(s, "sl")
+            send_telegram(
+                f"❌ Stop Loss\n"
+                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\n"
+                f"Вход: {format_price(s['entry'])}\n"
+                f"SL: {format_price(s['sl'])}\n"
+                f"Текущая цена: {format_price(p)}\n\n"
+                f"{build_stats_text()}"
+            )
+            changed = True
+            continue
+
+        if FAST_CANCEL_IF_NO_PROGRESS and not s.get("tp1_hit") and age_minutes >= FAST_MAX_MINUTES_TO_TP1:
+            directional, progress = directional_progress_ratio(s, p)
+            if (not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP:
+                apply_result(s, "expired")
+                send_telegram(
+                    f"⏱ FAST TRADE EXPIRED\n"
+                    f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                    f"Стратегия: {s['strategy']}\n"
+                    f"Цена не реализовалась за {FAST_MAX_MINUTES_TO_TP1} минут.\n"
+                    f"Вход: {format_price(s['entry'])}\n"
+                    f"Текущая цена: {format_price(p)}\n"
+                    f"TP1: {format_price(s['tp1'])}\n"
+                    f"Прогресс к TP1: {progress*100:.1f}%\n\n"
+                    f"{build_stats_text()}"
+                )
+                changed = True
+                continue
+
+        if age_minutes >= FAST_HARD_EXPIRE_MINUTES and not s.get("tp1_hit"):
+            apply_result(s, "expired")
+            send_telegram(
+                f"⏱ HARD EXPIRE\n"
+                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\n"
+                f"TP1 не достигнут за {FAST_HARD_EXPIRE_MINUTES} минут.\n"
+                f"Текущая цена: {format_price(p)}\n\n"
+                f"{build_stats_text()}"
+            )
+            changed = True
+            continue
+
+        hit_any = False
+        for key in ["tp1", "tp2", "tp3", "tp4"]:
+            if s.get(key) and not s.get(f"{key}_hit") and target_hit(side, p, s[key]):
+                s[f"{key}_hit"] = True
+                hit_any = True
+                send_telegram(
+                    f"🎯 {key.upper()} HIT\n"
+                    f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                    f"Стратегия: {s['strategy']}\n"
+                    f"{key.upper()}: {format_price(s[key])}\n"
+                    f"Текущая цена: {format_price(p)}"
+                )
+
+        if s.get("tp5") and target_hit(side, p, s["tp5"]):
+            s["tp5_hit"] = True
+            apply_result(s, "profit")
+            send_telegram(
+                f"✅ FULL LADDER TAKE PROFIT\n"
+                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\n"
+                f"TP5 достигнут: {format_price(p)}\n"
+                f"Время в сделке: {age_minutes:.1f} мин\n\n"
+                f"{build_stats_text()}"
+            )
+            changed = True
+            continue
+
+        if hit_any:
+            changed = True
+
+        remaining.append(s)
+
+    if changed:
+        STATE["active_signals"] = remaining
+        save_state()
+
+# ============================================================
+# Background tasks / HTTP endpoints
+# ============================================================
+
+async def scan_loop():
+    await asyncio.sleep(3)
+    send_telegram(
+        f"✅ {APP_NAME} активирован.\n"
+        f"Deploy marker: {DEPLOY_MARKER}\n\n"
+        f"Mode: MARKET DUMP + AERO STYLE + LOCAL STOP SCALPER.\n"
+        f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
+        f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
+        f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
+        f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}."
+    )
+    try:
+        scan = run_scan(manual=True)
+        send_telegram(build_diagnostic(scan))
+    except Exception as e:
+        STATE["last_error"] = f"first scan exception: {repr(e)}"
+        save_state()
+        send_telegram(f"⚠️ Ошибка первого скана: {repr(e)}")
+
+    while True:
+        try:
+            if AUTO_SCAN_ENABLED:
+                run_scan(manual=False)
+        except Exception as e:
+            STATE["last_error"] = f"scan_loop: {repr(e)}"
+            save_state()
+            send_telegram(f"⚠️ Ошибка auto-scan: {repr(e)}")
+        await asyncio.sleep(AUTO_SCAN_SECONDS)
+
+
+async def track_loop():
+    await asyncio.sleep(8)
+    while True:
+        try:
+            if AUTO_TRACK_ENABLED:
+                track_active_signals()
+        except Exception as e:
+            STATE["last_error"] = f"track_loop: {repr(e)}"
+            save_state()
+        await asyncio.sleep(AUTO_TRACK_SECONDS)
+
+
+@app.on_event("startup")
+async def startup_event():
+    global STATE
+    STATE = load_state()
+    asyncio.create_task(scan_loop())
+    asyncio.create_task(track_loop())
+
+
 @app.get("/")
-async def root() -> JSONResponse:
-    return JSONResponse({
-        "ok": True,
-        "app": APP_NAME,
-        "no_ccxt": True,
-        "strict_confirmation": STRICT_CONFIRMATION,
-        "pending_candidates": len(pending_candidates),
-        "uptime_sec": round(time.time() - started_at, 1),
-        "active_trades": len(state.active_trades),
-        "stats": asdict(state.stats),
-        "last_scan": last_scan_info,
-    })
+def root():
+    return HTMLResponse(
+        f"<h3>{APP_NAME}</h3>"
+        f"<p>{DEPLOY_MARKER}</p>"
+        f"<p>Use /health /version /scan /auto-status /stats /test-telegram</p>"
+    )
 
 
 @app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse({"ok": True, "status": "running", "no_ccxt": True})
+def health():
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "deploy": DEPLOY_MARKER,
+        "active": len(STATE.get("active_signals", [])),
+        "last_error": STATE.get("last_error", ""),
+    }
+
+
+@app.get("/version")
+def version():
+    return {"app": APP_NAME, "deploy_marker": DEPLOY_MARKER}
+
+
+@app.get("/auto-status")
+def auto_status():
+    return JSONResponse({
+        "app": APP_NAME,
+        "deploy": DEPLOY_MARKER,
+        "active_signals": STATE.get("active_signals", []),
+        "last_scan": STATE.get("last_scan", {}),
+        "last_error": STATE.get("last_error", ""),
+        "stats": STATE.get("stats", {}),
+    })
+
+
+@app.get("/scan")
+def manual_scan(send: bool = Query(True)):
+    scan = run_scan(manual=True)
+    if send:
+        send_telegram(build_diagnostic(scan))
+    return JSONResponse(scan)
 
 
 @app.get("/stats")
-async def stats_route() -> PlainTextResponse:
-    async with state_lock:
-        return PlainTextResponse(format_stats())
+def stats():
+    return HTMLResponse("<pre>" + build_stats_text() + "</pre>")
 
 
-@app.get("/stats/send")
-async def stats_send_route() -> JSONResponse:
-    async with state_lock:
-        msg = format_stats()
-    mid = await send_telegram(msg)
-    return JSONResponse({"ok": bool(mid), "message_id": mid})
-
-
-@app.get("/telegram/test")
-async def telegram_test() -> JSONResponse:
-    get_me = await telegram_get_me()
-    mid = await send_telegram(
-        "✅ <b>Тест Telegram успешный</b>\n"
-        "Бот подключен к каналу/чату.\n"
-        "Версия: <b>точные отскоки/отбои без ccxt</b>."
-    )
-    return JSONResponse({"ok": bool(mid), "message_id": mid, "getMe": get_me})
-
-
-@app.get("/debug")
-async def debug_route() -> JSONResponse:
-    return JSONResponse({
-        "ok": True,
-        "token_present": bool(TELEGRAM_BOT_TOKEN),
-        "chat_id_present": bool(TELEGRAM_CHAT_ID),
-        "chat_id_preview": TELEGRAM_CHAT_ID[:8] + "..." if TELEGRAM_CHAT_ID else "",
-        "scan_interval": SCAN_INTERVAL_SECONDS,
-        "min_score": MIN_SCORE,
-        "fallback_score": FALLBACK_SCORE,
-        "leverage": LEVERAGE,
-        "last_scan": last_scan_info,
-        "pending_candidates": pending_candidates,
-        "strict_confirmation": STRICT_CONFIRMATION,
-        "confirmation_scans": CONFIRMATION_SCANS,
-        "state": state_to_json(),
-    })
-
-
-@app.get("/scan/once")
-async def scan_once_route() -> JSONResponse:
-    """Manual debug scan. Useful only if Render service URL is available."""
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0 BingXSignalBot/1.0"}) as session:
-        symbols = await get_top_symbols(session)
-        semaphore = asyncio.Semaphore(8)
-        tasks = [scan_one_symbol(session, sym, semaphore) for sym in symbols[:30]]
-        raw_candidates = await asyncio.gather(*tasks)
-        candidates = [c for c in raw_candidates if c is not None]
-        candidates.sort(key=lambda x: x.score, reverse=True)
-    return JSONResponse({
-        "checked": min(30, len(symbols)),
-        "candidates": [asdict(c) for c in candidates[:10]],
-    })
+@app.get("/test-telegram")
+def test_telegram():
+    ok = send_telegram(f"✅ Test Telegram OK\n{APP_NAME}\n{DEPLOY_MARKER}")
+    return {"sent": ok, "last_error": STATE.get("last_error", "")}
 
 
 if __name__ == "__main__":
-    # Local run fallback. Render should use uvicorn bot:app --host 0.0.0.0 --port 1000
     import uvicorn
-    uvicorn.run("bot:app", host="0.0.0.0", port=int(os.getenv("PORT", "1000")))
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
