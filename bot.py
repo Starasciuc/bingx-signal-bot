@@ -29,6 +29,9 @@ What it does:
 - Uses chronological train, calibration, and independent newest-test blocks.
 - Promotes a challenger only if it beats both the baseline and current champion.
 - Learns a probability threshold that maximizes an expectancy-style objective.
+- Sends a Telegram report for every scheduled training attempt, including failures.
+- Audits each promoted model on later closed decisions and compares before/after.
+- Automatically rolls back a promoted model only after a guarded live-data failure.
 - Never changes leverage, stop-loss safety limits, API permissions, or source code.
 
 This module does NOT guarantee profit and must be used in paper/shadow mode first.
@@ -68,6 +71,24 @@ MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
 # passed the independent holdout checks below. Set true to observe forever.
 SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "false").lower() == "true"
 ROUND_TRIP_COST_MOVE = float(os.getenv("ROUND_TRIP_COST_MOVE", "0.0012"))
+
+# Post-promotion audit. A "decision" is either a live signal accepted by the
+# active model or a model-blocked candidate that is followed in shadow. Accepted
+# candidates that were not sent only because all live slots were occupied are
+# excluded, so they cannot distort the live comparison.
+LIVE_AUDIT_ENABLED = os.getenv("ADAPTIVE_LIVE_AUDIT_ENABLED", "true").lower() == "true"
+LIVE_AUDIT_EVERY = int(os.getenv("ADAPTIVE_LIVE_AUDIT_EVERY", "25"))
+LIVE_AUDIT_BASELINE_WINDOW = int(os.getenv("ADAPTIVE_LIVE_AUDIT_BASELINE_WINDOW", "50"))
+LIVE_AUDIT_MIN_LIVE = int(os.getenv("ADAPTIVE_LIVE_AUDIT_MIN_LIVE", "10"))
+LIVE_AUDIT_MIN_BASELINE = int(os.getenv("ADAPTIVE_LIVE_AUDIT_MIN_BASELINE", "15"))
+AUTO_ROLLBACK_ENABLED = os.getenv("ADAPTIVE_AUTO_ROLLBACK", "true").lower() == "true"
+ROLLBACK_EXPECTANCY_DROP_R = float(os.getenv("ADAPTIVE_ROLLBACK_EXPECTANCY_DROP_R", "0.15"))
+ROLLBACK_SUCCESS_DROP = float(os.getenv("ADAPTIVE_ROLLBACK_SUCCESS_DROP", "0.08"))
+ROLLBACK_SEVERE_EXPECTANCY_R = float(os.getenv("ADAPTIVE_ROLLBACK_SEVERE_EXPECTANCY_R", "-0.20"))
+ROLLBACK_MIN_BLOCKED = int(os.getenv("ADAPTIVE_ROLLBACK_MIN_BLOCKED", "10"))
+ROLLBACK_HARMFUL_BLOCK_WIN_RATE = float(
+    os.getenv("ADAPTIVE_ROLLBACK_HARMFUL_BLOCK_WIN_RATE", "0.45")
+)
 
 # Never let learning touch these safety-critical settings.
 LOCKED_SAFETY_KEYS = {
@@ -128,6 +149,11 @@ class ModelState:
     validation_baseline_expectancy_r: float = 0.0
     last_candidate_reason: str = "warmup"
     created_at: int = 0
+    parent_version: int = 0
+    activation_trade_id: int = 0
+    activation_closed_count: int = 0
+    last_live_audit_decision_count: int = 0
+    last_live_audit_at: int = 0
 
     def __post_init__(self) -> None:
         if self.weights is None:
@@ -193,6 +219,14 @@ def init_adaptive_db() -> None:
                 message TEXT NOT NULL,
                 payload_json TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS adaptive_model_versions (
+                version INTEGER PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                saved_at INTEGER NOT NULL,
+                note TEXT NOT NULL DEFAULT ''
+            );
             """
         )
 
@@ -213,6 +247,11 @@ def init_adaptive_db() -> None:
             if column not in existing_columns:
                 conn.execute(statement)
 
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_adaptive_trades_model_decision "
+            "ON adaptive_trades(model_version, source, shadow_accepted, id)"
+        )
+
         row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
         if row is None:
             state = ModelState(created_at=int(time.time()))
@@ -220,6 +259,45 @@ def init_adaptive_db() -> None:
                 "INSERT INTO adaptive_model_state(id, state_json) VALUES(1, ?)",
                 (json.dumps(asdict(state), ensure_ascii=False),),
             )
+        else:
+            try:
+                raw = json.loads(row["state_json"])
+                allowed = {field.name for field in fields(ModelState)}
+                state = ModelState(**{key: value for key, value in raw.items() if key in allowed})
+            except Exception:
+                state = ModelState(created_at=int(time.time()))
+                conn.execute(
+                    "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
+                    (json.dumps(asdict(state), ensure_ascii=False),),
+                )
+
+        # When upgrading an already-active V16.1 model, begin its live audit
+        # after the upgrade instead of incorrectly treating old rows as live
+        # post-promotion evidence.
+        if state.active and state.activation_trade_id <= 0:
+            latest = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS n FROM adaptive_trades"
+            ).fetchone()
+            state.activation_trade_id = int(latest["max_id"] or 0)
+            state.activation_closed_count = int(latest["n"] or 0)
+            state.last_live_audit_decision_count = 0
+            conn.execute(
+                "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
+                (json.dumps(asdict(state), ensure_ascii=False),),
+            )
+
+        initial_status = "active" if state.active else ("baseline" if state.version == 0 else "inactive")
+        conn.execute(
+            "INSERT OR IGNORE INTO adaptive_model_versions"
+            "(version, state_json, status, saved_at, note) VALUES(?,?,?,?,?)",
+            (
+                int(state.version),
+                json.dumps(asdict(state), ensure_ascii=False),
+                initial_status,
+                int(time.time()),
+                "database_initialized",
+            ),
+        )
         conn.commit()
 
 
@@ -326,6 +404,66 @@ def _save_model_state(state: ModelState) -> None:
             (json.dumps(asdict(state), ensure_ascii=False),),
         )
         conn.commit()
+
+
+def _model_state_from_json(raw_json: str) -> Optional[ModelState]:
+    try:
+        raw = json.loads(raw_json)
+        allowed = {field.name for field in fields(ModelState)}
+        state = ModelState(**{key: value for key, value in raw.items() if key in allowed})
+        if (
+            len(state.weights) != len(FEATURE_NAMES) + 1
+            or len(state.mean) != len(FEATURE_NAMES)
+            or len(state.std) != len(FEATURE_NAMES)
+        ):
+            return None
+        return state
+    except Exception:
+        return None
+
+
+def _save_model_snapshot(state: ModelState, status: str, note: str = "") -> None:
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            "INSERT INTO adaptive_model_versions"
+            "(version, state_json, status, saved_at, note) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(version) DO UPDATE SET "
+            "state_json=excluded.state_json, status=excluded.status, "
+            "saved_at=excluded.saved_at, note=excluded.note",
+            (
+                int(state.version),
+                json.dumps(asdict(state), ensure_ascii=False),
+                str(status),
+                int(time.time()),
+                str(note),
+            ),
+        )
+        conn.commit()
+
+
+def _load_model_snapshot(version: int) -> Optional[ModelState]:
+    with _LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT state_json FROM adaptive_model_versions WHERE version=?",
+            (int(version),),
+        ).fetchone()
+    return _model_state_from_json(row["state_json"]) if row else None
+
+
+def _next_model_version() -> int:
+    with _LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS max_version FROM adaptive_model_versions"
+        ).fetchone()
+    return int(row["max_version"] or 0) + 1
+
+
+def _latest_trade_marker() -> Tuple[int, int]:
+    with _LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS n FROM adaptive_trades"
+        ).fetchone()
+    return int(row["max_id"] or 0), int(row["n"] or 0)
 
 
 def _event(event_type: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
@@ -472,8 +610,24 @@ def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[st
     if cursor.rowcount == 0:
         return {"trained": False, "reason": "duplicate_signal", "inserted": False}
 
-    report = maybe_retrain()
-    return {"inserted": True, **report}
+    # Audit the currently active champion before a scheduled retraining can
+    # replace it on the same milestone outcome.
+    live_audit = maybe_live_audit()
+    if live_audit and live_audit.get("action") == "rollback":
+        training_report = {
+            "attempted": False,
+            "trained": False,
+            "reason": "rollback_cooldown",
+            "closed_count": adaptive_closed_count(),
+        }
+    else:
+        training_report = maybe_retrain()
+    return {
+        "inserted": True,
+        "live_audit": live_audit,
+        "training_report": training_report,
+        **training_report,
+    }
 
 
 def _sigmoid(z: float) -> float:
@@ -634,6 +788,205 @@ def _selection_metrics(
     }
 
 
+def _outcome_metrics(rows: Sequence[Any]) -> Dict[str, Any]:
+    profit = 0
+    sl = 0
+    expired = 0
+    pnl_values: List[float] = []
+    for row in rows:
+        result = str(row["result"] or "")
+        if result == "profit":
+            profit += 1
+        elif result == "sl":
+            sl += 1
+        else:
+            expired += 1
+        pnl_values.append(float(row["pnl_r"] or 0.0))
+
+    total = len(rows)
+    resolved = profit + sl
+    return {
+        "n": total,
+        "profit": profit,
+        "sl": sl,
+        "expired": expired,
+        "success_rate": profit / total if total else 0.0,
+        "resolved_wr": profit / resolved if resolved else 0.0,
+        "expectancy_r": sum(pnl_values) / total if total else 0.0,
+    }
+
+
+def _metrics_line(metrics: Dict[str, Any]) -> str:
+    return (
+        f"{int(metrics.get('profit', 0))} TP3+ / "
+        f"{int(metrics.get('sl', 0))} SL / "
+        f"{int(metrics.get('expired', 0))} expired · "
+        f"успех всех {float(metrics.get('success_rate', 0))*100:.1f}% · "
+        f"{float(metrics.get('expectancy_r', 0)):+.3f}R"
+    )
+
+
+def _collect_live_audit_metrics(state: ModelState) -> Dict[str, Any]:
+    baseline_limit = max(1, LIVE_AUDIT_BASELINE_WINDOW)
+    with _LOCK, _connect() as conn:
+        baseline_rows = conn.execute(
+            """
+            SELECT id, result, label, pnl_r, source, shadow_accepted
+            FROM adaptive_trades
+            WHERE source='live' AND id <= ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(state.activation_trade_id), baseline_limit),
+        ).fetchall()
+        decision_rows = conn.execute(
+            """
+            SELECT id, result, label, pnl_r, source, shadow_accepted
+            FROM adaptive_trades
+            WHERE id > ? AND model_version = ?
+              AND (
+                    source='live'
+                    OR (source='shadow' AND shadow_accepted=0)
+                  )
+            ORDER BY id ASC
+            """,
+            (int(state.activation_trade_id), int(state.version)),
+        ).fetchall()
+
+    live_rows = [row for row in decision_rows if str(row["source"]) == "live"]
+    blocked_rows = [
+        row
+        for row in decision_rows
+        if str(row["source"]) == "shadow" and int(row["shadow_accepted"] or 0) == 0
+    ]
+    return {
+        "model_version": int(state.version),
+        "decision_count": len(decision_rows),
+        "baseline": _outcome_metrics(baseline_rows),
+        "live": _outcome_metrics(live_rows),
+        "blocked": _outcome_metrics(blocked_rows),
+    }
+
+
+def _rollback_to_parent(state: ModelState, closed_count: int, reason: str) -> Dict[str, Any]:
+    failed_version = int(state.version)
+    parent_version = int(state.parent_version or 0)
+    latest_id, latest_count = _latest_trade_marker()
+
+    state.last_live_audit_at = int(time.time())
+    _save_model_snapshot(state, "rolled_back", reason)
+
+    restored = _load_model_snapshot(parent_version)
+    if restored is None:
+        parent_version = 0
+        restored = ModelState(version=0, active=False, created_at=int(time.time()))
+
+    restored.active = bool(parent_version > 0)
+    restored.activation_trade_id = latest_id
+    restored.activation_closed_count = latest_count
+    restored.last_live_audit_decision_count = 0
+    restored.last_live_audit_at = int(time.time())
+    restored.last_attempted_closed_count = max(
+        int(restored.last_attempted_closed_count or 0), int(closed_count)
+    )
+    restored.last_candidate_reason = f"restored_after_v{failed_version}"
+    _save_model_state(restored)
+    _save_model_snapshot(
+        restored,
+        "active" if restored.active else "baseline",
+        f"restored_after_v{failed_version}",
+    )
+    return {
+        "from_version": failed_version,
+        "to_version": int(restored.version),
+        "to_active": bool(restored.active),
+    }
+
+
+def maybe_live_audit(force: bool = False) -> Optional[Dict[str, Any]]:
+    if not LIVE_AUDIT_ENABLED or SHADOW_ONLY:
+        return None
+    state = get_model_state()
+    if not state.active or state.version <= 0 or state.activation_trade_id < 0:
+        return None
+
+    metrics = _collect_live_audit_metrics(state)
+    decision_count = int(metrics["decision_count"])
+    audit_every = max(1, LIVE_AUDIT_EVERY)
+    if not force and decision_count - int(state.last_live_audit_decision_count or 0) < audit_every:
+        return None
+
+    baseline = metrics["baseline"]
+    live = metrics["live"]
+    blocked = metrics["blocked"]
+    enough_baseline = int(baseline["n"]) >= max(1, LIVE_AUDIT_MIN_BASELINE)
+    enough_live = int(live["n"]) >= max(1, LIVE_AUDIT_MIN_LIVE)
+
+    expectancy_drop = float(baseline["expectancy_r"]) - float(live["expectancy_r"])
+    success_drop = float(baseline["success_rate"]) - float(live["success_rate"])
+    material_underperformance = (
+        enough_baseline
+        and enough_live
+        and expectancy_drop >= ROLLBACK_EXPECTANCY_DROP_R
+        and success_drop >= ROLLBACK_SUCCESS_DROP
+    )
+    severe_negative = (
+        enough_baseline
+        and enough_live
+        and float(live["expectancy_r"]) <= ROLLBACK_SEVERE_EXPECTANCY_R
+        and float(baseline["expectancy_r"]) >= 0.0
+    )
+    harmful_blocking = (
+        enough_baseline
+        and enough_live
+        and int(blocked["n"]) >= max(1, ROLLBACK_MIN_BLOCKED)
+        and float(blocked["success_rate"]) >= ROLLBACK_HARMFUL_BLOCK_WIN_RATE
+        and float(blocked["success_rate"]) >= float(live["success_rate"]) + 0.10
+        and float(blocked["expectancy_r"]) > 0.0
+    )
+
+    if not enough_baseline or not enough_live:
+        action = "collect_more"
+        reason = "not_enough_live_comparison_rows"
+    elif AUTO_ROLLBACK_ENABLED and (material_underperformance or severe_negative or harmful_blocking):
+        action = "rollback"
+        if severe_negative:
+            reason = "severe_negative_live_expectancy"
+        elif harmful_blocking:
+            reason = "too_many_profitable_signals_blocked"
+        else:
+            reason = "live_model_worse_than_baseline"
+    else:
+        action = "keep"
+        reason = "live_model_guard_passed"
+
+    state.last_live_audit_decision_count = decision_count
+    state.last_live_audit_at = int(time.time())
+    rollback: Optional[Dict[str, Any]] = None
+    if action == "rollback":
+        rollback = _rollback_to_parent(state, adaptive_closed_count(), reason)
+    else:
+        _save_model_state(state)
+        _save_model_snapshot(state, "active", f"live_audit:{reason}")
+
+    payload: Dict[str, Any] = {
+        **metrics,
+        "action": action,
+        "reason": reason,
+        "enough_baseline": enough_baseline,
+        "enough_live": enough_live,
+        "expectancy_drop_r": expectancy_drop,
+        "success_drop": success_drop,
+        "rollback": rollback,
+    }
+    _event(
+        "live_model_audit",
+        "Adaptive model rolled back" if action == "rollback" else "Adaptive live audit completed",
+        payload,
+    )
+    return payload
+
+
 def _predict_state_on_raw(state: ModelState, rows: Sequence[Sequence[float]]) -> List[float]:
     if (
         not state.active
@@ -646,6 +999,39 @@ def _predict_state_on_raw(state: ModelState, rows: Sequence[Sequence[float]]) ->
     return _predict_matrix(state.weights, normalized)
 
 
+def _training_attempt_failed(
+    state: ModelState,
+    reason: str,
+    closed_count: int,
+    rows: Sequence[Any],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    state.last_attempted_closed_count = int(closed_count)
+    state.last_candidate_reason = str(reason)
+    _save_model_state(state)
+    _save_model_snapshot(
+        state,
+        "active" if state.active else ("baseline" if state.version == 0 else "inactive"),
+        f"training_attempt:{reason}",
+    )
+    payload: Dict[str, Any] = {
+        "attempted": True,
+        "trained": False,
+        "promoted": False,
+        "reason": reason,
+        "candidate_reason": reason,
+        "closed_count": int(closed_count),
+        "next_at": int(closed_count) + max(1, RETRAIN_EVERY),
+        "active": bool(state.active),
+        "version": int(state.version),
+        "training_data": _outcome_metrics(rows),
+    }
+    if extra:
+        payload.update(extra)
+    _event("model_training_attempt", "Adaptive training attempt postponed", payload)
+    return payload
+
+
 def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     init_adaptive_db()
     state = get_model_state()
@@ -653,7 +1039,8 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     with _LOCK, _connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, label, pnl_r, features_json
+            SELECT id, result, label, pnl_r, features_json,
+                   source, model_version, shadow_accepted
             FROM adaptive_trades
             ORDER BY closed_at ASC, id ASC
             """
@@ -662,15 +1049,18 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     closed_count = len(rows)
     if closed_count < MIN_TRAIN_TRADES:
         return {
+            "attempted": bool(force),
             "trained": False,
             "reason": "warmup",
             "closed_count": closed_count,
             "needed": MIN_TRAIN_TRADES,
+            "training_data": _outcome_metrics(rows),
         }
 
     last_attempt = max(state.last_attempted_closed_count, state.last_trained_closed_count)
     if not force and last_attempt > 0 and closed_count - last_attempt < RETRAIN_EVERY:
         return {
+            "attempted": False,
             "trained": False,
             "reason": "waiting_for_more_trades",
             "closed_count": closed_count,
@@ -685,15 +1075,13 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     positives = sum(labels)
     negatives = len(labels) - positives
     if positives < MIN_POSITIVE_ROWS or negatives < MIN_NEGATIVE_ROWS:
-        state.last_attempted_closed_count = closed_count
-        state.last_candidate_reason = "class_imbalance"
-        _save_model_state(state)
-        return {
-            "trained": False,
-            "reason": "class_imbalance",
-            "positives": positives,
-            "negatives": negatives,
-        }
+        return _training_attempt_failed(
+            state,
+            "class_imbalance",
+            closed_count,
+            rows,
+            {"positives": positives, "negatives": negatives},
+        )
 
     # Three chronological blocks prevent threshold selection from contaminating
     # the final promotion test: train -> calibration -> independent newest test.
@@ -706,10 +1094,17 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     train_size = len(rows) - calibration_size - test_size
 
     if train_size < 25 or calibration_size < 10 or test_size < 10:
-        state.last_attempted_closed_count = closed_count
-        state.last_candidate_reason = "split_too_small"
-        _save_model_state(state)
-        return {"trained": False, "reason": "split_too_small", "closed_count": closed_count}
+        return _training_attempt_failed(
+            state,
+            "split_too_small",
+            closed_count,
+            rows,
+            {
+                "train_rows": train_size,
+                "calibration_rows": calibration_size,
+                "validation_rows": test_size,
+            },
+        )
 
     train_end = train_size
     calibration_end = train_size + calibration_size
@@ -723,10 +1118,16 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     pnl_test = pnl_r[calibration_end:]
 
     if sum(y_train) < 4 or (len(y_train) - sum(y_train)) < 4:
-        state.last_attempted_closed_count = closed_count
-        state.last_candidate_reason = "train_split_too_small"
-        _save_model_state(state)
-        return {"trained": False, "reason": "train_split_too_small"}
+        return _training_attempt_failed(
+            state,
+            "train_split_too_small",
+            closed_count,
+            rows,
+            {
+                "train_positives": int(sum(y_train)),
+                "train_negatives": int(len(y_train) - sum(y_train)),
+            },
+        )
 
     mean, std = _mean_std(x_train_raw)
     x_train = _normalize(x_train_raw, mean, std)
@@ -745,6 +1146,14 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
 
     threshold, calibration_metrics = _choose_threshold(y_cal, cal_prob, pnl_cal)
     test_metrics = _selection_metrics(y_test, test_prob, pnl_test, threshold)
+    test_rows = rows[calibration_end:]
+    selected_test_indices = [
+        i for i, probability in enumerate(test_prob) if probability >= threshold
+    ]
+    test_baseline_outcomes = _outcome_metrics(test_rows)
+    test_candidate_outcomes = _outcome_metrics(
+        [test_rows[i] for i in selected_test_indices]
+    )
 
     enough_test_classes = min(sum(y_test), len(y_test) - sum(y_test)) >= 3
     passes_absolute_gate = (
@@ -775,7 +1184,15 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         or test_metrics["expectancy_r"]
         >= champion_expectancy + MIN_EXPECTANCY_IMPROVEMENT_R
     )
-    promote = bool(passes_absolute_gate and beats_champion)
+    champion_live_audit_ready = True
+    champion_decision_count = 0
+    if state.active and LIVE_AUDIT_ENABLED and not SHADOW_ONLY:
+        champion_live_metrics = _collect_live_audit_metrics(state)
+        champion_decision_count = int(champion_live_metrics["decision_count"])
+        champion_live_audit_ready = champion_decision_count >= max(1, LIVE_AUDIT_EVERY)
+    promote = bool(
+        passes_absolute_gate and beats_champion and champion_live_audit_ready
+    )
 
     if not enough_test_classes:
         candidate_reason = "independent_test_class_imbalance"
@@ -791,12 +1208,21 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         candidate_reason = "expectancy_not_better_than_baseline"
     elif not beats_champion:
         candidate_reason = "champion_kept"
+    elif not champion_live_audit_ready:
+        candidate_reason = "champion_live_audit_pending"
     else:
         candidate_reason = "promoted"
 
     if promote:
+        parent_version = int(state.version) if state.active else 0
+        _save_model_snapshot(
+            state,
+            "archived" if state.active else "baseline",
+            "replaced_by_new_champion",
+        )
+        activation_trade_id = int(rows[-1]["id"]) if rows else 0
         new_state = ModelState(
-            version=state.version + 1,
+            version=_next_model_version(),
             active=True,
             threshold=threshold,
             trained_rows=len(rows),
@@ -816,6 +1242,11 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
             validation_baseline_expectancy_r=test_metrics["baseline_expectancy_r"],
             last_candidate_reason=candidate_reason,
             created_at=int(time.time()),
+            parent_version=parent_version,
+            activation_trade_id=activation_trade_id,
+            activation_closed_count=closed_count,
+            last_live_audit_decision_count=0,
+            last_live_audit_at=0,
         )
     elif state.active:
         # A weaker challenger must never deactivate or overwrite the champion.
@@ -847,8 +1278,15 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
             created_at=int(time.time()),
         )
     _save_model_state(new_state)
+    _save_model_snapshot(
+        new_state,
+        "active" if new_state.active else ("baseline" if new_state.version == 0 else "inactive"),
+        f"training_result:{candidate_reason}",
+    )
 
     payload = {
+        "attempted": True,
+        "trained": True,
         "version": new_state.version,
         "active": new_state.active,
         "promoted": promote,
@@ -869,6 +1307,12 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         "baseline_expectancy_r": round(test_metrics["baseline_expectancy_r"], 4),
         "champion_expectancy_r": round(champion_expectancy, 4),
         "champion_selected_count": champion_count,
+        "champion_live_audit_ready": champion_live_audit_ready,
+        "champion_decision_count": champion_decision_count,
+        "training_data": _outcome_metrics(rows),
+        "test_baseline": test_baseline_outcomes,
+        "test_candidate": test_candidate_outcomes,
+        "next_at": closed_count + max(1, RETRAIN_EVERY),
         "shadow_only": SHADOW_ONLY,
     }
     _event(
@@ -877,6 +1321,138 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         payload,
     )
     return {"trained": True, **payload}
+
+
+ADAPTIVE_REASON_RU: Dict[str, str] = {
+    "warmup": "ещё не накоплено 50 результатов",
+    "class_imbalance": "слишком мало положительных или отрицательных примеров",
+    "split_too_small": "недостаточно данных для трёх независимых частей проверки",
+    "train_split_too_small": "в обучающей части недостаточно разных результатов",
+    "independent_test_class_imbalance": "в последней независимой проверке мало разных исходов",
+    "logloss_not_better": "прогноз новой модели не точнее базового",
+    "too_few_selected_test_rows": "новая модель выбрала слишком мало проверочных сигналов",
+    "coverage_too_low": "модель блокирует слишком большую часть сигналов",
+    "negative_test_expectancy": "средний результат новой модели остаётся отрицательным",
+    "expectancy_not_better_than_baseline": "средний результат не лучше базовой стратегии",
+    "champion_kept": "действующая модель лучше нового кандидата",
+    "champion_live_audit_pending": "сначала нужен live-аудит действующей модели",
+    "promoted": "новая модель прошла все проверки",
+    "not_enough_live_comparison_rows": "для честного сравнения до/после пока мало live-сделок",
+    "severe_negative_live_expectancy": "реальный средний результат модели стал сильно отрицательным",
+    "too_many_profitable_signals_blocked": "модель заблокировала слишком много прибыльных сигналов",
+    "live_model_worse_than_baseline": "реальные результаты модели хуже предыдущей версии",
+    "live_model_guard_passed": "live-проверка не выявила ухудшения",
+}
+
+
+def _adaptive_reason_ru(reason: Any) -> str:
+    key = str(reason or "unknown")
+    return ADAPTIVE_REASON_RU.get(key, key)
+
+
+def format_training_attempt_message(report: Dict[str, Any]) -> str:
+    promoted = bool(report.get("promoted"))
+    trained = bool(report.get("trained"))
+    active = bool(report.get("active"))
+    version = int(report.get("version", 0) or 0)
+    closed_count = int(report.get("closed_count", 0) or 0)
+    reason = str(report.get("candidate_reason", report.get("reason", "unknown")))
+    dataset = report.get("training_data") or {}
+
+    if promoted:
+        title = f"✅ НОВАЯ ADAPTIVE-МОДЕЛЬ V{version} ВКЛЮЧЕНА"
+    elif trained:
+        title = "🧠 Анализ завершён — кандидат отклонён"
+    else:
+        title = "🧠 Анализ выполнен — обучение отложено"
+
+    lines = [
+        title,
+        f"Закрытых результатов: {closed_count}",
+        f"Все данные: {_metrics_line(dataset)}",
+        f"Причина: {_adaptive_reason_ru(reason)}",
+    ]
+
+    baseline = report.get("test_baseline")
+    candidate = report.get("test_candidate")
+    if baseline and candidate:
+        lines.extend(
+            [
+                "",
+                f"ДО · независимая проверка: {_metrics_line(baseline)}",
+                f"КАНДИДАТ · выбранные сигналы: {_metrics_line(candidate)}",
+                f"Порог допуска: {float(report.get('threshold', 0)):.3f} · "
+                f"покрытие {float(report.get('coverage', 0))*100:.1f}%",
+            ]
+        )
+
+    if promoted:
+        lines.extend(
+            [
+                "",
+                f"Решение: V{version} теперь фильтрует новые сигналы.",
+                f"Следующий live-отчёт — после {max(1, LIVE_AUDIT_EVERY)} "
+                "закрытых решений этой модели.",
+            ]
+        )
+    elif active:
+        lines.append(f"Решение: действующая V{version} сохранена без изменений.")
+    else:
+        lines.append("Решение: базовая стратегия продолжает работать без adaptive-блокировки.")
+
+    if not trained:
+        lines.append(
+            f"Следующая автоматическая попытка: на {int(report.get('next_at', closed_count + RETRAIN_EVERY))} результатах."
+        )
+    return "\n".join(lines)
+
+
+def format_live_audit_message(report: Dict[str, Any]) -> str:
+    version = int(report.get("model_version", 0) or 0)
+    decisions = int(report.get("decision_count", 0) or 0)
+    baseline = report.get("baseline") or {}
+    live = report.get("live") or {}
+    blocked = report.get("blocked") or {}
+    action = str(report.get("action", "collect_more"))
+    reason = str(report.get("reason", "unknown"))
+    correctly_blocked = int(blocked.get("sl", 0)) + int(blocked.get("expired", 0))
+    missed_winners = int(blocked.get("profit", 0))
+
+    if action == "rollback":
+        title = f"↩️ LIVE-АУДИТ V{version}: АВТООТКАТ"
+    elif action == "keep":
+        title = f"✅ LIVE-АУДИТ V{version}: МОДЕЛЬ ОСТАВЛЕНА"
+    else:
+        title = f"📊 LIVE-АУДИТ V{version}: НУЖНО БОЛЬШЕ ДАННЫХ"
+
+    lines = [
+        title,
+        f"Закрытых решений модели: {decisions}",
+        "",
+        f"ДО · последние {int(baseline.get('n', 0))} live: {_metrics_line(baseline)}",
+        f"ПОСЛЕ · отправленные {int(live.get('n', 0))} live: {_metrics_line(live)}",
+        f"ЗАБЛОКИРОВАНО · {int(blocked.get('n', 0))}: {_metrics_line(blocked)}",
+        f"Правильно заблокировано: {correctly_blocked} · пропущено TP3+: {missed_winners}",
+        "",
+        f"Причина решения: {_adaptive_reason_ru(reason)}",
+    ]
+
+    rollback = report.get("rollback") or {}
+    if action == "rollback":
+        to_version = int(rollback.get("to_version", 0) or 0)
+        if bool(rollback.get("to_active")):
+            lines.append(f"Решение: V{version} отключена, восстановлена V{to_version}.")
+        else:
+            lines.append(f"Решение: V{version} отключена, восстановлена базовая стратегия.")
+    elif action == "keep":
+        lines.append(f"Решение: V{version} продолжает фильтровать сигналы.")
+    else:
+        need_live = max(0, max(1, LIVE_AUDIT_MIN_LIVE) - int(live.get("n", 0)))
+        need_baseline = max(0, max(1, LIVE_AUDIT_MIN_BASELINE) - int(baseline.get("n", 0)))
+        lines.append(
+            f"Решение: пока ничего не менять; нужно ещё live {need_live}, baseline {need_baseline}."
+        )
+    return "\n".join(lines)
 
 
 def adaptive_report() -> str:
@@ -969,6 +1545,23 @@ def adaptive_report() -> str:
         lines.append(f"\nWarm-up: need {MIN_TRAIN_TRADES-total} more closed trades before first training.")
     elif not state.active:
         lines.append("\nModel is not allowed to block signals because validation improvement is not yet strong enough.")
+    elif LIVE_AUDIT_ENABLED and not SHADOW_ONLY:
+        live_preview = _collect_live_audit_metrics(state)
+        pending_decisions = max(
+            0,
+            int(live_preview["decision_count"])
+            - int(state.last_live_audit_decision_count or 0),
+        )
+        lines.extend(
+            [
+                f"\nLive audit V{state.version}: "
+                f"{pending_decisions}/{max(1, LIVE_AUDIT_EVERY)} new decisions toward next report "
+                f"(total {int(live_preview['decision_count'])})",
+                f"Before: {_metrics_line(live_preview['baseline'])}",
+                f"After live: {_metrics_line(live_preview['live'])}",
+                f"Blocked shadow: {_metrics_line(live_preview['blocked'])}",
+            ]
+        )
 
     return "\n".join(lines)
 
@@ -1009,6 +1602,10 @@ def build_export_payload() -> Dict[str, Any]:
             "SELECT created_at, event_type, message, payload_json "
             "FROM adaptive_events ORDER BY id DESC LIMIT 250"
         ).fetchall()
+        version_rows = conn.execute(
+            "SELECT version, state_json, status, saved_at, note "
+            "FROM adaptive_model_versions ORDER BY version ASC"
+        ).fetchall()
 
     trades: List[Dict[str, Any]] = []
     for row in trade_rows:
@@ -1022,14 +1619,21 @@ def build_export_payload() -> Dict[str, Any]:
         item["payload"] = json.loads(item.pop("payload_json") or "{}")
         events.append(item)
 
+    model_versions: List[Dict[str, Any]] = []
+    for row in version_rows:
+        item = dict(row)
+        item["state"] = json.loads(item.pop("state_json") or "{}")
+        model_versions.append(item)
+
     state_snapshot = json.loads(json.dumps(globals().get("STATE", {}), ensure_ascii=False))
     return {
-        "export_schema": 2,
+        "export_schema": 3,
         "exported_at": int(time.time()),
         "app": globals().get("APP_NAME", "adaptive futures bot"),
         "deploy_marker": globals().get("DEPLOY_MARKER", "unknown"),
         "state": state_snapshot,
         "adaptive_model": asdict(get_model_state()),
+        "adaptive_model_versions": model_versions,
         "adaptive_trades": trades,
         "adaptive_events": events,
     }
@@ -1057,8 +1661,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.1 TP3 GUARDED LEARNING"
-DEPLOY_MARKER = "V16_1_TP3_LEARNING_AFTER_50_2026_08_01"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.2 AUDIT + ROLLBACK"
+DEPLOY_MARKER = "V16_2_TP3_AUDIT_ROLLBACK_2026_08_01"
 
 app = FastAPI(title=APP_NAME)
 
@@ -3348,22 +3952,15 @@ def safe_record_learning_result(
         if report.get("inserted"):
             signal["learning_recorded"] = result
             maybe_send_auto_backup()
-        if report.get("trained"):
-            promoted = bool(report.get("promoted"))
-            send_telegram(
-                ("✅ Новый adaptive champion принят\n" if promoted else "🧠 Challenger проверен; champion сохранён\n")
-                + f"Version: {report.get('version')}\n"
-                + f"Reason: {report.get('candidate_reason')}\n"
-                + f"Closed outcomes: {report.get('closed_count')}\n"
-                + f"Independent test: {report.get('validation_rows')}\n"
-                + f"Model logloss: {report.get('model_logloss')} vs base {report.get('base_logloss')}\n"
-                + f"Threshold: {report.get('threshold')}\n"
-                + f"Selected WR: {float(report.get('selected_wr', 0))*100:.1f}%\n"
-                + f"Expectancy: {float(report.get('expectancy_r', 0)):+.3f}R "
-                + f"vs base {float(report.get('baseline_expectancy_r', 0)):+.3f}R\n"
-                + f"Coverage: {float(report.get('coverage', 0))*100:.1f}%\n"
-                + f"Shadow only: {report.get('shadow_only')}"
-            )
+        live_audit = report.get("live_audit")
+        if isinstance(live_audit, dict):
+            send_telegram(format_live_audit_message(live_audit))
+
+        training_report = report.get("training_report")
+        if not isinstance(training_report, dict):
+            training_report = report
+        if training_report.get("attempted"):
+            send_telegram(format_training_attempt_message(training_report))
     except Exception as e:
         STATE["last_error"] = f"adaptive record error: {repr(e)}"
         save_state()
@@ -3600,6 +4197,8 @@ async def scan_loop():
         f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}.\n"
         f"Adaptive: {'permanent shadow' if SHADOW_ONLY else 'guarded live after independent validation'}; "
         f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
+        f"Audit: before/after every {LIVE_AUDIT_EVERY} closed model decisions · "
+        f"automatic rollback: {AUTO_ROLLBACK_ENABLED}.\n"
         f"Shadow candidates: {SHADOW_TRACKING_ENABLED} · automatic JSON backup every {AUTO_BACKUP_EVERY_CLOSED} outcomes.\n"
         f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH}."
     )
