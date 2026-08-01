@@ -3,11 +3,13 @@ import time
 import json
 import random
 import asyncio
+import io
+import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 
 
@@ -24,8 +26,8 @@ What it does:
 - Stores every closed signal and its feature snapshot in SQLite.
 - Retrains after MIN_TRAIN_TRADES closed trades and then every RETRAIN_EVERY trades.
 - Uses a simple logistic model implemented with the Python standard library.
-- Validates on the newest 30% of trades (walk-forward style).
-- Activates a new model only if it beats a constant base-rate model.
+- Uses chronological train, calibration, and independent newest-test blocks.
+- Promotes a challenger only if it beats both the baseline and current champion.
 - Learns a probability threshold that maximizes an expectancy-style objective.
 - Never changes leverage, stop-loss safety limits, API permissions, or source code.
 
@@ -39,25 +41,33 @@ import random
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 DB_PATH = os.getenv("ADAPTIVE_DB_PATH", "adaptive_bot.sqlite3")
+# Begin the first error-analysis cycle after 50 outcomes. The independent newest
+# test still decides whether the challenger is strong enough to affect signals.
 MIN_TRAIN_TRADES = int(os.getenv("ADAPTIVE_MIN_TRAIN_TRADES", "50"))
 RETRAIN_EVERY = int(os.getenv("ADAPTIVE_RETRAIN_EVERY", "25"))
 MAX_TRAIN_ROWS = int(os.getenv("ADAPTIVE_MAX_TRAIN_ROWS", "1500"))
-VALIDATION_FRACTION = float(os.getenv("ADAPTIVE_VALIDATION_FRACTION", "0.30"))
-MIN_VALIDATION_ROWS = int(os.getenv("ADAPTIVE_MIN_VALIDATION_ROWS", "15"))
-MIN_POSITIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_POSITIVE_ROWS", "8"))
-MIN_NEGATIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_NEGATIVE_ROWS", "8"))
-MIN_MODEL_IMPROVEMENT = float(os.getenv("ADAPTIVE_MIN_MODEL_IMPROVEMENT", "0.015"))
+VALIDATION_FRACTION = float(os.getenv("ADAPTIVE_VALIDATION_FRACTION", "0.20"))
+MIN_VALIDATION_ROWS = int(os.getenv("ADAPTIVE_MIN_VALIDATION_ROWS", "10"))
+MIN_CALIBRATION_ROWS = int(os.getenv("ADAPTIVE_MIN_CALIBRATION_ROWS", "10"))
+MIN_POSITIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_POSITIVE_ROWS", "5"))
+MIN_NEGATIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_NEGATIVE_ROWS", "5"))
+MIN_MODEL_IMPROVEMENT = float(os.getenv("ADAPTIVE_MIN_MODEL_IMPROVEMENT", "0.010"))
+MIN_EXPECTANCY_IMPROVEMENT_R = float(os.getenv("ADAPTIVE_MIN_EXPECTANCY_IMPROVEMENT_R", "0.05"))
+MIN_SELECTED_TEST_ROWS = int(os.getenv("ADAPTIVE_MIN_SELECTED_TEST_ROWS", "5"))
 MIN_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MIN_SIGNAL_PROBABILITY", "0.60"))
 MAX_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MAX_SIGNAL_PROBABILITY", "0.82"))
-MIN_VALIDATION_COVERAGE = float(os.getenv("ADAPTIVE_MIN_VALIDATION_COVERAGE", "0.15"))
+MIN_VALIDATION_COVERAGE = float(os.getenv("ADAPTIVE_MIN_VALIDATION_COVERAGE", "0.20"))
 MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
-SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "true").lower() == "true"
+# Guarded live is the default: the model still cannot block anything until it has
+# passed the independent holdout checks below. Set true to observe forever.
+SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "false").lower() == "true"
+ROUND_TRIP_COST_MOVE = float(os.getenv("ROUND_TRIP_COST_MOVE", "0.0012"))
 
 # Never let learning touch these safety-critical settings.
 LOCKED_SAFETY_KEYS = {
@@ -89,6 +99,10 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "is_dump",
     "is_instant",
     "is_aero",
+    "edge_3m",
+    "edge_15m",
+    "edge_30m",
+    "btc_alignment",
 )
 
 
@@ -109,6 +123,10 @@ class ModelState:
     mean: List[float] = None
     std: List[float] = None
     last_trained_closed_count: int = 0
+    last_attempted_closed_count: int = 0
+    validation_expectancy_r: float = 0.0
+    validation_baseline_expectancy_r: float = 0.0
+    last_candidate_reason: str = "warmup"
     created_at: int = 0
 
     def __post_init__(self) -> None:
@@ -142,6 +160,7 @@ def init_adaptive_db() -> None:
                 signal_id TEXT UNIQUE,
                 created_at INTEGER NOT NULL,
                 closed_at INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'live',
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
                 strategy TEXT NOT NULL,
@@ -149,6 +168,10 @@ def init_adaptive_db() -> None:
                 result TEXT NOT NULL,
                 label INTEGER NOT NULL,
                 pnl_r REAL NOT NULL DEFAULT 0,
+                exit_price REAL,
+                mfe_r REAL NOT NULL DEFAULT 0,
+                mae_r REAL NOT NULL DEFAULT 0,
+                duration_minutes REAL NOT NULL DEFAULT 0,
                 features_json TEXT NOT NULL,
                 model_version INTEGER NOT NULL DEFAULT 0,
                 model_probability REAL,
@@ -172,6 +195,24 @@ def init_adaptive_db() -> None:
             );
             """
         )
+
+        # Migrate an existing V15 database in place. SQLite does not support
+        # ADD COLUMN IF NOT EXISTS on all Render Python images.
+        existing_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(adaptive_trades)").fetchall()
+        }
+        migrations = {
+            "source": "ALTER TABLE adaptive_trades ADD COLUMN source TEXT NOT NULL DEFAULT 'live'",
+            "exit_price": "ALTER TABLE adaptive_trades ADD COLUMN exit_price REAL",
+            "mfe_r": "ALTER TABLE adaptive_trades ADD COLUMN mfe_r REAL NOT NULL DEFAULT 0",
+            "mae_r": "ALTER TABLE adaptive_trades ADD COLUMN mae_r REAL NOT NULL DEFAULT 0",
+            "duration_minutes": "ALTER TABLE adaptive_trades ADD COLUMN duration_minutes REAL NOT NULL DEFAULT 0",
+        }
+        for column, statement in migrations.items():
+            if column not in existing_columns:
+                conn.execute(statement)
+
         row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
         if row is None:
             state = ModelState(created_at=int(time.time()))
@@ -198,6 +239,17 @@ def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
     mode = str(trade.get("setup_mode", "")).upper()
     strategy = str(trade.get("strategy", "")).upper()
     btc_text = str(trade.get("btc_text", "")).upper()
+    direction = 1.0 if side == "LONG" else -1.0
+    ch3m = _clip(trade.get("ch3m_1m"), -1, 1)
+    ch15m = _clip(trade.get("ch15m"), -1, 1)
+    ch30m = _clip(trade.get("ch30m"), -1, 1)
+    btc_bull = 1.0 if "BTC BULL" in btc_text else 0.0
+    btc_bear = 1.0 if "BTC BEAR" in btc_text else 0.0
+    btc_alignment = 0.0
+    if (side == "LONG" and btc_bull) or (side == "SHORT" and btc_bear):
+        btc_alignment = 1.0
+    elif (side == "LONG" and btc_bear) or (side == "SHORT" and btc_bull):
+        btc_alignment = -1.0
 
     entry = _clip(trade.get("entry"), 1e-12, 1e18, 1.0)
     sl = _clip(trade.get("sl"), 0.0, 1e18, entry)
@@ -207,9 +259,9 @@ def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
         "score": _clip(trade.get("score"), 0, 100) / 100.0,
         "is_long": 1.0 if side == "LONG" else 0.0,
         "is_a_plus": 1.0 if grade == "A+" else 0.0,
-        "ch3m_abs": _clip(abs(_clip(trade.get("ch3m_1m"), -1, 1)), 0, 0.25) / 0.25,
-        "ch15m_abs": _clip(abs(_clip(trade.get("ch15m"), -1, 1)), 0, 0.40) / 0.40,
-        "ch30m_abs": _clip(abs(_clip(trade.get("ch30m"), -1, 1)), 0, 0.60) / 0.60,
+        "ch3m_abs": _clip(abs(ch3m), 0, 0.25) / 0.25,
+        "ch15m_abs": _clip(abs(ch15m), 0, 0.40) / 0.40,
+        "ch30m_abs": _clip(abs(ch30m), 0, 0.60) / 0.60,
         "vol1": _clip(trade.get("vol1"), 0, 8) / 8.0,
         "vol5": _clip(trade.get("volume_ratio", trade.get("vol5", 1.0)), 0, 8) / 8.0,
         "range1": _clip(trade.get("range1"), 0, 8) / 8.0,
@@ -218,12 +270,17 @@ def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
         "ladder_rr": _clip(trade.get("ladder_rr"), 0, 6) / 6.0,
         "final_rr": _clip(trade.get("final_rr"), 0, 8) / 8.0,
         "sl_price_move": _clip(sl_move, 0, 0.08) / 0.08,
-        "btc_bull": 1.0 if "BTC BULL" in btc_text else 0.0,
-        "btc_bear": 1.0 if "BTC BEAR" in btc_text else 0.0,
+        "btc_bull": btc_bull,
+        "btc_bear": btc_bear,
         "is_reversal": 1.0 if "REVERSAL" in mode else 0.0,
         "is_dump": 1.0 if "DUMP" in mode or "DUMP" in strategy else 0.0,
         "is_instant": 1.0 if "INSTANT" in mode or "INSTANT" in strategy else 0.0,
         "is_aero": 1.0 if "AERO" in mode or "AERO" in strategy else 0.0,
+        # Directional edge is positive when price pressure agrees with the trade.
+        "edge_3m": _clip(direction * ch3m, -0.25, 0.25) / 0.25,
+        "edge_15m": _clip(direction * ch15m, -0.40, 0.40) / 0.40,
+        "edge_30m": _clip(direction * ch30m, -0.60, 0.60) / 0.60,
+        "btc_alignment": btc_alignment,
     }
 
 
@@ -238,7 +295,27 @@ def get_model_state() -> ModelState:
         if row is None:
             return ModelState()
         raw = json.loads(row["state_json"])
-        return ModelState(**raw)
+        allowed = {field.name for field in fields(ModelState)}
+        state = ModelState(**{key: value for key, value in raw.items() if key in allowed})
+        expected_weights = len(FEATURE_NAMES) + 1
+        if (
+            len(state.weights) != expected_weights
+            or len(state.mean) != len(FEATURE_NAMES)
+            or len(state.std) != len(FEATURE_NAMES)
+        ):
+            # Feature schema changed. Old trades remain useful, but old coefficients
+            # cannot be applied to the new vector and must return to warm-up.
+            state.active = False
+            state.weights = [0.0] * expected_weights
+            state.mean = [0.0] * len(FEATURE_NAMES)
+            state.std = [1.0] * len(FEATURE_NAMES)
+            state.last_candidate_reason = "feature_schema_changed"
+            conn.execute(
+                "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
+                (json.dumps(asdict(state), ensure_ascii=False),),
+            )
+            conn.commit()
+        return state
 
 
 def _save_model_state(state: ModelState) -> None:
@@ -285,11 +362,12 @@ def adaptive_gate(trade: Dict[str, Any]) -> Tuple[bool, str, Optional[float]]:
         return True, f"adaptive warm-up: {state.trained_rows}/{MIN_TRAIN_TRADES}", None
 
     accepted = probability >= state.threshold
+    trade["adaptive_probability"] = probability
+    trade["adaptive_shadow_probability"] = probability
+    trade["adaptive_shadow_accepted"] = accepted
+    trade["adaptive_model_version"] = state.version
 
     if SHADOW_ONLY:
-        trade["adaptive_shadow_probability"] = probability
-        trade["adaptive_shadow_accepted"] = accepted
-        trade["adaptive_model_version"] = state.version
         return True, (
             f"adaptive shadow v{state.version}: p={probability:.3f}, "
             f"threshold={state.threshold:.3f}, would_accept={accepted}"
@@ -302,22 +380,30 @@ def adaptive_gate(trade: Dict[str, Any]) -> Tuple[bool, str, Optional[float]]:
 
 
 def _estimate_pnl_r(signal: Dict[str, Any], result: str) -> float:
+    """Estimate the actually executable result in risk units.
+
+    A profit is recorded only at TP3. TP1 and TP2 are intermediate targets and
+    do not create a positive label. Expired trades use their observed exit price
+    instead of an invented constant value. Round-trip fees/slippage are included
+    through ROUND_TRIP_COST_MOVE.
+    """
+    entry = _clip(signal.get("entry"), 1e-12, 1e18, 1.0)
+    sl = _clip(signal.get("sl"), 0.0, 1e18, entry)
+    risk = max(abs(entry - sl), entry * 1e-8)
+    cost_r = entry * max(0.0, ROUND_TRIP_COST_MOVE) / risk
+
     if result == "sl":
-        return -1.0
-    if result == "expired":
-        return -0.10
+        return -1.0 - cost_r
+    if result == "profit":
+        profit_target = _clip(signal.get(PROFIT_TARGET_KEY), 0.0, 1e18, entry)
+        return abs(profit_target - entry) / risk - cost_r
 
-    hit_count = sum(bool(signal.get(f"tp{i}_hit")) for i in range(1, 6))
-    if hit_count >= 5:
-        return max(0.5, float(signal.get("ladder_rr", 1.0) or 1.0))
-    if hit_count >= 3:
-        return 0.70
-    if hit_count >= 1:
-        return 0.25
-    return 0.10
+    exit_price = _clip(signal.get("_closing_price"), 1e-12, 1e18, entry)
+    direction = 1.0 if str(signal.get("side", "")).upper() == "LONG" else -1.0
+    return direction * (exit_price - entry) / risk - cost_r
 
 
-def record_closed_trade(signal: Dict[str, Any], result: str) -> Dict[str, Any]:
+def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[str] = None) -> Dict[str, Any]:
     """
     Call this exactly once when a signal closes.
 
@@ -338,25 +424,32 @@ def record_closed_trade(signal: Dict[str, Any], result: str) -> Dict[str, Any]:
         or f"{signal.get('symbol','?')}:{signal.get('side','?')}:{created_at}:{signal.get('strategy','?')}"
     )
     features = build_feature_dict(signal)
-    probability = signal.get("adaptive_shadow_probability")
+    probability = signal.get("adaptive_probability", signal.get("adaptive_shadow_probability"))
     model_version = int(signal.get("adaptive_model_version", 0) or 0)
     shadow_accepted = signal.get("adaptive_shadow_accepted")
     label = 1 if result == "profit" else 0
     pnl_r = _estimate_pnl_r(signal, result)
+    source = str(source or signal.get("signal_source", "live"))
+    exit_price = signal.get("_closing_price")
+    mfe_r = float(signal.get("mfe_r", 0.0) or 0.0)
+    mae_r = float(signal.get("mae_r", 0.0) or 0.0)
+    duration_minutes = max(0.0, (closed_at - created_at) / 60.0)
 
     with _LOCK, _connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT OR IGNORE INTO adaptive_trades(
-                signal_id, created_at, closed_at, symbol, side, strategy, grade,
-                result, label, pnl_r, features_json, model_version,
+                signal_id, created_at, closed_at, source, symbol, side, strategy, grade,
+                result, label, pnl_r, exit_price, mfe_r, mae_r, duration_minutes,
+                features_json, model_version,
                 model_probability, shadow_accepted
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 signal_id,
                 created_at,
                 closed_at,
+                source,
                 str(signal.get("symbol", "?")),
                 str(signal.get("side", "?")),
                 str(signal.get("strategy", "?")),
@@ -364,6 +457,10 @@ def record_closed_trade(signal: Dict[str, Any], result: str) -> Dict[str, Any]:
                 result,
                 label,
                 pnl_r,
+                float(exit_price) if exit_price is not None else None,
+                mfe_r,
+                mae_r,
+                duration_minutes,
                 json.dumps(features, ensure_ascii=False),
                 model_version,
                 float(probability) if probability is not None else None,
@@ -372,8 +469,11 @@ def record_closed_trade(signal: Dict[str, Any], result: str) -> Dict[str, Any]:
         )
         conn.commit()
 
+    if cursor.rowcount == 0:
+        return {"trained": False, "reason": "duplicate_signal", "inserted": False}
+
     report = maybe_retrain()
-    return report
+    return {"inserted": True, **report}
 
 
 def _sigmoid(z: float) -> float:
@@ -509,6 +609,43 @@ def _choose_threshold(labels: Sequence[int], probabilities: Sequence[float], pnl
     return best_threshold, best_metrics
 
 
+def _selection_metrics(
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    pnl_r: Sequence[float],
+    threshold: float,
+) -> Dict[str, float]:
+    chosen = [i for i, probability in enumerate(probabilities) if probability >= threshold]
+    selected_count = len(chosen)
+    coverage = selected_count / max(len(labels), 1)
+    selected_wr = (
+        sum(labels[i] for i in chosen) / selected_count if selected_count else 0.0
+    )
+    expectancy = (
+        sum(pnl_r[i] for i in chosen) / selected_count if selected_count else -999.0
+    )
+    return {
+        "coverage": coverage,
+        "selected_wr": selected_wr,
+        "selected_count": float(selected_count),
+        "expectancy_r": expectancy,
+        "baseline_wr": sum(labels) / max(len(labels), 1),
+        "baseline_expectancy_r": sum(pnl_r) / max(len(pnl_r), 1),
+    }
+
+
+def _predict_state_on_raw(state: ModelState, rows: Sequence[Sequence[float]]) -> List[float]:
+    if (
+        not state.active
+        or len(state.weights) != len(FEATURE_NAMES) + 1
+        or len(state.mean) != len(FEATURE_NAMES)
+        or len(state.std) != len(FEATURE_NAMES)
+    ):
+        return []
+    normalized = _normalize(rows, state.mean, state.std)
+    return _predict_matrix(state.weights, normalized)
+
+
 def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     init_adaptive_db()
     state = get_model_state()
@@ -531,16 +668,13 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
             "needed": MIN_TRAIN_TRADES,
         }
 
-    if (
-        not force
-        and state.last_trained_closed_count > 0
-        and closed_count - state.last_trained_closed_count < RETRAIN_EVERY
-    ):
+    last_attempt = max(state.last_attempted_closed_count, state.last_trained_closed_count)
+    if not force and last_attempt > 0 and closed_count - last_attempt < RETRAIN_EVERY:
         return {
             "trained": False,
             "reason": "waiting_for_more_trades",
             "closed_count": closed_count,
-            "next_at": state.last_trained_closed_count + RETRAIN_EVERY,
+            "next_at": last_attempt + RETRAIN_EVERY,
         }
 
     rows = rows[-MAX_TRAIN_ROWS:]
@@ -551,6 +685,9 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     positives = sum(labels)
     negatives = len(labels) - positives
     if positives < MIN_POSITIVE_ROWS or negatives < MIN_NEGATIVE_ROWS:
+        state.last_attempted_closed_count = closed_count
+        state.last_candidate_reason = "class_imbalance"
+        _save_model_state(state)
         return {
             "trained": False,
             "reason": "class_imbalance",
@@ -558,79 +695,185 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
             "negatives": negatives,
         }
 
-    validation_size = max(MIN_VALIDATION_ROWS, int(len(rows) * VALIDATION_FRACTION))
-    validation_size = min(validation_size, len(rows) // 2)
-    train_size = len(rows) - validation_size
+    # Three chronological blocks prevent threshold selection from contaminating
+    # the final promotion test: train -> calibration -> independent newest test.
+    test_size = max(MIN_VALIDATION_ROWS, int(len(rows) * VALIDATION_FRACTION))
+    calibration_size = max(MIN_CALIBRATION_ROWS, int(len(rows) * VALIDATION_FRACTION))
+    max_holdout = len(rows) // 2
+    if test_size + calibration_size > max_holdout:
+        test_size = max(MIN_VALIDATION_ROWS, max_holdout // 2)
+        calibration_size = max_holdout - test_size
+    train_size = len(rows) - calibration_size - test_size
 
-    x_train_raw = vectors[:train_size]
-    y_train = labels[:train_size]
-    x_val_raw = vectors[train_size:]
-    y_val = labels[train_size:]
-    pnl_val = pnl_r[train_size:]
+    if train_size < 25 or calibration_size < 10 or test_size < 10:
+        state.last_attempted_closed_count = closed_count
+        state.last_candidate_reason = "split_too_small"
+        _save_model_state(state)
+        return {"trained": False, "reason": "split_too_small", "closed_count": closed_count}
+
+    train_end = train_size
+    calibration_end = train_size + calibration_size
+    x_train_raw = vectors[:train_end]
+    y_train = labels[:train_end]
+    x_cal_raw = vectors[train_end:calibration_end]
+    y_cal = labels[train_end:calibration_end]
+    pnl_cal = pnl_r[train_end:calibration_end]
+    x_test_raw = vectors[calibration_end:]
+    y_test = labels[calibration_end:]
+    pnl_test = pnl_r[calibration_end:]
 
     if sum(y_train) < 4 or (len(y_train) - sum(y_train)) < 4:
+        state.last_attempted_closed_count = closed_count
+        state.last_candidate_reason = "train_split_too_small"
+        _save_model_state(state)
         return {"trained": False, "reason": "train_split_too_small"}
 
     mean, std = _mean_std(x_train_raw)
     x_train = _normalize(x_train_raw, mean, std)
-    x_val = _normalize(x_val_raw, mean, std)
+    x_cal = _normalize(x_cal_raw, mean, std)
+    x_test = _normalize(x_test_raw, mean, std)
 
     weights = _train_logistic(x_train, y_train)
-    val_prob = _predict_matrix(weights, x_val)
+    cal_prob = _predict_matrix(weights, x_cal)
+    test_prob = _predict_matrix(weights, x_test)
 
     train_base_rate = min(0.95, max(0.05, sum(y_train) / len(y_train)))
-    base_prob = [train_base_rate] * len(y_val)
-    base_loss = _logloss(y_val, base_prob)
-    model_loss = _logloss(y_val, val_prob)
+    base_prob = [train_base_rate] * len(y_test)
+    base_loss = _logloss(y_test, base_prob)
+    model_loss = _logloss(y_test, test_prob)
     improvement = base_loss - model_loss
 
-    threshold, threshold_metrics = _choose_threshold(y_val, val_prob, pnl_val)
-    activate = (
-        improvement >= MIN_MODEL_IMPROVEMENT
-        and threshold_metrics["selected_count"] >= 5
-        and threshold_metrics["coverage"] >= MIN_VALIDATION_COVERAGE
-        and threshold_metrics["expectancy_r"] > 0
+    threshold, calibration_metrics = _choose_threshold(y_cal, cal_prob, pnl_cal)
+    test_metrics = _selection_metrics(y_test, test_prob, pnl_test, threshold)
+
+    enough_test_classes = min(sum(y_test), len(y_test) - sum(y_test)) >= 3
+    passes_absolute_gate = (
+        enough_test_classes
+        and improvement >= MIN_MODEL_IMPROVEMENT
+        and test_metrics["selected_count"] >= MIN_SELECTED_TEST_ROWS
+        and test_metrics["coverage"] >= MIN_VALIDATION_COVERAGE
+        and test_metrics["expectancy_r"] > 0
+        and test_metrics["expectancy_r"]
+        >= test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R
+        and test_metrics["selected_wr"] >= test_metrics["baseline_wr"]
     )
 
-    new_state = ModelState(
-        version=state.version + 1,
-        active=bool(activate),
-        threshold=threshold,
-        trained_rows=len(rows),
-        validation_rows=len(y_val),
-        base_logloss=base_loss,
-        model_logloss=model_loss,
-        validation_win_rate=sum(y_val) / max(len(y_val), 1),
-        validation_coverage=threshold_metrics["coverage"],
-        validation_selected_wr=threshold_metrics["selected_wr"],
-        validation_selected_count=int(threshold_metrics["selected_count"]),
-        weights=list(weights),
-        mean=list(mean),
-        std=list(std),
-        last_trained_closed_count=closed_count,
-        created_at=int(time.time()),
+    champion_expectancy = test_metrics["baseline_expectancy_r"]
+    champion_count = len(y_test)
+    if state.active:
+        champion_prob = _predict_state_on_raw(state, x_test_raw)
+        if champion_prob:
+            champion_metrics = _selection_metrics(
+                y_test, champion_prob, pnl_test, state.threshold
+            )
+            if champion_metrics["selected_count"] >= MIN_SELECTED_TEST_ROWS:
+                champion_expectancy = champion_metrics["expectancy_r"]
+                champion_count = int(champion_metrics["selected_count"])
+
+    beats_champion = (
+        not state.active
+        or test_metrics["expectancy_r"]
+        >= champion_expectancy + MIN_EXPECTANCY_IMPROVEMENT_R
     )
+    promote = bool(passes_absolute_gate and beats_champion)
+
+    if not enough_test_classes:
+        candidate_reason = "independent_test_class_imbalance"
+    elif improvement < MIN_MODEL_IMPROVEMENT:
+        candidate_reason = "logloss_not_better"
+    elif test_metrics["selected_count"] < MIN_SELECTED_TEST_ROWS:
+        candidate_reason = "too_few_selected_test_rows"
+    elif test_metrics["coverage"] < MIN_VALIDATION_COVERAGE:
+        candidate_reason = "coverage_too_low"
+    elif test_metrics["expectancy_r"] <= 0:
+        candidate_reason = "negative_test_expectancy"
+    elif test_metrics["expectancy_r"] < test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R:
+        candidate_reason = "expectancy_not_better_than_baseline"
+    elif not beats_champion:
+        candidate_reason = "champion_kept"
+    else:
+        candidate_reason = "promoted"
+
+    if promote:
+        new_state = ModelState(
+            version=state.version + 1,
+            active=True,
+            threshold=threshold,
+            trained_rows=len(rows),
+            validation_rows=len(y_test),
+            base_logloss=base_loss,
+            model_logloss=model_loss,
+            validation_win_rate=sum(y_test) / max(len(y_test), 1),
+            validation_coverage=test_metrics["coverage"],
+            validation_selected_wr=test_metrics["selected_wr"],
+            validation_selected_count=int(test_metrics["selected_count"]),
+            weights=list(weights),
+            mean=list(mean),
+            std=list(std),
+            last_trained_closed_count=closed_count,
+            last_attempted_closed_count=closed_count,
+            validation_expectancy_r=test_metrics["expectancy_r"],
+            validation_baseline_expectancy_r=test_metrics["baseline_expectancy_r"],
+            last_candidate_reason=candidate_reason,
+            created_at=int(time.time()),
+        )
+    elif state.active:
+        # A weaker challenger must never deactivate or overwrite the champion.
+        new_state = state
+        new_state.last_attempted_closed_count = closed_count
+        new_state.last_candidate_reason = candidate_reason
+    else:
+        # Keep the latest failed candidate metrics visible, but inactive.
+        new_state = ModelState(
+            version=state.version,
+            active=False,
+            threshold=threshold,
+            trained_rows=len(rows),
+            validation_rows=len(y_test),
+            base_logloss=base_loss,
+            model_logloss=model_loss,
+            validation_win_rate=sum(y_test) / max(len(y_test), 1),
+            validation_coverage=test_metrics["coverage"],
+            validation_selected_wr=test_metrics["selected_wr"],
+            validation_selected_count=int(test_metrics["selected_count"]),
+            weights=list(weights),
+            mean=list(mean),
+            std=list(std),
+            last_trained_closed_count=0,
+            last_attempted_closed_count=closed_count,
+            validation_expectancy_r=test_metrics["expectancy_r"],
+            validation_baseline_expectancy_r=test_metrics["baseline_expectancy_r"],
+            last_candidate_reason=candidate_reason,
+            created_at=int(time.time()),
+        )
     _save_model_state(new_state)
 
     payload = {
         "version": new_state.version,
         "active": new_state.active,
+        "promoted": promote,
+        "candidate_reason": candidate_reason,
         "closed_count": closed_count,
         "trained_rows": new_state.trained_rows,
-        "validation_rows": new_state.validation_rows,
+        "calibration_rows": len(y_cal),
+        "validation_rows": len(y_test),
         "base_logloss": round(base_loss, 6),
         "model_logloss": round(model_loss, 6),
         "improvement": round(improvement, 6),
         "threshold": round(threshold, 3),
-        "coverage": round(threshold_metrics["coverage"], 3),
-        "selected_wr": round(threshold_metrics["selected_wr"], 3),
-        "selected_count": int(threshold_metrics["selected_count"]),
-        "expectancy_r": round(threshold_metrics["expectancy_r"], 4),
+        "calibration_coverage": round(calibration_metrics["coverage"], 3),
+        "coverage": round(test_metrics["coverage"], 3),
+        "selected_wr": round(test_metrics["selected_wr"], 3),
+        "selected_count": int(test_metrics["selected_count"]),
+        "expectancy_r": round(test_metrics["expectancy_r"], 4),
+        "baseline_expectancy_r": round(test_metrics["baseline_expectancy_r"], 4),
+        "champion_expectancy_r": round(champion_expectancy, 4),
+        "champion_selected_count": champion_count,
         "shadow_only": SHADOW_ONLY,
     }
     _event(
         "model_retrained",
-        "Adaptive model retrained and activated" if activate else "Adaptive model retrained but not activated",
+        "Adaptive challenger promoted" if promote else "Adaptive challenger rejected; champion kept",
         payload,
     )
     return {"trained": True, **payload}
@@ -667,6 +910,14 @@ def adaptive_report() -> str:
             WHERE shadow_accepted IS NOT NULL
             """
         ).fetchone()
+        source_rows = conn.execute(
+            """
+            SELECT source, COUNT(*) AS n, SUM(label) AS wins, AVG(pnl_r) AS expectancy_r
+            FROM adaptive_trades
+            GROUP BY source
+            ORDER BY source
+            """
+        ).fetchall()
 
     wr = wins / total * 100 if total else 0.0
     lines = [
@@ -681,7 +932,20 @@ def adaptive_report() -> str:
         f"Validation logloss: model {state.model_logloss:.4f} vs base {state.base_logloss:.4f}",
         f"Validation selected WR: {state.validation_selected_wr*100:.1f}%",
         f"Validation coverage: {state.validation_coverage*100:.1f}%",
+        f"Validation expectancy: {state.validation_expectancy_r:+.3f}R "
+        f"vs baseline {state.validation_baseline_expectancy_r:+.3f}R",
+        f"Last candidate: {state.last_candidate_reason}",
     ]
+
+    if source_rows:
+        lines.append("\nData sources:")
+        for row in source_rows:
+            n = int(row["n"] or 0)
+            w = int(row["wins"] or 0)
+            exp_r = float(row["expectancy_r"] or 0.0)
+            lines.append(
+                f"{row['source']}: {w}/{n} wins · WR {w/max(n,1)*100:.1f}% · expectancy {exp_r:+.3f}R"
+            )
 
     if shadow and shadow["n"]:
         accepted = int(shadow["accepted"] or 0)
@@ -734,6 +998,49 @@ def recent_adaptive_events(limit: int = 20) -> List[Dict[str, Any]]:
     return out
 
 
+def build_export_payload() -> Dict[str, Any]:
+    """Create a portable JSON backup without Telegram tokens or environment data."""
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        trade_rows = conn.execute(
+            "SELECT * FROM adaptive_trades ORDER BY closed_at ASC, id ASC"
+        ).fetchall()
+        event_rows = conn.execute(
+            "SELECT created_at, event_type, message, payload_json "
+            "FROM adaptive_events ORDER BY id DESC LIMIT 250"
+        ).fetchall()
+
+    trades: List[Dict[str, Any]] = []
+    for row in trade_rows:
+        item = dict(row)
+        item["features"] = json.loads(item.pop("features_json") or "{}")
+        trades.append(item)
+
+    events: List[Dict[str, Any]] = []
+    for row in event_rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        events.append(item)
+
+    state_snapshot = json.loads(json.dumps(globals().get("STATE", {}), ensure_ascii=False))
+    return {
+        "export_schema": 2,
+        "exported_at": int(time.time()),
+        "app": globals().get("APP_NAME", "adaptive futures bot"),
+        "deploy_marker": globals().get("DEPLOY_MARKER", "unknown"),
+        "state": state_snapshot,
+        "adaptive_model": asdict(get_model_state()),
+        "adaptive_trades": trades,
+        "adaptive_events": events,
+    }
+
+
+def build_export_bytes() -> bytes:
+    return json.dumps(
+        build_export_payload(), ensure_ascii=False, indent=2
+    ).encode("utf-8")
+
+
 # ============================================================
 # V13.28 — MARKET DUMP + AERO STYLE SCALPER
 # Professional goal:
@@ -750,14 +1057,15 @@ def recent_adaptive_events(limit: int = 20) -> List[Dict[str, Any]]:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V15 SHADOW LEARNING"
-DEPLOY_MARKER = "V15_SHADOW_LEARNING_2026_07_31"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.1 TP3 GUARDED LEARNING"
+DEPLOY_MARKER = "V16_1_TP3_LEARNING_AFTER_50_2026_08_01"
 
 app = FastAPI(title=APP_NAME)
 
 BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_29_local_stop_dump_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
@@ -783,6 +1091,16 @@ MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
+
+# Shadow candidates are hypothetical trades: they are never sent as live signals,
+# but their outcomes let the challenger learn from accepted and rejected examples.
+SHADOW_TRACKING_ENABLED = os.getenv("SHADOW_TRACKING_ENABLED", "true").lower() == "true"
+SHADOW_MAX_ACTIVE = int(os.getenv("SHADOW_MAX_ACTIVE", "24"))
+SHADOW_PER_SCAN = int(os.getenv("SHADOW_PER_SCAN", "4"))
+SHADOW_COOLDOWN_SECONDS = int(os.getenv("SHADOW_COOLDOWN_SECONDS", "600"))
+LADDER_FOLLOWUP_MINUTES = int(os.getenv("LADDER_FOLLOWUP_MINUTES", "90"))
+AUTO_TELEGRAM_BACKUP = os.getenv("AUTO_TELEGRAM_BACKUP", "true").lower() == "true"
+AUTO_BACKUP_EVERY_CLOSED = int(os.getenv("AUTO_BACKUP_EVERY_CLOSED", "25"))
 
 # --- Fast burst requirements ---
 FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
@@ -835,6 +1153,11 @@ TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0120"))
 TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0185"))
 TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0260"))
 TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0350"))
+
+# User accounting rule: TP1/TP2 are intermediate only. A signal becomes a
+# positive trade for statistics and learning only when TP3 is reached.
+PROFIT_TARGET_NUMBER = 3
+PROFIT_TARGET_KEY = "tp3"
 
 # --- Risk / stop ---
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
@@ -1025,6 +1348,9 @@ FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
 STATE: Dict[str, Any] = {}
 KLINE_CACHE: Dict[str, Tuple[float, Optional[List[Dict[str, float]]]]] = {}
 TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
+STATE_IO_LOCK = threading.RLock()
+SCAN_RUN_LOCK = threading.Lock()
+TRACK_RUN_LOCK = threading.Lock()
 
 # ============================================================
 # State / utilities
@@ -1051,7 +1377,9 @@ def base_asset(symbol: str) -> str:
 
 def default_state() -> Dict[str, Any]:
     return {
+        "schema_version": 2,
         "active_signals": [],
+        "shadow_signals": [],
         "stats": {
             "total": {"profit": 0, "sl": 0, "expired": 0},
             "side": {},
@@ -1062,6 +1390,8 @@ def default_state() -> Dict[str, Any]:
         },
         "pair_cooldown": {},
         "strategy_cooldown": {},
+        "shadow_cooldown": {},
+        "last_backup_closed_count": 0,
         "last_scan": {},
         "last_diag_ts": 0,
         "last_error": "",
@@ -1077,6 +1407,17 @@ def load_state() -> Dict[str, Any]:
         base = default_state()
         if isinstance(data, dict):
             base.update(data)
+        # Deep defaults keep an older V13/V15 state compatible with V16.
+        base.setdefault("active_signals", [])
+        base.setdefault("shadow_signals", [])
+        base.setdefault("pair_cooldown", {})
+        base.setdefault("strategy_cooldown", {})
+        base.setdefault("shadow_cooldown", {})
+        base.setdefault("last_backup_closed_count", 0)
+        stats = base.setdefault("stats", {})
+        for bucket, value in default_state()["stats"].items():
+            stats.setdefault(bucket, value.copy() if isinstance(value, dict) else value)
+        base["schema_version"] = 2
         return base
     except Exception:
         return default_state()
@@ -1084,10 +1425,18 @@ def load_state() -> Dict[str, Any]:
 
 def save_state() -> None:
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(STATE, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        path = Path(STATE_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with STATE_IO_LOCK:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(STATE, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, path)
+    except Exception as e:
+        # Do not recursively call save_state from its own error path.
+        STATE["last_error"] = f"state save error: {repr(e)}"
 
 
 def inc_stat(bucket: str, key: str, result: str) -> None:
@@ -1097,9 +1446,11 @@ def inc_stat(bucket: str, key: str, result: str) -> None:
     item[result] = item.get(result, 0) + 1
 
 
-def apply_result(signal: Dict[str, Any], result: str) -> None:
+def apply_result(signal: Dict[str, Any], result: str) -> bool:
     if result not in ("profit", "sl", "expired"):
-        return
+        return False
+    if signal.get("stats_recorded"):
+        return False
     stats = STATE.setdefault("stats", default_state()["stats"])
     stats.setdefault("total", {"profit": 0, "sl": 0, "expired": 0})[result] += 1
     inc_stat("side", signal.get("side", "?"), result)
@@ -1107,16 +1458,24 @@ def apply_result(signal: Dict[str, Any], result: str) -> None:
     inc_stat("strategy", signal.get("strategy", "?"), result)
     inc_stat("symbol", signal.get("symbol", "?"), result)
     inc_stat("type", signal.get("trade_type", "?"), result)
+    signal["stats_recorded"] = result
+    signal["closed_at"] = now_ts()
     save_state()
+    return True
 
 
 def wr_text(item: Dict[str, int]) -> str:
     p = int(item.get("profit", 0))
     sl = int(item.get("sl", 0))
     exp = int(item.get("expired", 0))
-    closed = p + sl + exp
-    wr = p / closed * 100 if closed else 0.0
-    return f"{p} профит / {sl} SL / {exp} expired / WR {wr:.1f}%"
+    resolved = p + sl
+    all_outcomes = resolved + exp
+    resolved_wr = p / resolved * 100 if resolved else 0.0
+    all_success = p / all_outcomes * 100 if all_outcomes else 0.0
+    return (
+        f"{p} профит / {sl} SL / {exp} time-stop · "
+        f"WR TP/SL {resolved_wr:.1f}% · успех всех {all_success:.1f}%"
+    )
 
 
 def build_stats_text() -> str:
@@ -1151,6 +1510,64 @@ def send_telegram(text: str) -> bool:
         STATE["last_error"] = f"Telegram exception: {repr(e)}"
         save_state()
         return False
+
+
+def send_telegram_document(data: bytes, filename: str, caption: str = "") -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        STATE["last_error"] = "Telegram env missing for document backup"
+        save_state()
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    try:
+        files = {
+            "document": (filename, io.BytesIO(data), "application/json"),
+        }
+        form = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:900]}
+        response = requests.post(url, data=form, files=files, timeout=30)
+        if not response.ok:
+            STATE["last_error"] = (
+                f"Telegram document error {response.status_code}: {response.text[:250]}"
+            )
+            save_state()
+            return False
+        return True
+    except Exception as e:
+        STATE["last_error"] = f"Telegram document exception: {repr(e)}"
+        save_state()
+        return False
+
+
+def admin_authorized(key: str) -> bool:
+    return bool(ADMIN_KEY) and secrets.compare_digest(str(key or ""), ADMIN_KEY)
+
+
+def adaptive_closed_count() -> int:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        return int(conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"])
+
+
+def maybe_send_auto_backup() -> None:
+    if not AUTO_TELEGRAM_BACKUP or AUTO_BACKUP_EVERY_CLOSED <= 0:
+        return
+    try:
+        closed_count = adaptive_closed_count()
+        last_count = int(STATE.get("last_backup_closed_count", 0) or 0)
+        if closed_count < AUTO_BACKUP_EVERY_CLOSED:
+            return
+        if closed_count - last_count < AUTO_BACKUP_EVERY_CLOSED:
+            return
+        filename = f"adaptive_backup_{closed_count}_{int(time.time())}.json"
+        if send_telegram_document(
+            build_export_bytes(),
+            filename,
+            f"🧠 Backup adaptive data · {closed_count} closed outcomes",
+        ):
+            STATE["last_backup_closed_count"] = closed_count
+            save_state()
+    except Exception as e:
+        STATE["last_error"] = f"automatic backup error: {repr(e)}"
+        save_state()
 
 
 def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -2653,6 +3070,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 trade["adaptive_probability"] = adaptive_probability
             if not adaptive_ok:
                 blocks["adaptive_model_block"] = blocks.get("adaptive_model_block", 0) + 1
+                add_shadow_signal(trade, "adaptive_model_block")
                 if len(near_miss) < 8:
                     near_miss.append(f"{display_symbol(symbol)} {side}: {adaptive_reason}")
                 continue
@@ -2695,6 +3113,7 @@ def build_signal_message(s: Dict[str, Any]) -> str:
         f"TP3: {format_price(s['tp3'])}\n"
         f"TP4: {format_price(s['tp4'])}\n"
         f"TP5: {format_price(s['tp5'])}\n"
+        f"Учёт результата: TP1/TP2 промежуточные; profit только после TP3.\n"
         f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
         f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
         f"Риск: multiplier x{s['risk_mult']:.2f}\n"
@@ -2713,9 +3132,10 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V13.29 Local Stop Dump Scalper\n"
+        f"🧪 Диагностика V16 Guarded Learning\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
-        f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
+        f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · "
+        f"shadow: {scan.get('shadow_added', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
         f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
@@ -2725,14 +3145,82 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     )
 
 
+def ensure_signal_runtime_fields(signal: Dict[str, Any], source: str) -> None:
+    created_at = int(signal.get("created_at", now_ts()) or now_ts())
+    signal["created_at"] = created_at
+    signal.setdefault(
+        "signal_id",
+        f"{source}:{signal.get('symbol','?')}:{signal.get('side','?')}:"
+        f"{signal.get('strategy','?')}:{created_at}:{time.time_ns() % 1_000_000_000}",
+    )
+    signal["signal_source"] = source
+    signal.setdefault("mfe_r", 0.0)
+    signal.setdefault("mae_r", 0.0)
+    signal.setdefault("stats_recorded", None)
+
+
+def update_excursion(signal: Dict[str, Any], price: float) -> None:
+    entry = float(signal.get("entry", 0.0) or 0.0)
+    sl = float(signal.get("sl", entry) or entry)
+    risk = abs(entry - sl)
+    if entry <= 0 or risk <= 0:
+        return
+    direction = 1.0 if signal.get("side") == "LONG" else -1.0
+    move_r = direction * (price - entry) / risk
+    signal["mfe_r"] = max(float(signal.get("mfe_r", 0.0) or 0.0), move_r)
+    signal["mae_r"] = min(float(signal.get("mae_r", 0.0) or 0.0), move_r)
+    signal["last_observed_price"] = price
+    signal["last_observed_at"] = now_ts()
+
+
+def shadow_key(signal: Dict[str, Any]) -> str:
+    return (
+        f"{signal.get('symbol','?')}:{signal.get('side','?')}:"
+        f"{signal.get('strategy','?')}"
+    )
+
+
+def remove_matching_shadow(signal: Dict[str, Any]) -> None:
+    key = shadow_key(signal)
+    STATE["shadow_signals"] = [
+        item for item in STATE.setdefault("shadow_signals", [])
+        if shadow_key(item) != key
+    ]
+
+
+def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
+    if not SHADOW_TRACKING_ENABLED:
+        return False
+    shadows = STATE.setdefault("shadow_signals", [])
+    if len(shadows) >= SHADOW_MAX_ACTIVE:
+        return False
+    key = shadow_key(signal)
+    cooldowns = STATE.setdefault("shadow_cooldown", {})
+    if now_ts() < int(cooldowns.get(key, 0) or 0):
+        return False
+    if any(shadow_key(item) == key for item in shadows):
+        return False
+
+    shadow = dict(signal)
+    ensure_signal_runtime_fields(shadow, "shadow")
+    shadow["shadow_reason"] = reason
+    shadow["stats_recorded"] = None
+    shadows.append(shadow)
+    cooldowns[key] = now_ts() + SHADOW_COOLDOWN_SECONDS
+    save_state()
+    return True
+
+
 def add_active_signal(s: Dict[str, Any]) -> None:
+    remove_matching_shadow(s)
+    ensure_signal_runtime_fields(s, "live")
     STATE.setdefault("active_signals", []).append(s)
     STATE.setdefault("pair_cooldown", {})[s["symbol"]] = now_ts() + PAIR_COOLDOWN_SECONDS
     STATE.setdefault("strategy_cooldown", {})[s["strategy"]] = now_ts() + STRATEGY_COOLDOWN_SECONDS
     save_state()
 
 
-def run_scan(manual: bool = False) -> Dict[str, Any]:
+def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
     start = time.time()
     blocks: Dict[str, int] = {}
     near_miss: List[str] = []
@@ -2745,6 +3233,7 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
         "universe": len(symbols),
         "candidates": 0,
         "sent": 0,
+        "shadow_added": 0,
         "blocks": blocks,
         "near_miss": near_miss,
         "hot_notes": hot_notes,
@@ -2780,7 +3269,11 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
     scan["candidates"] = len(found)
 
     sent = 0
-    free_slots = max(0, MAX_ACTIVE_SIGNALS - len(STATE.get("active_signals", [])))
+    open_risk_count = sum(
+        1 for signal in STATE.get("active_signals", [])
+        if not signal.get(PROFIT_TARGET_KEY + "_hit") and not signal.get("stats_recorded")
+    )
+    free_slots = max(0, MAX_ACTIVE_SIGNALS - open_risk_count)
     send_limit = min(MAX_SIGNALS_PER_SCAN, free_slots)
     if send_limit <= 0 and found:
         blocks["active_slots_full_send_block"] = blocks.get("active_slots_full_send_block", 0) + 1
@@ -2791,7 +3284,14 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
         send_telegram(build_signal_message(s))
         sent += 1
 
+    shadow_added = 0
+    if SHADOW_TRACKING_ENABLED:
+        for candidate in found[send_limit:send_limit + max(0, SHADOW_PER_SCAN)]:
+            if add_shadow_signal(candidate, "qualified_not_sent"):
+                shadow_added += 1
+
     scan["sent"] = sent
+    scan["shadow_added"] = shadow_added
     scan["elapsed"] = time.time() - start
     STATE["last_scan"] = scan
     save_state()
@@ -2802,6 +3302,11 @@ def run_scan(manual: bool = False) -> Dict[str, Any]:
         save_state()
 
     return scan
+
+
+def run_scan(manual: bool = False) -> Dict[str, Any]:
+    with SCAN_RUN_LOCK:
+        return _run_scan_impl(manual=manual)
 
 
 def current_price(symbol: str) -> Optional[float]:
@@ -2832,129 +3337,251 @@ def directional_progress_ratio(s: Dict[str, Any], p: float) -> Tuple[bool, float
     return directional, progress
 
 
-def safe_record_learning_result(signal: Dict[str, Any], result: str) -> None:
-    """Persist a closed trade and retrain safely without interrupting the bot."""
+def safe_record_learning_result(
+    signal: Dict[str, Any], result: str, source: Optional[str] = None
+) -> None:
+    """Persist one outcome and evaluate a challenger without interrupting scans."""
+    if signal.get("learning_recorded"):
+        return
     try:
-        report = record_closed_trade(signal, result)
+        report = record_closed_trade(signal, result, source=source)
+        if report.get("inserted"):
+            signal["learning_recorded"] = result
+            maybe_send_auto_backup()
         if report.get("trained"):
+            promoted = bool(report.get("promoted"))
             send_telegram(
-                "🧠 Adaptive model retrained\n"
-                f"Version: {report.get('version')}\n"
-                f"Active: {report.get('active')}\n"
-                f"Closed trades: {report.get('closed_count')}\n"
-                f"Model logloss: {report.get('model_logloss')}\n"
-                f"Base logloss: {report.get('base_logloss')}\n"
-                f"Threshold: {report.get('threshold')}\n"
-                f"Selected WR: {float(report.get('selected_wr', 0))*100:.1f}%\n"
-                f"Coverage: {float(report.get('coverage', 0))*100:.1f}%\n"
-                f"Shadow only: {report.get('shadow_only')}"
+                ("✅ Новый adaptive champion принят\n" if promoted else "🧠 Challenger проверен; champion сохранён\n")
+                + f"Version: {report.get('version')}\n"
+                + f"Reason: {report.get('candidate_reason')}\n"
+                + f"Closed outcomes: {report.get('closed_count')}\n"
+                + f"Independent test: {report.get('validation_rows')}\n"
+                + f"Model logloss: {report.get('model_logloss')} vs base {report.get('base_logloss')}\n"
+                + f"Threshold: {report.get('threshold')}\n"
+                + f"Selected WR: {float(report.get('selected_wr', 0))*100:.1f}%\n"
+                + f"Expectancy: {float(report.get('expectancy_r', 0)):+.3f}R "
+                + f"vs base {float(report.get('baseline_expectancy_r', 0)):+.3f}R\n"
+                + f"Coverage: {float(report.get('coverage', 0))*100:.1f}%\n"
+                + f"Shadow only: {report.get('shadow_only')}"
             )
     except Exception as e:
         STATE["last_error"] = f"adaptive record error: {repr(e)}"
         save_state()
 
 
-def track_active_signals() -> None:
-    active = STATE.setdefault("active_signals", [])
-    if not active:
-        return
+def track_shadow_signals() -> bool:
+    shadows = STATE.setdefault("shadow_signals", [])
+    if not shadows:
+        return False
 
-    remaining = []
+    remaining: List[Dict[str, Any]] = []
     changed = False
-
-    for s in active:
-        p = current_price(s["symbol"])
-        if p is None:
-            remaining.append(s)
+    for signal in shadows:
+        ensure_signal_runtime_fields(signal, "shadow")
+        price = current_price(signal["symbol"])
+        if price is None:
+            remaining.append(signal)
             continue
 
-        side = s["side"]
-        age_minutes = (now_ts() - int(s.get("created_at", now_ts()))) / 60.0
+        update_excursion(signal, price)
+        side = signal["side"]
+        age_minutes = (now_ts() - int(signal.get("created_at", now_ts()))) / 60.0
 
-        if sl_hit(side, p, s["sl"]):
-            apply_result(s, "sl")
-            safe_record_learning_result(s, "sl")
-            send_telegram(
-                f"❌ Stop Loss\n"
-                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
-                f"Стратегия: {s['strategy']}\n"
-                f"Вход: {format_price(s['entry'])}\n"
-                f"SL: {format_price(s['sl'])}\n"
-                f"Текущая цена: {format_price(p)}\n\n"
-                f"{build_stats_text()}"
-            )
+        if sl_hit(side, price, signal["sl"]):
+            signal["_closing_price"] = signal["sl"]
+            safe_record_learning_result(signal, "sl", source="shadow")
             changed = True
             continue
 
-        if FAST_CANCEL_IF_NO_PROGRESS and not s.get("tp1_hit") and age_minutes >= FAST_MAX_MINUTES_TO_TP1:
-            directional, progress = directional_progress_ratio(s, p)
-            if (not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP:
-                apply_result(s, "expired")
-                safe_record_learning_result(s, "expired")
+        for key in ["tp1", "tp2"]:
+            if target_hit(side, price, signal[key]):
+                signal[f"{key}_hit"] = True
+
+        if target_hit(side, price, signal[PROFIT_TARGET_KEY]):
+            signal[PROFIT_TARGET_KEY + "_hit"] = True
+            signal["_closing_price"] = signal[PROFIT_TARGET_KEY]
+            safe_record_learning_result(signal, "profit", source="shadow")
+            changed = True
+            continue
+
+        directional, progress = directional_progress_ratio(signal, price)
+        fast_stop = (
+            FAST_CANCEL_IF_NO_PROGRESS
+            and age_minutes >= FAST_MAX_MINUTES_TO_TP1
+            and ((not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP)
+        )
+        if signal.get("tp1_hit"):
+            fast_stop = False
+        if fast_stop or age_minutes >= FAST_HARD_EXPIRE_MINUTES:
+            signal["_closing_price"] = price
+            safe_record_learning_result(signal, "expired", source="shadow")
+            changed = True
+            continue
+
+        remaining.append(signal)
+
+    if changed:
+        STATE["shadow_signals"] = remaining
+    return changed
+
+
+def _track_active_signals_impl() -> None:
+    active = STATE.setdefault("active_signals", [])
+    remaining: List[Dict[str, Any]] = []
+    changed = False
+
+    for signal in active:
+        ensure_signal_runtime_fields(signal, "live")
+        price = current_price(signal["symbol"])
+        if price is None:
+            remaining.append(signal)
+            continue
+
+        update_excursion(signal, price)
+        side = signal["side"]
+        age_minutes = (now_ts() - int(signal.get("created_at", now_ts()))) / 60.0
+
+        # Migrate an already-running signal only if TP3 was actually reached.
+        if signal.get("tp3_hit") and not signal.get("stats_recorded"):
+            signal["_closing_price"] = signal.get("tp3", price)
+            if apply_result(signal, "profit"):
+                safe_record_learning_result(signal, "profit", source="live")
+            changed = True
+
+        # TP1 and TP2 are intermediate. Full stop risk and the time-stop remain
+        # active until TP3. Only TP3 locks a positive statistical outcome.
+        if not signal.get("tp3_hit"):
+            if sl_hit(side, price, signal["sl"]):
+                signal["_closing_price"] = signal["sl"]
+                if apply_result(signal, "sl"):
+                    safe_record_learning_result(signal, "sl", source="live")
                 send_telegram(
-                    f"⏱ FAST TRADE EXPIRED\n"
-                    f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
-                    f"Стратегия: {s['strategy']}\n"
-                    f"Цена не реализовалась за {FAST_MAX_MINUTES_TO_TP1} минут.\n"
-                    f"Вход: {format_price(s['entry'])}\n"
-                    f"Текущая цена: {format_price(p)}\n"
-                    f"TP1: {format_price(s['tp1'])}\n"
-                    f"Прогресс к TP1: {progress*100:.1f}%\n\n"
+                    f"❌ Stop Loss\n"
+                    f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
+                    f"Стратегия: {signal['strategy']}\n"
+                    f"Вход: {format_price(signal['entry'])}\n"
+                    f"SL: {format_price(signal['sl'])}\n"
+                    f"Текущая цена: {format_price(price)}\n\n"
                     f"{build_stats_text()}"
                 )
                 changed = True
                 continue
 
-        if age_minutes >= FAST_HARD_EXPIRE_MINUTES and not s.get("tp1_hit"):
-            apply_result(s, "expired")
-            safe_record_learning_result(s, "expired")
-            send_telegram(
-                f"⏱ HARD EXPIRE\n"
-                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
-                f"Стратегия: {s['strategy']}\n"
-                f"TP1 не достигнут за {FAST_HARD_EXPIRE_MINUTES} минут.\n"
-                f"Текущая цена: {format_price(p)}\n\n"
-                f"{build_stats_text()}"
-            )
-            changed = True
-            continue
+            for key in ["tp1", "tp2"]:
+                if (
+                    not signal.get(f"{key}_hit")
+                    and target_hit(side, price, signal[key])
+                ):
+                    signal[f"{key}_hit"] = True
+                    changed = True
+                    send_telegram(
+                        f"🎯 {key.upper()} HIT — промежуточная цель\n"
+                        f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
+                        f"Стратегия: {signal['strategy']}\n"
+                        f"{key.upper()}: {format_price(signal[key])}\n"
+                        f"Текущая цена: {format_price(price)}\n"
+                        f"Сделка станет положительной только при TP3."
+                    )
 
-        hit_any = False
-        for key in ["tp1", "tp2", "tp3", "tp4"]:
-            if s.get(key) and not s.get(f"{key}_hit") and target_hit(side, p, s[key]):
-                s[f"{key}_hit"] = True
-                hit_any = True
+            if target_hit(side, price, signal["tp3"]):
+                signal["tp3_hit"] = True
+                signal["profit_locked_at"] = now_ts()
+                signal["_closing_price"] = signal["tp3"]
+                if apply_result(signal, "profit"):
+                    safe_record_learning_result(signal, "profit", source="live")
+                send_telegram(
+                    f"✅ TP3 — сделка засчитана в profit\n"
+                    f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
+                    f"Стратегия: {signal['strategy']}\n"
+                    f"TP3: {format_price(signal['tp3'])}\n"
+                    f"Текущая цена: {format_price(price)}\n\n"
+                    f"{build_stats_text()}"
+                )
+                changed = True
+
+            if not signal.get("tp3_hit"):
+                directional, progress = directional_progress_ratio(signal, price)
+                fast_stop = (
+                    FAST_CANCEL_IF_NO_PROGRESS
+                    and age_minutes >= FAST_MAX_MINUTES_TO_TP1
+                    and not signal.get("tp1_hit")
+                    and ((not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP)
+                )
+                if fast_stop or age_minutes >= FAST_HARD_EXPIRE_MINUTES:
+                    signal["_closing_price"] = price
+                    result_r = _estimate_pnl_r(signal, "expired")
+                    if apply_result(signal, "expired"):
+                        safe_record_learning_result(signal, "expired", source="live")
+                    label = "FAST TIME-STOP" if fast_stop else "HARD TIME-STOP"
+                    stop_reason = (
+                        f"TP1 не получил достаточного движения за {age_minutes:.1f} мин.\n"
+                        if fast_stop
+                        else f"TP3 не достигнут за {age_minutes:.1f} мин.\n"
+                    )
+                    send_telegram(
+                        f"⏱ {label}\n"
+                        f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
+                        f"Стратегия: {signal['strategy']}\n"
+                        f"{stop_reason}"
+                        f"Вход: {format_price(signal['entry'])}\n"
+                        f"Цена выхода: {format_price(price)}\n"
+                        f"Прогресс к TP1: {progress*100:.1f}% · итог {result_r:+.2f}R\n\n"
+                        f"{build_stats_text()}"
+                    )
+                    changed = True
+                    continue
+
+        # After TP3, TP4/TP5 are informational and cannot double-count profit.
+        for key in ["tp4"]:
+            if (
+                signal.get("tp3_hit")
+                and signal.get(key)
+                and not signal.get(f"{key}_hit")
+                and target_hit(side, price, signal[key])
+            ):
+                signal[f"{key}_hit"] = True
+                changed = True
                 send_telegram(
                     f"🎯 {key.upper()} HIT\n"
-                    f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
-                    f"Стратегия: {s['strategy']}\n"
-                    f"{key.upper()}: {format_price(s[key])}\n"
-                    f"Текущая цена: {format_price(p)}"
+                    f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
+                    f"Стратегия: {signal['strategy']}\n"
+                    f"{key.upper()}: {format_price(signal[key])}\n"
+                    f"Текущая цена: {format_price(price)}"
                 )
 
-        if s.get("tp5") and target_hit(side, p, s["tp5"]):
-            s["tp5_hit"] = True
-            apply_result(s, "profit")
-            safe_record_learning_result(s, "profit")
+        if signal.get("tp3_hit") and target_hit(side, price, signal["tp5"]):
+            signal["tp5_hit"] = True
             send_telegram(
                 f"✅ FULL LADDER TAKE PROFIT\n"
-                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
-                f"Стратегия: {s['strategy']}\n"
-                f"TP5 достигнут: {format_price(p)}\n"
+                f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
+                f"Стратегия: {signal['strategy']}\n"
+                f"TP5 достигнут: {format_price(price)}\n"
                 f"Время в сделке: {age_minutes:.1f} мин\n\n"
                 f"{build_stats_text()}"
             )
             changed = True
             continue
 
-        if hit_any:
+        if signal.get("tp3_hit") and age_minutes >= LADDER_FOLLOWUP_MINUTES:
             changed = True
+            continue
 
-        remaining.append(s)
+        remaining.append(signal)
 
+    if track_shadow_signals():
+        changed = True
     if changed:
         STATE["active_signals"] = remaining
         save_state()
+
+
+def track_active_signals() -> None:
+    if not TRACK_RUN_LOCK.acquire(blocking=False):
+        return
+    try:
+        _track_active_signals_impl()
+    finally:
+        TRACK_RUN_LOCK.release()
 
 # ============================================================
 # Background tasks / HTTP endpoints
@@ -2969,10 +3596,15 @@ async def scan_loop():
         f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
-        f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}."
+        f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
+        f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}.\n"
+        f"Adaptive: {'permanent shadow' if SHADOW_ONLY else 'guarded live after independent validation'}; "
+        f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
+        f"Shadow candidates: {SHADOW_TRACKING_ENABLED} · automatic JSON backup every {AUTO_BACKUP_EVERY_CLOSED} outcomes.\n"
+        f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH}."
     )
     try:
-        scan = run_scan(manual=True)
+        scan = await asyncio.to_thread(run_scan, True)
         send_telegram(build_diagnostic(scan))
     except Exception as e:
         STATE["last_error"] = f"first scan exception: {repr(e)}"
@@ -2982,7 +3614,7 @@ async def scan_loop():
     while True:
         try:
             if AUTO_SCAN_ENABLED:
-                run_scan(manual=False)
+                await asyncio.to_thread(run_scan, False)
         except Exception as e:
             STATE["last_error"] = f"scan_loop: {repr(e)}"
             save_state()
@@ -2995,7 +3627,7 @@ async def track_loop():
     while True:
         try:
             if AUTO_TRACK_ENABLED:
-                track_active_signals()
+                await asyncio.to_thread(track_active_signals)
         except Exception as e:
             STATE["last_error"] = f"track_loop: {repr(e)}"
             save_state()
@@ -3020,7 +3652,8 @@ def root():
     return HTMLResponse(
         f"<h3>{APP_NAME}</h3>"
         f"<p>{DEPLOY_MARKER}</p>"
-        f"<p>Use /health /version /scan /auto-status /stats /adaptive-report /adaptive-retrain /adaptive-events /test-telegram</p>"
+        f"<p>Use /health /version /scan /auto-status /stats /adaptive-report "
+        f"/adaptive-retrain /adaptive-events /export-data /telegram-backup /test-telegram</p>"
     )
 
 
@@ -3074,7 +3707,12 @@ def adaptive_report_endpoint():
 
 
 @app.get("/adaptive-retrain")
-def adaptive_retrain_endpoint():
+def adaptive_retrain_endpoint(key: str = Query("")):
+    if not admin_authorized(key):
+        return JSONResponse(
+            {"ok": False, "error": "Set ADMIN_KEY and provide ?key=..."},
+            status_code=403,
+        )
     try:
         return JSONResponse(maybe_retrain(force=True))
     except Exception as e:
@@ -3087,6 +3725,48 @@ def adaptive_events_endpoint(limit: int = Query(20, ge=1, le=100)):
         return JSONResponse(recent_adaptive_events(limit))
     except Exception as e:
         return JSONResponse({"error": repr(e)}, status_code=500)
+
+
+@app.get("/export-data")
+def export_data_endpoint(key: str = Query("")):
+    if not admin_authorized(key):
+        return JSONResponse(
+            {"ok": False, "error": "Set ADMIN_KEY and provide ?key=..."},
+            status_code=403,
+        )
+    try:
+        closed_count = adaptive_closed_count()
+        filename = f"adaptive_backup_{closed_count}_{int(time.time())}.json"
+        return Response(
+            content=build_export_bytes(),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": repr(e)}, status_code=500)
+
+
+@app.get("/telegram-backup")
+def telegram_backup_endpoint(key: str = Query("")):
+    if not admin_authorized(key):
+        return JSONResponse(
+            {"ok": False, "error": "Set ADMIN_KEY and provide ?key=..."},
+            status_code=403,
+        )
+    try:
+        closed_count = adaptive_closed_count()
+        filename = f"adaptive_backup_{closed_count}_{int(time.time())}.json"
+        sent = send_telegram_document(
+            build_export_bytes(),
+            filename,
+            f"🧠 Manual adaptive backup · {closed_count} outcomes",
+        )
+        if sent:
+            STATE["last_backup_closed_count"] = closed_count
+            save_state()
+        return {"ok": sent, "closed_count": closed_count, "filename": filename}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": repr(e)}, status_code=500)
 
 
 @app.get("/test-telegram")
