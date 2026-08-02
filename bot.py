@@ -90,6 +90,29 @@ ROLLBACK_HARMFUL_BLOCK_WIN_RATE = float(
     os.getenv("ADAPTIVE_ROLLBACK_HARMFUL_BLOCK_WIN_RATE", "0.45")
 )
 
+# V16.3 evidence guard. These defaults come from the user's first 50 closed
+# outcomes: every candidate below Score 99 or with raw 1m volume ratio <= 0.80
+# was non-profitable. The rule is still audited on NEW outcomes and can disable
+# itself if shadow tracking shows that it is rejecting profitable TP3+ trades.
+EVIDENCE_GUARD_ENABLED = os.getenv("EVIDENCE_GUARD_ENABLED", "true").lower() == "true"
+EVIDENCE_GUARD_VERSION = 1
+EVIDENCE_MIN_SCORE = float(os.getenv("EVIDENCE_MIN_SCORE", "99"))
+EVIDENCE_MIN_VOL1 = float(os.getenv("EVIDENCE_MIN_VOL1", "0.80"))
+EVIDENCE_AUDIT_ENABLED = os.getenv("EVIDENCE_AUDIT_ENABLED", "true").lower() == "true"
+EVIDENCE_AUDIT_EVERY = int(os.getenv("EVIDENCE_AUDIT_EVERY", "25"))
+EVIDENCE_AUDIT_BASELINE_WINDOW = int(os.getenv("EVIDENCE_AUDIT_BASELINE_WINDOW", "50"))
+EVIDENCE_AUDIT_MIN_ACCEPTED = int(os.getenv("EVIDENCE_AUDIT_MIN_ACCEPTED", "8"))
+EVIDENCE_AUDIT_MIN_BLOCKED = int(os.getenv("EVIDENCE_AUDIT_MIN_BLOCKED", "5"))
+EVIDENCE_ROLLBACK_WINNERS = int(os.getenv("EVIDENCE_ROLLBACK_WINNERS", "2"))
+EVIDENCE_ROLLBACK_EXPECTANCY_DROP_R = float(
+    os.getenv("EVIDENCE_ROLLBACK_EXPECTANCY_DROP_R", "0.15")
+)
+EVIDENCE_ROLLBACK_SUCCESS_DROP = float(
+    os.getenv("EVIDENCE_ROLLBACK_SUCCESS_DROP", "0.08")
+)
+
+ADAPTIVE_SEED_PATH = os.getenv("ADAPTIVE_SEED_PATH", "adaptive_seed.json")
+
 # Never let learning touch these safety-critical settings.
 LOCKED_SAFETY_KEYS = {
     "LEVERAGE",
@@ -124,6 +147,12 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "edge_15m",
     "edge_30m",
     "btc_alignment",
+    # Non-linear quality markers added in V16.3. _vector_from_dict derives
+    # them for old V16.2 backups, so all 50 historical rows remain trainable.
+    "score_below_guard",
+    "vol1_below_guard",
+    "evidence_quality_pass",
+    "symbol_fail_streak",
 )
 
 
@@ -164,6 +193,20 @@ class ModelState:
             self.std = [1.0] * len(FEATURE_NAMES)
 
 
+@dataclass
+class EvidenceGuardState:
+    version: int = EVIDENCE_GUARD_VERSION
+    active: bool = EVIDENCE_GUARD_ENABLED
+    min_score: float = EVIDENCE_MIN_SCORE
+    min_vol1: float = EVIDENCE_MIN_VOL1
+    activation_trade_id: int = 0
+    activation_closed_count: int = 0
+    last_audit_decision_count: int = 0
+    last_audit_at: int = 0
+    created_at: int = 0
+    disabled_reason: str = ""
+
+
 _LOCK = threading.RLock()
 
 
@@ -201,7 +244,10 @@ def init_adaptive_db() -> None:
                 features_json TEXT NOT NULL,
                 model_version INTEGER NOT NULL DEFAULT 0,
                 model_probability REAL,
-                shadow_accepted INTEGER
+                shadow_accepted INTEGER,
+                evidence_guard_version INTEGER NOT NULL DEFAULT 0,
+                evidence_guard_accepted INTEGER,
+                evidence_guard_reason TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_adaptive_trades_closed
@@ -227,6 +273,11 @@ def init_adaptive_db() -> None:
                 saved_at INTEGER NOT NULL,
                 note TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS adaptive_rule_guard_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state_json TEXT NOT NULL
+            );
             """
         )
 
@@ -242,6 +293,9 @@ def init_adaptive_db() -> None:
             "mfe_r": "ALTER TABLE adaptive_trades ADD COLUMN mfe_r REAL NOT NULL DEFAULT 0",
             "mae_r": "ALTER TABLE adaptive_trades ADD COLUMN mae_r REAL NOT NULL DEFAULT 0",
             "duration_minutes": "ALTER TABLE adaptive_trades ADD COLUMN duration_minutes REAL NOT NULL DEFAULT 0",
+            "evidence_guard_version": "ALTER TABLE adaptive_trades ADD COLUMN evidence_guard_version INTEGER NOT NULL DEFAULT 0",
+            "evidence_guard_accepted": "ALTER TABLE adaptive_trades ADD COLUMN evidence_guard_accepted INTEGER",
+            "evidence_guard_reason": "ALTER TABLE adaptive_trades ADD COLUMN evidence_guard_reason TEXT",
         }
         for column, statement in migrations.items():
             if column not in existing_columns:
@@ -250,6 +304,10 @@ def init_adaptive_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_adaptive_trades_model_decision "
             "ON adaptive_trades(model_version, source, shadow_accepted, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_adaptive_trades_evidence_decision "
+            "ON adaptive_trades(evidence_guard_version, source, evidence_guard_accepted, id)"
         )
 
         row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
@@ -298,6 +356,61 @@ def init_adaptive_db() -> None:
                 "database_initialized",
             ),
         )
+
+        guard_row = conn.execute(
+            "SELECT state_json FROM adaptive_rule_guard_state WHERE id = 1"
+        ).fetchone()
+        latest = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS n FROM adaptive_trades"
+        ).fetchone()
+        reset_guard = False
+        if guard_row is None:
+            guard = EvidenceGuardState(
+                activation_trade_id=int(latest["max_id"] or 0),
+                activation_closed_count=int(latest["n"] or 0),
+                created_at=int(time.time()),
+            )
+            reset_guard = True
+        else:
+            try:
+                raw_guard = json.loads(guard_row["state_json"])
+                allowed_guard = {field.name for field in fields(EvidenceGuardState)}
+                guard = EvidenceGuardState(
+                    **{key: value for key, value in raw_guard.items() if key in allowed_guard}
+                )
+            except Exception:
+                guard = EvidenceGuardState(
+                    activation_trade_id=int(latest["max_id"] or 0),
+                    activation_closed_count=int(latest["n"] or 0),
+                    created_at=int(time.time()),
+                )
+                reset_guard = True
+
+        # A threshold/version change is a new rule experiment and therefore
+        # receives a fresh before/after activation marker.
+        if (
+            int(guard.version) != EVIDENCE_GUARD_VERSION
+            or abs(float(guard.min_score) - EVIDENCE_MIN_SCORE) > 1e-9
+            or abs(float(guard.min_vol1) - EVIDENCE_MIN_VOL1) > 1e-9
+        ):
+            guard = EvidenceGuardState(
+                activation_trade_id=int(latest["max_id"] or 0),
+                activation_closed_count=int(latest["n"] or 0),
+                created_at=int(time.time()),
+            )
+            reset_guard = True
+
+        if not EVIDENCE_GUARD_ENABLED and guard.active:
+            guard.active = False
+            guard.disabled_reason = "disabled_by_environment"
+            reset_guard = True
+
+        if reset_guard:
+            conn.execute(
+                "INSERT INTO adaptive_rule_guard_state(id, state_json) VALUES(1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json",
+                (json.dumps(asdict(guard), ensure_ascii=False),),
+            )
         conn.commit()
 
 
@@ -333,7 +446,7 @@ def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
     sl = _clip(trade.get("sl"), 0.0, 1e18, entry)
     sl_move = abs(entry - sl) / max(entry, 1e-12)
 
-    return {
+    features = {
         "score": _clip(trade.get("score"), 0, 100) / 100.0,
         "is_long": 1.0 if side == "LONG" else 0.0,
         "is_a_plus": 1.0 if grade == "A+" else 0.0,
@@ -359,11 +472,39 @@ def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
         "edge_15m": _clip(direction * ch15m, -0.40, 0.40) / 0.40,
         "edge_30m": _clip(direction * ch30m, -0.60, 0.60) / 0.60,
         "btc_alignment": btc_alignment,
+        "symbol_fail_streak": _clip(trade.get("symbol_fail_streak"), 0, 5) / 5.0,
     }
+    raw_score = features["score"] * 100.0
+    raw_vol1 = features["vol1"] * 8.0
+    features["score_below_guard"] = 1.0 if raw_score < EVIDENCE_MIN_SCORE else 0.0
+    features["vol1_below_guard"] = 1.0 if raw_vol1 <= EVIDENCE_MIN_VOL1 else 0.0
+    features["evidence_quality_pass"] = (
+        1.0
+        if raw_score >= EVIDENCE_MIN_SCORE and raw_vol1 > EVIDENCE_MIN_VOL1
+        else 0.0
+    )
+    return features
 
 
 def _vector_from_dict(features: Dict[str, float]) -> List[float]:
-    return [float(features.get(name, 0.0)) for name in FEATURE_NAMES]
+    # V16.2 backups do not contain the four fields below. Derive the three
+    # quality markers from the normalized historical score/vol1 values so the
+    # first 50 outcomes remain usable after the feature-schema upgrade.
+    compatible = dict(features or {})
+    raw_score = _clip(compatible.get("score"), 0, 1) * 100.0
+    raw_vol1 = _clip(compatible.get("vol1"), 0, 1) * 8.0
+    compatible.setdefault(
+        "score_below_guard", 1.0 if raw_score < EVIDENCE_MIN_SCORE else 0.0
+    )
+    compatible.setdefault(
+        "vol1_below_guard", 1.0 if raw_vol1 <= EVIDENCE_MIN_VOL1 else 0.0
+    )
+    compatible.setdefault(
+        "evidence_quality_pass",
+        1.0 if raw_score >= EVIDENCE_MIN_SCORE and raw_vol1 > EVIDENCE_MIN_VOL1 else 0.0,
+    )
+    compatible.setdefault("symbol_fail_streak", 0.0)
+    return [float(compatible.get(name, 0.0)) for name in FEATURE_NAMES]
 
 
 def get_model_state() -> ModelState:
@@ -466,6 +607,81 @@ def _latest_trade_marker() -> Tuple[int, int]:
     return int(row["max_id"] or 0), int(row["n"] or 0)
 
 
+def get_evidence_guard_state() -> EvidenceGuardState:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT state_json FROM adaptive_rule_guard_state WHERE id = 1"
+        ).fetchone()
+    if row is None:
+        latest_id, latest_count = _latest_trade_marker()
+        state = EvidenceGuardState(
+            activation_trade_id=latest_id,
+            activation_closed_count=latest_count,
+            created_at=int(time.time()),
+        )
+        _save_evidence_guard_state(state)
+        return state
+    try:
+        raw = json.loads(row["state_json"])
+        allowed = {field.name for field in fields(EvidenceGuardState)}
+        return EvidenceGuardState(
+            **{key: value for key, value in raw.items() if key in allowed}
+        )
+    except Exception:
+        latest_id, latest_count = _latest_trade_marker()
+        state = EvidenceGuardState(
+            activation_trade_id=latest_id,
+            activation_closed_count=latest_count,
+            created_at=int(time.time()),
+        )
+        _save_evidence_guard_state(state)
+        return state
+
+
+def _save_evidence_guard_state(state: EvidenceGuardState) -> None:
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            "INSERT INTO adaptive_rule_guard_state(id, state_json) VALUES(1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json",
+            (json.dumps(asdict(state), ensure_ascii=False),),
+        )
+        conn.commit()
+
+
+def evidence_guard(trade: Dict[str, Any]) -> Tuple[bool, str]:
+    """Apply the auditable V16.3 Score/Vol1 rule before a live signal.
+
+    Rejected candidates are not discarded: analyze_symbol sends them to the
+    shadow tracker so the bot can measure missed TP3 winners and auto-disable
+    this guard if new evidence contradicts the first 50 outcomes.
+    """
+    state = get_evidence_guard_state()
+    score = float(trade.get("score", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 0.0) or 0.0)
+    failures: List[str] = []
+    if score < float(state.min_score):
+        failures.append(f"Score {score:.0f} < {state.min_score:.0f}")
+    if vol1 <= float(state.min_vol1):
+        failures.append(f"Vol1 x{vol1:.2f} <= x{state.min_vol1:.2f}")
+
+    accepted = bool(not state.active or not failures)
+    if not state.active:
+        reason = f"evidence guard v{state.version} inactive ({state.disabled_reason or 'audit rollback'})"
+    elif accepted:
+        reason = (
+            f"evidence guard v{state.version} passed: Score {score:.0f}, "
+            f"Vol1 x{vol1:.2f}"
+        )
+    else:
+        reason = f"evidence guard v{state.version} blocked: " + "; ".join(failures)
+
+    trade["evidence_guard_version"] = int(state.version)
+    trade["evidence_guard_accepted"] = accepted
+    trade["evidence_guard_reason"] = reason
+    return accepted, reason
+
+
 def _event(event_type: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
     with _LOCK, _connect() as conn:
         conn.execute(
@@ -565,6 +781,9 @@ def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[st
     probability = signal.get("adaptive_probability", signal.get("adaptive_shadow_probability"))
     model_version = int(signal.get("adaptive_model_version", 0) or 0)
     shadow_accepted = signal.get("adaptive_shadow_accepted")
+    evidence_guard_version = int(signal.get("evidence_guard_version", 0) or 0)
+    evidence_guard_accepted = signal.get("evidence_guard_accepted")
+    evidence_guard_reason = signal.get("evidence_guard_reason")
     label = 1 if result == "profit" else 0
     pnl_r = _estimate_pnl_r(signal, result)
     source = str(source or signal.get("signal_source", "live"))
@@ -580,8 +799,9 @@ def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[st
                 signal_id, created_at, closed_at, source, symbol, side, strategy, grade,
                 result, label, pnl_r, exit_price, mfe_r, mae_r, duration_minutes,
                 features_json, model_version,
-                model_probability, shadow_accepted
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                model_probability, shadow_accepted,
+                evidence_guard_version, evidence_guard_accepted, evidence_guard_reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 signal_id,
@@ -603,6 +823,9 @@ def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[st
                 model_version,
                 float(probability) if probability is not None else None,
                 int(bool(shadow_accepted)) if shadow_accepted is not None else None,
+                evidence_guard_version,
+                int(bool(evidence_guard_accepted)) if evidence_guard_accepted is not None else None,
+                str(evidence_guard_reason) if evidence_guard_reason is not None else None,
             ),
         )
         conn.commit()
@@ -612,6 +835,7 @@ def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[st
 
     # Audit the currently active champion before a scheduled retraining can
     # replace it on the same milestone outcome.
+    evidence_guard_audit = maybe_evidence_guard_audit()
     live_audit = maybe_live_audit()
     if live_audit and live_audit.get("action") == "rollback":
         training_report = {
@@ -624,6 +848,7 @@ def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[st
         training_report = maybe_retrain()
     return {
         "inserted": True,
+        "evidence_guard_audit": evidence_guard_audit,
         "live_audit": live_audit,
         "training_report": training_report,
         **training_report,
@@ -824,6 +1049,134 @@ def _metrics_line(metrics: Dict[str, Any]) -> str:
         f"успех всех {float(metrics.get('success_rate', 0))*100:.1f}% · "
         f"{float(metrics.get('expectancy_r', 0)):+.3f}R"
     )
+
+
+def _collect_evidence_guard_metrics(state: EvidenceGuardState) -> Dict[str, Any]:
+    baseline_limit = max(1, EVIDENCE_AUDIT_BASELINE_WINDOW)
+    with _LOCK, _connect() as conn:
+        baseline_rows = conn.execute(
+            """
+            SELECT id, result, label, pnl_r, source
+            FROM adaptive_trades
+            WHERE source='live' AND id <= ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(state.activation_trade_id), baseline_limit),
+        ).fetchall()
+        decision_rows = conn.execute(
+            """
+            SELECT id, result, label, pnl_r, source,
+                   evidence_guard_accepted, evidence_guard_reason
+            FROM adaptive_trades
+            WHERE id > ? AND evidence_guard_version = ?
+              AND (
+                    (source='live' AND evidence_guard_accepted=1)
+                    OR (source='shadow' AND evidence_guard_accepted=0)
+                  )
+            ORDER BY id ASC
+            """,
+            (int(state.activation_trade_id), int(state.version)),
+        ).fetchall()
+
+    accepted_rows = [
+        row
+        for row in decision_rows
+        if str(row["source"]) == "live" and int(row["evidence_guard_accepted"] or 0) == 1
+    ]
+    blocked_rows = [
+        row
+        for row in decision_rows
+        if str(row["source"]) == "shadow" and int(row["evidence_guard_accepted"] or 0) == 0
+    ]
+    return {
+        "guard_version": int(state.version),
+        "decision_count": len(decision_rows),
+        "baseline": _outcome_metrics(baseline_rows),
+        "accepted": _outcome_metrics(accepted_rows),
+        "blocked": _outcome_metrics(blocked_rows),
+    }
+
+
+def maybe_evidence_guard_audit(force: bool = False) -> Optional[Dict[str, Any]]:
+    if not EVIDENCE_AUDIT_ENABLED:
+        return None
+    state = get_evidence_guard_state()
+    if not state.active:
+        return None
+
+    metrics = _collect_evidence_guard_metrics(state)
+    decision_count = int(metrics["decision_count"])
+    audit_every = max(1, EVIDENCE_AUDIT_EVERY)
+    if (
+        not force
+        and decision_count - int(state.last_audit_decision_count or 0) < audit_every
+    ):
+        return None
+
+    baseline = metrics["baseline"]
+    accepted = metrics["accepted"]
+    blocked = metrics["blocked"]
+    enough_accepted = int(accepted["n"]) >= max(1, EVIDENCE_AUDIT_MIN_ACCEPTED)
+    enough_blocked = int(blocked["n"]) >= max(1, EVIDENCE_AUDIT_MIN_BLOCKED)
+    enough_baseline = int(baseline["n"]) >= 15
+
+    # The most direct proof of harm is a profitable shadow group that the rule
+    # refused. A second guarded condition catches broad before/after collapse.
+    harmful_blocking = (
+        enough_accepted
+        and enough_blocked
+        and int(blocked["profit"]) >= max(1, EVIDENCE_ROLLBACK_WINNERS)
+        and float(blocked["expectancy_r"]) > 0.0
+        and float(blocked["success_rate"])
+        >= float(accepted["success_rate"]) + 0.10
+    )
+    material_underperformance = (
+        enough_baseline
+        and enough_accepted
+        and float(baseline["expectancy_r"]) - float(accepted["expectancy_r"])
+        >= EVIDENCE_ROLLBACK_EXPECTANCY_DROP_R
+        and float(baseline["success_rate"]) - float(accepted["success_rate"])
+        >= EVIDENCE_ROLLBACK_SUCCESS_DROP
+    )
+
+    if not enough_accepted or not enough_blocked:
+        action = "collect_more"
+        reason = "evidence_not_enough_comparison_rows"
+    elif harmful_blocking:
+        action = "rollback"
+        reason = "evidence_too_many_profitable_signals_blocked"
+    elif material_underperformance:
+        action = "rollback"
+        reason = "evidence_guard_worse_than_baseline"
+    else:
+        action = "keep"
+        reason = "evidence_guard_passed"
+
+    state.last_audit_decision_count = decision_count
+    state.last_audit_at = int(time.time())
+    if action == "rollback":
+        state.active = False
+        state.disabled_reason = reason
+    _save_evidence_guard_state(state)
+
+    payload: Dict[str, Any] = {
+        **metrics,
+        "action": action,
+        "reason": reason,
+        "enough_baseline": enough_baseline,
+        "enough_accepted": enough_accepted,
+        "enough_blocked": enough_blocked,
+        "guard_active": bool(state.active),
+        "min_score": float(state.min_score),
+        "min_vol1": float(state.min_vol1),
+    }
+    _event(
+        "evidence_guard_audit",
+        "Evidence guard rolled back" if action == "rollback" else "Evidence guard audit completed",
+        payload,
+    )
+    return payload
 
 
 def _collect_live_audit_metrics(state: ModelState) -> Dict[str, Any]:
@@ -1342,6 +1695,12 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "too_many_profitable_signals_blocked": "модель заблокировала слишком много прибыльных сигналов",
     "live_model_worse_than_baseline": "реальные результаты модели хуже предыдущей версии",
     "live_model_guard_passed": "live-проверка не выявила ухудшения",
+    "feature_schema_changed": "добавлены новые признаки качества; старые исходы сохранены",
+    "seed_restored_feature_upgrade": "50 исходов восстановлены; следующая проверка продолжится по графику",
+    "evidence_not_enough_comparison_rows": "для честной проверки фильтра пока мало отправленных или shadow-исходов",
+    "evidence_too_many_profitable_signals_blocked": "фильтр начал пропускать слишком много TP3+ сигналов",
+    "evidence_guard_worse_than_baseline": "результаты после фильтра хуже исходной выборки",
+    "evidence_guard_passed": "новый защитный фильтр не показал ухудшения",
 }
 
 
@@ -1455,9 +1814,50 @@ def format_live_audit_message(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_evidence_guard_audit_message(report: Dict[str, Any]) -> str:
+    version = int(report.get("guard_version", EVIDENCE_GUARD_VERSION) or 0)
+    decisions = int(report.get("decision_count", 0) or 0)
+    baseline = report.get("baseline") or {}
+    accepted = report.get("accepted") or {}
+    blocked = report.get("blocked") or {}
+    action = str(report.get("action", "collect_more"))
+    reason = str(report.get("reason", "unknown"))
+    correctly_blocked = int(blocked.get("sl", 0)) + int(blocked.get("expired", 0))
+    missed_winners = int(blocked.get("profit", 0))
+
+    if action == "rollback":
+        title = f"↩️ АУДИТ V16.3 · RULE {version}: АВТООТКАТ"
+    elif action == "keep":
+        title = f"✅ АУДИТ V16.3 · RULE {version}: ФИЛЬТР ОСТАВЛЕН"
+    else:
+        title = f"📊 АУДИТ V16.3 · RULE {version}: НУЖНО БОЛЬШЕ ДАННЫХ"
+
+    lines = [
+        title,
+        f"Закрытых решений фильтра: {decisions}",
+        f"Правило: Score ≥ {float(report.get('min_score', EVIDENCE_MIN_SCORE)):.0f} · "
+        f"Vol1 > x{float(report.get('min_vol1', EVIDENCE_MIN_VOL1)):.2f}",
+        "",
+        f"ДО · последние {int(baseline.get('n', 0))} live: {_metrics_line(baseline)}",
+        f"ПОСЛЕ · отправленные {int(accepted.get('n', 0))}: {_metrics_line(accepted)}",
+        f"SHADOW-БЛОК · {int(blocked.get('n', 0))}: {_metrics_line(blocked)}",
+        f"Правильно заблокировано: {correctly_blocked} · пропущено TP3+: {missed_winners}",
+        "",
+        f"Причина решения: {_adaptive_reason_ru(reason)}",
+    ]
+    if action == "rollback":
+        lines.append("Решение: фильтр Score/Vol1 отключён; базовая логика продолжает работать.")
+    elif action == "keep":
+        lines.append("Решение: фильтр Score/Vol1 продолжает отбирать live-сигналы.")
+    else:
+        lines.append("Решение: пока ничего не менять; бот продолжит собирать shadow-сравнение.")
+    return "\n".join(lines)
+
+
 def adaptive_report() -> str:
     init_adaptive_db()
     state = get_model_state()
+    guard_state = get_evidence_guard_state()
 
     with _LOCK, _connect() as conn:
         total = conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"]
@@ -1511,7 +1911,28 @@ def adaptive_report() -> str:
         f"Validation expectancy: {state.validation_expectancy_r:+.3f}R "
         f"vs baseline {state.validation_baseline_expectancy_r:+.3f}R",
         f"Last candidate: {state.last_candidate_reason}",
+        "",
+        f"Evidence guard v{guard_state.version}: active={guard_state.active} · "
+        f"Score ≥ {guard_state.min_score:.0f} · Vol1 > x{guard_state.min_vol1:.2f}",
+        f"Evidence guard reason: {guard_state.disabled_reason or 'running'}",
     ]
+
+    if guard_state.active and EVIDENCE_AUDIT_ENABLED:
+        guard_preview = _collect_evidence_guard_metrics(guard_state)
+        guard_pending = max(
+            0,
+            int(guard_preview["decision_count"])
+            - int(guard_state.last_audit_decision_count or 0),
+        )
+        lines.extend(
+            [
+                f"Evidence audit: {guard_pending}/{max(1, EVIDENCE_AUDIT_EVERY)} "
+                f"new decisions (total {int(guard_preview['decision_count'])})",
+                f"Guard before: {_metrics_line(guard_preview['baseline'])}",
+                f"Guard after live: {_metrics_line(guard_preview['accepted'])}",
+                f"Guard blocked shadow: {_metrics_line(guard_preview['blocked'])}",
+            ]
+        )
 
     if source_rows:
         lines.append("\nData sources:")
@@ -1627,12 +2048,13 @@ def build_export_payload() -> Dict[str, Any]:
 
     state_snapshot = json.loads(json.dumps(globals().get("STATE", {}), ensure_ascii=False))
     return {
-        "export_schema": 3,
+        "export_schema": 4,
         "exported_at": int(time.time()),
         "app": globals().get("APP_NAME", "adaptive futures bot"),
         "deploy_marker": globals().get("DEPLOY_MARKER", "unknown"),
         "state": state_snapshot,
         "adaptive_model": asdict(get_model_state()),
+        "evidence_guard": asdict(get_evidence_guard_state()),
         "adaptive_model_versions": model_versions,
         "adaptive_trades": trades,
         "adaptive_events": events,
@@ -1661,8 +2083,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.2 AUDIT + ROLLBACK"
-DEPLOY_MARKER = "V16_2_TP3_AUDIT_ROLLBACK_2026_08_01"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.3 EVIDENCE GUARD"
+DEPLOY_MARKER = "V16_3_EVIDENCE_GUARD_SYMBOL_QUARANTINE_2026_08_02"
 
 app = FastAPI(title=APP_NAME)
 
@@ -1695,6 +2117,13 @@ MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
+MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "8"))
+
+# A symbol that produces three consecutive non-profit outcomes is quarantined
+# for 12 hours. Shadow observation continues and any TP3+ clears the quarantine.
+SYMBOL_QUARANTINE_ENABLED = os.getenv("SYMBOL_QUARANTINE_ENABLED", "true").lower() == "true"
+SYMBOL_FAIL_LIMIT = int(os.getenv("SYMBOL_FAIL_LIMIT", "3"))
+SYMBOL_QUARANTINE_SECONDS = int(os.getenv("SYMBOL_QUARANTINE_SECONDS", "43200"))
 
 # Shadow candidates are hypothetical trades: they are never sent as live signals,
 # but their outcomes let the challenger learn from accepted and rejected examples.
@@ -1950,6 +2379,7 @@ FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
 ]]
 
 STATE: Dict[str, Any] = {}
+SEED_RESTORE_INFO: Dict[str, Any] = {"restored": 0, "source": "", "reason": "not_checked"}
 KLINE_CACHE: Dict[str, Tuple[float, Optional[List[Dict[str, float]]]]] = {}
 TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
 STATE_IO_LOCK = threading.RLock()
@@ -1981,7 +2411,7 @@ def base_asset(symbol: str) -> str:
 
 def default_state() -> Dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "active_signals": [],
         "shadow_signals": [],
         "stats": {
@@ -1995,6 +2425,9 @@ def default_state() -> Dict[str, Any]:
         "pair_cooldown": {},
         "strategy_cooldown": {},
         "shadow_cooldown": {},
+        "symbol_outcomes": {},
+        "live_send_timestamps": [],
+        "seed_restore": {},
         "last_backup_closed_count": 0,
         "last_scan": {},
         "last_diag_ts": 0,
@@ -2017,11 +2450,14 @@ def load_state() -> Dict[str, Any]:
         base.setdefault("pair_cooldown", {})
         base.setdefault("strategy_cooldown", {})
         base.setdefault("shadow_cooldown", {})
+        base.setdefault("symbol_outcomes", {})
+        base.setdefault("live_send_timestamps", [])
+        base.setdefault("seed_restore", {})
         base.setdefault("last_backup_closed_count", 0)
         stats = base.setdefault("stats", {})
         for bucket, value in default_state()["stats"].items():
             stats.setdefault(bucket, value.copy() if isinstance(value, dict) else value)
-        base["schema_version"] = 2
+        base["schema_version"] = 3
         return base
     except Exception:
         return default_state()
@@ -2041,6 +2477,209 @@ def save_state() -> None:
     except Exception as e:
         # Do not recursively call save_state from its own error path.
         STATE["last_error"] = f"state save error: {repr(e)}"
+
+
+def _adaptive_seed_candidates() -> List[Path]:
+    candidates: List[Path] = []
+    configured = Path(ADAPTIVE_SEED_PATH)
+    if not configured.is_absolute():
+        configured = Path.cwd() / configured
+    candidates.append(configured)
+
+    roots = [Path.cwd(), Path(__file__).resolve().parent]
+    for root in roots:
+        try:
+            candidates.extend(sorted(root.glob("*.json")))
+        except Exception:
+            continue
+
+    state_path = Path(STATE_FILE)
+    if not state_path.is_absolute():
+        state_path = Path.cwd() / state_path
+    state_path = state_path.resolve()
+
+    unique: List[Path] = []
+    seen = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            continue
+        marker = str(resolved)
+        if marker in seen or resolved == state_path:
+            continue
+        seen.add(marker)
+        unique.append(resolved)
+    return unique
+
+
+def restore_adaptive_seed_if_empty() -> Dict[str, Any]:
+    """Restore a portable V16.2/V16.3 export only into an empty adaptive DB.
+
+    Active signals and cooldowns are intentionally not restored: stale market
+    positions must never come back after a deploy. Historical outcomes, stats
+    and the 50-trade training milestone are preserved.
+    """
+    init_adaptive_db()
+    if adaptive_closed_count() > 0:
+        return {"restored": 0, "source": "", "reason": "database_not_empty"}
+
+    seed_path: Optional[Path] = None
+    payload: Optional[Dict[str, Any]] = None
+    for candidate in _adaptive_seed_candidates():
+        if not candidate.is_file():
+            continue
+        try:
+            with candidate.open("r", encoding="utf-8") as handle:
+                possible = json.load(handle)
+            trades = possible.get("adaptive_trades") if isinstance(possible, dict) else None
+            if isinstance(trades, list) and trades:
+                seed_path = candidate
+                payload = possible
+                break
+        except Exception:
+            continue
+
+    if seed_path is None or payload is None:
+        return {"restored": 0, "source": "", "reason": "seed_not_found"}
+
+    seed_trades = payload.get("adaptive_trades") or []
+    inserted = 0
+    with _LOCK, _connect() as conn:
+        if int(conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"] or 0) > 0:
+            return {"restored": 0, "source": "", "reason": "database_not_empty"}
+
+        for index, item in enumerate(seed_trades):
+            if not isinstance(item, dict):
+                continue
+            result = str(item.get("result", "expired"))
+            if result not in {"profit", "sl", "expired"}:
+                continue
+            features_payload = item.get("features")
+            if not isinstance(features_payload, dict):
+                try:
+                    features_payload = json.loads(item.get("features_json") or "{}")
+                except Exception:
+                    features_payload = {}
+            created_at = int(item.get("created_at", int(time.time())) or int(time.time()))
+            closed_at = int(item.get("closed_at", created_at) or created_at)
+            signal_id = str(item.get("signal_id") or f"seed:{index}:{created_at}")
+            evidence_accepted = item.get("evidence_guard_accepted")
+            shadow_accepted = item.get("shadow_accepted")
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO adaptive_trades(
+                    signal_id, created_at, closed_at, source, symbol, side, strategy, grade,
+                    result, label, pnl_r, exit_price, mfe_r, mae_r, duration_minutes,
+                    features_json, model_version, model_probability, shadow_accepted,
+                    evidence_guard_version, evidence_guard_accepted, evidence_guard_reason
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    signal_id,
+                    created_at,
+                    closed_at,
+                    str(item.get("source", "live")),
+                    str(item.get("symbol", "?")),
+                    str(item.get("side", "?")),
+                    str(item.get("strategy", "?")),
+                    str(item.get("grade", "?")),
+                    result,
+                    1 if result == "profit" else 0,
+                    float(item.get("pnl_r", 0.0) or 0.0),
+                    float(item["exit_price"]) if item.get("exit_price") is not None else None,
+                    float(item.get("mfe_r", 0.0) or 0.0),
+                    float(item.get("mae_r", 0.0) or 0.0),
+                    float(item.get("duration_minutes", 0.0) or 0.0),
+                    json.dumps(features_payload, ensure_ascii=False),
+                    int(item.get("model_version", 0) or 0),
+                    float(item["model_probability"])
+                    if item.get("model_probability") is not None
+                    else None,
+                    int(bool(shadow_accepted)) if shadow_accepted is not None else None,
+                    int(item.get("evidence_guard_version", 0) or 0),
+                    int(bool(evidence_accepted)) if evidence_accepted is not None else None,
+                    str(item.get("evidence_guard_reason"))
+                    if item.get("evidence_guard_reason") is not None
+                    else None,
+                ),
+            )
+            inserted += max(0, int(cursor.rowcount or 0))
+
+        for event in payload.get("adaptive_events") or []:
+            if not isinstance(event, dict):
+                continue
+            event_payload = event.get("payload")
+            if not isinstance(event_payload, dict):
+                event_payload = {}
+            conn.execute(
+                "INSERT INTO adaptive_events(created_at, event_type, message, payload_json) "
+                "VALUES(?,?,?,?)",
+                (
+                    int(event.get("created_at", int(time.time())) or int(time.time())),
+                    str(event.get("event_type", "seed_event")),
+                    str(event.get("message", "Imported from adaptive seed")),
+                    json.dumps(event_payload, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+
+    if inserted <= 0:
+        return {"restored": 0, "source": seed_path.name, "reason": "no_valid_rows"}
+
+    raw_model = payload.get("adaptive_model") or {}
+    allowed_model = {field.name for field in fields(ModelState)}
+    try:
+        restored_model = ModelState(
+            **{key: value for key, value in raw_model.items() if key in allowed_model}
+        )
+    except Exception:
+        restored_model = ModelState()
+    restored_model.active = False
+    restored_model.weights = [0.0] * (len(FEATURE_NAMES) + 1)
+    restored_model.mean = [0.0] * len(FEATURE_NAMES)
+    restored_model.std = [1.0] * len(FEATURE_NAMES)
+    restored_model.trained_rows = inserted
+    restored_model.last_attempted_closed_count = max(
+        inserted, int(restored_model.last_attempted_closed_count or 0)
+    )
+    restored_model.last_candidate_reason = "seed_restored_feature_upgrade"
+    restored_model.activation_trade_id = 0
+    restored_model.activation_closed_count = 0
+    restored_model.last_live_audit_decision_count = 0
+    _save_model_state(restored_model)
+    _save_model_snapshot(
+        restored_model,
+        "baseline" if restored_model.version == 0 else "inactive",
+        "portable_seed_restored_feature_upgrade",
+    )
+
+    latest_id, latest_count = _latest_trade_marker()
+    restored_guard = EvidenceGuardState(
+        activation_trade_id=latest_id,
+        activation_closed_count=latest_count,
+        created_at=int(time.time()),
+    )
+    _save_evidence_guard_state(restored_guard)
+
+    seed_state = payload.get("state") or {}
+    seed_stats = seed_state.get("stats") if isinstance(seed_state, dict) else None
+    if isinstance(seed_stats, dict):
+        STATE["stats"] = seed_stats
+    STATE["last_backup_closed_count"] = latest_count
+    STATE["seed_restore"] = {
+        "restored": inserted,
+        "source": seed_path.name,
+        "at": now_ts(),
+    }
+    rebuild_symbol_outcomes_from_adaptive_db()
+    save_state()
+    _event(
+        "portable_seed_restored",
+        f"Restored {inserted} adaptive outcomes from portable JSON",
+        {"restored": inserted, "source": seed_path.name},
+    )
+    return {"restored": inserted, "source": seed_path.name, "reason": "restored"}
 
 
 def inc_stat(bucket: str, key: str, result: str) -> None:
@@ -3586,6 +4225,123 @@ def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _prune_live_send_timestamps(current_ts: Optional[int] = None) -> List[int]:
+    current = int(current_ts or now_ts())
+    cutoff = current - 24 * 60 * 60
+    cleaned: List[int] = []
+    for value in STATE.setdefault("live_send_timestamps", []):
+        try:
+            timestamp = int(value)
+        except Exception:
+            continue
+        if timestamp > cutoff:
+            cleaned.append(timestamp)
+    STATE["live_send_timestamps"] = cleaned
+    return cleaned
+
+
+def live_signal_budget_24h() -> Tuple[int, int]:
+    sent = len(_prune_live_send_timestamps())
+    if MAX_LIVE_SIGNALS_24H <= 0:
+        return sent, 10**9
+    return sent, max(0, MAX_LIVE_SIGNALS_24H - sent)
+
+
+def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
+    """Rebuild only the lightweight per-symbol streak state from saved rows."""
+    if not SYMBOL_QUARANTINE_ENABLED:
+        STATE["symbol_outcomes"] = {}
+        return {}
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT symbol, result, source, closed_at FROM adaptive_trades "
+            "ORDER BY closed_at ASC, id ASC"
+        ).fetchall()
+
+    outcomes: Dict[str, Any] = {}
+    for row in rows:
+        symbol = normalize_symbol(str(row["symbol"] or "?"))
+        item = outcomes.setdefault(
+            symbol,
+            {
+                "fail_streak": 0,
+                "quarantine_until": 0,
+                "observations": 0,
+                "last_result": "",
+                "last_source": "",
+                "updated_at": 0,
+            },
+        )
+        result = str(row["result"] or "expired")
+        closed_at = int(row["closed_at"] or 0)
+        item["observations"] = int(item.get("observations", 0) or 0) + 1
+        if result == "profit":
+            item["fail_streak"] = 0
+            item["quarantine_until"] = 0
+        else:
+            item["fail_streak"] = int(item.get("fail_streak", 0) or 0) + 1
+            if item["fail_streak"] >= max(1, SYMBOL_FAIL_LIMIT):
+                item["quarantine_until"] = closed_at + max(1, SYMBOL_QUARANTINE_SECONDS)
+        item["last_result"] = result
+        item["last_source"] = str(row["source"] or "live")
+        item["updated_at"] = closed_at
+    STATE["symbol_outcomes"] = outcomes
+    return outcomes
+
+
+def symbol_quarantine_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
+    symbol = normalize_symbol(str(trade.get("symbol", "?")))
+    item = STATE.setdefault("symbol_outcomes", {}).get(symbol) or {}
+    fail_streak = int(item.get("fail_streak", 0) or 0)
+    quarantine_until = int(item.get("quarantine_until", 0) or 0)
+    trade["symbol_fail_streak"] = fail_streak
+    trade["symbol_quarantine_until"] = quarantine_until
+
+    if not SYMBOL_QUARANTINE_ENABLED:
+        return True, "symbol quarantine disabled"
+    if now_ts() < quarantine_until:
+        hours_left = max(0.0, (quarantine_until - now_ts()) / 3600.0)
+        return False, (
+            f"symbol quarantine: {display_symbol(symbol)} has {fail_streak} consecutive "
+            f"non-profit outcomes; retry in {hours_left:.1f}h"
+        )
+    return True, f"symbol streak {fail_streak}/{max(1, SYMBOL_FAIL_LIMIT)}"
+
+
+def update_symbol_outcome_guard(
+    signal: Dict[str, Any], result: str, source: Optional[str] = None
+) -> Dict[str, Any]:
+    if not SYMBOL_QUARANTINE_ENABLED:
+        return {}
+    symbol = normalize_symbol(str(signal.get("symbol", "?")))
+    outcomes = STATE.setdefault("symbol_outcomes", {})
+    item = outcomes.setdefault(
+        symbol,
+        {
+            "fail_streak": 0,
+            "quarantine_until": 0,
+            "observations": 0,
+            "last_result": "",
+            "last_source": "",
+            "updated_at": 0,
+        },
+    )
+    item["observations"] = int(item.get("observations", 0) or 0) + 1
+    if result == "profit":
+        item["fail_streak"] = 0
+        item["quarantine_until"] = 0
+    else:
+        item["fail_streak"] = int(item.get("fail_streak", 0) or 0) + 1
+        if item["fail_streak"] >= max(1, SYMBOL_FAIL_LIMIT):
+            item["quarantine_until"] = now_ts() + max(1, SYMBOL_QUARANTINE_SECONDS)
+    item["last_result"] = result
+    item["last_source"] = str(source or signal.get("signal_source", "live"))
+    item["updated_at"] = now_ts()
+    save_state()
+    return dict(item)
+
+
 def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], near_miss: List[str]) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
     c1 = get_klines(symbol, "1m", 120, cache_seconds=6)
@@ -3666,6 +4422,31 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             continue
         trade["trader_pattern_reason"] = t_reason
 
+        # V16.3: evaluate the transparent evidence rule first. A blocked trade
+        # is still followed in shadow, so the bot can measure missed winners and
+        # automatically roll the rule back. The symbol gate is evaluated on the
+        # same candidate and contributes its failure streak to adaptive features.
+        symbol_ok, symbol_reason = symbol_quarantine_gate(trade)
+        trade["symbol_quarantine_reason"] = symbol_reason
+        try:
+            evidence_ok, evidence_reason = evidence_guard(trade)
+            if not evidence_ok:
+                blocks["evidence_guard_block"] = blocks.get("evidence_guard_block", 0) + 1
+                add_shadow_signal(trade, "evidence_guard_block")
+                if len(near_miss) < 8:
+                    near_miss.append(f"{display_symbol(symbol)} {side}: {evidence_reason}")
+                continue
+        except Exception as e:
+            trade["evidence_guard_reason"] = f"evidence guard error bypass: {repr(e)}"
+            STATE["last_error"] = trade["evidence_guard_reason"]
+
+        if not symbol_ok:
+            blocks["symbol_quarantine_block"] = blocks.get("symbol_quarantine_block", 0) + 1
+            add_shadow_signal(trade, "symbol_quarantine_block")
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side}: {symbol_reason}")
+            continue
+
         # Adaptive model starts in shadow mode. During warm-up it never blocks signals.
         try:
             adaptive_ok, adaptive_reason, adaptive_probability = adaptive_gate(trade)
@@ -3721,6 +4502,8 @@ def build_signal_message(s: Dict[str, Any]) -> str:
         f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
         f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
         f"Риск: multiplier x{s['risk_mult']:.2f}\n"
+        f"Evidence guard: {s.get('evidence_guard_reason', 'not evaluated')}\n"
+        f"Symbol guard: {s.get('symbol_quarantine_reason', 'no history')}\n"
         f"Adaptive: {s.get('adaptive_reason', 'warm-up')}\n\n"
         f"📌 Логика:\n{s['reason']}\n"
         f"15m: {s['ch15m']*100:+.2f}% · 30m: {s['ch30m']*100:+.2f}% · 1m3: {s['ch3m_1m']*100:+.2f}%\n"
@@ -3736,7 +4519,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16 Guarded Learning\n"
+        f"🧪 Диагностика V16.3 Evidence Guard\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · "
         f"shadow: {scan.get('shadow_added', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
@@ -3821,6 +4604,9 @@ def add_active_signal(s: Dict[str, Any]) -> None:
     STATE.setdefault("active_signals", []).append(s)
     STATE.setdefault("pair_cooldown", {})[s["symbol"]] = now_ts() + PAIR_COOLDOWN_SECONDS
     STATE.setdefault("strategy_cooldown", {})[s["strategy"]] = now_ts() + STRATEGY_COOLDOWN_SECONDS
+    timestamps = _prune_live_send_timestamps()
+    timestamps.append(now_ts())
+    STATE["live_send_timestamps"] = timestamps
     save_state()
 
 
@@ -3878,11 +4664,21 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         if not signal.get(PROFIT_TARGET_KEY + "_hit") and not signal.get("stats_recorded")
     )
     free_slots = max(0, MAX_ACTIVE_SIGNALS - open_risk_count)
-    send_limit = min(MAX_SIGNALS_PER_SCAN, free_slots)
+    sent_24h, daily_remaining = live_signal_budget_24h()
+    send_limit = min(MAX_SIGNALS_PER_SCAN, free_slots, daily_remaining)
     if send_limit <= 0 and found:
-        blocks["active_slots_full_send_block"] = blocks.get("active_slots_full_send_block", 0) + 1
+        if daily_remaining <= 0:
+            block_key = "daily_live_cap_block"
+            detail = (
+                f"24h live cap reached: {sent_24h}/{MAX_LIVE_SIGNALS_24H}; "
+                "qualified candidates stay in shadow"
+            )
+        else:
+            block_key = "active_slots_full_send_block"
+            detail = f"found {len(found)} candidate(s), but active slots are full"
+        blocks[block_key] = blocks.get(block_key, 0) + 1
         if len(near_miss) < 8:
-            near_miss.append(f"found {len(found)} candidate(s), but active slots are full")
+            near_miss.append(detail)
     for s in found[:send_limit]:
         add_active_signal(s)
         send_telegram(build_signal_message(s))
@@ -3891,7 +4687,8 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
     shadow_added = 0
     if SHADOW_TRACKING_ENABLED:
         for candidate in found[send_limit:send_limit + max(0, SHADOW_PER_SCAN)]:
-            if add_shadow_signal(candidate, "qualified_not_sent"):
+            shadow_reason = "daily_live_cap" if daily_remaining <= 0 else "qualified_not_sent"
+            if add_shadow_signal(candidate, shadow_reason):
                 shadow_added += 1
 
     scan["sent"] = sent
@@ -3951,7 +4748,11 @@ def safe_record_learning_result(
         report = record_closed_trade(signal, result, source=source)
         if report.get("inserted"):
             signal["learning_recorded"] = result
+            update_symbol_outcome_guard(signal, result, source=source)
             maybe_send_auto_backup()
+        evidence_audit = report.get("evidence_guard_audit")
+        if isinstance(evidence_audit, dict):
+            send_telegram(format_evidence_guard_audit_message(evidence_audit))
         live_audit = report.get("live_audit")
         if isinstance(live_audit, dict):
             send_telegram(format_live_audit_message(live_audit))
@@ -4186,6 +4987,20 @@ def track_active_signals() -> None:
 
 async def scan_loop():
     await asyncio.sleep(3)
+    guard_state = get_evidence_guard_state()
+    restored_count = int(SEED_RESTORE_INFO.get("restored", 0) or 0)
+    restored_text = (
+        f"restored {restored_count} outcomes from {SEED_RESTORE_INFO.get('source', 'JSON')}"
+        if restored_count
+        else str(SEED_RESTORE_INFO.get("reason", "not needed"))
+    )
+    state_storage = str(Path(STATE_FILE))
+    db_storage = str(Path(DB_PATH))
+    storage_warning = (
+        "persistent /var/data paths configured"
+        if state_storage.startswith("/var/data/") and db_storage.startswith("/var/data/")
+        else "WARNING: configure Render Disk /var/data and absolute storage paths"
+    )
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
@@ -4195,12 +5010,19 @@ async def scan_loop():
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
         f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
         f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}.\n"
+        f"Evidence guard v{guard_state.version}: active={guard_state.active} · "
+        f"Score ≥ {guard_state.min_score:.0f} · Vol1 > x{guard_state.min_vol1:.2f}; "
+        f"audit every {EVIDENCE_AUDIT_EVERY} decisions.\n"
+        f"Symbol quarantine: {SYMBOL_QUARANTINE_ENABLED} · after {SYMBOL_FAIL_LIMIT} "
+        f"non-profit outcomes for {SYMBOL_QUARANTINE_SECONDS/3600:.0f}h · TP3 resets.\n"
+        f"Live frequency cap: {MAX_LIVE_SIGNALS_24H}/24h; extra candidates stay in shadow.\n"
         f"Adaptive: {'permanent shadow' if SHADOW_ONLY else 'guarded live after independent validation'}; "
         f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
         f"Audit: before/after every {LIVE_AUDIT_EVERY} closed model decisions · "
         f"automatic rollback: {AUTO_ROLLBACK_ENABLED}.\n"
         f"Shadow candidates: {SHADOW_TRACKING_ENABLED} · automatic JSON backup every {AUTO_BACKUP_EVERY_CLOSED} outcomes.\n"
-        f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH}."
+        f"Seed JSON: {restored_text}.\n"
+        f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH} · {storage_warning}."
     )
     try:
         scan = await asyncio.to_thread(run_scan, True)
@@ -4235,10 +5057,14 @@ async def track_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    global STATE
+    global STATE, SEED_RESTORE_INFO
     STATE = load_state()
     try:
         init_adaptive_db()
+        SEED_RESTORE_INFO = restore_adaptive_seed_if_empty()
+        if adaptive_closed_count() > 0:
+            rebuild_symbol_outcomes_from_adaptive_db()
+            save_state()
     except Exception as e:
         STATE["last_error"] = f"adaptive DB init error: {repr(e)}"
         save_state()
