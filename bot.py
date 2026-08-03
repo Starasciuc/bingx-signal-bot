@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.6.5
+# VERIFIED GITHUB DEPLOY FILE — V16.7
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -1466,7 +1466,8 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         rows = conn.execute(
             """
             SELECT id, result, label, pnl_r, features_json,
-                   source, model_version, shadow_accepted
+                   source, model_version, shadow_accepted, decision_reason,
+                   side, strategy
             FROM adaptive_trades
             ORDER BY closed_at ASC, id ASC
             """
@@ -1588,21 +1589,43 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     test_candidate_outcomes = _outcome_metrics(
         [test_rows[i] for i in selected_test_indices]
     )
-    selected_live_test_rows = [
+    selected_forward_test_rows = [
         test_rows[i]
         for i in selected_test_indices
-        if str(test_rows[i]["source"] or "live").lower() == "live"
+        if (
+            str(test_rows[i]["source"] or "live").lower() == "live"
+            or str(test_rows[i]["decision_reason"] or "") == PAPER_VALIDATION_REASON
+        )
     ]
-    test_live_candidate_outcomes = _outcome_metrics(selected_live_test_rows)
-    live_validation_ready = (
-        int(test_live_candidate_outcomes["n"])
+    test_forward_candidate_outcomes = _outcome_metrics(selected_forward_test_rows)
+    test_side_breakdown = {
+        "long": _outcome_metrics(
+            [row for row in test_rows if str(row["side"] or "").upper() == "LONG"]
+        ),
+        "short": _outcome_metrics(
+            [row for row in test_rows if str(row["side"] or "").upper() == "SHORT"]
+        ),
+    }
+    recent_strategy_breakdown = {
+        strategy_name: _outcome_metrics(
+            [
+                row for row in test_rows
+                if str(row["strategy"] or "") == strategy_name
+            ]
+        )
+        for strategy_name in sorted(
+            {str(row["strategy"] or "?") for row in test_rows}
+        )
+    }
+    forward_validation_ready = (
+        int(test_forward_candidate_outcomes["n"])
         >= max(1, MIN_SELECTED_LIVE_TEST_ROWS)
     )
-    live_validation_positive = (
-        live_validation_ready
-        and float(test_live_candidate_outcomes["success_rate"])
+    forward_validation_positive = (
+        forward_validation_ready
+        and float(test_forward_candidate_outcomes["success_rate"])
         > ADAPTIVE_TARGET_SUCCESS_RATE
-        and float(test_live_candidate_outcomes["expectancy_r"]) > 0
+        and float(test_forward_candidate_outcomes["expectancy_r"]) > 0
     )
 
     enough_test_classes = min(sum(y_test), len(y_test) - sum(y_test)) >= 3
@@ -1616,7 +1639,7 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         and test_metrics["expectancy_r"]
         >= test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R
         and test_metrics["selected_wr"] >= test_metrics["baseline_wr"]
-        and live_validation_positive
+        and forward_validation_positive
     )
 
     champion_expectancy = test_metrics["baseline_expectancy_r"]
@@ -1659,12 +1682,28 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     )
     promote = bool(confirmation_passed and confirmation_ready)
 
+    failed_checks: List[str] = []
+    if not enough_test_classes:
+        failed_checks.append("independent_test_class_imbalance")
+    if improvement < MIN_MODEL_IMPROVEMENT:
+        failed_checks.append("logloss_not_better")
+    if test_metrics["selected_count"] < MIN_SELECTED_TEST_ROWS:
+        failed_checks.append("too_few_selected_test_rows")
+    if test_metrics["coverage"] < MIN_VALIDATION_COVERAGE:
+        failed_checks.append("coverage_too_low")
+    if test_metrics["selected_wr"] <= ADAPTIVE_TARGET_SUCCESS_RATE:
+        failed_checks.append("tp3_majority_not_reached")
+    if test_metrics["expectancy_r"] <= 0:
+        failed_checks.append("negative_test_expectancy")
+    if test_metrics["expectancy_r"] < test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R:
+        failed_checks.append("expectancy_not_better_than_baseline")
+    if not forward_validation_ready:
+        failed_checks.append("not_enough_forward_test_rows")
+    elif not forward_validation_positive:
+        failed_checks.append("selected_forward_test_failed")
+
     if not enough_test_classes:
         candidate_reason = "independent_test_class_imbalance"
-    elif not live_validation_ready:
-        candidate_reason = "not_enough_selected_live_test_rows"
-    elif not live_validation_positive:
-        candidate_reason = "selected_live_test_failed"
     elif improvement < MIN_MODEL_IMPROVEMENT:
         candidate_reason = "logloss_not_better"
     elif test_metrics["selected_count"] < MIN_SELECTED_TEST_ROWS:
@@ -1677,6 +1716,10 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         candidate_reason = "negative_test_expectancy"
     elif test_metrics["expectancy_r"] < test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R:
         candidate_reason = "expectancy_not_better_than_baseline"
+    elif not forward_validation_ready:
+        candidate_reason = "not_enough_forward_test_rows"
+    elif not forward_validation_positive:
+        candidate_reason = "selected_forward_test_failed"
     elif not beats_champion:
         candidate_reason = "champion_kept"
     elif not champion_live_audit_ready:
@@ -1792,6 +1835,7 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         "champion_decision_count": champion_decision_count,
         "candidate_pass_streak": candidate_pass_streak,
         "candidate_selected_total": candidate_selected_total,
+        "failed_checks": failed_checks,
         "confirmation_passes_required": max(1, ADAPTIVE_CONFIRMATION_PASSES),
         "confirmation_selected_required": max(1, ADAPTIVE_CONFIRMATION_SELECTED),
         "deployment_fraction": float(new_state.deployment_fraction or 0.0),
@@ -1799,10 +1843,12 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         "source_breakdown": _source_breakdown(rows),
         "test_baseline": test_baseline_outcomes,
         "test_candidate": test_candidate_outcomes,
-        "test_live_candidate": test_live_candidate_outcomes,
+        "test_forward_candidate": test_forward_candidate_outcomes,
+        "test_side_breakdown": test_side_breakdown,
+        "recent_strategy_breakdown": recent_strategy_breakdown,
         "min_selected_live_test_rows": max(1, MIN_SELECTED_LIVE_TEST_ROWS),
-        "live_validation_ready": live_validation_ready,
-        "live_validation_positive": live_validation_positive,
+        "forward_validation_ready": forward_validation_ready,
+        "forward_validation_positive": forward_validation_positive,
         "next_at": closed_count + max(1, RETRAIN_EVERY),
         "shadow_only": SHADOW_ONLY,
     }
@@ -1822,6 +1868,8 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "independent_test_class_imbalance": "в последней независимой проверке мало разных исходов",
     "not_enough_selected_live_test_rows": "кандидат не набрал достаточно реальных LIVE-сделок для допуска",
     "selected_live_test_failed": "отдельная проверка кандидата на реальных LIVE-сделках отрицательная",
+    "not_enough_forward_test_rows": "кандидат не набрал достаточно подтверждённых PAPER/LIVE-сделок в новой независимой проверке",
+    "selected_forward_test_failed": "подтверждённая PAPER/LIVE-проверка кандидата отрицательная",
     "logloss_not_better": "прогноз новой модели не точнее базового",
     "too_few_selected_test_rows": "новая модель выбрала слишком мало проверочных сигналов",
     "coverage_too_low": "модель блокирует слишком большую часть сигналов",
@@ -1884,7 +1932,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
 
     baseline = report.get("test_baseline")
     candidate = report.get("test_candidate")
-    live_candidate = report.get("test_live_candidate")
+    forward_candidate = report.get("test_forward_candidate")
     if baseline and candidate:
         lines.extend(
             [
@@ -1895,11 +1943,32 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
                 f"покрытие {float(report.get('coverage', 0))*100:.1f}%",
             ]
         )
-        if live_candidate:
+        if forward_candidate:
             lines.append(
-                f"LIVE КАНДИДАТ · только реальные сигналы: {_metrics_line(live_candidate)} · "
+                f"FORWARD КАНДИДАТ · подтверждённые PAPER/LIVE: {_metrics_line(forward_candidate)} · "
                 f"нужно минимум {int(report.get('min_selected_live_test_rows', MIN_SELECTED_LIVE_TEST_ROWS))}."
             )
+
+    failed_checks = [
+        _adaptive_reason_ru(item) for item in (report.get("failed_checks") or [])
+    ]
+    if failed_checks:
+        lines.append("Не пройдены проверки: " + "; ".join(failed_checks))
+
+    sides = report.get("test_side_breakdown") or {}
+    if sides:
+        lines.extend(
+            [
+                "",
+                f"LONG · новая проверка: {_metrics_line(sides.get('long') or {})}",
+                f"SHORT · новая проверка: {_metrics_line(sides.get('short') or {})}",
+            ]
+        )
+    strategies = report.get("recent_strategy_breakdown") or {}
+    if strategies:
+        lines.append("Стратегии · новая проверка:")
+        for strategy_name, strategy_metrics in strategies.items():
+            lines.append(f"• {strategy_name}: {_metrics_line(strategy_metrics or {})}")
 
     if reason == "candidate_confirmation_pending":
         lines.append(
@@ -2311,8 +2380,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.5 LIVE EVIDENCE RECOVERY"
-DEPLOY_MARKER = "V16_6_5_LIVE_EVIDENCE_RECOVERY_125_2026_08_03"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.7 FORWARD PAPER VALIDATION"
+DEPLOY_MARKER = "V16_7_FORWARD_PAPER_VALIDATION_150_2026_08_03"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2355,15 +2424,24 @@ MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "
 MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "0"))
 MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
 
-# --- V16.6 evidence-backed entry quality ---
-# On 125 saved outcomes this joint condition retained 46 setups at +0.077R,
-# while the 79 rejected rows averaged -0.294R. It also stayed positive in the
-# newest 25-row block. The three conditions are applied jointly; no single
-# threshold is treated as proof by itself.
+# --- V16.7 forward entry validation ---
+# The joint rule was useful through outcome 125, but the 126-150 forward block
+# showed regime drift: some rejected INSTANT LONG setups outperformed the ones
+# that passed. The production gate remains conservative. Its strongest LONG
+# challenger is now routed through the same pre-LIVE confirmation and then
+# shown as an explicit PAPER signal, never silently promoted to LIVE.
 DATA_ENTRY_GATE_ENABLED = os.getenv("DATA_ENTRY_GATE_ENABLED", "true").lower() == "true"
 DATA_MIN_VOL1 = float(os.getenv("DATA_MIN_VOL1", "1.00"))
 DATA_MIN_RANGE1 = float(os.getenv("DATA_MIN_RANGE1", "1.50"))
 DATA_MIN_DIRECTIONAL_3M = float(os.getenv("DATA_MIN_DIRECTIONAL_3M", "0.0080"))
+
+PAPER_VALIDATION_ENABLED = os.getenv("PAPER_VALIDATION_ENABLED", "true").lower() == "true"
+PAPER_LONG_CHALLENGER_ENABLED = os.getenv(
+    "PAPER_LONG_CHALLENGER_ENABLED", "true"
+).lower() == "true"
+PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "true"
+PAPER_VALIDATION_REASON = "paper_validation"
+PAPER_LONG_STRATEGY = "PRO_INSTANT_EDGE_LONG"
 
 # Weak strategies are paused only in LIVE. They continue producing SHADOW
 # outcomes and automatically recover when the newest rolling evidence improves.
@@ -2375,6 +2453,11 @@ STRATEGY_GUARD_MAX_SUCCESS_RATE = float(os.getenv("STRATEGY_GUARD_MAX_SUCCESS_RA
 STRATEGY_RECOVERY_WINDOW = int(os.getenv("STRATEGY_RECOVERY_WINDOW", "5"))
 STRATEGY_RECOVERY_MIN_PROFITS = int(os.getenv("STRATEGY_RECOVERY_MIN_PROFITS", "2"))
 STRATEGY_RECOVERY_MIN_EXPECTANCY_R = float(os.getenv("STRATEGY_RECOVERY_MIN_EXPECTANCY_R", "0.05"))
+# MARKET_DUMP_SHORT was persistently negative through outcome 150. It remains
+# SHADOW until the newest recovery window meets the ordinary recovery rule.
+MARKET_DUMP_SHORT_REQUALIFY = os.getenv(
+    "MARKET_DUMP_SHORT_REQUALIFY", "true"
+).lower() == "true"
 
 # A detected setup is not sent immediately. It must keep its direction for a
 # short observation window, remain near the original entry and confirm on 1m.
@@ -2403,9 +2486,8 @@ SHADOW_MAX_ACTIVE = int(os.getenv("SHADOW_MAX_ACTIVE", "40"))
 SHADOW_PER_SCAN = int(os.getenv("SHADOW_PER_SCAN", "6"))
 SHADOW_COOLDOWN_SECONDS = int(os.getenv("SHADOW_COOLDOWN_SECONDS", "600"))
 
-# V16.6.5: the 125-outcome backup showed 24 SHADOW vs only one LIVE result in
-# the newest block. Extra near-miss probes are therefore disabled by default:
-# the bottleneck is timely LIVE confirmation, not a lack of simulated rows.
+# V16.7: extra near-miss probes remain disabled. Forward learning now uses only
+# explicitly confirmed and visible PAPER candidates plus genuine LIVE results.
 # The implementation remains available for controlled experiments via env.
 SHADOW_PROBE_ENABLED = os.getenv("SHADOW_PROBE_ENABLED", "false").lower() == "true"
 SHADOW_PROBE_PER_SCAN = int(os.getenv("SHADOW_PROBE_PER_SCAN", "3"))
@@ -2493,7 +2575,9 @@ LOCAL_STOP_MODES = {
     "AERO_STYLE_SHORT", "AERO_STYLE_LONG",
 }
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
-A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
+# A+ did not outperform B in the newest 50 outcomes. Grade still ranks a setup,
+# but it cannot increase suggested risk until a fresh forward audit proves it.
+A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.08"))
 
 # --- V13.22 professional quality gate ---
 # Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
@@ -4931,6 +5015,17 @@ def data_entry_quality_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
     return accepted, reason
 
 
+def paper_long_challenger_eligible(trade: Dict[str, Any]) -> bool:
+    """Forward-test the strongest rejected lane without leaking it into LIVE."""
+    return bool(
+        PAPER_VALIDATION_ENABLED
+        and PAPER_LONG_CHALLENGER_ENABLED
+        and str(trade.get("side", "")).upper() == "LONG"
+        and str(trade.get("strategy", "")).upper() == PAPER_LONG_STRATEGY
+        and not bool(trade.get("data_entry_gate_accepted", False))
+    )
+
+
 def strategy_circuit_breaker(trade: Dict[str, Any]) -> Tuple[bool, str]:
     """Pause a weak strategy in LIVE while continuously rechecking it in SHADOW."""
     strategy = str(trade.get("strategy", "?"))
@@ -4959,11 +5054,20 @@ def strategy_circuit_breaker(trade: Dict[str, Any]) -> Tuple[bool, str]:
         and int(recovery["profit"]) >= max(1, STRATEGY_RECOVERY_MIN_PROFITS)
         and float(recovery["expectancy_r"]) >= STRATEGY_RECOVERY_MIN_EXPECTANCY_R
     )
-    accepted = bool(not weak or recovered)
+    forced_requalification = bool(
+        MARKET_DUMP_SHORT_REQUALIFY
+        and strategy == "PRO_MARKET_DUMP_SHORT"
+    )
+    accepted = bool(recovered if forced_requalification else (not weak or recovered))
     reason = (
         f"strategy guard passed: last {int(metrics['n'])}, {_metrics_line(metrics)}"
         if accepted
-        else f"strategy LIVE paused: last {int(metrics['n'])}, {_metrics_line(metrics)}"
+        else (
+            f"strategy LIVE paused until recovery: last {int(metrics['n'])}, "
+            f"{_metrics_line(metrics)}"
+            if forced_requalification
+            else f"strategy LIVE paused: last {int(metrics['n'])}, {_metrics_line(metrics)}"
+        )
     )
     trade["strategy_guard_accepted"] = accepted
     trade["strategy_guard_reason"] = reason
@@ -5191,6 +5295,21 @@ def analyze_symbol(
         data_ok, data_reason = data_entry_quality_gate(trade)
         if not data_ok:
             blocks["data_entry_gate_block"] = blocks.get("data_entry_gate_block", 0) + 1
+            if paper_long_challenger_eligible(trade):
+                # This path is deliberately PAPER-only. It must first retain
+                # direction during the normal 10-120s confirmation window.
+                # Even a confirmed setup can only become a visible shadow
+                # observation; it cannot enter the LIVE send queue.
+                trade["paper_validation_only"] = True
+                trade["paper_validation_origin"] = data_reason
+                trade["paper_validation_lane"] = "rejected_instant_long"
+                candidates.append(trade)
+                blocks["paper_long_challenger"] = blocks.get("paper_long_challenger", 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(
+                        f"{display_symbol(symbol)} {side}: PAPER challenger · {data_reason}"
+                    )
+                continue
             shadow_observed = add_shadow_signal(trade, "data_entry_gate_block") or shadow_observed
             if len(near_miss) < 8:
                 near_miss.append(f"{display_symbol(symbol)} {side}: {data_reason}")
@@ -5315,20 +5434,64 @@ def build_signal_message(s: Dict[str, Any]) -> str:
     )
 
 
+def build_paper_signal_message(s: Dict[str, Any]) -> str:
+    return (
+        "📋 PAPER-ПРОВЕРКА — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
+        f"{s['side']} {display_symbol(s['symbol'])} · {s['grade']} · Score {s['score']}\n"
+        f"Стратегия: {s['strategy']}\n"
+        "Статус: подтверждённый challenger; только независимое наблюдение.\n\n"
+        f"Вход наблюдения: {format_price(s['entry'])}\n"
+        f"TP1: {format_price(s['tp1'])}\n"
+        f"TP2: {format_price(s['tp2'])}\n"
+        f"TP3: {format_price(s['tp3'])} · только здесь считается profit\n"
+        f"TP4: {format_price(s['tp4'])}\n"
+        f"TP5: {format_price(s['tp5'])}\n"
+        f"SL: {format_price(s['sl'])}\n\n"
+        f"Подтверждение: {int(s.get('pending_confirmation_seconds', 0) or 0)}с · "
+        f"движение {float(s.get('pending_confirmation_move', 0.0) or 0.0)*100:+.2f}%\n"
+        f"Почему PAPER: {s.get('paper_validation_origin', 'forward challenger')}\n"
+        f"Следующий отчёт обучения — каждые {RETRAIN_EVERY} закрытых результатов."
+    )
+
+
+def build_paper_result_message(
+    signal: Dict[str, Any], result: str, closing_price: float
+) -> str:
+    labels = {
+        "profit": "✅ TP3+",
+        "sl": "❌ STOP LOSS",
+        "expired": "⏱ EXPIRED",
+    }
+    pnl_r = _estimate_pnl_r(signal, result)
+    age_minutes = max(
+        0.0, (now_ts() - int(signal.get("created_at", now_ts()) or now_ts())) / 60.0
+    )
+    return (
+        f"📋 PAPER РЕЗУЛЬТАТ: {labels.get(result, result.upper())}\n"
+        f"{signal.get('side', '?')} {display_symbol(signal.get('symbol', '?'))}\n"
+        f"Стратегия: {signal.get('strategy', '?')}\n"
+        f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
+        f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
+        "Это результат виртуального наблюдения, не реальная сделка."
+    )
+
+
 def build_diagnostic(scan: Dict[str, Any]) -> str:
     blocks = scan.get("blocks", {})
     block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:12]]
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16.6.5 Live Evidence Recovery\n"
+        f"🧪 Диагностика V16.7 Forward Paper Validation\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
+        f"PAPER отправлено: {scan.get('paper_sent', 0)} · "
         f"shadow новых: {scan.get('shadow_added', 0)} "
         f"(near-miss {scan.get('near_miss_added', 0)}) · "
         f"shadow активных: {scan.get('shadow_active', 0)} "
         f"(near-miss {scan.get('near_miss_active', 0)}) · "
+        f"PAPER активных: {scan.get('paper_active', 0)} · "
         f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
@@ -5414,6 +5577,37 @@ def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
             else SHADOW_COOLDOWN_SECONDS
         )
         cooldowns[key] = now_ts() + max(0, cooldown_seconds)
+        save_state()
+    return True
+
+
+def set_confirmed_paper_signal(signal: Dict[str, Any]) -> bool:
+    """Replace the pre-confirmation shadow with its confirmed PAPER entry."""
+    if not SHADOW_TRACKING_ENABLED or not PAPER_VALIDATION_ENABLED:
+        return False
+    with STATE_IO_LOCK:
+        shadows = STATE.setdefault("shadow_signals", [])
+        key = shadow_key(signal)
+        paper = dict(signal)
+        ensure_signal_runtime_fields(paper, "shadow")
+        paper["shadow_reason"] = PAPER_VALIDATION_REASON
+        paper["paper_validation_visible"] = True
+        paper["stats_recorded"] = None
+        paper["learning_recorded"] = None
+
+        replaced = False
+        for index, item in enumerate(shadows):
+            if shadow_key(item) == key:
+                shadows[index] = paper
+                replaced = True
+                break
+        if not replaced:
+            if len(shadows) >= SHADOW_MAX_ACTIVE:
+                return False
+            shadows.append(paper)
+        STATE.setdefault("shadow_cooldown", {})[key] = now_ts() + max(
+            0, SHADOW_COOLDOWN_SECONDS
+        )
         save_state()
     return True
 
@@ -5535,10 +5729,15 @@ def process_pending_signals(
             if len(near_miss) < 8:
                 near_miss.append(quality_reason)
             continue
-        strategy_ok, _ = strategy_circuit_breaker(refreshed)
-        if not strategy_ok:
-            blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
-            continue
+        if refreshed.get("paper_validation_only"):
+            refreshed["strategy_guard_reason"] = (
+                "PAPER challenger bypasses LIVE strategy gate; never eligible for LIVE"
+            )
+        else:
+            strategy_ok, _ = strategy_circuit_breaker(refreshed)
+            if not strategy_ok:
+                blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
+                continue
         confirmed.append(refreshed)
 
     STATE["pending_signals"] = remaining
@@ -5585,10 +5784,15 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         "sent": 0,
         "shadow_added": 0,
         "near_miss_added": 0,
+        "paper_sent": 0,
         "shadow_active": len(STATE.setdefault("shadow_signals", [])),
         "near_miss_active": sum(
             1 for item in STATE.setdefault("shadow_signals", [])
             if str(item.get("shadow_reason", "")) == "near_miss_probe"
+        ),
+        "paper_active": sum(
+            1 for item in STATE.setdefault("shadow_signals", [])
+            if str(item.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
         ),
         "blocks": blocks,
         "near_miss": near_miss,
@@ -5696,6 +5900,20 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]),
         reverse=True,
     )
+    paper_ready = [
+        item for item in ready_candidates
+        if bool(item.get("paper_validation_only"))
+    ]
+    ready_candidates = [
+        item for item in ready_candidates
+        if not bool(item.get("paper_validation_only"))
+    ]
+    paper_sent = 0
+    for paper_candidate in paper_ready:
+        if set_confirmed_paper_signal(paper_candidate):
+            send_telegram(build_paper_signal_message(paper_candidate))
+            paper_sent += 1
+    scan["paper_sent"] = paper_sent
     scan["pending_added"] = pending_added
     scan["pending_active"] = len(STATE.get("pending_signals", []))
     scan["confirmed"] = len(confirmed_candidates)
@@ -5797,6 +6015,10 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         1 for item in STATE.setdefault("shadow_signals", [])
         if str(item.get("shadow_reason", "")) == "near_miss_probe"
     )
+    scan["paper_active"] = sum(
+        1 for item in STATE.setdefault("shadow_signals", [])
+        if str(item.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+    )
     scan["elapsed"] = time.time() - start
     STATE["last_scan"] = scan
     save_state()
@@ -5893,6 +6115,13 @@ def track_shadow_signals() -> bool:
         if sl_hit(side, price, signal["sl"]):
             signal["_closing_price"] = signal["sl"]
             safe_record_learning_result(signal, "sl", source="shadow")
+            if (
+                PAPER_NOTIFY_RESULTS
+                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+            ):
+                send_telegram(
+                    build_paper_result_message(signal, "sl", float(signal["sl"]))
+                )
             changed = True
             continue
 
@@ -5904,6 +6133,15 @@ def track_shadow_signals() -> bool:
             signal[PROFIT_TARGET_KEY + "_hit"] = True
             signal["_closing_price"] = signal[PROFIT_TARGET_KEY]
             safe_record_learning_result(signal, "profit", source="shadow")
+            if (
+                PAPER_NOTIFY_RESULTS
+                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+            ):
+                send_telegram(
+                    build_paper_result_message(
+                        signal, "profit", float(signal[PROFIT_TARGET_KEY])
+                    )
+                )
             changed = True
             continue
 
@@ -5918,6 +6156,13 @@ def track_shadow_signals() -> bool:
         if fast_stop or age_minutes >= FAST_HARD_EXPIRE_MINUTES:
             signal["_closing_price"] = price
             safe_record_learning_result(signal, "expired", source="shadow")
+            if (
+                PAPER_NOTIFY_RESULTS
+                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+            ):
+                send_telegram(
+                    build_paper_result_message(signal, "expired", float(price))
+                )
             changed = True
             continue
 
@@ -6128,8 +6373,14 @@ async def scan_loop():
         f"wait {PRE_LIVE_MIN_SECONDS}–{PRE_LIVE_MAX_SECONDS}s · "
         f"confirm move ≥ {PRE_LIVE_MIN_DIRECTIONAL_MOVE*100:.2f}% · "
         f"anti-chase ≤ {PRE_LIVE_MAX_CHASE_MOVE*100:.2f}%.\n"
+        f"Forward PAPER validation: {PAPER_VALIDATION_ENABLED} · rejected "
+        f"{PAPER_LONG_STRATEGY} challengers must pass the same confirmation · "
+        f"visible in Telegram · never LIVE automatically.\n"
         f"Strategy circuit breaker: {STRATEGY_CIRCUIT_BREAKER_ENABLED} · "
         f"rolling {STRATEGY_GUARD_WINDOW} outcomes · weak strategies stay in SHADOW.\n"
+        f"MARKET_DUMP_SHORT requalification: {MARKET_DUMP_SHORT_REQUALIFY} · "
+        f"needs ≥ {STRATEGY_RECOVERY_MIN_PROFITS} TP3+ in newest "
+        f"{STRATEGY_RECOVERY_WINDOW} and expectancy ≥ {STRATEGY_RECOVERY_MIN_EXPECTANCY_R:+.2f}R.\n"
         f"Near-miss SHADOW: {SHADOW_PROBE_ENABLED} · up to {SHADOW_PROBE_PER_SCAN}/scan · "
         f"max {SHADOW_PROBE_MAX_ACTIVE} active · never LIVE · no symbol quarantine impact.\n"
         f"Evidence guard v{guard_state.version}: active={guard_state.active} · "
@@ -6145,8 +6396,10 @@ async def scan_loop():
         f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
         f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
         f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
-        f"Model activation guard: at least {MIN_SELECTED_LIVE_TEST_ROWS} selected real LIVE outcomes "
-        f"in the independent test · LIVE TP3+ majority · positive LIVE expectancy.\n"
+        f"Model activation guard: at least {MIN_SELECTED_LIVE_TEST_ROWS} selected confirmed "
+        f"PAPER/LIVE outcomes in the independent test · TP3+ majority · positive expectancy · "
+        f"{ADAPTIVE_CONFIRMATION_PASSES} consecutive passes and "
+        f"{ADAPTIVE_CONFIRMATION_SELECTED} selected outcomes.\n"
         f"Adaptive model: active={model_state.active} · version={model_state.version} · "
         f"LIVE fraction={float(model_state.deployment_fraction or 0)*100:.0f}%.\n"
         f"Audit: before/after every {LIVE_AUDIT_EVERY} closed model decisions · "
