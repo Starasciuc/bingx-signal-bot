@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.6.3
+# VERIFIED GITHUB DEPLOY FILE — V16.6.5
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -67,6 +67,7 @@ MIN_NEGATIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_NEGATIVE_ROWS", "5"))
 MIN_MODEL_IMPROVEMENT = float(os.getenv("ADAPTIVE_MIN_MODEL_IMPROVEMENT", "0.010"))
 MIN_EXPECTANCY_IMPROVEMENT_R = float(os.getenv("ADAPTIVE_MIN_EXPECTANCY_IMPROVEMENT_R", "0.05"))
 MIN_SELECTED_TEST_ROWS = int(os.getenv("ADAPTIVE_MIN_SELECTED_TEST_ROWS", "5"))
+MIN_SELECTED_LIVE_TEST_ROWS = int(os.getenv("ADAPTIVE_MIN_SELECTED_LIVE_TEST_ROWS", "5"))
 MIN_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MIN_SIGNAL_PROBABILITY", "0.60"))
 MAX_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MAX_SIGNAL_PROBABILITY", "0.82"))
 MIN_VALIDATION_COVERAGE = float(os.getenv("ADAPTIVE_MIN_VALIDATION_COVERAGE", "0.25"))
@@ -164,6 +165,9 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "vol1_below_guard",
     "evidence_quality_pass",
     "symbol_fail_streak",
+    # LIVE and SHADOW have materially different distributions in the saved
+    # 125 outcomes. The model may learn from both, but it must distinguish them.
+    "is_shadow",
 )
 
 
@@ -489,6 +493,7 @@ def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
         "edge_30m": _clip(direction * ch30m, -0.60, 0.60) / 0.60,
         "btc_alignment": btc_alignment,
         "symbol_fail_streak": _clip(trade.get("symbol_fail_streak"), 0, 5) / 5.0,
+        "is_shadow": 1.0 if str(trade.get("signal_source", "live")).lower() == "shadow" else 0.0,
     }
     raw_score = features["score"] * 100.0
     raw_vol1 = features["vol1"] * 8.0
@@ -520,6 +525,7 @@ def _vector_from_dict(features: Dict[str, float]) -> List[float]:
         1.0 if raw_score >= EVIDENCE_MIN_SCORE and raw_vol1 > EVIDENCE_MIN_VOL1 else 0.0,
     )
     compatible.setdefault("symbol_fail_streak", 0.0)
+    compatible.setdefault("is_shadow", 0.0)
     return [float(compatible.get(name, 0.0)) for name in FEATURE_NAMES]
 
 
@@ -1490,7 +1496,15 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     rows = rows[-MAX_TRAIN_ROWS:]
     labels = [int(row["label"]) for row in rows]
     pnl_r = [float(row["pnl_r"]) for row in rows]
-    vectors = [_vector_from_dict(json.loads(row["features_json"])) for row in rows]
+    vectors: List[List[float]] = []
+    for row in rows:
+        feature_payload = json.loads(row["features_json"])
+        # Portable backups before V16.6.5 do not contain is_shadow inside the
+        # feature JSON, but the database source column is authoritative.
+        feature_payload["is_shadow"] = (
+            1.0 if str(row["source"] or "live").lower() == "shadow" else 0.0
+        )
+        vectors.append(_vector_from_dict(feature_payload))
 
     positives = sum(labels)
     negatives = len(labels) - positives
@@ -1574,6 +1588,22 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
     test_candidate_outcomes = _outcome_metrics(
         [test_rows[i] for i in selected_test_indices]
     )
+    selected_live_test_rows = [
+        test_rows[i]
+        for i in selected_test_indices
+        if str(test_rows[i]["source"] or "live").lower() == "live"
+    ]
+    test_live_candidate_outcomes = _outcome_metrics(selected_live_test_rows)
+    live_validation_ready = (
+        int(test_live_candidate_outcomes["n"])
+        >= max(1, MIN_SELECTED_LIVE_TEST_ROWS)
+    )
+    live_validation_positive = (
+        live_validation_ready
+        and float(test_live_candidate_outcomes["success_rate"])
+        > ADAPTIVE_TARGET_SUCCESS_RATE
+        and float(test_live_candidate_outcomes["expectancy_r"]) > 0
+    )
 
     enough_test_classes = min(sum(y_test), len(y_test) - sum(y_test)) >= 3
     passes_absolute_gate = (
@@ -1586,6 +1616,7 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         and test_metrics["expectancy_r"]
         >= test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R
         and test_metrics["selected_wr"] >= test_metrics["baseline_wr"]
+        and live_validation_positive
     )
 
     champion_expectancy = test_metrics["baseline_expectancy_r"]
@@ -1630,6 +1661,10 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
 
     if not enough_test_classes:
         candidate_reason = "independent_test_class_imbalance"
+    elif not live_validation_ready:
+        candidate_reason = "not_enough_selected_live_test_rows"
+    elif not live_validation_positive:
+        candidate_reason = "selected_live_test_failed"
     elif improvement < MIN_MODEL_IMPROVEMENT:
         candidate_reason = "logloss_not_better"
     elif test_metrics["selected_count"] < MIN_SELECTED_TEST_ROWS:
@@ -1764,6 +1799,10 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         "source_breakdown": _source_breakdown(rows),
         "test_baseline": test_baseline_outcomes,
         "test_candidate": test_candidate_outcomes,
+        "test_live_candidate": test_live_candidate_outcomes,
+        "min_selected_live_test_rows": max(1, MIN_SELECTED_LIVE_TEST_ROWS),
+        "live_validation_ready": live_validation_ready,
+        "live_validation_positive": live_validation_positive,
         "next_at": closed_count + max(1, RETRAIN_EVERY),
         "shadow_only": SHADOW_ONLY,
     }
@@ -1781,6 +1820,8 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "split_too_small": "недостаточно данных для трёх независимых частей проверки",
     "train_split_too_small": "в обучающей части недостаточно разных результатов",
     "independent_test_class_imbalance": "в последней независимой проверке мало разных исходов",
+    "not_enough_selected_live_test_rows": "кандидат не набрал достаточно реальных LIVE-сделок для допуска",
+    "selected_live_test_failed": "отдельная проверка кандидата на реальных LIVE-сделках отрицательная",
     "logloss_not_better": "прогноз новой модели не точнее базового",
     "too_few_selected_test_rows": "новая модель выбрала слишком мало проверочных сигналов",
     "coverage_too_low": "модель блокирует слишком большую часть сигналов",
@@ -1843,6 +1884,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
 
     baseline = report.get("test_baseline")
     candidate = report.get("test_candidate")
+    live_candidate = report.get("test_live_candidate")
     if baseline and candidate:
         lines.extend(
             [
@@ -1853,6 +1895,11 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
                 f"покрытие {float(report.get('coverage', 0))*100:.1f}%",
             ]
         )
+        if live_candidate:
+            lines.append(
+                f"LIVE КАНДИДАТ · только реальные сигналы: {_metrics_line(live_candidate)} · "
+                f"нужно минимум {int(report.get('min_selected_live_test_rows', MIN_SELECTED_LIVE_TEST_ROWS))}."
+            )
 
     if reason == "candidate_confirmation_pending":
         lines.append(
@@ -2264,8 +2311,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.3 FAST TIMELY ENTRY"
-DEPLOY_MARKER = "V16_6_3_PARALLEL_FAST_SCAN_TIMELY_CONFIRMATION_2026_08_03"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.5 LIVE EVIDENCE RECOVERY"
+DEPLOY_MARKER = "V16_6_5_LIVE_EVIDENCE_RECOVERY_125_2026_08_03"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2309,10 +2356,10 @@ MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS
 MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
 
 # --- V16.6 evidence-backed entry quality ---
-# On the first 100 saved outcomes this joint condition retained 38 setups and
-# improved expectancy from -0.175R to +0.075R. It was positive both before and
-# after the final chronological holdout boundary. The three conditions are
-# applied jointly; no single threshold is treated as proof by itself.
+# On 125 saved outcomes this joint condition retained 46 setups at +0.077R,
+# while the 79 rejected rows averaged -0.294R. It also stayed positive in the
+# newest 25-row block. The three conditions are applied jointly; no single
+# threshold is treated as proof by itself.
 DATA_ENTRY_GATE_ENABLED = os.getenv("DATA_ENTRY_GATE_ENABLED", "true").lower() == "true"
 DATA_MIN_VOL1 = float(os.getenv("DATA_MIN_VOL1", "1.00"))
 DATA_MIN_RANGE1 = float(os.getenv("DATA_MIN_RANGE1", "1.50"))
@@ -2332,7 +2379,7 @@ STRATEGY_RECOVERY_MIN_EXPECTANCY_R = float(os.getenv("STRATEGY_RECOVERY_MIN_EXPE
 # A detected setup is not sent immediately. It must keep its direction for a
 # short observation window, remain near the original entry and confirm on 1m.
 PRE_LIVE_CONFIRMATION_ENABLED = os.getenv("PRE_LIVE_CONFIRMATION_ENABLED", "true").lower() == "true"
-PRE_LIVE_MIN_SECONDS = int(os.getenv("PRE_LIVE_MIN_SECONDS", "30"))
+PRE_LIVE_MIN_SECONDS = int(os.getenv("PRE_LIVE_MIN_SECONDS", "10"))
 PRE_LIVE_MAX_SECONDS = int(os.getenv("PRE_LIVE_MAX_SECONDS", "120"))
 PRE_LIVE_MIN_DIRECTIONAL_MOVE = float(os.getenv("PRE_LIVE_MIN_DIRECTIONAL_MOVE", "0.0008"))
 PRE_LIVE_MAX_CHASE_MOVE = float(os.getenv("PRE_LIVE_MAX_CHASE_MOVE", "0.0040"))
@@ -2355,6 +2402,19 @@ SHADOW_TRACKING_ENABLED = os.getenv("SHADOW_TRACKING_ENABLED", "true").lower() =
 SHADOW_MAX_ACTIVE = int(os.getenv("SHADOW_MAX_ACTIVE", "40"))
 SHADOW_PER_SCAN = int(os.getenv("SHADOW_PER_SCAN", "6"))
 SHADOW_COOLDOWN_SECONDS = int(os.getenv("SHADOW_COOLDOWN_SECONDS", "600"))
+
+# V16.6.5: the 125-outcome backup showed 24 SHADOW vs only one LIVE result in
+# the newest block. Extra near-miss probes are therefore disabled by default:
+# the bottleneck is timely LIVE confirmation, not a lack of simulated rows.
+# The implementation remains available for controlled experiments via env.
+SHADOW_PROBE_ENABLED = os.getenv("SHADOW_PROBE_ENABLED", "false").lower() == "true"
+SHADOW_PROBE_PER_SCAN = int(os.getenv("SHADOW_PROBE_PER_SCAN", "3"))
+SHADOW_PROBE_MAX_ACTIVE = int(os.getenv("SHADOW_PROBE_MAX_ACTIVE", "6"))
+SHADOW_PROBE_COOLDOWN_SECONDS = int(os.getenv("SHADOW_PROBE_COOLDOWN_SECONDS", "1800"))
+SHADOW_PROBE_MIN_DIRECTIONAL_3M = float(os.getenv("SHADOW_PROBE_MIN_DIRECTIONAL_3M", "0.0025"))
+SHADOW_PROBE_MIN_VOL1 = float(os.getenv("SHADOW_PROBE_MIN_VOL1", "0.25"))
+SHADOW_PROBE_MIN_RANGE1 = float(os.getenv("SHADOW_PROBE_MIN_RANGE1", "0.50"))
+SHADOW_PROBE_MIN_EVIDENCE_SCORE = float(os.getenv("SHADOW_PROBE_MIN_EVIDENCE_SCORE", "2.20"))
 LADDER_FOLLOWUP_MINUTES = int(os.getenv("LADDER_FOLLOWUP_MINUTES", "90"))
 AUTO_TELEGRAM_BACKUP = os.getenv("AUTO_TELEGRAM_BACKUP", "true").lower() == "true"
 AUTO_BACKUP_EVERY_CLOSED = int(os.getenv("AUTO_BACKUP_EVERY_CLOSED", "25"))
@@ -2429,6 +2489,7 @@ LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0065")) 
 LOCAL_STOP_MODES = {
     "MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG",
     "INSTANT_EVIDENCE_SHORT", "INSTANT_EVIDENCE_LONG",
+    "INSTANT_SHADOW_OBSERVATION_SHORT", "INSTANT_SHADOW_OBSERVATION_LONG",
     "AERO_STYLE_SHORT", "AERO_STYLE_LONG",
 }
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
@@ -2539,8 +2600,9 @@ FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").low
 BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.020")) # avoid alt scalp during violent BTC shock
 
 # --- Side control / professional LONG repair ---
-# SHORT is already working in live stats. LONG is now stricter and must look like a real reclaim,
-# not a late buy at the end of a pump.
+# The 125-outcome audit found that evidence-qualified LONGs were the strongest
+# family, while both recent SHORT families stayed negative. LONG protection is
+# therefore based only on comparable evidence-qualified LIVE history.
 ALLOW_LONG = os.getenv("ALLOW_LONG", "true").lower() == "true"
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "true").lower() == "true"
 LONG_BLOCK_BTC_BEAR = os.getenv("LONG_BLOCK_BTC_BEAR", "false").lower() == "true"
@@ -2557,6 +2619,8 @@ LONG_REQUIRE_HIGHER_LOW = os.getenv("LONG_REQUIRE_HIGHER_LOW", "true").lower() =
 LONG_STATS_PROTECTION = os.getenv("LONG_STATS_PROTECTION", "true").lower() == "true"
 LONG_STATS_MIN_CLOSED = int(os.getenv("LONG_STATS_MIN_CLOSED", "4"))
 LONG_STATS_MIN_WR = float(os.getenv("LONG_STATS_MIN_WR", "40"))
+LONG_STATS_WINDOW = int(os.getenv("LONG_STATS_WINDOW", "20"))
+LONG_STATS_MIN_EXPECTANCY_R = float(os.getenv("LONG_STATS_MIN_EXPECTANCY_R", "0.00"))
 
 # --- V13.21 context-adaptive rules ---
 # Professional idea: BTC direction is not a simple long/short switch.
@@ -2613,6 +2677,7 @@ TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
 STATE_IO_LOCK = threading.RLock()
 SCAN_RUN_LOCK = threading.Lock()
 TRACK_RUN_LOCK = threading.Lock()
+LONG_STATS_CACHE: Dict[str, Any] = {"ts": 0.0, "value": (True, "not evaluated")}
 
 # ============================================================
 # State / utilities
@@ -3464,7 +3529,7 @@ def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
     notes: List[str] = []
     scan_symbols = symbols[:MAX_ANALYZE_SYMBOLS]
 
-    # V16.6.3: network-bound candle requests must not run one symbol at a time.
+    # V16.6.5: network-bound candle requests must not run one symbol at a time.
     # The old sequential pass took more than three minutes, so a live impulse
     # often disappeared before deep analysis reached that symbol.
     if HOT_SCAN_WORKERS <= 1 or len(scan_symbols) <= 1:
@@ -3674,20 +3739,66 @@ def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15:
 
 
 def long_live_stats_ok() -> Tuple[bool, str]:
-    """Protect the bot from repeatedly taking bad LONGs while still allowing recovery later.
-    If live LONG stats are poor, allow only very high-quality LONGs by blocking B-class setups upstream.
+    """Evaluate only comparable, evidence-qualified LIVE LONG outcomes.
+
+    Older versions used every historical LONG, including trades created before
+    the joint Vol1/Range1/directional gate existed. That legacy mixture could
+    keep blocking the improved LONG family even though the 125-row audit showed
+    positive expectancy for evidence-qualified LIVE LONGs.
     """
     if not LONG_STATS_PROTECTION:
         return True, "long stats protection disabled"
-    stats = STATE.setdefault("stats", default_state()["stats"])
-    item = stats.get("side", {}).get("LONG", {})
-    closed = int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0))
-    if closed < LONG_STATS_MIN_CLOSED:
-        return True, "not enough LONG stats"
-    wr = int(item.get("profit", 0)) / max(closed, 1) * 100.0
-    if wr < LONG_STATS_MIN_WR:
-        return False, f"LONG stats weak: WR {wr:.1f}% after {closed}"
-    return True, "LONG stats ok"
+    current = time.time()
+    cached_at = float(LONG_STATS_CACHE.get("ts", 0.0) or 0.0)
+    if current - cached_at < 30.0:
+        value = LONG_STATS_CACHE.get("value", (True, "cached"))
+        return bool(value[0]), str(value[1])
+
+    try:
+        init_adaptive_db()
+        with _LOCK, _connect() as conn:
+            rows = conn.execute(
+                "SELECT result, pnl_r, features_json FROM adaptive_trades "
+                "WHERE source='live' AND side='LONG' ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+
+        comparable: List[Any] = []
+        for row in rows:
+            features = json.loads(row["features_json"] or "{}")
+            directional_3m = float(features.get("edge_3m", 0.0) or 0.0) * 0.25
+            vol1 = float(features.get("vol1", 0.0) or 0.0) * 8.0
+            range1 = float(features.get("range1", 0.0) or 0.0) * 8.0
+            if (
+                directional_3m >= DATA_MIN_DIRECTIONAL_3M
+                and vol1 >= DATA_MIN_VOL1
+                and range1 >= DATA_MIN_RANGE1
+            ):
+                comparable.append(row)
+            if len(comparable) >= max(1, LONG_STATS_WINDOW):
+                break
+
+        closed = len(comparable)
+        if closed < max(1, LONG_STATS_MIN_CLOSED):
+            result = (True, f"not enough comparable LIVE LONG stats: {closed}")
+        else:
+            profits = sum(1 for row in comparable if str(row["result"]) == "profit")
+            wr = profits / max(closed, 1) * 100.0
+            expectancy = sum(float(row["pnl_r"] or 0.0) for row in comparable) / max(closed, 1)
+            accepted = bool(
+                wr >= LONG_STATS_MIN_WR
+                and expectancy >= LONG_STATS_MIN_EXPECTANCY_R
+            )
+            result = (
+                accepted,
+                f"evidence LIVE LONG: {profits}/{closed} TP3+ · "
+                f"success {wr:.1f}% · {expectancy:+.3f}R",
+            )
+    except Exception as exc:
+        result = (True, f"LONG evidence stats unavailable; safety gates remain: {repr(exc)}")
+
+    LONG_STATS_CACHE["ts"] = current
+    LONG_STATS_CACHE["value"] = result
+    return result
 
 
 def professional_long_reclaim_gate(
@@ -4196,7 +4307,7 @@ def evidence_imbalance_setup(
     btc: Dict[str, Any],
     side: str,
 ) -> Optional[Dict[str, Any]]:
-    """V16.6.3 direct path for a proven live imbalance.
+    """V16.6.5 direct path for a proven live imbalance.
 
     Older fast/instant templates can reject a coin before the evidence-backed
     Vol1/Range1/directional rule is evaluated. This constructor does not lower
@@ -4280,6 +4391,103 @@ def evidence_imbalance_setup(
         "setup_mode": setup_mode,
         "t1h": trend_state(c1h),
         "btc_text": btc.get("text", ""),
+    }
+
+
+def near_miss_shadow_setup(
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    c1h: List[Dict[str, float]],
+    btc: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build a measurement-only trade for an almost-qualifying imbalance.
+
+    This constructor is deliberately separate from every LIVE path. It gives
+    the adaptive layer labelled outcomes during quiet sessions without lowering
+    the evidence gate or sending an experimental signal to Telegram.
+    """
+    if not SHADOW_PROBE_ENABLED or not SHADOW_TRACKING_ENABLED:
+        return None
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
+        return None
+
+    ch3m = percent_change(c1, 3)
+    if abs(ch3m) < SHADOW_PROBE_MIN_DIRECTIONAL_3M:
+        return None
+    side = "LONG" if ch3m > 0 else "SHORT"
+    if (side == "LONG" and not ALLOW_LONG) or (side == "SHORT" and not ALLOW_SHORT):
+        return None
+
+    vol1 = volume_ratio(c1, 20)
+    range1 = candle_range_ratio(c1, 20)
+    if vol1 < SHADOW_PROBE_MIN_VOL1 or range1 < SHADOW_PROBE_MIN_RANGE1:
+        return None
+
+    directional_3m = abs(ch3m)
+    evidence_score = (
+        directional_3m / max(DATA_MIN_DIRECTIONAL_3M, 1e-9)
+        + vol1 / max(DATA_MIN_VOL1, 1e-9)
+        + range1 / max(DATA_MIN_RANGE1, 1e-9)
+    )
+    if evidence_score < SHADOW_PROBE_MIN_EVIDENCE_SCORE:
+        return None
+
+    price = float(c1[-1]["close"])
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol5 = volume_ratio(c5, 20)
+    range5 = candle_range_ratio(c5, 20)
+    level = (
+        min(x["low"] for x in c1[-10:])
+        if side == "LONG"
+        else max(x["high"] for x in c1[-10:])
+    )
+    score = max(0, min(87, 62 + int(min(evidence_score, 5.0) * 5)))
+    setup_mode = f"INSTANT_SHADOW_OBSERVATION_{side}"
+
+    live_failures: List[str] = []
+    if directional_3m < DATA_MIN_DIRECTIONAL_3M:
+        live_failures.append(
+            f"move {directional_3m*100:.2f}% < {DATA_MIN_DIRECTIONAL_3M*100:.2f}%"
+        )
+    if vol1 < DATA_MIN_VOL1:
+        live_failures.append(f"Vol1 x{vol1:.2f} < x{DATA_MIN_VOL1:.2f}")
+    if range1 < DATA_MIN_RANGE1:
+        live_failures.append(f"Range1 x{range1:.2f} < x{DATA_MIN_RANGE1:.2f}")
+    live_gap = "; ".join(live_failures) if live_failures else "numeric gate passed; structure rejected"
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": f"SHADOW_NEAR_MISS_{side}",
+        "trade_type": f"SHADOW NEAR-MISS {side}",
+        "score": score,
+        "grade": "B",
+        "entry": price,
+        "level": level,
+        "reason": (
+            f"SHADOW ONLY: near-miss observation, never a LIVE signal. "
+            f"Evidence score {evidence_score:.2f}; 1m3 {ch3m*100:+.2f}%, "
+            f"Vol1 x{vol1:.2f}, Range1 x{range1:.2f}; LIVE gap: {live_gap}."
+        ),
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": setup_mode,
+        "t1h": trend_state(c1h),
+        "btc_text": btc.get("text", ""),
+        "shadow_probe_score": evidence_score,
+        "shadow_probe_live_gap": live_gap,
+        "shadow_probe_never_live": True,
     }
 
 
@@ -4789,12 +4997,16 @@ def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT symbol, result, source, closed_at FROM adaptive_trades "
+            "SELECT symbol, result, source, closed_at, decision_reason FROM adaptive_trades "
             "ORDER BY closed_at ASC, id ASC"
         ).fetchall()
 
     outcomes: Dict[str, Any] = {}
     for row in rows:
+        # Exploratory near-miss probes train the model, but must never punish or
+        # quarantine a symbol that was not actually eligible for LIVE.
+        if str(row["decision_reason"] or "") == "near_miss_probe":
+            continue
         symbol = normalize_symbol(str(row["symbol"] or "?"))
         item = outcomes.setdefault(
             symbol,
@@ -4876,7 +5088,14 @@ def update_symbol_outcome_guard(
     return dict(item)
 
 
-def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], near_miss: List[str]) -> Optional[Dict[str, Any]]:
+def analyze_symbol(
+    symbol: str,
+    btc: Dict[str, Any],
+    blocks: Dict[str, int],
+    near_miss: List[str],
+    allow_shadow_probe: bool = False,
+    shadow_probe_sink: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
     # Refresh the execution tape; reuse the slower 5m context collected by the
     # hot scan. This removes one duplicate request per symbol without entering
@@ -4895,6 +5114,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
         return None
 
     candidates: List[Dict[str, Any]] = []
+    shadow_observed = False
     for side in ("LONG", "SHORT"):
         if side == "LONG" and not ALLOW_LONG:
             blocks["long_disabled"] = blocks.get("long_disabled", 0) + 1
@@ -4971,7 +5191,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
         data_ok, data_reason = data_entry_quality_gate(trade)
         if not data_ok:
             blocks["data_entry_gate_block"] = blocks.get("data_entry_gate_block", 0) + 1
-            add_shadow_signal(trade, "data_entry_gate_block")
+            shadow_observed = add_shadow_signal(trade, "data_entry_gate_block") or shadow_observed
             if len(near_miss) < 8:
                 near_miss.append(f"{display_symbol(symbol)} {side}: {data_reason}")
             continue
@@ -4979,7 +5199,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
         strategy_ok, strategy_reason = strategy_circuit_breaker(trade)
         if not strategy_ok:
             blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
-            add_shadow_signal(trade, "strategy_circuit_breaker")
+            shadow_observed = add_shadow_signal(trade, "strategy_circuit_breaker") or shadow_observed
             if len(near_miss) < 8:
                 near_miss.append(f"{display_symbol(symbol)} {side}: {strategy_reason}")
             continue
@@ -4994,7 +5214,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             evidence_ok, evidence_reason = evidence_guard(trade)
             if not evidence_ok:
                 blocks["evidence_guard_block"] = blocks.get("evidence_guard_block", 0) + 1
-                add_shadow_signal(trade, "evidence_guard_block")
+                shadow_observed = add_shadow_signal(trade, "evidence_guard_block") or shadow_observed
                 if len(near_miss) < 8:
                     near_miss.append(f"{display_symbol(symbol)} {side}: {evidence_reason}")
                 continue
@@ -5004,7 +5224,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
 
         if not symbol_ok:
             blocks["symbol_quarantine_block"] = blocks.get("symbol_quarantine_block", 0) + 1
-            add_shadow_signal(trade, "symbol_quarantine_block")
+            shadow_observed = add_shadow_signal(trade, "symbol_quarantine_block") or shadow_observed
             if len(near_miss) < 8:
                 near_miss.append(f"{display_symbol(symbol)} {side}: {symbol_reason}")
             continue
@@ -5017,7 +5237,7 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
                 trade["adaptive_probability"] = adaptive_probability
             if not adaptive_ok:
                 blocks["adaptive_model_block"] = blocks.get("adaptive_model_block", 0) + 1
-                add_shadow_signal(trade, "adaptive_model_block")
+                shadow_observed = add_shadow_signal(trade, "adaptive_model_block") or shadow_observed
                 if len(near_miss) < 8:
                     near_miss.append(f"{display_symbol(symbol)} {side}: {adaptive_reason}")
                 continue
@@ -5027,6 +5247,26 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             STATE["last_error"] = trade["adaptive_reason"]
 
         candidates.append(trade)
+
+    # Optional measurement path: a strict no-setup scan can produce neither
+    # LIVE nor SHADOW rows. Observe only a bounded top-ranked near miss. This
+    # branch cannot return a candidate and therefore can never send a signal.
+    if not candidates and not shadow_observed and allow_shadow_probe:
+        probe_setup = near_miss_shadow_setup(symbol, c1, c5, c15, c1h, btc)
+        if probe_setup:
+            probe_trade = calculate_fast_trade(probe_setup, c1, c5)
+            if probe_trade:
+                data_entry_quality_gate(probe_trade)
+                if shadow_probe_sink is not None:
+                    with STATE_IO_LOCK:
+                        shadow_probe_sink.append(probe_trade)
+                elif add_shadow_signal(probe_trade, "near_miss_probe"):
+                    blocks["near_miss_shadow_added"] = blocks.get("near_miss_shadow_added", 0) + 1
+                    if len(near_miss) < 8:
+                        near_miss.append(
+                            f"{display_symbol(symbol)} {probe_trade['side']}: "
+                            f"saved to SHADOW only · {probe_trade['shadow_probe_live_gap']}"
+                        )
 
     if not candidates:
         return None
@@ -5081,11 +5321,15 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16.6.3 Fast Timely Entry\n"
+        f"🧪 Диагностика V16.6.5 Live Evidence Recovery\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
-        f"shadow: {scan.get('shadow_added', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
+        f"shadow новых: {scan.get('shadow_added', 0)} "
+        f"(near-miss {scan.get('near_miss_added', 0)}) · "
+        f"shadow активных: {scan.get('shadow_active', 0)} "
+        f"(near-miss {scan.get('near_miss_active', 0)}) · "
+        f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
         f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
@@ -5141,23 +5385,36 @@ def remove_matching_shadow(signal: Dict[str, Any]) -> None:
 def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
     if not SHADOW_TRACKING_ENABLED:
         return False
-    shadows = STATE.setdefault("shadow_signals", [])
-    if len(shadows) >= SHADOW_MAX_ACTIVE:
-        return False
-    key = shadow_key(signal)
-    cooldowns = STATE.setdefault("shadow_cooldown", {})
-    if now_ts() < int(cooldowns.get(key, 0) or 0):
-        return False
-    if any(shadow_key(item) == key for item in shadows):
-        return False
+    with STATE_IO_LOCK:
+        shadows = STATE.setdefault("shadow_signals", [])
+        if len(shadows) >= SHADOW_MAX_ACTIVE:
+            return False
+        if reason == "near_miss_probe":
+            active_probes = sum(
+                1 for item in shadows
+                if str(item.get("shadow_reason", "")) == "near_miss_probe"
+            )
+            if active_probes >= max(0, SHADOW_PROBE_MAX_ACTIVE):
+                return False
+        key = shadow_key(signal)
+        cooldowns = STATE.setdefault("shadow_cooldown", {})
+        if now_ts() < int(cooldowns.get(key, 0) or 0):
+            return False
+        if any(shadow_key(item) == key for item in shadows):
+            return False
 
-    shadow = dict(signal)
-    ensure_signal_runtime_fields(shadow, "shadow")
-    shadow["shadow_reason"] = reason
-    shadow["stats_recorded"] = None
-    shadows.append(shadow)
-    cooldowns[key] = now_ts() + SHADOW_COOLDOWN_SECONDS
-    save_state()
+        shadow = dict(signal)
+        ensure_signal_runtime_fields(shadow, "shadow")
+        shadow["shadow_reason"] = reason
+        shadow["stats_recorded"] = None
+        shadows.append(shadow)
+        cooldown_seconds = (
+            SHADOW_PROBE_COOLDOWN_SECONDS
+            if reason == "near_miss_probe"
+            else SHADOW_COOLDOWN_SECONDS
+        )
+        cooldowns[key] = now_ts() + max(0, cooldown_seconds)
+        save_state()
     return True
 
 
@@ -5327,6 +5584,12 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         "candidates": 0,
         "sent": 0,
         "shadow_added": 0,
+        "near_miss_added": 0,
+        "shadow_active": len(STATE.setdefault("shadow_signals", [])),
+        "near_miss_active": sum(
+            1 for item in STATE.setdefault("shadow_signals", [])
+            if str(item.get("shadow_reason", "")) == "near_miss_probe"
+        ),
         "blocks": blocks,
         "near_miss": near_miss,
         "hot_notes": hot_notes,
@@ -5350,12 +5613,26 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
     confirmed_candidates = process_pending_signals(blocks, near_miss)
 
     found: List[Dict[str, Any]] = []
+    probe_candidates: List[Dict[str, Any]] = []
 
     def analyze_one(sym: str) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, int], List[str], Optional[Exception]]:
         local_blocks: Dict[str, int] = {}
         local_near: List[str] = []
         try:
-            return sym, analyze_symbol(sym, btc, local_blocks, local_near), local_blocks, local_near, None
+            return (
+                sym,
+                analyze_symbol(
+                    sym,
+                    btc,
+                    local_blocks,
+                    local_near,
+                    allow_shadow_probe=SHADOW_PROBE_ENABLED,
+                    shadow_probe_sink=probe_candidates,
+                ),
+                local_blocks,
+                local_near,
+                None,
+            )
         except Exception as exc:
             return sym, None, local_blocks, local_near, exc
 
@@ -5384,6 +5661,26 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
                 near_miss.append(item)
         if candidate:
             found.append(candidate)
+
+    # Rank all measurement-only candidates after the parallel scan. This keeps
+    # the three strongest near misses, rather than whichever worker finishes
+    # first or whichever symbol happened to rank first in the hot list.
+    probe_candidates.sort(
+        key=lambda item: (
+            float(item.get("shadow_probe_score", 0.0) or 0.0),
+            abs(float(item.get("ch3m_1m", 0.0) or 0.0)),
+            float(item.get("vol1", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+    for probe_trade in probe_candidates[:max(0, SHADOW_PROBE_PER_SCAN)]:
+        if add_shadow_signal(probe_trade, "near_miss_probe"):
+            blocks["near_miss_shadow_added"] = blocks.get("near_miss_shadow_added", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(
+                    f"{display_symbol(probe_trade['symbol'])} {probe_trade['side']}: "
+                    f"saved to SHADOW only · {probe_trade['shadow_probe_live_gap']}"
+                )
 
     found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
     scan["candidates"] = len(found)
@@ -5474,20 +5771,32 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         sent += 1
 
     shadow_added = 0
+    near_miss_added = 0
     if SHADOW_TRACKING_ENABLED:
         for candidate, shadow_reason in shadow_queue[:max(0, SHADOW_PER_SCAN)]:
             add_shadow_signal(candidate, shadow_reason)
 
         # Include shadows created directly by data/model guards and pending
         # confirmation, not only overflow candidates from the send queue.
-        shadow_added = sum(
-            1
+        new_shadows = [
+            item
             for item in STATE.setdefault("shadow_signals", [])
             if item.get("signal_id") and str(item.get("signal_id")) not in shadow_before_ids
+        ]
+        shadow_added = len(new_shadows)
+        near_miss_added = sum(
+            1 for item in new_shadows
+            if str(item.get("shadow_reason", "")) == "near_miss_probe"
         )
 
     scan["sent"] = sent
     scan["shadow_added"] = shadow_added
+    scan["near_miss_added"] = near_miss_added
+    scan["shadow_active"] = len(STATE.setdefault("shadow_signals", []))
+    scan["near_miss_active"] = sum(
+        1 for item in STATE.setdefault("shadow_signals", [])
+        if str(item.get("shadow_reason", "")) == "near_miss_probe"
+    )
     scan["elapsed"] = time.time() - start
     STATE["last_scan"] = scan
     save_state()
@@ -5543,7 +5852,8 @@ def safe_record_learning_result(
         report = record_closed_trade(signal, result, source=source)
         if report.get("inserted"):
             signal["learning_recorded"] = result
-            update_symbol_outcome_guard(signal, result, source=source)
+            if str(signal.get("shadow_reason", "")) != "near_miss_probe":
+                update_symbol_outcome_guard(signal, result, source=source)
             maybe_send_auto_backup()
         evidence_audit = report.get("evidence_guard_audit")
         if isinstance(evidence_audit, dict):
@@ -5820,6 +6130,8 @@ async def scan_loop():
         f"anti-chase ≤ {PRE_LIVE_MAX_CHASE_MOVE*100:.2f}%.\n"
         f"Strategy circuit breaker: {STRATEGY_CIRCUIT_BREAKER_ENABLED} · "
         f"rolling {STRATEGY_GUARD_WINDOW} outcomes · weak strategies stay in SHADOW.\n"
+        f"Near-miss SHADOW: {SHADOW_PROBE_ENABLED} · up to {SHADOW_PROBE_PER_SCAN}/scan · "
+        f"max {SHADOW_PROBE_MAX_ACTIVE} active · never LIVE · no symbol quarantine impact.\n"
         f"Evidence guard v{guard_state.version}: active={guard_state.active} · "
         f"Score ≥ {guard_state.min_score:.0f} · Vol1 > x{guard_state.min_vol1:.2f}; "
         f"audit every {EVIDENCE_AUDIT_EVERY} decisions.\n"
@@ -5833,6 +6145,8 @@ async def scan_loop():
         f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
         f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
         f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
+        f"Model activation guard: at least {MIN_SELECTED_LIVE_TEST_ROWS} selected real LIVE outcomes "
+        f"in the independent test · LIVE TP3+ majority · positive LIVE expectancy.\n"
         f"Adaptive model: active={model_state.active} · version={model_state.version} · "
         f"LIVE fraction={float(model_state.deployment_fraction or 0)*100:.0f}%.\n"
         f"Audit: before/after every {LIVE_AUDIT_EVERY} closed model decisions · "
