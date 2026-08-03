@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.6.2
+# VERIFIED GITHUB DEPLOY FILE — V16.6.3
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -8,6 +8,7 @@ import asyncio
 import io
 import secrets
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -2263,8 +2264,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.2 EVIDENCE ENTRY PATH"
-DEPLOY_MARKER = "V16_6_2_EVIDENCE_IMBALANCE_NO_FAST_BYPASS_2026_08_03"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.3 FAST TIMELY ENTRY"
+DEPLOY_MARKER = "V16_6_3_PARALLEL_FAST_SCAN_TIMELY_CONFIRMATION_2026_08_03"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2289,6 +2290,8 @@ MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
 MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
 HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "80"))
 MIN_HOT_CANDIDATES = int(os.getenv("MIN_HOT_CANDIDATES", "70"))
+HOT_SCAN_WORKERS = max(1, int(os.getenv("HOT_SCAN_WORKERS", "6")))
+DEEP_SCAN_WORKERS = max(1, int(os.getenv("DEEP_SCAN_WORKERS", "6")))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 
 # --- Signal limits ---
@@ -3400,8 +3403,10 @@ def hot_score(symbol: str) -> Tuple[float, str]:
     V13.19 intentionally avoids using 15m candles here to keep scans fast.
     Deep analysis still loads 15m/1h only for selected candidates.
     """
-    c1 = get_klines(symbol, "1m", 60, cache_seconds=8)
-    c5 = get_klines(symbol, "5m", 80, cache_seconds=18)
+    # Use the same candle depth as deep analysis. The 5m snapshot can be reused
+    # there, while 1m is intentionally refreshed before an actual entry.
+    c1 = get_klines(symbol, "1m", 120, cache_seconds=8)
+    c5 = get_klines(symbol, "5m", 120, cache_seconds=18)
     if not c1 or not c5:
         return 0.0, "no candles"
 
@@ -3457,13 +3462,41 @@ def hot_score(symbol: str) -> Tuple[float, str]:
 def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
     scored: List[Tuple[float, str, str]] = []
     notes: List[str] = []
-    for sym in symbols[:MAX_ANALYZE_SYMBOLS]:
-        try:
-            sc, note = hot_score(sym)
-            if sc > 0:
-                scored.append((sc, sym, note))
-        except Exception as e:
-            STATE["last_error"] = f"hot_score {sym}: {repr(e)}"
+    scan_symbols = symbols[:MAX_ANALYZE_SYMBOLS]
+
+    # V16.6.3: network-bound candle requests must not run one symbol at a time.
+    # The old sequential pass took more than three minutes, so a live impulse
+    # often disappeared before deep analysis reached that symbol.
+    if HOT_SCAN_WORKERS <= 1 or len(scan_symbols) <= 1:
+        results = []
+        for sym in scan_symbols:
+            try:
+                results.append((sym, hot_score(sym), None))
+            except Exception as e:
+                results.append((sym, None, e))
+    else:
+        results = []
+        with ThreadPoolExecutor(
+            max_workers=min(HOT_SCAN_WORKERS, len(scan_symbols)),
+            thread_name_prefix="hot-scan",
+        ) as pool:
+            future_map = {pool.submit(hot_score, sym): sym for sym in scan_symbols}
+            for future in as_completed(future_map):
+                sym = future_map[future]
+                try:
+                    results.append((sym, future.result(), None))
+                except Exception as e:
+                    results.append((sym, None, e))
+
+    for sym, result, error in results:
+        if error is not None:
+            STATE["last_error"] = f"hot_score {sym}: {repr(error)}"
+            continue
+        if result is None:
+            continue
+        sc, note = result
+        if sc > 0:
+            scored.append((sc, sym, note))
     scored.sort(reverse=True, key=lambda x: x[0])
 
     for sc, sym, note in scored[:12]:
@@ -4163,7 +4196,7 @@ def evidence_imbalance_setup(
     btc: Dict[str, Any],
     side: str,
 ) -> Optional[Dict[str, Any]]:
-    """V16.6.2 direct path for a proven live imbalance.
+    """V16.6.3 direct path for a proven live imbalance.
 
     Older fast/instant templates can reject a coin before the evidence-backed
     Vol1/Range1/directional rule is evaluated. This constructor does not lower
@@ -4845,8 +4878,11 @@ def update_symbol_outcome_guard(
 
 def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], near_miss: List[str]) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
-    c1 = get_klines(symbol, "1m", 120, cache_seconds=6)
-    c5 = get_klines(symbol, "5m", 120, cache_seconds=15)
+    # Refresh the execution tape; reuse the slower 5m context collected by the
+    # hot scan. This removes one duplicate request per symbol without entering
+    # on stale 1m pressure.
+    c1 = get_klines(symbol, "1m", 120, cache_seconds=4)
+    c5 = get_klines(symbol, "5m", 120, cache_seconds=60)
     c15 = get_klines(symbol, "15m", 120, cache_seconds=30)
     c1h = get_klines(symbol, "1h", 120, cache_seconds=90)
 
@@ -5045,7 +5081,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16.6.2 Evidence Entry Path\n"
+        f"🧪 Диагностика V16.6.3 Fast Timely Entry\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -5276,6 +5312,11 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
     start = time.time()
     blocks: Dict[str, int] = {}
     near_miss: List[str] = []
+    shadow_before_ids = {
+        str(item.get("signal_id", ""))
+        for item in STATE.setdefault("shadow_signals", [])
+        if item.get("signal_id")
+    }
     btc = btc_context()
     symbols = get_symbols()
     selected, hot_notes = select_hot_symbols(symbols)
@@ -5309,15 +5350,40 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
     confirmed_candidates = process_pending_signals(blocks, near_miss)
 
     found: List[Dict[str, Any]] = []
-    for sym in selected:
+
+    def analyze_one(sym: str) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, int], List[str], Optional[Exception]]:
+        local_blocks: Dict[str, int] = {}
+        local_near: List[str] = []
         try:
-            s = analyze_symbol(sym, btc, blocks, near_miss)
-            scan["checked"] += 1
-            if s:
-                found.append(s)
-        except Exception as e:
+            return sym, analyze_symbol(sym, btc, local_blocks, local_near), local_blocks, local_near, None
+        except Exception as exc:
+            return sym, None, local_blocks, local_near, exc
+
+    if DEEP_SCAN_WORKERS <= 1 or len(selected) <= 1:
+        analysis_results = [analyze_one(sym) for sym in selected]
+    else:
+        analysis_results = []
+        with ThreadPoolExecutor(
+            max_workers=min(DEEP_SCAN_WORKERS, len(selected)),
+            thread_name_prefix="deep-scan",
+        ) as pool:
+            future_map = {pool.submit(analyze_one, sym): sym for sym in selected}
+            for future in as_completed(future_map):
+                analysis_results.append(future.result())
+
+    for sym, candidate, local_blocks, local_near, error in analysis_results:
+        if error is not None:
             blocks["analyze_exception"] = blocks.get("analyze_exception", 0) + 1
-            STATE["last_error"] = f"analyze {sym}: {repr(e)}"
+            STATE["last_error"] = f"analyze {sym}: {repr(error)}"
+            continue
+        scan["checked"] += 1
+        for key, value in local_blocks.items():
+            blocks[key] = blocks.get(key, 0) + int(value)
+        for item in local_near:
+            if len(near_miss) < 8:
+                near_miss.append(item)
+        if candidate:
+            found.append(candidate)
 
     found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
     scan["candidates"] = len(found)
@@ -5407,11 +5473,18 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         send_telegram(build_signal_message(s))
         sent += 1
 
-    shadow_added = pending_added
+    shadow_added = 0
     if SHADOW_TRACKING_ENABLED:
         for candidate, shadow_reason in shadow_queue[:max(0, SHADOW_PER_SCAN)]:
-            if add_shadow_signal(candidate, shadow_reason):
-                shadow_added += 1
+            add_shadow_signal(candidate, shadow_reason)
+
+        # Include shadows created directly by data/model guards and pending
+        # confirmation, not only overflow candidates from the send queue.
+        shadow_added = sum(
+            1
+            for item in STATE.setdefault("shadow_signals", [])
+            if item.get("signal_id") and str(item.get("signal_id")) not in shadow_before_ids
+        )
 
     scan["sent"] = sent
     scan["shadow_added"] = shadow_added
@@ -5735,7 +5808,8 @@ async def scan_loop():
         f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
         f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}.\n"
         f"Opportunity engine: analyze up to {MAX_ANALYZE_SYMBOLS} contracts · "
-        f"deep-check {HOT_SYMBOLS_TO_ANALYZE} hot names (minimum pool {MIN_HOT_CANDIDATES}).\n"
+        f"deep-check {HOT_SYMBOLS_TO_ANALYZE} hot names (minimum pool {MIN_HOT_CANDIDATES}) · "
+        f"parallel workers {HOT_SCAN_WORKERS}/{DEEP_SCAN_WORKERS}.\n"
         f"Evidence entry gate: Vol1 ≥ x{DATA_MIN_VOL1:.2f} · Range1 ≥ x{DATA_MIN_RANGE1:.2f} · "
         f"directional 3m ≥ {DATA_MIN_DIRECTIONAL_3M*100:.2f}%.\n"
         f"Evidence imbalance path: active · qualifying setups bypass obsolete no_fast templates, "
