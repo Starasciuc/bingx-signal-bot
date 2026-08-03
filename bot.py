@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.6
+# VERIFIED GITHUB DEPLOY FILE — V16.6.1
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2263,8 +2263,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6 QUALITY + FREQUENCY LEARNING"
-DEPLOY_MARKER = "V16_6_QUALITY_FREQUENCY_OPPORTUNITY_ENGINE_2026_08_03"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.1 UNLIMITED QUALITY ENTRY"
+DEPLOY_MARKER = "V16_6_1_NO_DAILY_CAP_TIMELY_TP3_ENTRY_2026_08_03"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2298,9 +2298,11 @@ MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
-MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "10"))
-MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "5"))
-MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "1800"))
+# Zero means unlimited. Quality gates, pair cooldown, strategy protection and
+# the maximum number of simultaneously active trades remain in force.
+MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "0"))
+MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "0"))
+MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "0"))
 MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
 
 # --- V16.6 evidence-backed entry quality ---
@@ -2327,8 +2329,8 @@ STRATEGY_RECOVERY_MIN_EXPECTANCY_R = float(os.getenv("STRATEGY_RECOVERY_MIN_EXPE
 # A detected setup is not sent immediately. It must keep its direction for a
 # short observation window, remain near the original entry and confirm on 1m.
 PRE_LIVE_CONFIRMATION_ENABLED = os.getenv("PRE_LIVE_CONFIRMATION_ENABLED", "true").lower() == "true"
-PRE_LIVE_MIN_SECONDS = int(os.getenv("PRE_LIVE_MIN_SECONDS", "45"))
-PRE_LIVE_MAX_SECONDS = int(os.getenv("PRE_LIVE_MAX_SECONDS", "180"))
+PRE_LIVE_MIN_SECONDS = int(os.getenv("PRE_LIVE_MIN_SECONDS", "30"))
+PRE_LIVE_MAX_SECONDS = int(os.getenv("PRE_LIVE_MAX_SECONDS", "120"))
 PRE_LIVE_MIN_DIRECTIONAL_MOVE = float(os.getenv("PRE_LIVE_MIN_DIRECTIONAL_MOVE", "0.0008"))
 PRE_LIVE_MAX_CHASE_MOVE = float(os.getenv("PRE_LIVE_MAX_CHASE_MOVE", "0.0040"))
 PRE_LIVE_MAX_ADVERSE_MOVE = float(os.getenv("PRE_LIVE_MAX_ADVERSE_MOVE", "0.0035"))
@@ -4938,7 +4940,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16.6 Quality + Frequency Learning\n"
+        f"🧪 Диагностика V16.6.1 Unlimited Quality Entry\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -5270,8 +5272,10 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
             local_side[side] += 1
         if model_version > 0:
             local_adaptive += 1
-        # A real send closes the one-hour gate for the rest of this scan.
-        spacing_open = False
+        # With forced spacing disabled, more than one independently confirmed
+        # setup may be sent in the same scan (still bounded by active slots).
+        if MIN_LIVE_SIGNAL_SPACING_SECONDS > 0:
+            spacing_open = False
 
     if not selected_live and ready_candidates:
         if free_slots <= 0:
@@ -5640,9 +5644,10 @@ async def scan_loop():
         f"audit every {EVIDENCE_AUDIT_EVERY} decisions.\n"
         f"Symbol quarantine: {SYMBOL_QUARANTINE_ENABLED} · after {SYMBOL_FAIL_LIMIT} "
         f"non-profit outcomes for {SYMBOL_QUARANTINE_SECONDS/3600:.0f}h · TP3 resets.\n"
-        f"Balanced LIVE: max {MAX_LIVE_SIGNALS_24H}/24h · "
-        f"LONG ≤ {MAX_LIVE_SIGNALS_PER_SIDE_24H} · SHORT ≤ {MAX_LIVE_SIGNALS_PER_SIDE_24H} · "
-        f"spacing {MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min.\n"
+        f"LIVE limits: daily={'unlimited' if MAX_LIVE_SIGNALS_24H <= 0 else MAX_LIVE_SIGNALS_24H} · "
+        f"per side={'unlimited' if MAX_LIVE_SIGNALS_PER_SIDE_24H <= 0 else MAX_LIVE_SIGNALS_PER_SIDE_24H} · "
+        f"forced spacing={'none' if MIN_LIVE_SIGNAL_SPACING_SECONDS <= 0 else f'{MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min'} · "
+        f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
         f"Adaptive: {'permanent shadow' if SHADOW_ONLY else 'guarded live after independent validation'}; "
         f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
         f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
