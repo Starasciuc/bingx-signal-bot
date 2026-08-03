@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.4.1
+# VERIFIED GITHUB DEPLOY FILE — V16.6
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -69,6 +69,9 @@ MIN_SELECTED_TEST_ROWS = int(os.getenv("ADAPTIVE_MIN_SELECTED_TEST_ROWS", "5"))
 MIN_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MIN_SIGNAL_PROBABILITY", "0.60"))
 MAX_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MAX_SIGNAL_PROBABILITY", "0.82"))
 MIN_VALIDATION_COVERAGE = float(os.getenv("ADAPTIVE_MIN_VALIDATION_COVERAGE", "0.25"))
+# The user's explicit target: TP3+ must be a strict majority of all closed
+# outcomes selected by a challenger (more than SL and expired combined).
+ADAPTIVE_TARGET_SUCCESS_RATE = float(os.getenv("ADAPTIVE_TARGET_SUCCESS_RATE", "0.50"))
 ADAPTIVE_CONFIRMATION_PASSES = int(os.getenv("ADAPTIVE_CONFIRMATION_PASSES", "2"))
 ADAPTIVE_CONFIRMATION_SELECTED = int(os.getenv("ADAPTIVE_CONFIRMATION_SELECTED", "20"))
 ADAPTIVE_INITIAL_LIVE_FRACTION = float(os.getenv("ADAPTIVE_INITIAL_LIVE_FRACTION", "0.25"))
@@ -154,7 +157,7 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "edge_15m",
     "edge_30m",
     "btc_alignment",
-    # Non-linear quality markers retained in V16.4.1. _vector_from_dict derives
+    # Non-linear quality markers retained in V16.6. _vector_from_dict derives
     # them for old V16.2 backups, so all 50 historical rows remain trainable.
     "score_below_guard",
     "vol1_below_guard",
@@ -1000,6 +1003,12 @@ def _choose_threshold(labels: Sequence[int], probabilities: Sequence[float], pnl
         wr = wins / len(chosen)
         expectancy = sum(pnl_r[i] for i in chosen) / len(chosen)
 
+        # Do not optimize a candidate that cannot meet the requested TP3-majority
+        # objective even on calibration data. Coverage still prevents a tiny,
+        # cherry-picked handful of signals from winning the search.
+        if wr <= ADAPTIVE_TARGET_SUCCESS_RATE:
+            continue
+
         # Prefer expectancy and stability, not win-rate alone.
         score = expectancy * 2.0 + wr * 0.5 + coverage * 0.15
         if score > best_score:
@@ -1571,6 +1580,7 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         and improvement >= MIN_MODEL_IMPROVEMENT
         and test_metrics["selected_count"] >= MIN_SELECTED_TEST_ROWS
         and test_metrics["coverage"] >= MIN_VALIDATION_COVERAGE
+        and test_metrics["selected_wr"] > ADAPTIVE_TARGET_SUCCESS_RATE
         and test_metrics["expectancy_r"] > 0
         and test_metrics["expectancy_r"]
         >= test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R
@@ -1625,6 +1635,8 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         candidate_reason = "too_few_selected_test_rows"
     elif test_metrics["coverage"] < MIN_VALIDATION_COVERAGE:
         candidate_reason = "coverage_too_low"
+    elif test_metrics["selected_wr"] <= ADAPTIVE_TARGET_SUCCESS_RATE:
+        candidate_reason = "tp3_majority_not_reached"
     elif test_metrics["expectancy_r"] <= 0:
         candidate_reason = "negative_test_expectancy"
     elif test_metrics["expectancy_r"] < test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R:
@@ -1771,6 +1783,7 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "logloss_not_better": "прогноз новой модели не точнее базового",
     "too_few_selected_test_rows": "новая модель выбрала слишком мало проверочных сигналов",
     "coverage_too_low": "модель блокирует слишком большую часть сигналов",
+    "tp3_majority_not_reached": "TP3+ ещё не превышает сумму SL и expired на независимой проверке",
     "negative_test_expectancy": "средний результат новой модели остаётся отрицательным",
     "expectancy_not_better_than_baseline": "средний результат не лучше базовой стратегии",
     "champion_kept": "действующая модель лучше нового кандидата",
@@ -1934,11 +1947,11 @@ def format_evidence_guard_audit_message(report: Dict[str, Any]) -> str:
     missed_winners = int(blocked.get("profit", 0))
 
     if action == "rollback":
-        title = f"↩️ АУДИТ V16.4 · RULE {version}: АВТООТКАТ"
+        title = f"↩️ АУДИТ V16.6 · RULE {version}: АВТООТКАТ"
     elif action == "keep":
-        title = f"✅ АУДИТ V16.4 · RULE {version}: ФИЛЬТР ОСТАВЛЕН"
+        title = f"✅ АУДИТ V16.6 · RULE {version}: ФИЛЬТР ОСТАВЛЕН"
     else:
-        title = f"📊 АУДИТ V16.4 · RULE {version}: НУЖНО БОЛЬШЕ ДАННЫХ"
+        title = f"📊 АУДИТ V16.6 · RULE {version}: НУЖНО БОЛЬШЕ ДАННЫХ"
 
     lines = [
         title,
@@ -2071,6 +2084,13 @@ def adaptive_report() -> str:
             lines.append(
                 f"{row['strategy']}: {w}/{n} wins · WR {w/n*100:.1f}% · expectancy {exp_r:+.3f}R"
             )
+
+    guard_statuses = STATE.get("strategy_guard_status", {}) if isinstance(STATE, dict) else {}
+    if guard_statuses:
+        lines.append("\nStrategy circuit breaker:")
+        for strategy, item in sorted(guard_statuses.items()):
+            status = "LIVE allowed" if bool(item.get("accepted", True)) else "SHADOW only"
+            lines.append(f"{strategy}: {status}")
 
     if total < MIN_TRAIN_TRADES:
         lines.append(f"\nWarm-up: need {MIN_TRAIN_TRADES-total} more closed trades before first training.")
@@ -2243,8 +2263,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.4.1 BALANCED LIVE + SOURCE AUDIT"
-DEPLOY_MARKER = "V16_4_1_BALANCED_LIVE_SOURCE_AUDIT_FINAL_2026_08_03"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6 QUALITY + FREQUENCY LEARNING"
+DEPLOY_MARKER = "V16_6_QUALITY_FREQUENCY_OPPORTUNITY_ENGINE_2026_08_03"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2266,21 +2286,57 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.04"))
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
-HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "60"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
+HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "80"))
+MIN_HOT_CANDIDATES = int(os.getenv("MIN_HOT_CANDIDATES", "70"))
 DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 
 # --- Signal limits ---
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
 B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
-MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "6"))
-MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "3"))
-MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "3600"))
+MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "10"))
+MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "5"))
+MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "1800"))
 MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
+
+# --- V16.6 evidence-backed entry quality ---
+# On the first 100 saved outcomes this joint condition retained 38 setups and
+# improved expectancy from -0.175R to +0.075R. It was positive both before and
+# after the final chronological holdout boundary. The three conditions are
+# applied jointly; no single threshold is treated as proof by itself.
+DATA_ENTRY_GATE_ENABLED = os.getenv("DATA_ENTRY_GATE_ENABLED", "true").lower() == "true"
+DATA_MIN_VOL1 = float(os.getenv("DATA_MIN_VOL1", "1.00"))
+DATA_MIN_RANGE1 = float(os.getenv("DATA_MIN_RANGE1", "1.50"))
+DATA_MIN_DIRECTIONAL_3M = float(os.getenv("DATA_MIN_DIRECTIONAL_3M", "0.0080"))
+
+# Weak strategies are paused only in LIVE. They continue producing SHADOW
+# outcomes and automatically recover when the newest rolling evidence improves.
+STRATEGY_CIRCUIT_BREAKER_ENABLED = os.getenv("STRATEGY_CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
+STRATEGY_GUARD_WINDOW = int(os.getenv("STRATEGY_GUARD_WINDOW", "10"))
+STRATEGY_GUARD_MIN_ROWS = int(os.getenv("STRATEGY_GUARD_MIN_ROWS", "8"))
+STRATEGY_GUARD_MAX_EXPECTANCY_R = float(os.getenv("STRATEGY_GUARD_MAX_EXPECTANCY_R", "-0.20"))
+STRATEGY_GUARD_MAX_SUCCESS_RATE = float(os.getenv("STRATEGY_GUARD_MAX_SUCCESS_RATE", "0.20"))
+STRATEGY_RECOVERY_WINDOW = int(os.getenv("STRATEGY_RECOVERY_WINDOW", "5"))
+STRATEGY_RECOVERY_MIN_PROFITS = int(os.getenv("STRATEGY_RECOVERY_MIN_PROFITS", "2"))
+STRATEGY_RECOVERY_MIN_EXPECTANCY_R = float(os.getenv("STRATEGY_RECOVERY_MIN_EXPECTANCY_R", "0.05"))
+
+# A detected setup is not sent immediately. It must keep its direction for a
+# short observation window, remain near the original entry and confirm on 1m.
+PRE_LIVE_CONFIRMATION_ENABLED = os.getenv("PRE_LIVE_CONFIRMATION_ENABLED", "true").lower() == "true"
+PRE_LIVE_MIN_SECONDS = int(os.getenv("PRE_LIVE_MIN_SECONDS", "45"))
+PRE_LIVE_MAX_SECONDS = int(os.getenv("PRE_LIVE_MAX_SECONDS", "180"))
+PRE_LIVE_MIN_DIRECTIONAL_MOVE = float(os.getenv("PRE_LIVE_MIN_DIRECTIONAL_MOVE", "0.0008"))
+PRE_LIVE_MAX_CHASE_MOVE = float(os.getenv("PRE_LIVE_MAX_CHASE_MOVE", "0.0040"))
+PRE_LIVE_MAX_ADVERSE_MOVE = float(os.getenv("PRE_LIVE_MAX_ADVERSE_MOVE", "0.0035"))
+PRE_LIVE_MIN_VOL1 = float(os.getenv("PRE_LIVE_MIN_VOL1", "0.80"))
+PRE_LIVE_MIN_RANGE1 = float(os.getenv("PRE_LIVE_MIN_RANGE1", "1.00"))
+PRE_LIVE_CLOSE_LONG = float(os.getenv("PRE_LIVE_CLOSE_LONG", "0.58"))
+PRE_LIVE_CLOSE_SHORT = float(os.getenv("PRE_LIVE_CLOSE_SHORT", "0.42"))
+PRE_LIVE_MAX_ACTIVE = int(os.getenv("PRE_LIVE_MAX_ACTIVE", "28"))
 
 # A symbol that produces three consecutive non-profit outcomes is quarantined
 # for 12 hours. Shadow observation continues and any TP3+ clears the quarantine.
@@ -2291,8 +2347,8 @@ SYMBOL_QUARANTINE_SECONDS = int(os.getenv("SYMBOL_QUARANTINE_SECONDS", "43200"))
 # Shadow candidates are hypothetical trades: they are never sent as live signals,
 # but their outcomes let the challenger learn from accepted and rejected examples.
 SHADOW_TRACKING_ENABLED = os.getenv("SHADOW_TRACKING_ENABLED", "true").lower() == "true"
-SHADOW_MAX_ACTIVE = int(os.getenv("SHADOW_MAX_ACTIVE", "24"))
-SHADOW_PER_SCAN = int(os.getenv("SHADOW_PER_SCAN", "4"))
+SHADOW_MAX_ACTIVE = int(os.getenv("SHADOW_MAX_ACTIVE", "40"))
+SHADOW_PER_SCAN = int(os.getenv("SHADOW_PER_SCAN", "6"))
 SHADOW_COOLDOWN_SECONDS = int(os.getenv("SHADOW_COOLDOWN_SECONDS", "600"))
 LADDER_FOLLOWUP_MINUTES = int(os.getenv("LADDER_FOLLOWUP_MINUTES", "90"))
 AUTO_TELEGRAM_BACKUP = os.getenv("AUTO_TELEGRAM_BACKUP", "true").lower() == "true"
@@ -2576,6 +2632,7 @@ def default_state() -> Dict[str, Any]:
     return {
         "schema_version": 4,
         "active_signals": [],
+        "pending_signals": [],
         "shadow_signals": [],
         "stats": {
             "total": {"profit": 0, "sl": 0, "expired": 0},
@@ -2589,6 +2646,7 @@ def default_state() -> Dict[str, Any]:
         "strategy_cooldown": {},
         "shadow_cooldown": {},
         "symbol_outcomes": {},
+        "strategy_guard_status": {},
         "live_send_timestamps": [],
         "live_send_history": [],
         "seed_restore": {},
@@ -2611,11 +2669,13 @@ def load_state() -> Dict[str, Any]:
             base.update(data)
         # Deep defaults keep an older V13/V15 state compatible with V16.
         base.setdefault("active_signals", [])
+        base.setdefault("pending_signals", [])
         base.setdefault("shadow_signals", [])
         base.setdefault("pair_cooldown", {})
         base.setdefault("strategy_cooldown", {})
         base.setdefault("shadow_cooldown", {})
         base.setdefault("symbol_outcomes", {})
+        base.setdefault("strategy_guard_status", {})
         base.setdefault("live_send_timestamps", [])
         base.setdefault("live_send_history", [])
         base.setdefault("seed_restore", {})
@@ -3407,7 +3467,10 @@ def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
 
     # Keep the bot alive: if the market is quiet and strict hot score returns too few,
     # still analyze the best live-ranked names. The deeper fast filters remain in place.
-    min_live_candidates = min(HOT_SYMBOLS_TO_ANALYZE, 50)
+    # V16.6 expands the opportunity pool instead of weakening the entry gate.
+    # More liquid/moving names reach deep analysis, while every LIVE entry still
+    # has to pass the evidence gate and the delayed continuation confirmation.
+    min_live_candidates = min(HOT_SYMBOLS_TO_ANALYZE, max(1, MIN_HOT_CANDIDATES))
     if len(selected) < min_live_candidates:
         seen = set(selected)
         for sc, sym, _ in scored:
@@ -4495,6 +4558,94 @@ def live_signal_budget_24h(current_ts: Optional[int] = None) -> Dict[str, Any]:
     }
 
 
+def data_entry_quality_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
+    """Joint entry rule validated on chronological slices of the saved 100 outcomes."""
+    if not DATA_ENTRY_GATE_ENABLED:
+        return True, "data entry gate disabled"
+    side = str(trade.get("side", "")).upper()
+    direction = 1.0 if side == "LONG" else -1.0
+    vol1 = float(trade.get("vol1", 0.0) or 0.0)
+    range1 = float(trade.get("range1", 0.0) or 0.0)
+    directional_3m = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
+    failures: List[str] = []
+    if vol1 < DATA_MIN_VOL1:
+        failures.append(f"Vol1 x{vol1:.2f} < x{DATA_MIN_VOL1:.2f}")
+    if range1 < DATA_MIN_RANGE1:
+        failures.append(f"Range1 x{range1:.2f} < x{DATA_MIN_RANGE1:.2f}")
+    if directional_3m < DATA_MIN_DIRECTIONAL_3M:
+        failures.append(
+            f"directional 3m {directional_3m*100:.2f}% < {DATA_MIN_DIRECTIONAL_3M*100:.2f}%"
+        )
+    accepted = not failures
+    reason = (
+        f"data gate passed: Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
+        f"directional 3m {directional_3m*100:.2f}%"
+        if accepted
+        else "data gate blocked: " + "; ".join(failures)
+    )
+    trade["data_entry_gate_accepted"] = accepted
+    trade["data_entry_gate_reason"] = reason
+    return accepted, reason
+
+
+def strategy_circuit_breaker(trade: Dict[str, Any]) -> Tuple[bool, str]:
+    """Pause a weak strategy in LIVE while continuously rechecking it in SHADOW."""
+    strategy = str(trade.get("strategy", "?"))
+    if not STRATEGY_CIRCUIT_BREAKER_ENABLED:
+        return True, "strategy circuit breaker disabled"
+    init_adaptive_db()
+    window = max(1, STRATEGY_GUARD_WINDOW)
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT result, pnl_r FROM adaptive_trades WHERE strategy=? "
+            "ORDER BY id DESC LIMIT ?",
+            (strategy, window),
+        ).fetchall()
+    ordered = list(reversed(rows))
+    metrics = _outcome_metrics(ordered)
+    recovery_rows = ordered[-max(1, STRATEGY_RECOVERY_WINDOW):]
+    recovery = _outcome_metrics(recovery_rows)
+    enough = int(metrics["n"]) >= max(1, STRATEGY_GUARD_MIN_ROWS)
+    weak = (
+        enough
+        and float(metrics["expectancy_r"]) <= STRATEGY_GUARD_MAX_EXPECTANCY_R
+        and float(metrics["success_rate"]) <= STRATEGY_GUARD_MAX_SUCCESS_RATE
+    )
+    recovered = (
+        int(recovery["n"]) >= max(1, STRATEGY_RECOVERY_WINDOW)
+        and int(recovery["profit"]) >= max(1, STRATEGY_RECOVERY_MIN_PROFITS)
+        and float(recovery["expectancy_r"]) >= STRATEGY_RECOVERY_MIN_EXPECTANCY_R
+    )
+    accepted = bool(not weak or recovered)
+    reason = (
+        f"strategy guard passed: last {int(metrics['n'])}, {_metrics_line(metrics)}"
+        if accepted
+        else f"strategy LIVE paused: last {int(metrics['n'])}, {_metrics_line(metrics)}"
+    )
+    trade["strategy_guard_accepted"] = accepted
+    trade["strategy_guard_reason"] = reason
+
+    statuses = STATE.setdefault("strategy_guard_status", {})
+    previous = statuses.get(strategy)
+    if previous is None or bool(previous.get("accepted", True)) != accepted:
+        statuses[strategy] = {
+            "accepted": accepted,
+            "reason": reason,
+            "updated_at": now_ts(),
+        }
+        save_state()
+        if not accepted:
+            send_telegram(
+                f"⏸ Стратегия временно переведена в SHADOW\n{strategy}\n{reason}\n"
+                "Новые исходы продолжают отслеживаться; восстановление автоматическое."
+            )
+        elif previous is not None:
+            send_telegram(
+                f"▶️ Стратегия восстановлена в LIVE\n{strategy}\n{reason}"
+            )
+    return accepted, reason
+
+
 def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
     """Rebuild only the lightweight per-symbol streak state from saved rows."""
     if not SYMBOL_QUARANTINE_ENABLED:
@@ -4670,7 +4821,27 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             continue
         trade["trader_pattern_reason"] = t_reason
 
-        # V16.4.1: evaluate the transparent evidence rule first. A blocked trade
+        # V16.6: the joint Vol1/Range1/directional-move condition was the only
+        # compact entry filter with positive expectancy in both chronological
+        # development and holdout slices of the saved 100 outcomes. Rejected
+        # setups remain visible in SHADOW, so the rule can be challenged later.
+        data_ok, data_reason = data_entry_quality_gate(trade)
+        if not data_ok:
+            blocks["data_entry_gate_block"] = blocks.get("data_entry_gate_block", 0) + 1
+            add_shadow_signal(trade, "data_entry_gate_block")
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side}: {data_reason}")
+            continue
+
+        strategy_ok, strategy_reason = strategy_circuit_breaker(trade)
+        if not strategy_ok:
+            blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
+            add_shadow_signal(trade, "strategy_circuit_breaker")
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side}: {strategy_reason}")
+            continue
+
+        # V16.6: evaluate the transparent evidence rule first. A blocked trade
         # is still followed in shadow, so the bot can measure missed winners and
         # automatically roll the rule back. The symbol gate is evaluated on the
         # same candidate and contributes its failure streak to adaptive features.
@@ -4767,9 +4938,10 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16.4.1 Balanced Live + Source Audit\n"
+        f"🧪 Диагностика V16.6 Quality + Frequency Learning\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
-        f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · "
+        f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
+        f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
         f"shadow: {scan.get('shadow_added', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
@@ -4846,6 +5018,134 @@ def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
     return True
 
 
+def pending_key(signal: Dict[str, Any]) -> str:
+    return shadow_key(signal)
+
+
+def add_pending_signal(signal: Dict[str, Any]) -> bool:
+    if not PRE_LIVE_CONFIRMATION_ENABLED:
+        return False
+    pending = STATE.setdefault("pending_signals", [])
+    if len(pending) >= max(1, PRE_LIVE_MAX_ACTIVE):
+        return False
+    key = pending_key(signal)
+    if any(pending_key(item) == key for item in pending):
+        return False
+    item = dict(signal)
+    item["pending_started_at"] = now_ts()
+    item["pending_reference_entry"] = float(signal.get("entry", 0.0) or 0.0)
+    item["pending_status"] = "waiting_confirmation"
+    pending.append(item)
+    # This parallel observation is removed if the candidate becomes LIVE. If
+    # confirmation fails, it stays in SHADOW and gives us an honest outcome.
+    add_shadow_signal(signal, "pre_live_confirmation")
+    save_state()
+    return True
+
+
+def process_pending_signals(
+    blocks: Dict[str, int], near_miss: List[str]
+) -> List[Dict[str, Any]]:
+    if not PRE_LIVE_CONFIRMATION_ENABLED:
+        return []
+    pending = STATE.setdefault("pending_signals", [])
+    if not pending:
+        return []
+
+    confirmed: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    current_ts = now_ts()
+    for item in pending:
+        started = int(item.get("pending_started_at", current_ts) or current_ts)
+        age = max(0, current_ts - started)
+        if age > max(PRE_LIVE_MIN_SECONDS, PRE_LIVE_MAX_SECONDS):
+            blocks["pre_live_confirmation_expired"] = blocks.get("pre_live_confirmation_expired", 0) + 1
+            continue
+
+        symbol = str(item.get("symbol", ""))
+        side = str(item.get("side", "")).upper()
+        reference = float(item.get("pending_reference_entry", item.get("entry", 0.0)) or 0.0)
+        c1 = get_klines(symbol, "1m", 80, cache_seconds=4)
+        c5 = get_klines(symbol, "5m", 80, cache_seconds=8)
+        if not c1 or not c5 or reference <= 0:
+            remaining.append(item)
+            continue
+
+        price = float(c1[-1]["close"])
+        direction = 1.0 if side == "LONG" else -1.0
+        directional_move = direction * (price - reference) / reference
+        if directional_move <= -max(0.0, PRE_LIVE_MAX_ADVERSE_MOVE):
+            blocks["pre_live_adverse_reject"] = blocks.get("pre_live_adverse_reject", 0) + 1
+            continue
+        if directional_move >= max(PRE_LIVE_MIN_DIRECTIONAL_MOVE, PRE_LIVE_MAX_CHASE_MOVE):
+            blocks["pre_live_chase_reject"] = blocks.get("pre_live_chase_reject", 0) + 1
+            continue
+        if age < max(0, PRE_LIVE_MIN_SECONDS):
+            remaining.append(item)
+            continue
+
+        last = c1[-1]
+        previous = c1[-2]
+        location = close_location(last)
+        vol1 = volume_ratio(c1, 20)
+        range1 = candle_range_ratio(c1, 20)
+        directional_3m = direction * percent_change(c1, 3)
+        ema9 = ema(closes(c1[-30:]), 9)
+        if side == "LONG":
+            candle_ok = (
+                last["close"] > last["open"]
+                and last["close"] > previous["close"]
+                and location >= PRE_LIVE_CLOSE_LONG
+                and price > ema9
+            )
+        else:
+            candle_ok = (
+                last["close"] < last["open"]
+                and last["close"] < previous["close"]
+                and location <= PRE_LIVE_CLOSE_SHORT
+                and price < ema9
+            )
+        confirmed_now = (
+            directional_move >= PRE_LIVE_MIN_DIRECTIONAL_MOVE
+            and directional_3m >= DATA_MIN_DIRECTIONAL_3M * 0.75
+            and vol1 >= PRE_LIVE_MIN_VOL1
+            and range1 >= PRE_LIVE_MIN_RANGE1
+            and candle_ok
+        )
+        if not confirmed_now:
+            remaining.append(item)
+            continue
+
+        setup = dict(item)
+        setup["entry"] = price
+        setup["ch3m_1m"] = direction * directional_3m
+        setup["ch2m"] = percent_change(c1, 2)
+        setup["vol1"] = vol1
+        setup["range1"] = range1
+        setup["pending_confirmation_seconds"] = age
+        setup["pending_confirmation_move"] = directional_move
+        setup["pre_live_confirmed"] = True
+        refreshed = calculate_fast_trade(setup, c1, c5)
+        if not refreshed:
+            blocks["pre_live_reprice_sl_block"] = blocks.get("pre_live_reprice_sl_block", 0) + 1
+            continue
+        quality_ok, quality_block, quality_reason = professional_quality_gate(refreshed, symbol)
+        if not quality_ok:
+            blocks[quality_block] = blocks.get(quality_block, 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(quality_reason)
+            continue
+        strategy_ok, _ = strategy_circuit_breaker(refreshed)
+        if not strategy_ok:
+            blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
+            continue
+        confirmed.append(refreshed)
+
+    STATE["pending_signals"] = remaining
+    save_state()
+    return confirmed
+
+
 def add_active_signal(s: Dict[str, Any]) -> None:
     remove_matching_shadow(s)
     ensure_signal_runtime_fields(s, "live")
@@ -4899,6 +5199,8 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         STATE["last_error"] = f"pre-scan track_active_signals: {repr(e)}"
         save_state()
 
+    confirmed_candidates = process_pending_signals(blocks, near_miss)
+
     found: List[Dict[str, Any]] = []
     for sym in selected:
         try:
@@ -4912,6 +5214,21 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
 
     found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
     scan["candidates"] = len(found)
+    pending_added = 0
+    if PRE_LIVE_CONFIRMATION_ENABLED:
+        for candidate in found:
+            if add_pending_signal(candidate):
+                pending_added += 1
+        ready_candidates = confirmed_candidates
+    else:
+        ready_candidates = found
+    ready_candidates.sort(
+        key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]),
+        reverse=True,
+    )
+    scan["pending_added"] = pending_added
+    scan["pending_active"] = len(STATE.get("pending_signals", []))
+    scan["confirmed"] = len(confirmed_candidates)
 
     sent = 0
     open_risk_count = sum(
@@ -4928,7 +5245,7 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
     spacing_open = int(budget["spacing_left"]) <= 0
     scan_limit = min(MAX_SIGNALS_PER_SCAN, free_slots)
 
-    for candidate in found:
+    for candidate in ready_candidates:
         side = str(candidate.get("side", "UNKNOWN")).upper()
         model_version = int(candidate.get("adaptive_model_version", 0) or 0)
         reason = ""
@@ -4956,10 +5273,10 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         # A real send closes the one-hour gate for the rest of this scan.
         spacing_open = False
 
-    if not selected_live and found:
+    if not selected_live and ready_candidates:
         if free_slots <= 0:
             block_key = "active_slots_full_send_block"
-            detail = f"found {len(found)} candidate(s), but active slots are full"
+            detail = f"found {len(ready_candidates)} confirmed candidate(s), but active slots are full"
         elif int(budget["remaining"]) <= 0:
             block_key = "daily_live_cap_block"
             detail = f"24h live cap reached: {budget['total']}/{MAX_LIVE_SIGNALS_24H}"
@@ -4981,7 +5298,7 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         send_telegram(build_signal_message(s))
         sent += 1
 
-    shadow_added = 0
+    shadow_added = pending_added
     if SHADOW_TRACKING_ENABLED:
         for candidate, shadow_reason in shadow_queue[:max(0, SHADOW_PER_SCAN)]:
             if add_shadow_signal(candidate, shadow_reason):
@@ -5308,6 +5625,16 @@ async def scan_loop():
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
         f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
         f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}.\n"
+        f"Opportunity engine: analyze up to {MAX_ANALYZE_SYMBOLS} contracts · "
+        f"deep-check {HOT_SYMBOLS_TO_ANALYZE} hot names (minimum pool {MIN_HOT_CANDIDATES}).\n"
+        f"Evidence entry gate: Vol1 ≥ x{DATA_MIN_VOL1:.2f} · Range1 ≥ x{DATA_MIN_RANGE1:.2f} · "
+        f"directional 3m ≥ {DATA_MIN_DIRECTIONAL_3M*100:.2f}%.\n"
+        f"Pre-LIVE confirmation: {PRE_LIVE_CONFIRMATION_ENABLED} · "
+        f"wait {PRE_LIVE_MIN_SECONDS}–{PRE_LIVE_MAX_SECONDS}s · "
+        f"confirm move ≥ {PRE_LIVE_MIN_DIRECTIONAL_MOVE*100:.2f}% · "
+        f"anti-chase ≤ {PRE_LIVE_MAX_CHASE_MOVE*100:.2f}%.\n"
+        f"Strategy circuit breaker: {STRATEGY_CIRCUIT_BREAKER_ENABLED} · "
+        f"rolling {STRATEGY_GUARD_WINDOW} outcomes · weak strategies stay in SHADOW.\n"
         f"Evidence guard v{guard_state.version}: active={guard_state.active} · "
         f"Score ≥ {guard_state.min_score:.0f} · Vol1 > x{guard_state.min_vol1:.2f}; "
         f"audit every {EVIDENCE_AUDIT_EVERY} decisions.\n"
@@ -5318,6 +5645,8 @@ async def scan_loop():
         f"spacing {MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min.\n"
         f"Adaptive: {'permanent shadow' if SHADOW_ONLY else 'guarded live after independent validation'}; "
         f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
+        f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
+        f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
         f"Adaptive model: active={model_state.active} · version={model_state.version} · "
         f"LIVE fraction={float(model_state.deployment_fraction or 0)*100:.0f}%.\n"
         f"Audit: before/after every {LIVE_AUDIT_EVERY} closed model decisions · "
