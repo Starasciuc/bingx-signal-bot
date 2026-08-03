@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.6.1
+# VERIFIED GITHUB DEPLOY FILE — V16.6.2
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2263,8 +2263,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.1 UNLIMITED QUALITY ENTRY"
-DEPLOY_MARKER = "V16_6_1_NO_DAILY_CAP_TIMELY_TP3_ENTRY_2026_08_03"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.6.2 EVIDENCE ENTRY PATH"
+DEPLOY_MARKER = "V16_6_2_EVIDENCE_IMBALANCE_NO_FAST_BYPASS_2026_08_03"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2423,7 +2423,11 @@ MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # techn
 LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
 LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0145"))  # 1.45% price risk cap; x20 ≈ 29% ROI
 LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0065"))  # keep stop not too tight
-LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG", "AERO_STYLE_SHORT", "AERO_STYLE_LONG"}
+LOCAL_STOP_MODES = {
+    "MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG",
+    "INSTANT_EVIDENCE_SHORT", "INSTANT_EVIDENCE_LONG",
+    "AERO_STYLE_SHORT", "AERO_STYLE_LONG",
+}
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
 
@@ -4150,6 +4154,102 @@ def market_dump_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Di
     }
 
 
+def evidence_imbalance_setup(
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    c1h: List[Dict[str, float]],
+    btc: Dict[str, Any],
+    side: str,
+) -> Optional[Dict[str, Any]]:
+    """V16.6.2 direct path for a proven live imbalance.
+
+    Older fast/instant templates can reject a coin before the evidence-backed
+    Vol1/Range1/directional rule is evaluated. This constructor does not lower
+    that rule. It only creates a candidate when all three requirements already
+    pass, the closing candle is directional and a fresh micro break exists.
+    The normal RR, trader-pattern, delayed confirmation and adaptive gates still
+    run afterwards.
+    """
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
+        return None
+
+    direction = 1.0 if side == "LONG" else -1.0
+    price = float(c1[-1]["close"])
+    last1 = c1[-1]
+    ch3m = percent_change(c1, 3)
+    directional_3m = direction * ch3m
+    vol1 = volume_ratio(c1, 20)
+    range1 = candle_range_ratio(c1, 20)
+
+    # Exact V16.6 evidence gate: this path is an alternative detector, not a
+    # relaxation of the quality threshold.
+    if directional_3m < DATA_MIN_DIRECTIONAL_3M:
+        return None
+    if vol1 < DATA_MIN_VOL1 or range1 < DATA_MIN_RANGE1:
+        return None
+
+    location = close_location(last1)
+    if side == "LONG":
+        if last1["close"] <= last1["open"] or location < max(TRADER_CLOSE_LONG, PRE_LIVE_CLOSE_LONG):
+            return None
+    else:
+        if last1["close"] >= last1["open"] or location > min(TRADER_CLOSE_SHORT, PRE_LIVE_CLOSE_SHORT):
+            return None
+
+    micro_ok, micro_reason = micro_structure_break(c1, side)
+    if not micro_ok:
+        return None
+
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol5 = volume_ratio(c5, 20)
+    range5 = candle_range_ratio(c5, 20)
+    level = (
+        min(x["low"] for x in c1[-10:])
+        if side == "LONG"
+        else max(x["high"] for x in c1[-10:])
+    )
+
+    score = 82
+    score += min(8, int(max(0.0, directional_3m - DATA_MIN_DIRECTIONAL_3M) * 1000))
+    score += min(5, int(max(0.0, vol1 - DATA_MIN_VOL1) * 5))
+    score += min(5, int(max(0.0, range1 - DATA_MIN_RANGE1) * 4))
+    score = max(0, min(100, score))
+    setup_mode = f"INSTANT_EVIDENCE_{side}"
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": f"PRO_EVIDENCE_IMBALANCE_{side}",
+        "trade_type": f"EVIDENCE IMBALANCE {side}",
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 1.20 and range1 >= 1.80 else "B",
+        "entry": price,
+        "level": level,
+        "reason": (
+            f"EVIDENCE IMBALANCE {side}: прямой путь для подтверждённого живого дисбаланса; "
+            f"1m3 {ch3m*100:+.2f}%, Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
+            f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}; {micro_reason}. "
+            "Старый fast-шаблон не используется, но все финальные проверки остаются обязательными."
+        ),
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": setup_mode,
+        "t1h": trend_state(c1h),
+        "btc_text": btc.get("text", ""),
+    }
+
+
 def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
     side = setup["side"]
     entry = setup["entry"]
@@ -4776,6 +4876,11 @@ def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], nea
             if setup:
                 blocks["market_dump_short"] = blocks.get("market_dump_short", 0) + 1
         if not setup:
+            setup = evidence_imbalance_setup(symbol, c1, c5, c15, c1h, btc, side)
+            if setup:
+                key = f"evidence_imbalance_{side.lower()}"
+                blocks[key] = blocks.get(key, 0) + 1
+        if not setup:
             blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
             continue
 
@@ -4940,7 +5045,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16.6.1 Unlimited Quality Entry\n"
+        f"🧪 Диагностика V16.6.2 Evidence Entry Path\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -5633,6 +5738,8 @@ async def scan_loop():
         f"deep-check {HOT_SYMBOLS_TO_ANALYZE} hot names (minimum pool {MIN_HOT_CANDIDATES}).\n"
         f"Evidence entry gate: Vol1 ≥ x{DATA_MIN_VOL1:.2f} · Range1 ≥ x{DATA_MIN_RANGE1:.2f} · "
         f"directional 3m ≥ {DATA_MIN_DIRECTIONAL_3M*100:.2f}%.\n"
+        f"Evidence imbalance path: active · qualifying setups bypass obsolete no_fast templates, "
+        f"but still pass RR/structure/confirmation/model checks.\n"
         f"Pre-LIVE confirmation: {PRE_LIVE_CONFIRMATION_ENABLED} · "
         f"wait {PRE_LIVE_MIN_SECONDS}–{PRE_LIVE_MAX_SECONDS}s · "
         f"confirm move ≥ {PRE_LIVE_MIN_DIRECTIONAL_MOVE*100:.2f}% · "
