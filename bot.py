@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.8.1
+# VERIFIED GITHUB DEPLOY FILE — V16.9
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -166,7 +166,7 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "vol1_below_guard",
     "evidence_quality_pass",
     "symbol_fail_streak",
-    # Retained for feature-schema compatibility. V16.8 no longer trains on
+    # Retained for feature-schema compatibility. V16.9 does not train on
     # ordinary diagnostic SHADOW rows; registered PAPER rows still carry 1.0.
     "is_shadow",
 )
@@ -349,7 +349,7 @@ def init_adaptive_db() -> None:
                         conn.execute(
                             "SELECT COUNT(*) AS n FROM adaptive_trades "
                             "WHERE lower(COALESCE(source, 'live'))='live' "
-                            "OR COALESCE(decision_reason, '')='paper_validation'"
+                            "OR COALESCE(decision_reason, '')='quality_forward_v16_9'"
                         ).fetchone()["n"]
                         or 0
                     )
@@ -585,7 +585,7 @@ def get_model_state() -> ModelState:
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM adaptive_trades "
                     "WHERE lower(COALESCE(source, 'live'))='live' "
-                    "OR COALESCE(decision_reason, '')='paper_validation'"
+                    "OR COALESCE(decision_reason, '')='quality_forward_v16_9'"
                 ).fetchone()["n"]
                 or 0
             )
@@ -1531,7 +1531,7 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
             """
         ).fetchall()
 
-    # V16.8 fixes data provenance: ordinary SHADOW rows are diagnostics, not
+    # V16.9 preserves the data-provenance fix: ordinary SHADOW rows are diagnostics, not
     # independent execution evidence.  Only real LIVE outcomes and the visible,
     # pre-registered PAPER lane can train or promote the adaptive model.
     rows = [
@@ -1542,6 +1542,38 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
         )
     ]
     closed_count = len(rows)
+    paper_rows = [
+        row for row in all_rows
+        if str(row["decision_reason"] or "") == PAPER_VALIDATION_REASON
+    ]
+    if PRO_QUALITY_FORWARD_ENABLED and len(paper_rows) < PAPER_LANE_REQUIRED_OUTCOMES:
+        paper_count = len(paper_rows)
+        last_forward_report = int(STATE.get("last_forward_report_count", 0) or 0)
+        milestone_report = bool(
+            paper_count > 0
+            and paper_count % max(1, RETRAIN_EVERY) == 0
+            and paper_count > last_forward_report
+        )
+        if milestone_report:
+            STATE["last_forward_report_count"] = paper_count
+            save_state()
+        return {
+            "attempted": milestone_report,
+            "trained": False,
+            "promoted": False,
+            "reason": "forward_validation_freeze",
+            "candidate_reason": "forward_validation_freeze",
+            "closed_count": closed_count,
+            "all_closed_count": len(all_rows),
+            "needed": PAPER_LANE_REQUIRED_OUTCOMES,
+            "paper_collected": paper_count,
+            "training_data": _outcome_metrics(rows),
+            "all_data": _outcome_metrics(all_rows),
+            "paper_validation_data": _outcome_metrics(paper_rows),
+            "source_breakdown": _source_breakdown(rows),
+            "model_data_policy": MODEL_DATA_POLICY,
+            "next_at": closed_count + (PAPER_LANE_REQUIRED_OUTCOMES - paper_count),
+        }
     if closed_count < MIN_TRAIN_TRADES:
         return {
             "attempted": bool(force),
@@ -1975,6 +2007,7 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "live_model_guard_passed": "live-проверка не выявила ухудшения",
     "feature_schema_changed": "добавлены новые признаки качества; старые исходы сохранены",
     "model_dataset_policy_changed": "модель сброшена безопасно: обычный SHADOW исключён из обучения",
+    "forward_validation_freeze": "критерии зафиксированы до 50 независимых A+ PAPER-исходов",
     "seed_restored_feature_upgrade": "50 исходов восстановлены; следующая проверка продолжится по графику",
     "evidence_not_enough_comparison_rows": "для честной проверки фильтра пока мало отправленных или shadow-исходов",
     "evidence_too_many_profitable_signals_blocked": "фильтр начал пропускать слишком много TP3+ сигналов",
@@ -2019,6 +2052,12 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
         lines.append(f"ВСЯ ТЕЛЕМЕТРИЯ: {_metrics_line(all_dataset)}")
     if paper_dataset:
         lines.append(f"FORWARD PAPER: {_metrics_line(paper_dataset)}")
+    if reason == "forward_validation_freeze":
+        lines.append(
+            f"Зафиксированная проверка: {int(report.get('paper_collected', 0) or 0)}/"
+            f"{int(report.get('needed', PAPER_LANE_REQUIRED_OUTCOMES) or PAPER_LANE_REQUIRED_OUTCOMES)} "
+            "независимых A+ PAPER-исходов. До завершения границы не меняются."
+        )
     if sources:
         lines.extend(
             [
@@ -2365,7 +2404,7 @@ def format_source_audit_message(window: int = 25) -> str:
 
     shadow_rows = [row for row in recent_rows if str(row["source"] or "") == "shadow"][-8:]
     if shadow_rows:
-        lines.append("\nПоследние SHADOW (не отправлялись как сделки):")
+        lines.append("\nПоследние SHADOW (видимые виртуальные наблюдения, не LIVE):")
         for row in shadow_rows:
             reason = str(row["decision_reason"] or "shadow observation")
             if len(reason) > 34:
@@ -2477,8 +2516,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.8.1 TRANSPARENT FORWARD"
-DEPLOY_MARKER = "V16_8_1_TRANSPARENT_FORWARD_225_2026_08_04"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.9 PRO QUALITY FORWARD"
+DEPLOY_MARKER = "V16_9_PRO_QUALITY_FORWARD_275_2026_08_04"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2521,7 +2560,7 @@ MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "
 MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "0"))
 MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
 
-# --- V16.8 pre-registered forward entry validation ---
+# --- V16.9 pre-registered professional forward validation ---
 # Production remains conservative.  One exact lane selected from the complete
 # 225-outcome history is shown as explicit PAPER and evaluated prospectively;
 # it is never silently promoted to LIVE.
@@ -2538,16 +2577,22 @@ PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "tru
 VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
     "VISIBLE_SHADOW_NOTIFICATIONS", "true"
 ).lower() == "true"
-PAPER_VALIDATION_REASON = "paper_validation"
+PAPER_VALIDATION_REASON = "quality_forward_v16_9"
 PAPER_LONG_STRATEGY = "PRO_INSTANT_EDGE_LONG"
-# Transparent forward challenger discovered before coding V16.8:
-# A+ + INSTANT LONG + directional 3m between 2.0% and 3.0% produced
-# 8 TP3+ / 0 SL / 2 expired across the saved 225 outcomes (+0.942R average).
-# Ten rows are not enough for LIVE deployment, so every new match is visible
-# PAPER until at least 20 genuinely forward outcomes have been collected.
-PAPER_LONG_EDGE_MIN = float(os.getenv("PAPER_LONG_EDGE_MIN", "0.0200"))
-PAPER_LONG_EDGE_MAX = float(os.getenv("PAPER_LONG_EDGE_MAX", "0.0300"))
-PAPER_LANE_REQUIRED_OUTCOMES = int(os.getenv("PAPER_LANE_REQUIRED_OUTCOMES", "20"))
+# V16.9 candidate is registered before its new forward sample begins:
+# A+ + INSTANT LONG + directional 3m >= 1.20%.  Across the saved history it
+# remained positive in both the original 225 and the newest 50 observations,
+# unlike the over-narrow 2-3% band.  It is PAPER-only until 50 independent,
+# prospectively collected outcomes have closed.
+PAPER_LONG_EDGE_MIN = float(os.getenv("PAPER_LONG_EDGE_MIN", "0.0120"))
+PAPER_LONG_EDGE_MAX = float(os.getenv("PAPER_LONG_EDGE_MAX", "0.2500"))
+PAPER_LANE_REQUIRED_OUTCOMES = int(os.getenv("PAPER_LANE_REQUIRED_OUTCOMES", "50"))
+PAPER_SYMBOL_COOLDOWN_SECONDS = int(
+    os.getenv("PAPER_SYMBOL_COOLDOWN_SECONDS", "43200")
+)
+PRO_QUALITY_FORWARD_ENABLED = os.getenv(
+    "PRO_QUALITY_FORWARD_ENABLED", "true"
+).lower() == "true"
 
 # Weak strategies are paused only in LIVE. They continue producing SHADOW
 # outcomes and automatically recover when the newest rolling evidence improves.
@@ -2916,6 +2961,7 @@ def default_state() -> Dict[str, Any]:
         "seed_restore": {},
         "last_backup_closed_count": 0,
         "last_source_audit_closed_count": 0,
+        "last_forward_report_count": 0,
         "last_scan": {},
         "last_diag_ts": 0,
         "last_error": "",
@@ -2945,6 +2991,7 @@ def load_state() -> Dict[str, Any]:
         base.setdefault("seed_restore", {})
         base.setdefault("last_backup_closed_count", 0)
         base.setdefault("last_source_audit_closed_count", 0)
+        base.setdefault("last_forward_report_count", 0)
         stats = base.setdefault("stats", {})
         for bucket, value in default_state()["stats"].items():
             stats.setdefault(bucket, value.copy() if isinstance(value, dict) else value)
@@ -3155,7 +3202,7 @@ def restore_adaptive_seed_if_empty() -> Dict[str, Any]:
         restored_model.last_candidate_reason = "feature_schema_changed"
     seed_marker = str(payload.get("deploy_marker", "") or "")
     restored_model.trained_rows = eligible_count
-    if not seed_marker.startswith("V16_8_"):
+    if not seed_marker.startswith(("V16_8_", "V16_9_")):
         # Older versions mixed diagnostic SHADOW rows into model training.
         # Preserve every outcome, but never restore that model as a champion.
         restored_model.active = False
@@ -3363,23 +3410,80 @@ def paper_validation_metrics() -> Dict[str, Any]:
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT result, pnl_r FROM adaptive_trades "
+            "SELECT result, pnl_r, symbol FROM adaptive_trades "
             "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
             (PAPER_VALIDATION_REASON,),
         ).fetchall()
-    return _outcome_metrics(rows)
+    metrics = _outcome_metrics(rows)
+    metrics["unique_symbols"] = len(
+        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
+    )
+    return metrics
 
 
-def maybe_send_auto_backup() -> None:
+def next_model_analysis_target() -> int:
+    state = get_model_state()
+    normal_target = max(
+        MIN_TRAIN_TRADES,
+        int(state.last_attempted_closed_count or 0) + max(1, RETRAIN_EVERY),
+    )
+    if not PRO_QUALITY_FORWARD_ENABLED:
+        return normal_target
+    paper_count = int(paper_validation_metrics().get("n", 0) or 0)
+    remaining = max(0, PAPER_LANE_REQUIRED_OUTCOMES - paper_count)
+    return max(normal_target, adaptive_model_data_count() + remaining)
+
+
+def closed_outcome_progress_message(
+    signal: Dict[str, Any], result: str, source: Optional[str] = None
+) -> str:
+    """Compact proof after every outcome successfully reaches SQLite."""
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT result, pnl_r, source FROM adaptive_trades ORDER BY id ASC"
+        ).fetchall()
+    metrics = _source_breakdown(rows)
+    total = int(metrics["all"]["n"])
+    last_backup = int(STATE.get("last_backup_closed_count", 0) or 0)
+    next_backup = max(last_backup + max(1, AUTO_BACKUP_EVERY_CLOSED), total)
+    if total - last_backup >= max(1, AUTO_BACKUP_EVERY_CLOSED):
+        backup_line = f"Backup уже должен быть отправлен: отметка {total}."
+    else:
+        backup_line = (
+            f"До следующего JSON: "
+            f"{max(0, last_backup + max(1, AUTO_BACKUP_EVERY_CLOSED) - total)} "
+            f"закрытых исходов (ориентир {next_backup})."
+        )
+    labels = {"profit": "TP3+", "sl": "SL", "expired": "expired"}
+    return (
+        "📊 СТАТИСТИКА ПОСЛЕ ЗАКРЫТИЯ\n"
+        f"Последний исход: {labels.get(result, result)} · "
+        f"{str(source or signal.get('signal_source', 'live')).upper()} · "
+        f"{display_symbol(signal.get('symbol', '?'))}\n"
+        f"ВСЕГО: {_metrics_line(metrics['all'])}\n"
+        f"LIVE: {_metrics_line(metrics['live'])}\n"
+        f"SHADOW/PAPER: {_metrics_line(metrics['shadow'])}\n"
+        f"Допустимых для модели LIVE+PAPER: {adaptive_model_data_count()}\n"
+        f"{backup_line}"
+    )
+
+
+def maybe_send_auto_backup() -> Dict[str, Any]:
     if not AUTO_TELEGRAM_BACKUP or AUTO_BACKUP_EVERY_CLOSED <= 0:
-        return
+        return {"attempted": False, "sent": False, "reason": "disabled"}
     try:
         closed_count = adaptive_closed_count()
         last_count = int(STATE.get("last_backup_closed_count", 0) or 0)
         if closed_count < AUTO_BACKUP_EVERY_CLOSED:
-            return
+            return {"attempted": False, "sent": False, "closed_count": closed_count}
         if closed_count - last_count < AUTO_BACKUP_EVERY_CLOSED:
-            return
+            return {
+                "attempted": False,
+                "sent": False,
+                "closed_count": closed_count,
+                "last_backup": last_count,
+            }
         last_audit_count = int(STATE.get("last_source_audit_closed_count", 0) or 0)
         if closed_count - last_audit_count >= AUTO_BACKUP_EVERY_CLOSED:
             if send_telegram(format_source_audit_message(AUTO_BACKUP_EVERY_CLOSED)):
@@ -3393,9 +3497,26 @@ def maybe_send_auto_backup() -> None:
         ):
             STATE["last_backup_closed_count"] = closed_count
             save_state()
+            return {
+                "attempted": True,
+                "sent": True,
+                "closed_count": closed_count,
+                "filename": filename,
+            }
+        return {
+            "attempted": True,
+            "sent": False,
+            "closed_count": closed_count,
+            "error": STATE.get("last_error", "Telegram document send failed"),
+        }
     except Exception as e:
         STATE["last_error"] = f"automatic backup error: {repr(e)}"
         save_state()
+        return {
+            "attempted": True,
+            "sent": False,
+            "error": STATE["last_error"],
+        }
 
 
 def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -5187,6 +5308,40 @@ def paper_long_challenger_eligible(trade: Dict[str, Any]) -> bool:
     )
 
 
+def paper_symbol_independence_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
+    """Prevent one coin/impulse from masquerading as independent evidence."""
+    symbol = normalize_symbol(str(trade.get("symbol", "?")))
+    for item in STATE.setdefault("pending_signals", []):
+        if (
+            normalize_symbol(str(item.get("symbol", "?"))) == symbol
+            and bool(item.get("paper_validation_only"))
+        ):
+            return False, "same symbol already awaiting PAPER confirmation"
+    for item in STATE.setdefault("shadow_signals", []):
+        if (
+            normalize_symbol(str(item.get("symbol", "?"))) == symbol
+            and str(item.get("shadow_reason", "")) in {
+                PAPER_VALIDATION_REASON,
+                "pre_live_confirmation",
+            }
+        ):
+            return False, "same symbol already has an active confirmation/PAPER observation"
+
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT MAX(closed_at) AS last_closed FROM adaptive_trades "
+            "WHERE symbol=? AND COALESCE(decision_reason, '') IN (?, 'pre_live_confirmation')",
+            (symbol, PAPER_VALIDATION_REASON),
+        ).fetchone()
+    last_closed = int(row["last_closed"] or 0)
+    elapsed = max(0, now_ts() - last_closed) if last_closed else 10**9
+    if elapsed < max(0, PAPER_SYMBOL_COOLDOWN_SECONDS):
+        hours_left = (PAPER_SYMBOL_COOLDOWN_SECONDS - elapsed) / 3600.0
+        return False, f"independence cooldown: same symbol, retry in {hours_left:.1f}h"
+    return True, "independent symbol window passed"
+
+
 def strategy_circuit_breaker(trade: Dict[str, Any]) -> Tuple[bool, str]:
     """Pause a weak strategy in LIVE while continuously rechecking it in SHADOW."""
     strategy = str(trade.get("strategy", "?"))
@@ -5270,10 +5425,11 @@ def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
     for row in rows:
         # Exploratory near-miss probes train the model, but must never punish or
         # quarantine a symbol that was not actually eligible for LIVE.
-        if str(row["decision_reason"] or "") in {
+        decision_reason = str(row["decision_reason"] or "")
+        if decision_reason in {
             "near_miss_probe",
             PAPER_VALIDATION_REASON,
-        }:
+        } or decision_reason.startswith("v16_9_"):
             continue
         symbol = normalize_symbol(str(row["symbol"] or "?"))
         item = outcomes.setdefault(
@@ -5452,30 +5608,72 @@ def analyze_symbol(
             continue
         trade["trader_pattern_reason"] = t_reason
 
-        # V16.8 forward lane.  The saved 225-outcome history contains one
-        # compact, pre-registered pattern with encouraging but still small
-        # evidence: A+ INSTANT LONG and +2%..+3% directional 3m.  Capture the
-        # observation at the same decision point used by that history.  It is
-        # visible in Telegram and recorded as PAPER, but can never enter LIVE.
-        if paper_long_challenger_eligible(trade):
+        # V16.9 fixed forward experiment.  B and every SHORT remain visible
+        # research observations, never actionable LIVE signals.  Every A+ LONG
+        # is also visible; only the pre-registered INSTANT LONG lane may enter
+        # the confirmed PAPER cohort used for the 50-trade decision.
+        if PRO_QUALITY_FORWARD_ENABLED:
+            grade = str(trade.get("grade", "B")).upper()
+            if grade != "A+":
+                blocks["v16_9_b_research_only"] = blocks.get(
+                    "v16_9_b_research_only", 0
+                ) + 1
+                shadow_observed = add_shadow_signal(
+                    trade, "v16_9_b_research_only"
+                ) or shadow_observed
+                continue
+            if side == "SHORT":
+                blocks["v16_9_short_research_only"] = blocks.get(
+                    "v16_9_short_research_only", 0
+                ) + 1
+                shadow_observed = add_shadow_signal(
+                    trade, "v16_9_short_research_only"
+                ) or shadow_observed
+                continue
+
             directional_3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
-            trade["paper_validation_only"] = True
-            trade["paper_validation_immediate"] = True
-            trade["paper_validation_lane"] = "a_plus_instant_long_2_3pct"
+            if paper_long_challenger_eligible(trade):
+                independent, independence_reason = paper_symbol_independence_gate(trade)
+                if independent:
+                    trade["paper_validation_only"] = True
+                    # Unlike V16.8, the entry must survive the same 10-120s
+                    # continuation check that a future micro-LIVE signal uses.
+                    trade["paper_validation_immediate"] = False
+                    trade["paper_validation_lane"] = "a_plus_instant_long_edge_1_2"
+                    trade["paper_validation_origin"] = (
+                        f"registered V16.9 A+ INSTANT LONG: directional 3m "
+                        f"{directional_3m*100:+.2f}% >= "
+                        f"{PAPER_LONG_EDGE_MIN*100:.2f}% · {independence_reason}"
+                    )
+                    candidates.append(trade)
+                    blocks["v16_9_a_plus_long_paper_candidate"] = blocks.get(
+                        "v16_9_a_plus_long_paper_candidate", 0
+                    ) + 1
+                    if len(near_miss) < 8:
+                        near_miss.append(
+                            f"{display_symbol(symbol)} LONG: A+ PAPER awaiting confirmation · "
+                            f"3m {directional_3m*100:+.2f}%"
+                        )
+                    continue
+                blocks["v16_9_correlated_repeat"] = blocks.get(
+                    "v16_9_correlated_repeat", 0
+                ) + 1
+                trade["paper_validation_origin"] = independence_reason
+                shadow_observed = add_shadow_signal(
+                    trade, "v16_9_correlated_repeat"
+                ) or shadow_observed
+                continue
+
+            blocks["v16_9_a_plus_long_research_only"] = blocks.get(
+                "v16_9_a_plus_long_research_only", 0
+            ) + 1
             trade["paper_validation_origin"] = (
-                f"pre-registered A+ INSTANT LONG band: directional 3m "
-                f"{directional_3m*100:+.2f}% is inside "
-                f"{PAPER_LONG_EDGE_MIN*100:.2f}%–{PAPER_LONG_EDGE_MAX*100:.2f}%"
+                f"A+ remains visible, but directional 3m {directional_3m*100:+.2f}% "
+                f"is below registered {PAPER_LONG_EDGE_MIN*100:.2f}% or strategy differs"
             )
-            candidates.append(trade)
-            blocks["paper_momentum_band_candidate"] = (
-                blocks.get("paper_momentum_band_candidate", 0) + 1
-            )
-            if len(near_miss) < 8:
-                near_miss.append(
-                    f"{display_symbol(symbol)} LONG: visible PAPER momentum band · "
-                    f"3m {directional_3m*100:+.2f}%"
-                )
+            shadow_observed = add_shadow_signal(
+                trade, "v16_9_a_plus_long_research_only"
+            ) or shadow_observed
             continue
 
         # V16.6: the joint Vol1/Range1/directional-move condition was the only
@@ -5622,8 +5820,8 @@ def build_paper_signal_message(s: Dict[str, Any]) -> str:
         f"TP4: {format_price(s['tp4'])}\n"
         f"TP5: {format_price(s['tp5'])}\n"
         f"SL: {format_price(s['sl'])}\n\n"
-        "Точка фиксации: сразу после профессионального RR/structure gate; "
-        "дополнительный фильтр после отбора не применяется.\n"
+        f"Подтверждение: {int(s.get('pending_confirmation_seconds', 0) or 0)}с · "
+        f"движение {float(s.get('pending_confirmation_move', 0.0) or 0.0)*100:+.2f}%\n"
         f"Почему PAPER: {s.get('paper_validation_origin', 'forward challenger')}\n"
         f"Следующий отчёт обучения — каждые {RETRAIN_EVERY} закрытых результатов."
     )
@@ -5649,8 +5847,9 @@ def build_paper_result_message(
         f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
         f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
         "Это результат виртуального наблюдения, не реальная сделка.\n"
-        f"Forward PAPER V16.8: {_metrics_line(paper_metrics)} · "
-        f"собрано {int(paper_metrics.get('n', 0))}/{max(1, PAPER_LANE_REQUIRED_OUTCOMES)}."
+        f"Forward PAPER V16.9: {_metrics_line(paper_metrics)} · "
+        f"собрано {int(paper_metrics.get('n', 0))}/{max(1, PAPER_LANE_REQUIRED_OUTCOMES)} · "
+        f"уникальных монет {int(paper_metrics.get('unique_symbols', 0))}."
     )
 
 
@@ -5702,7 +5901,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
     return (
-        f"🧪 Диагностика V16.8.1 Transparent Forward\n"
+        f"🧪 Диагностика V16.9 Pro Quality Forward\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -6266,6 +6465,11 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
         STATE["last_diag_ts"] = now_ts()
         save_state()
 
+    # A temporary Telegram document failure must not postpone the backup until
+    # another trade closes.  Every scan retries an overdue milestone until the
+    # file is acknowledged and last_backup_closed_count advances.
+    maybe_send_auto_backup()
+
     return scan
 
 
@@ -6312,12 +6516,19 @@ def safe_record_learning_result(
         report = record_closed_trade(signal, result, source=source)
         if report.get("inserted"):
             signal["learning_recorded"] = result
-            if str(signal.get("shadow_reason", "")) not in {
+            shadow_reason = str(signal.get("shadow_reason", ""))
+            if shadow_reason not in {
                 "near_miss_probe",
                 PAPER_VALIDATION_REASON,
-            }:
+            } and not shadow_reason.startswith("v16_9_"):
                 update_symbol_outcome_guard(signal, result, source=source)
-            maybe_send_auto_backup()
+            backup_report = maybe_send_auto_backup()
+            send_telegram(closed_outcome_progress_message(signal, result, source=source))
+            if backup_report.get("attempted") and not backup_report.get("sent"):
+                send_telegram(
+                    "⚠️ JSON-backup пока не отправлен; бот повторит попытку на следующем "
+                    f"скане. Ошибка: {backup_report.get('error', STATE.get('last_error', 'unknown'))}"
+                )
         evidence_audit = report.get("evidence_guard_audit")
         if isinstance(evidence_audit, dict):
             send_telegram(format_evidence_guard_audit_message(evidence_audit))
@@ -6622,8 +6833,8 @@ async def scan_loop():
         f"Opportunity engine: analyze up to {MAX_ANALYZE_SYMBOLS} contracts · "
         f"deep-check {HOT_SYMBOLS_TO_ANALYZE} hot names (minimum pool {MIN_HOT_CANDIDATES}) · "
         f"parallel workers {HOT_SCAN_WORKERS}/{DEEP_SCAN_WORKERS}.\n"
-        f"Evidence entry gate: Vol1 ≥ x{DATA_MIN_VOL1:.2f} · Range1 ≥ x{DATA_MIN_RANGE1:.2f} · "
-        f"directional 3m ≥ {DATA_MIN_DIRECTIONAL_3M*100:.2f}%.\n"
+        f"Legacy evidence gate remains diagnostic: Vol1 ≥ x{DATA_MIN_VOL1:.2f} · "
+        f"Range1 ≥ x{DATA_MIN_RANGE1:.2f} · directional 3m ≥ {DATA_MIN_DIRECTIONAL_3M*100:.2f}%.\n"
         f"Evidence imbalance path: active · qualifying setups bypass obsolete no_fast templates, "
         f"but still pass RR/structure/confirmation/model checks.\n"
         f"Pre-LIVE confirmation: {PRE_LIVE_CONFIRMATION_ENABLED} · "
@@ -6631,9 +6842,12 @@ async def scan_loop():
         f"confirm move ≥ {PRE_LIVE_MIN_DIRECTIONAL_MOVE*100:.2f}% · "
         f"anti-chase ≤ {PRE_LIVE_MAX_CHASE_MOVE*100:.2f}%.\n"
         f"Forward PAPER lane: {PAPER_VALIDATION_ENABLED} · A+ {PAPER_LONG_STRATEGY} LONG · "
-        f"directional 3m {PAPER_LONG_EDGE_MIN*100:.2f}%–{PAPER_LONG_EDGE_MAX*100:.2f}% · "
+        f"directional 3m ≥ {PAPER_LONG_EDGE_MIN*100:.2f}% · same pre-LIVE confirmation · "
+        f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
         f"visible in Telegram · never LIVE automatically · need "
         f"{PAPER_LANE_REQUIRED_OUTCOMES} new forward outcomes.\n"
+        f"Professional cohort policy: A+ LONG remains visible · B and every SHORT remain "
+        f"visible SHADOW research only · no automatic criteria changes before 50 PAPER closes.\n"
         f"Strategy circuit breaker: {STRATEGY_CIRCUIT_BREAKER_ENABLED} · "
         f"rolling {STRATEGY_GUARD_WINDOW} outcomes · weak strategies stay in SHADOW.\n"
         f"MARKET_DUMP_SHORT requalification: {MARKET_DUMP_SHORT_REQUALIFY} · "
@@ -6650,8 +6864,8 @@ async def scan_loop():
         f"per side={'unlimited' if MAX_LIVE_SIGNALS_PER_SIDE_24H <= 0 else MAX_LIVE_SIGNALS_PER_SIDE_24H} · "
         f"forced spacing={'none' if MIN_LIVE_SIGNAL_SPACING_SECONDS <= 0 else f'{MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min'} · "
         f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
-        f"Adaptive: {'permanent shadow' if SHADOW_ONLY else 'guarded live after independent validation'}; "
-        f"first training from {MIN_TRAIN_TRADES} outcomes.\n"
+        f"Adaptive: frozen during the 50-trade forward cohort; after it closes, "
+        f"guarded independent validation is required.\n"
         f"Model data policy: real LIVE + registered visible PAPER only; "
         f"ordinary SHADOW remains diagnostic and cannot promote a model.\n"
         f"Telegram transparency: LIVE entries/results visible · PAPER entries/results visible · "
@@ -6671,9 +6885,10 @@ async def scan_loop():
         f"Restored sources: LIVE={source_counts['live']} · SHADOW={source_counts['shadow']} · "
         f"ALL={source_counts['all']}.\n"
         f"Eligible model data={model_data_count} · next model analysis at "
-        f"{max(MIN_TRAIN_TRADES, int(model_state.last_attempted_closed_count or 0) + RETRAIN_EVERY)} eligible outcomes.\n"
+        f"{next_model_analysis_target()} eligible outcomes.\n"
         f"Forward PAPER collected: {int(paper_metrics.get('n', 0))}/"
-        f"{PAPER_LANE_REQUIRED_OUTCOMES} · {_metrics_line(paper_metrics)}.\n"
+        f"{PAPER_LANE_REQUIRED_OUTCOMES} · {_metrics_line(paper_metrics)} · unique symbols="
+        f"{int(paper_metrics.get('unique_symbols', 0))}.\n"
         f"Next JSON backup at {((source_counts['all'] // max(1, AUTO_BACKUP_EVERY_CLOSED)) + 1) * max(1, AUTO_BACKUP_EVERY_CLOSED)} total outcomes.\n"
         f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH} · {storage_warning}."
     )
