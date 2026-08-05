@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V16.9
+# VERIFIED GITHUB DEPLOY FILE — V16.9.1
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -79,7 +79,7 @@ ADAPTIVE_CONFIRMATION_SELECTED = int(os.getenv("ADAPTIVE_CONFIRMATION_SELECTED",
 ADAPTIVE_INITIAL_LIVE_FRACTION = float(os.getenv("ADAPTIVE_INITIAL_LIVE_FRACTION", "0.25"))
 ADAPTIVE_LIVE_FRACTION_STEP = float(os.getenv("ADAPTIVE_LIVE_FRACTION_STEP", "0.25"))
 MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
-MODEL_DATA_POLICY = "live_plus_confirmed_paper_v1"
+MODEL_DATA_POLICY = "live_plus_confirmed_pullback_paper_v2"
 # Guarded live is the default: the model still cannot block anything until it has
 # passed the independent holdout checks below. Set true to observe forever.
 SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "false").lower() == "true"
@@ -166,7 +166,7 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "vol1_below_guard",
     "evidence_quality_pass",
     "symbol_fail_streak",
-    # Retained for feature-schema compatibility. V16.9 does not train on
+    # Retained for feature-schema compatibility. V16.9.1 does not train on
     # ordinary diagnostic SHADOW rows; registered PAPER rows still carry 1.0.
     "is_shadow",
 )
@@ -349,7 +349,8 @@ def init_adaptive_db() -> None:
                         conn.execute(
                             "SELECT COUNT(*) AS n FROM adaptive_trades "
                             "WHERE lower(COALESCE(source, 'live'))='live' "
-                            "OR COALESCE(decision_reason, '')='quality_forward_v16_9'"
+                            "OR COALESCE(decision_reason, '')=?",
+                            (PAPER_VALIDATION_REASON,),
                         ).fetchone()["n"]
                         or 0
                     )
@@ -585,7 +586,8 @@ def get_model_state() -> ModelState:
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM adaptive_trades "
                     "WHERE lower(COALESCE(source, 'live'))='live' "
-                    "OR COALESCE(decision_reason, '')='quality_forward_v16_9'"
+                    "OR COALESCE(decision_reason, '')=?",
+                    (PAPER_VALIDATION_REASON,),
                 ).fetchone()["n"]
                 or 0
             )
@@ -1531,9 +1533,9 @@ def maybe_retrain(force: bool = False) -> Dict[str, Any]:
             """
         ).fetchall()
 
-    # V16.9 preserves the data-provenance fix: ordinary SHADOW rows are diagnostics, not
-    # independent execution evidence.  Only real LIVE outcomes and the visible,
-    # pre-registered PAPER lane can train or promote the adaptive model.
+    # V16.9.1 preserves the provenance fix: CONTROL and ordinary SHADOW rows are
+    # diagnostics.  Only real LIVE outcomes and the pre-registered confirmed
+    # pullback/reclaim PAPER lane can train or promote the adaptive model.
     rows = [
         row for row in all_rows
         if (
@@ -2007,7 +2009,7 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "live_model_guard_passed": "live-проверка не выявила ухудшения",
     "feature_schema_changed": "добавлены новые признаки качества; старые исходы сохранены",
     "model_dataset_policy_changed": "модель сброшена безопасно: обычный SHADOW исключён из обучения",
-    "forward_validation_freeze": "критерии зафиксированы до 50 независимых A+ PAPER-исходов",
+    "forward_validation_freeze": "критерии зафиксированы до 50 независимых A+ pullback/reclaim PAPER-исходов",
     "seed_restored_feature_upgrade": "50 исходов восстановлены; следующая проверка продолжится по графику",
     "evidence_not_enough_comparison_rows": "для честной проверки фильтра пока мало отправленных или shadow-исходов",
     "evidence_too_many_profitable_signals_blocked": "фильтр начал пропускать слишком много TP3+ сигналов",
@@ -2043,7 +2045,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
 
     lines = [
         title,
-        f"Данных модели (LIVE + подтверждённый PAPER): {closed_count}",
+        f"Данных модели (LIVE + подтверждённый PULLBACK PAPER): {closed_count}",
         f"ВСЕХ наблюдений, включая диагностический SHADOW: {all_closed_count}",
         f"ДАННЫЕ МОДЕЛИ: {_metrics_line(dataset)}",
         f"Причина: {_adaptive_reason_ru(reason)}",
@@ -2051,12 +2053,13 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
     if all_dataset:
         lines.append(f"ВСЯ ТЕЛЕМЕТРИЯ: {_metrics_line(all_dataset)}")
     if paper_dataset:
-        lines.append(f"FORWARD PAPER: {_metrics_line(paper_dataset)}")
+        lines.append(f"PULLBACK/RECLAIM PAPER: {_metrics_line(paper_dataset)}")
     if reason == "forward_validation_freeze":
         lines.append(
             f"Зафиксированная проверка: {int(report.get('paper_collected', 0) or 0)}/"
             f"{int(report.get('needed', PAPER_LANE_REQUIRED_OUTCOMES) or PAPER_LANE_REQUIRED_OUTCOMES)} "
-            "независимых A+ PAPER-исходов. До завершения границы не меняются."
+            "независимых A+ pullback/reclaim PAPER-исходов. "
+            "До завершения границы не меняются."
         )
     if sources:
         lines.extend(
@@ -2402,6 +2405,17 @@ def format_source_audit_message(window: int = 25) -> str:
         f"ВСЕГО: {int(all_sources['all']['n'])}",
     ]
 
+    control_metrics = control_validation_metrics()
+    reclaim_metrics = paper_validation_metrics()
+    lines.extend(
+        [
+            "",
+            f"CONTROL/WATCH V16.9.1: {_metrics_line(control_metrics)}",
+            f"PULLBACK/RECLAIM PAPER V16.9.1: {_metrics_line(reclaim_metrics)} · "
+            f"собрано {int(reclaim_metrics.get('n', 0))}/{PAPER_LANE_REQUIRED_OUTCOMES}",
+        ]
+    )
+
     shadow_rows = [row for row in recent_rows if str(row["source"] or "") == "shadow"][-8:]
     if shadow_rows:
         lines.append("\nПоследние SHADOW (видимые виртуальные наблюдения, не LIVE):")
@@ -2516,8 +2530,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V16.9 PRO QUALITY FORWARD"
-DEPLOY_MARKER = "V16_9_PRO_QUALITY_FORWARD_275_2026_08_04"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V16.9.1 PULLBACK RECLAIM FORWARD"
+DEPLOY_MARKER = "V16_9_1_PULLBACK_RECLAIM_FORWARD_350_2026_08_04"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2560,36 +2574,58 @@ MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "
 MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "0"))
 MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
 
-# --- V16.9 pre-registered professional forward validation ---
-# Production remains conservative.  One exact lane selected from the complete
-# 225-outcome history is shown as explicit PAPER and evaluated prospectively;
-# it is never silently promoted to LIVE.
+# --- V16.9.1 pre-registered pullback/reclaim forward validation ---
+# The 350-outcome audit showed that immediate continuation entries were often
+# stopped within two minutes.  V16.9.1 therefore observes the original impulse
+# as a visible CONTROL, then registers a separate PAPER entry only after a
+# bounded pullback and a fresh EMA/price reclaim.  Neither lane can become LIVE
+# automatically while the forward cohort is incomplete.
 DATA_ENTRY_GATE_ENABLED = os.getenv("DATA_ENTRY_GATE_ENABLED", "true").lower() == "true"
 DATA_MIN_VOL1 = float(os.getenv("DATA_MIN_VOL1", "1.00"))
 DATA_MIN_RANGE1 = float(os.getenv("DATA_MIN_RANGE1", "1.50"))
 DATA_MIN_DIRECTIONAL_3M = float(os.getenv("DATA_MIN_DIRECTIONAL_3M", "0.0080"))
 
 PAPER_VALIDATION_ENABLED = os.getenv("PAPER_VALIDATION_ENABLED", "true").lower() == "true"
-PAPER_LONG_CHALLENGER_ENABLED = os.getenv(
-    "PAPER_LONG_CHALLENGER_ENABLED", "true"
+PAPER_PULLBACK_CHALLENGER_ENABLED = os.getenv(
+    "PAPER_PULLBACK_CHALLENGER_ENABLED", "true"
 ).lower() == "true"
 PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "true"
 VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
     "VISIBLE_SHADOW_NOTIFICATIONS", "true"
 ).lower() == "true"
-PAPER_VALIDATION_REASON = "quality_forward_v16_9"
-PAPER_LONG_STRATEGY = "PRO_INSTANT_EDGE_LONG"
-# V16.9 candidate is registered before its new forward sample begins:
-# A+ + INSTANT LONG + directional 3m >= 1.20%.  Across the saved history it
-# remained positive in both the original 225 and the newest 50 observations,
-# unlike the over-narrow 2-3% band.  It is PAPER-only until 50 independent,
-# prospectively collected outcomes have closed.
-PAPER_LONG_EDGE_MIN = float(os.getenv("PAPER_LONG_EDGE_MIN", "0.0120"))
-PAPER_LONG_EDGE_MAX = float(os.getenv("PAPER_LONG_EDGE_MAX", "0.2500"))
+PAPER_VALIDATION_REASON = "pullback_reclaim_v16_9_1"
+PAPER_CONTROL_REASON = "control_instant_v16_9_1"
+LEGACY_PAPER_VALIDATION_REASON = "quality_forward_v16_9"
+PAPER_INSTANT_STRATEGIES = {
+    "LONG": "PRO_INSTANT_EDGE_LONG",
+    "SHORT": "PRO_INSTANT_EDGE_SHORT",
+}
+PAPER_RECLAIM_STRATEGIES = {
+    "LONG": "PRO_PULLBACK_RECLAIM_LONG",
+    "SHORT": "PRO_PULLBACK_RECLAIM_SHORT",
+}
+# The detector still needs a real directional impulse, but entry is no longer
+# allowed at the first hot print.  It must survive the retest state machine.
+PAPER_EDGE_MIN = float(os.getenv("PAPER_EDGE_MIN", "0.0120"))
+PAPER_EDGE_MAX = float(os.getenv("PAPER_EDGE_MAX", "0.2500"))
 PAPER_LANE_REQUIRED_OUTCOMES = int(os.getenv("PAPER_LANE_REQUIRED_OUTCOMES", "50"))
 PAPER_SYMBOL_COOLDOWN_SECONDS = int(
     os.getenv("PAPER_SYMBOL_COOLDOWN_SECONDS", "43200")
 )
+# Pullback/reclaim observation window.  The six-minute trade time-stop begins
+# only after the confirmed PAPER entry, not while the setup is on WATCH.
+PAPER_RECLAIM_MIN_SECONDS = int(os.getenv("PAPER_RECLAIM_MIN_SECONDS", "20"))
+PAPER_RECLAIM_MAX_SECONDS = int(os.getenv("PAPER_RECLAIM_MAX_SECONDS", "300"))
+PAPER_RECLAIM_MIN_PULLBACK = float(os.getenv("PAPER_RECLAIM_MIN_PULLBACK", "0.0012"))
+PAPER_RECLAIM_MAX_PULLBACK = float(os.getenv("PAPER_RECLAIM_MAX_PULLBACK", "0.0055"))
+PAPER_RECLAIM_ENTRY_FLOOR = float(os.getenv("PAPER_RECLAIM_ENTRY_FLOOR", "-0.0005"))
+PAPER_RECLAIM_MAX_CHASE = float(os.getenv("PAPER_RECLAIM_MAX_CHASE", "0.0035"))
+PAPER_RECLAIM_MIN_3M = float(os.getenv("PAPER_RECLAIM_MIN_3M", "0.0005"))
+PAPER_RECLAIM_MIN_VOL1 = float(os.getenv("PAPER_RECLAIM_MIN_VOL1", "0.45"))
+PAPER_RECLAIM_MIN_RANGE1 = float(os.getenv("PAPER_RECLAIM_MIN_RANGE1", "0.65"))
+PAPER_BREAKEVEN_AFTER_TP1 = os.getenv(
+    "PAPER_BREAKEVEN_AFTER_TP1", "true"
+).lower() == "true"
 PRO_QUALITY_FORWARD_ENABLED = os.getenv(
     "PRO_QUALITY_FORWARD_ENABLED", "true"
 ).lower() == "true"
@@ -2634,6 +2670,7 @@ SYMBOL_QUARANTINE_SECONDS = int(os.getenv("SYMBOL_QUARANTINE_SECONDS", "43200"))
 # but their outcomes let the challenger learn from accepted and rejected examples.
 SHADOW_TRACKING_ENABLED = os.getenv("SHADOW_TRACKING_ENABLED", "true").lower() == "true"
 SHADOW_MAX_ACTIVE = int(os.getenv("SHADOW_MAX_ACTIVE", "40"))
+SHADOW_PAPER_RESERVED_SLOTS = int(os.getenv("SHADOW_PAPER_RESERVED_SLOTS", "6"))
 SHADOW_PER_SCAN = int(os.getenv("SHADOW_PER_SCAN", "6"))
 SHADOW_COOLDOWN_SECONDS = int(os.getenv("SHADOW_COOLDOWN_SECONDS", "600"))
 
@@ -3421,6 +3458,22 @@ def paper_validation_metrics() -> Dict[str, Any]:
     return metrics
 
 
+def control_validation_metrics() -> Dict[str, Any]:
+    """Paired immediate-entry reference; visible but never model-eligible."""
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT result, pnl_r, symbol FROM adaptive_trades "
+            "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
+            (PAPER_CONTROL_REASON,),
+        ).fetchall()
+    metrics = _outcome_metrics(rows)
+    metrics["unique_symbols"] = len(
+        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
+    )
+    return metrics
+
+
 def next_model_analysis_target() -> int:
     state = get_model_state()
     normal_target = max(
@@ -3444,6 +3497,8 @@ def closed_outcome_progress_message(
             "SELECT result, pnl_r, source FROM adaptive_trades ORDER BY id ASC"
         ).fetchall()
     metrics = _source_breakdown(rows)
+    control_metrics = control_validation_metrics()
+    paper_metrics = paper_validation_metrics()
     total = int(metrics["all"]["n"])
     last_backup = int(STATE.get("last_backup_closed_count", 0) or 0)
     next_backup = max(last_backup + max(1, AUTO_BACKUP_EVERY_CLOSED), total)
@@ -3464,6 +3519,9 @@ def closed_outcome_progress_message(
         f"ВСЕГО: {_metrics_line(metrics['all'])}\n"
         f"LIVE: {_metrics_line(metrics['live'])}\n"
         f"SHADOW/PAPER: {_metrics_line(metrics['shadow'])}\n"
+        f"CONTROL/WATCH: {_metrics_line(control_metrics)}\n"
+        f"PULLBACK/RECLAIM PAPER: {_metrics_line(paper_metrics)} · "
+        f"{int(paper_metrics.get('n', 0))}/{PAPER_LANE_REQUIRED_OUTCOMES}\n"
         f"Допустимых для модели LIVE+PAPER: {adaptive_model_data_count()}\n"
         f"{backup_line}"
     )
@@ -5290,21 +5348,24 @@ def data_entry_quality_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
     return accepted, reason
 
 
-def paper_long_challenger_eligible(trade: Dict[str, Any]) -> bool:
-    """Forward-test one pre-registered lane without leaking it into LIVE.
+def paper_pullback_challenger_eligible(trade: Dict[str, Any]) -> bool:
+    """Select an A+ instant impulse for the fixed reclaim PAPER experiment.
 
-    The rule is intentionally fixed before forward collection starts.  It is
-    based on the saved 225 outcomes and must not be widened automatically while
-    the same forward sample is being evaluated.
+    LONG and SHORT are recorded separately in every report.  MARKET_DUMP and
+    evidence-only fallbacks are excluded because the 350-row audit did not show
+    a stable TP3 edge for them.  Eligibility only starts a WATCH state; it is
+    not an entry and can never be sent as LIVE.
     """
-    directional_3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
+    side = str(trade.get("side", "")).upper()
+    direction = 1.0 if side == "LONG" else -1.0
+    directional_3m = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
     return bool(
         PAPER_VALIDATION_ENABLED
-        and PAPER_LONG_CHALLENGER_ENABLED
-        and str(trade.get("side", "")).upper() == "LONG"
-        and str(trade.get("strategy", "")).upper() == PAPER_LONG_STRATEGY
+        and PAPER_PULLBACK_CHALLENGER_ENABLED
+        and side in PAPER_INSTANT_STRATEGIES
+        and str(trade.get("strategy", "")).upper() == PAPER_INSTANT_STRATEGIES[side]
         and str(trade.get("grade", "")).upper() == "A+"
-        and PAPER_LONG_EDGE_MIN <= directional_3m <= PAPER_LONG_EDGE_MAX
+        and PAPER_EDGE_MIN <= directional_3m <= PAPER_EDGE_MAX
     )
 
 
@@ -5322,7 +5383,7 @@ def paper_symbol_independence_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
             normalize_symbol(str(item.get("symbol", "?"))) == symbol
             and str(item.get("shadow_reason", "")) in {
                 PAPER_VALIDATION_REASON,
-                "pre_live_confirmation",
+                PAPER_CONTROL_REASON,
             }
         ):
             return False, "same symbol already has an active confirmation/PAPER observation"
@@ -5331,8 +5392,8 @@ def paper_symbol_independence_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
     with _LOCK, _connect() as conn:
         row = conn.execute(
             "SELECT MAX(closed_at) AS last_closed FROM adaptive_trades "
-            "WHERE symbol=? AND COALESCE(decision_reason, '') IN (?, 'pre_live_confirmation')",
-            (symbol, PAPER_VALIDATION_REASON),
+            "WHERE symbol=? AND COALESCE(decision_reason, '') IN (?, ?)",
+            (symbol, PAPER_VALIDATION_REASON, PAPER_CONTROL_REASON),
         ).fetchone()
     last_closed = int(row["last_closed"] or 0)
     elapsed = max(0, now_ts() - last_closed) if last_closed else 10**9
@@ -5429,7 +5490,9 @@ def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
         if decision_reason in {
             "near_miss_probe",
             PAPER_VALIDATION_REASON,
-        } or decision_reason.startswith("v16_9_"):
+            PAPER_CONTROL_REASON,
+            LEGACY_PAPER_VALIDATION_REASON,
+        } or decision_reason.startswith(("v16_9_", "v16_9_1_")):
             continue
         symbol = normalize_symbol(str(row["symbol"] or "?"))
         item = outcomes.setdefault(
@@ -5608,71 +5671,74 @@ def analyze_symbol(
             continue
         trade["trader_pattern_reason"] = t_reason
 
-        # V16.9 fixed forward experiment.  B and every SHORT remain visible
-        # research observations, never actionable LIVE signals.  Every A+ LONG
-        # is also visible; only the pre-registered INSTANT LONG lane may enter
-        # the confirmed PAPER cohort used for the 50-trade decision.
+        # V16.9.1 fixed forward experiment.  B and every MARKET_DUMP setup stay
+        # visible research only.  An A+ INSTANT LONG/SHORT is first registered
+        # as a CONTROL observation, then must form a bounded pullback/reclaim
+        # before a separate PAPER entry exists.  Nothing in this block is LIVE.
         if PRO_QUALITY_FORWARD_ENABLED:
             grade = str(trade.get("grade", "B")).upper()
             if grade != "A+":
-                blocks["v16_9_b_research_only"] = blocks.get(
-                    "v16_9_b_research_only", 0
+                blocks["v16_9_1_b_research_only"] = blocks.get(
+                    "v16_9_1_b_research_only", 0
                 ) + 1
                 shadow_observed = add_shadow_signal(
-                    trade, "v16_9_b_research_only"
-                ) or shadow_observed
-                continue
-            if side == "SHORT":
-                blocks["v16_9_short_research_only"] = blocks.get(
-                    "v16_9_short_research_only", 0
-                ) + 1
-                shadow_observed = add_shadow_signal(
-                    trade, "v16_9_short_research_only"
+                    trade, "v16_9_1_b_research_only"
                 ) or shadow_observed
                 continue
 
-            directional_3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
-            if paper_long_challenger_eligible(trade):
+            if str(trade.get("strategy", "")).upper() == "PRO_MARKET_DUMP_SHORT":
+                blocks["v16_9_1_market_dump_research_only"] = blocks.get(
+                    "v16_9_1_market_dump_research_only", 0
+                ) + 1
+                shadow_observed = add_shadow_signal(
+                    trade, "v16_9_1_market_dump_research_only"
+                ) or shadow_observed
+                continue
+
+            direction = 1.0 if side == "LONG" else -1.0
+            directional_3m = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
+            if paper_pullback_challenger_eligible(trade):
                 independent, independence_reason = paper_symbol_independence_gate(trade)
                 if independent:
                     trade["paper_validation_only"] = True
-                    # Unlike V16.8, the entry must survive the same 10-120s
-                    # continuation check that a future micro-LIVE signal uses.
                     trade["paper_validation_immediate"] = False
-                    trade["paper_validation_lane"] = "a_plus_instant_long_edge_1_2"
+                    trade["paper_validation_lane"] = "pullback_reclaim_v16_9_1"
                     trade["paper_validation_origin"] = (
-                        f"registered V16.9 A+ INSTANT LONG: directional 3m "
+                        f"registered V16.9.1 A+ INSTANT {side}: directional 3m "
                         f"{directional_3m*100:+.2f}% >= "
-                        f"{PAPER_LONG_EDGE_MIN*100:.2f}% · {independence_reason}"
+                        f"{PAPER_EDGE_MIN*100:.2f}% · WATCH for pullback/reclaim · "
+                        f"{independence_reason}"
                     )
                     candidates.append(trade)
-                    blocks["v16_9_a_plus_long_paper_candidate"] = blocks.get(
-                        "v16_9_a_plus_long_paper_candidate", 0
+                    blocks["v16_9_1_pullback_watch_candidate"] = blocks.get(
+                        "v16_9_1_pullback_watch_candidate", 0
                     ) + 1
                     if len(near_miss) < 8:
                         near_miss.append(
-                            f"{display_symbol(symbol)} LONG: A+ PAPER awaiting confirmation · "
+                            f"{display_symbol(symbol)} {side}: A+ WATCH awaiting pullback/reclaim · "
                             f"3m {directional_3m*100:+.2f}%"
                         )
                     continue
-                blocks["v16_9_correlated_repeat"] = blocks.get(
-                    "v16_9_correlated_repeat", 0
+                blocks["v16_9_1_correlated_repeat"] = blocks.get(
+                    "v16_9_1_correlated_repeat", 0
                 ) + 1
                 trade["paper_validation_origin"] = independence_reason
                 shadow_observed = add_shadow_signal(
-                    trade, "v16_9_correlated_repeat"
+                    trade, "v16_9_1_correlated_repeat"
                 ) or shadow_observed
                 continue
 
-            blocks["v16_9_a_plus_long_research_only"] = blocks.get(
-                "v16_9_a_plus_long_research_only", 0
+            blocks["v16_9_1_a_plus_noncohort_research"] = blocks.get(
+                "v16_9_1_a_plus_noncohort_research", 0
             ) + 1
             trade["paper_validation_origin"] = (
-                f"A+ remains visible, but directional 3m {directional_3m*100:+.2f}% "
-                f"is below registered {PAPER_LONG_EDGE_MIN*100:.2f}% or strategy differs"
+                f"A+ remains visible research, but directional 3m "
+                f"{directional_3m*100:+.2f}% is outside the registered "
+                f"{PAPER_EDGE_MIN*100:.2f}%–{PAPER_EDGE_MAX*100:.2f}% INSTANT cohort "
+                "or the strategy differs"
             )
             shadow_observed = add_shadow_signal(
-                trade, "v16_9_a_plus_long_research_only"
+                trade, "v16_9_1_a_plus_noncohort_research"
             ) or shadow_observed
             continue
 
@@ -5809,10 +5875,10 @@ def build_signal_message(s: Dict[str, Any]) -> str:
 
 def build_paper_signal_message(s: Dict[str, Any]) -> str:
     return (
-        "📋 PAPER-ПРОВЕРКА — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
+        "📋 PAPER-ВХОД V16.9.1 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
         f"{s['side']} {display_symbol(s['symbol'])} · {s['grade']} · Score {s['score']}\n"
         f"Стратегия: {s['strategy']}\n"
-        "Статус: зафиксированное forward-наблюдение; только PAPER.\n\n"
+        "Статус: откат удержан, EMA/price reclaim подтверждён; только PAPER.\n\n"
         f"Вход наблюдения: {format_price(s['entry'])}\n"
         f"TP1: {format_price(s['tp1'])}\n"
         f"TP2: {format_price(s['tp2'])}\n"
@@ -5820,10 +5886,11 @@ def build_paper_signal_message(s: Dict[str, Any]) -> str:
         f"TP4: {format_price(s['tp4'])}\n"
         f"TP5: {format_price(s['tp5'])}\n"
         f"SL: {format_price(s['sl'])}\n\n"
-        f"Подтверждение: {int(s.get('pending_confirmation_seconds', 0) or 0)}с · "
+        f"WATCH → entry: {int(s.get('pending_confirmation_seconds', 0) or 0)}с · "
         f"движение {float(s.get('pending_confirmation_move', 0.0) or 0.0)*100:+.2f}%\n"
+        f"Глубина отката: {float(s.get('pending_retest_depth', 0.0) or 0.0)*100:.2f}%\n"
         f"Почему PAPER: {s.get('paper_validation_origin', 'forward challenger')}\n"
-        f"Следующий отчёт обучения — каждые {RETRAIN_EVERY} закрытых результатов."
+        f"Следующий cohort-отчёт — каждые {RETRAIN_EVERY} закрытых PAPER-входов."
     )
 
 
@@ -5835,6 +5902,8 @@ def build_paper_result_message(
         "sl": "❌ STOP LOSS",
         "expired": "⏱ EXPIRED",
     }
+    if bool(signal.get("protected_exit")):
+        labels["expired"] = "🛡 ЗАЩИТНЫЙ ВЫХОД ПОСЛЕ TP1"
     pnl_r = _estimate_pnl_r(signal, result)
     age_minutes = max(
         0.0, (now_ts() - int(signal.get("created_at", now_ts()) or now_ts())) / 60.0
@@ -5846,14 +5915,44 @@ def build_paper_result_message(
         f"Стратегия: {signal.get('strategy', '?')}\n"
         f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
         f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
-        "Это результат виртуального наблюдения, не реальная сделка.\n"
-        f"Forward PAPER V16.9: {_metrics_line(paper_metrics)} · "
+        "Это результат подтверждённого виртуального входа, не реальная сделка.\n"
+        f"Pullback/Reclaim PAPER V16.9.1: {_metrics_line(paper_metrics)} · "
         f"собрано {int(paper_metrics.get('n', 0))}/{max(1, PAPER_LANE_REQUIRED_OUTCOMES)} · "
         f"уникальных монет {int(paper_metrics.get('unique_symbols', 0))}."
     )
 
 
+def build_control_signal_message(s: Dict[str, Any]) -> str:
+    return (
+        "🔬 CONTROL/WATCH V16.9.1 — НЕ ЯВЛЯЕТСЯ ВХОДОМ\n"
+        f"{s.get('side', '?')} {display_symbol(s.get('symbol', '?'))} · "
+        f"{s.get('grade', '?')} · Score {s.get('score', '?')}\n"
+        f"Исходный импульс: {s.get('strategy', '?')}\n"
+        f"Контрольная цена: {format_price(s.get('entry'))}\n"
+        f"TP3 reference: {format_price(s.get('tp3'))} · SL reference: {format_price(s.get('sl'))}\n"
+        "Бот теперь ждёт ограниченный откат и новый reclaim. Если подтверждения не будет, "
+        "настоящий PAPER-вход не создаётся. Контрольный исход не обучает модель."
+    )
+
+
+def build_control_result_message(
+    signal: Dict[str, Any], result: str, closing_price: float
+) -> str:
+    labels = {"profit": "✅ TP3+", "sl": "❌ SL", "expired": "⏱ EXPIRED"}
+    return (
+        f"🔬 CONTROL РЕЗУЛЬТАТ: {labels.get(result, result.upper())}\n"
+        f"{signal.get('side', '?')} {display_symbol(signal.get('symbol', '?'))}\n"
+        f"Контрольный импульс: {signal.get('strategy', '?')}\n"
+        f"Цена наблюдения: {format_price(signal.get('entry'))} · "
+        f"выход: {format_price(closing_price)}\n"
+        f"Итог: {_estimate_pnl_r(signal, result):+.3f}R.\n"
+        "Это парный контроль старого немедленного входа; он видим, но не обучает модель."
+    )
+
+
 def build_shadow_signal_message(s: Dict[str, Any]) -> str:
+    if str(s.get("shadow_reason", "")) == PAPER_CONTROL_REASON:
+        return build_control_signal_message(s)
     return (
         "👁 SHADOW-ВХОД — ВИДИМОЕ НАБЛЮДЕНИЕ, НЕ LIVE\n"
         f"{s.get('side', '?')} {display_symbol(s.get('symbol', '?'))} · "
@@ -5874,6 +5973,8 @@ def build_shadow_signal_message(s: Dict[str, Any]) -> str:
 def build_shadow_result_message(
     signal: Dict[str, Any], result: str, closing_price: float
 ) -> str:
+    if str(signal.get("shadow_reason", "")) == PAPER_CONTROL_REASON:
+        return build_control_result_message(signal, result, closing_price)
     labels = {
         "profit": "✅ TP3+",
         "sl": "❌ STOP LOSS",
@@ -5900,8 +6001,10 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:12]]
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
+    control_metrics = control_validation_metrics()
+    paper_metrics = paper_validation_metrics()
     return (
-        f"🧪 Диагностика V16.9 Pro Quality Forward\n"
+        f"🧪 Диагностика V16.9.1 Pullback Reclaim Forward\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -5913,7 +6016,10 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
         f"PAPER активных: {scan.get('paper_active', 0)} · "
         f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
-        f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
+        f"LIVE история: {wr_text(STATE.get('stats', {}).get('total', {}))}\n"
+        f"CONTROL/WATCH V16.9.1: {_metrics_line(control_metrics)}\n"
+        f"PULLBACK/RECLAIM PAPER: {_metrics_line(paper_metrics)} · "
+        f"{int(paper_metrics.get('n', 0))}/{PAPER_LANE_REQUIRED_OUTCOMES}\n\n"
         f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
         f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
         ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
@@ -5950,10 +6056,18 @@ def update_excursion(signal: Dict[str, Any], price: float) -> None:
 
 
 def shadow_key(signal: Dict[str, Any]) -> str:
-    return (
+    base = (
         f"{signal.get('symbol','?')}:{signal.get('side','?')}:"
         f"{signal.get('strategy','?')}"
     )
+    lane = str(
+        signal.get("shadow_reason")
+        or signal.get("paper_validation_lane")
+        or ""
+    )
+    if lane in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON}:
+        return f"{base}:{lane}"
+    return base
 
 
 def remove_matching_shadow(signal: Dict[str, Any]) -> None:
@@ -5969,7 +6083,11 @@ def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
         return False
     with STATE_IO_LOCK:
         shadows = STATE.setdefault("shadow_signals", [])
-        if len(shadows) >= SHADOW_MAX_ACTIVE:
+        protected_lane = reason in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON}
+        ordinary_limit = max(0, SHADOW_MAX_ACTIVE - max(0, SHADOW_PAPER_RESERVED_SLOTS))
+        if protected_lane and len(shadows) >= SHADOW_MAX_ACTIVE:
+            return False
+        if not protected_lane and len(shadows) >= ordinary_limit:
             return False
         if reason == "near_miss_probe":
             active_probes = sum(
@@ -5978,16 +6096,16 @@ def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
             )
             if active_probes >= max(0, SHADOW_PROBE_MAX_ACTIVE):
                 return False
-        key = shadow_key(signal)
+        shadow = dict(signal)
+        shadow["shadow_reason"] = reason
+        key = shadow_key(shadow)
         cooldowns = STATE.setdefault("shadow_cooldown", {})
         if now_ts() < int(cooldowns.get(key, 0) or 0):
             return False
         if any(shadow_key(item) == key for item in shadows):
             return False
 
-        shadow = dict(signal)
         ensure_signal_runtime_fields(shadow, "shadow")
-        shadow["shadow_reason"] = reason
         shadow["stats_recorded"] = None
         shadows.append(shadow)
         cooldown_seconds = (
@@ -6001,29 +6119,26 @@ def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
 
 
 def set_confirmed_paper_signal(signal: Dict[str, Any]) -> bool:
-    """Replace the pre-confirmation shadow with its confirmed PAPER entry."""
+    """Add the confirmed reclaim PAPER entry beside its paired CONTROL."""
     if not SHADOW_TRACKING_ENABLED or not PAPER_VALIDATION_ENABLED:
         return False
     with STATE_IO_LOCK:
         shadows = STATE.setdefault("shadow_signals", [])
         key = shadow_key(signal)
         paper = dict(signal)
+        paper.pop("signal_id", None)
+        paper["created_at"] = now_ts()
         ensure_signal_runtime_fields(paper, "shadow")
         paper["shadow_reason"] = PAPER_VALIDATION_REASON
         paper["paper_validation_visible"] = True
         paper["stats_recorded"] = None
         paper["learning_recorded"] = None
 
-        replaced = False
-        for index, item in enumerate(shadows):
-            if shadow_key(item) == key:
-                shadows[index] = paper
-                replaced = True
-                break
-        if not replaced:
-            if len(shadows) >= SHADOW_MAX_ACTIVE:
-                return False
-            shadows.append(paper)
+        if any(shadow_key(item) == key for item in shadows):
+            return False
+        if len(shadows) >= SHADOW_MAX_ACTIVE:
+            return False
+        shadows.append(paper)
         STATE.setdefault("shadow_cooldown", {})[key] = now_ts() + max(
             0, SHADOW_COOLDOWN_SECONDS
         )
@@ -6048,12 +6163,32 @@ def add_pending_signal(signal: Dict[str, Any]) -> bool:
     item["pending_started_at"] = now_ts()
     item["pending_reference_entry"] = float(signal.get("entry", 0.0) or 0.0)
     item["pending_status"] = "waiting_confirmation"
+    item["pending_retest_seen"] = False
+    item["pending_retest_depth"] = 0.0
     pending.append(item)
-    # This parallel observation is removed if the candidate becomes LIVE. If
-    # confirmation fails, it stays in SHADOW and gives us an honest outcome.
-    add_shadow_signal(signal, "pre_live_confirmation")
+    # The immediate impulse is a paired visible CONTROL.  It remains separate
+    # from a later reclaim entry and is never eligible for model promotion.
+    if not add_shadow_signal(signal, PAPER_CONTROL_REASON):
+        pending.pop()
+        return False
     save_state()
     return True
+
+
+def send_watch_status(item: Dict[str, Any], status: str, detail: str) -> None:
+    if not VISIBLE_SHADOW_NOTIFICATIONS:
+        return
+    send_telegram(
+        "🔬 A+ WATCH — PULLBACK/RECLAIM\n"
+        f"{item.get('side', '?')} {display_symbol(item.get('symbol', '?'))}\n"
+        f"Статус: {status}\n{detail}\n"
+        "Это наблюдение перед PAPER-входом; реальной сделки нет."
+    )
+
+
+def _candle_time_seconds(candle: Dict[str, Any]) -> float:
+    raw = float(candle.get("time", 0.0) or 0.0)
+    return raw / 1000.0 if raw > 10_000_000_000 else raw
 
 
 def process_pending_signals(
@@ -6071,8 +6206,14 @@ def process_pending_signals(
     for item in pending:
         started = int(item.get("pending_started_at", current_ts) or current_ts)
         age = max(0, current_ts - started)
-        if age > max(PRE_LIVE_MIN_SECONDS, PRE_LIVE_MAX_SECONDS):
-            blocks["pre_live_confirmation_expired"] = blocks.get("pre_live_confirmation_expired", 0) + 1
+        is_paper = bool(item.get("paper_validation_only"))
+        min_seconds = PAPER_RECLAIM_MIN_SECONDS if is_paper else PRE_LIVE_MIN_SECONDS
+        max_seconds = PAPER_RECLAIM_MAX_SECONDS if is_paper else PRE_LIVE_MAX_SECONDS
+        if age > max(min_seconds, max_seconds):
+            key = "paper_reclaim_watch_expired" if is_paper else "pre_live_confirmation_expired"
+            blocks[key] = blocks.get(key, 0) + 1
+            if is_paper:
+                send_watch_status(item, "ОТКЛОНЁН", "За 5 минут не сформировался подтверждённый reclaim.")
             continue
 
         symbol = str(item.get("symbol", ""))
@@ -6087,16 +6228,6 @@ def process_pending_signals(
         price = float(c1[-1]["close"])
         direction = 1.0 if side == "LONG" else -1.0
         directional_move = direction * (price - reference) / reference
-        if directional_move <= -max(0.0, PRE_LIVE_MAX_ADVERSE_MOVE):
-            blocks["pre_live_adverse_reject"] = blocks.get("pre_live_adverse_reject", 0) + 1
-            continue
-        if directional_move >= max(PRE_LIVE_MIN_DIRECTIONAL_MOVE, PRE_LIVE_MAX_CHASE_MOVE):
-            blocks["pre_live_chase_reject"] = blocks.get("pre_live_chase_reject", 0) + 1
-            continue
-        if age < max(0, PRE_LIVE_MIN_SECONDS):
-            remaining.append(item)
-            continue
-
         last = c1[-1]
         previous = c1[-2]
         location = close_location(last)
@@ -6104,27 +6235,111 @@ def process_pending_signals(
         range1 = candle_range_ratio(c1, 20)
         directional_3m = direction * percent_change(c1, 3)
         ema9 = ema(closes(c1[-30:]), 9)
-        if side == "LONG":
-            candle_ok = (
-                last["close"] > last["open"]
-                and last["close"] > previous["close"]
-                and location >= PRE_LIVE_CLOSE_LONG
-                and price > ema9
+
+        if is_paper:
+            observed = [
+                candle for candle in c1[-8:]
+                if _candle_time_seconds(candle) >= started
+            ]
+            if observed and side == "LONG":
+                retest_depth = max(
+                    0.0,
+                    (reference - min(float(candle["low"]) for candle in observed)) / reference,
+                )
+            elif observed:
+                retest_depth = max(
+                    0.0,
+                    (max(float(candle["high"]) for candle in observed) - reference) / reference,
+                )
+            else:
+                # Until a new candle opens, only the actually observed close is
+                # allowed to mark a retest; the impulse candle's earlier wick
+                # would otherwise create look-ahead leakage.
+                retest_depth = max(0.0, -directional_move)
+            deepest = max(float(item.get("pending_retest_depth", 0.0) or 0.0), retest_depth)
+            item["pending_retest_depth"] = deepest
+            if PAPER_RECLAIM_MIN_PULLBACK <= deepest <= PAPER_RECLAIM_MAX_PULLBACK:
+                item["pending_retest_seen"] = True
+
+            if deepest > PAPER_RECLAIM_MAX_PULLBACK:
+                blocks["paper_reclaim_too_deep"] = blocks.get("paper_reclaim_too_deep", 0) + 1
+                send_watch_status(
+                    item,
+                    "ОТКЛОНЁН",
+                    f"Откат {deepest*100:.2f}% глубже разрешённых "
+                    f"{PAPER_RECLAIM_MAX_PULLBACK*100:.2f}%.",
+                )
+                continue
+            if not bool(item.get("pending_retest_seen")):
+                if directional_move > PAPER_RECLAIM_MAX_CHASE:
+                    blocks["paper_reclaim_chase_without_retest"] = blocks.get(
+                        "paper_reclaim_chase_without_retest", 0
+                    ) + 1
+                    send_watch_status(
+                        item,
+                        "ПРОПУЩЕН",
+                        f"Цена ушла ещё на {directional_move*100:.2f}% без отката; поздний вход запрещён.",
+                    )
+                    continue
+                remaining.append(item)
+                continue
+            if age < max(0, min_seconds):
+                remaining.append(item)
+                continue
+
+            if side == "LONG":
+                candle_ok = (
+                    last["close"] > last["open"]
+                    and last["close"] > previous["close"]
+                    and location >= PRE_LIVE_CLOSE_LONG
+                    and price > ema9
+                )
+            else:
+                candle_ok = (
+                    last["close"] < last["open"]
+                    and last["close"] < previous["close"]
+                    and location <= PRE_LIVE_CLOSE_SHORT
+                    and price < ema9
+                )
+            confirmed_now = bool(
+                PAPER_RECLAIM_ENTRY_FLOOR <= directional_move <= PAPER_RECLAIM_MAX_CHASE
+                and directional_3m >= PAPER_RECLAIM_MIN_3M
+                and vol1 >= PAPER_RECLAIM_MIN_VOL1
+                and range1 >= PAPER_RECLAIM_MIN_RANGE1
+                and candle_ok
             )
         else:
-            candle_ok = (
-                last["close"] < last["open"]
-                and last["close"] < previous["close"]
-                and location <= PRE_LIVE_CLOSE_SHORT
-                and price < ema9
+            if directional_move <= -max(0.0, PRE_LIVE_MAX_ADVERSE_MOVE):
+                blocks["pre_live_adverse_reject"] = blocks.get("pre_live_adverse_reject", 0) + 1
+                continue
+            if directional_move >= max(PRE_LIVE_MIN_DIRECTIONAL_MOVE, PRE_LIVE_MAX_CHASE_MOVE):
+                blocks["pre_live_chase_reject"] = blocks.get("pre_live_chase_reject", 0) + 1
+                continue
+            if age < max(0, min_seconds):
+                remaining.append(item)
+                continue
+            if side == "LONG":
+                candle_ok = (
+                    last["close"] > last["open"]
+                    and last["close"] > previous["close"]
+                    and location >= PRE_LIVE_CLOSE_LONG
+                    and price > ema9
+                )
+            else:
+                candle_ok = (
+                    last["close"] < last["open"]
+                    and last["close"] < previous["close"]
+                    and location <= PRE_LIVE_CLOSE_SHORT
+                    and price < ema9
+                )
+            confirmed_now = bool(
+                directional_move >= PRE_LIVE_MIN_DIRECTIONAL_MOVE
+                and directional_3m >= DATA_MIN_DIRECTIONAL_3M * 0.75
+                and vol1 >= PRE_LIVE_MIN_VOL1
+                and range1 >= PRE_LIVE_MIN_RANGE1
+                and candle_ok
             )
-        confirmed_now = (
-            directional_move >= PRE_LIVE_MIN_DIRECTIONAL_MOVE
-            and directional_3m >= DATA_MIN_DIRECTIONAL_3M * 0.75
-            and vol1 >= PRE_LIVE_MIN_VOL1
-            and range1 >= PRE_LIVE_MIN_RANGE1
-            and candle_ok
-        )
+
         if not confirmed_now:
             remaining.append(item)
             continue
@@ -6138,19 +6353,33 @@ def process_pending_signals(
         setup["pending_confirmation_seconds"] = age
         setup["pending_confirmation_move"] = directional_move
         setup["pre_live_confirmed"] = True
+        if is_paper:
+            setup["strategy"] = PAPER_RECLAIM_STRATEGIES[side]
+            setup["trade_type"] = f"PULLBACK RECLAIM {side}"
+            setup["setup_mode"] = f"INSTANT_PULLBACK_RECLAIM_{side}"
+            setup["paper_validation_lane"] = PAPER_VALIDATION_REASON
+            setup["paper_validation_origin"] = (
+                f"V16.9.1 confirmed {side}: impulse → pullback "
+                f"{float(item.get('pending_retest_depth', 0.0) or 0.0)*100:.2f}% → "
+                f"EMA9/price reclaim after {age}s; move vs WATCH {directional_move*100:+.2f}%"
+            )
         refreshed = calculate_fast_trade(setup, c1, c5)
         if not refreshed:
             blocks["pre_live_reprice_sl_block"] = blocks.get("pre_live_reprice_sl_block", 0) + 1
+            if is_paper:
+                send_watch_status(item, "ОТКЛОНЁН", "После нового входа защитный SL/RR не прошёл проверку.")
             continue
         quality_ok, quality_block, quality_reason = professional_quality_gate(refreshed, symbol)
         if not quality_ok:
             blocks[quality_block] = blocks.get(quality_block, 0) + 1
             if len(near_miss) < 8:
                 near_miss.append(quality_reason)
+            if is_paper:
+                send_watch_status(item, "ОТКЛОНЁН", quality_reason)
             continue
         if refreshed.get("paper_validation_only"):
             refreshed["strategy_guard_reason"] = (
-                "PAPER challenger bypasses LIVE strategy gate; never eligible for LIVE"
+                "PULLBACK PAPER bypasses LIVE strategy gate; never eligible for LIVE"
             )
         else:
             strategy_ok, _ = strategy_circuit_breaker(refreshed)
@@ -6309,8 +6538,8 @@ def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
     scan["candidates"] = len(found)
     pending_added = 0
     if PRE_LIVE_CONFIRMATION_ENABLED:
-        # The fixed PAPER lane is measured at the historical decision point;
-        # adding the later confirmation here would silently change the rule.
+        # V16.9.1 has no immediate registered PAPER entry.  Every challenger
+        # must complete the pullback/reclaim state machine above.
         immediate_paper = [
             candidate for candidate in found
             if bool(candidate.get("paper_validation_immediate"))
@@ -6520,7 +6749,9 @@ def safe_record_learning_result(
             if shadow_reason not in {
                 "near_miss_probe",
                 PAPER_VALIDATION_REASON,
-            } and not shadow_reason.startswith("v16_9_"):
+                PAPER_CONTROL_REASON,
+                LEGACY_PAPER_VALIDATION_REASON,
+            } and not shadow_reason.startswith(("v16_9_", "v16_9_1_")):
                 update_symbol_outcome_guard(signal, result, source=source)
             backup_report = maybe_send_auto_backup()
             send_telegram(closed_outcome_progress_message(signal, result, source=source))
@@ -6564,19 +6795,24 @@ def track_shadow_signals() -> bool:
         side = signal["side"]
         age_minutes = (now_ts() - int(signal.get("created_at", now_ts()))) / 60.0
 
-        if sl_hit(side, price, signal["sl"]):
-            signal["_closing_price"] = signal["sl"]
-            safe_record_learning_result(signal, "sl", source="shadow")
+        protected_stop = signal.get("protected_sl")
+        effective_sl = float(protected_stop if protected_stop is not None else signal["sl"])
+        if sl_hit(side, price, effective_sl):
+            protected_exit = protected_stop is not None
+            close_result = "expired" if protected_exit else "sl"
+            signal["protected_exit"] = protected_exit
+            signal["_closing_price"] = effective_sl
+            safe_record_learning_result(signal, close_result, source="shadow")
             if (
                 PAPER_NOTIFY_RESULTS
                 and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
             ):
                 send_telegram(
-                    build_paper_result_message(signal, "sl", float(signal["sl"]))
+                    build_paper_result_message(signal, close_result, effective_sl)
                 )
             elif VISIBLE_SHADOW_NOTIFICATIONS:
                 send_telegram(
-                    build_shadow_result_message(signal, "sl", float(signal["sl"]))
+                    build_shadow_result_message(signal, close_result, effective_sl)
                 )
             changed = True
             continue
@@ -6584,6 +6820,27 @@ def track_shadow_signals() -> bool:
         for key in ["tp1", "tp2"]:
             if target_hit(side, price, signal[key]):
                 signal[f"{key}_hit"] = True
+
+        if (
+            PAPER_BREAKEVEN_AFTER_TP1
+            and signal.get("tp1_hit")
+            and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+            and signal.get("protected_sl") is None
+        ):
+            entry = float(signal.get("entry", price) or price)
+            fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
+            candidate_stop = (
+                entry * (1.0 + fee_buffer)
+                if side == "LONG"
+                else entry * (1.0 - fee_buffer)
+            )
+            signal["protected_sl"] = (
+                max(float(signal["sl"]), candidate_stop)
+                if side == "LONG"
+                else min(float(signal["sl"]), candidate_stop)
+            )
+            signal["tp1_protected"] = True
+            changed = True
 
         if target_hit(side, price, signal[PROFIT_TARGET_KEY]):
             signal[PROFIT_TARGET_KEY + "_hit"] = True
@@ -6808,6 +7065,7 @@ async def scan_loop():
     source_counts = adaptive_source_counts()
     model_data_count = adaptive_model_data_count()
     paper_metrics = paper_validation_metrics()
+    control_metrics = control_validation_metrics()
     restored_count = int(SEED_RESTORE_INFO.get("restored", 0) or 0)
     restored_text = (
         f"restored {restored_count} outcomes from {SEED_RESTORE_INFO.get('source', 'JSON')}"
@@ -6824,8 +7082,9 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: MARKET DUMP + AERO STYLE + LOCAL STOP SCALPER.\n"
-        f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
+        f"Mode: PULLBACK/RECLAIM FORWARD PAPER + VISIBLE CONTROL.\n"
+        f"Логика: hot coin → A+ impulse WATCH → bounded pullback → EMA9/price reclaim → "
+        f"confirmed PAPER entry → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
         f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
@@ -6837,22 +7096,22 @@ async def scan_loop():
         f"Range1 ≥ x{DATA_MIN_RANGE1:.2f} · directional 3m ≥ {DATA_MIN_DIRECTIONAL_3M*100:.2f}%.\n"
         f"Evidence imbalance path: active · qualifying setups bypass obsolete no_fast templates, "
         f"but still pass RR/structure/confirmation/model checks.\n"
-        f"Pre-LIVE confirmation: {PRE_LIVE_CONFIRMATION_ENABLED} · "
-        f"wait {PRE_LIVE_MIN_SECONDS}–{PRE_LIVE_MAX_SECONDS}s · "
-        f"confirm move ≥ {PRE_LIVE_MIN_DIRECTIONAL_MOVE*100:.2f}% · "
-        f"anti-chase ≤ {PRE_LIVE_MAX_CHASE_MOVE*100:.2f}%.\n"
-        f"Forward PAPER lane: {PAPER_VALIDATION_ENABLED} · A+ {PAPER_LONG_STRATEGY} LONG · "
-        f"directional 3m ≥ {PAPER_LONG_EDGE_MIN*100:.2f}% · same pre-LIVE confirmation · "
+        f"Pullback/reclaim confirmation: {PRE_LIVE_CONFIRMATION_ENABLED} · "
+        f"WATCH {PAPER_RECLAIM_MIN_SECONDS}–{PAPER_RECLAIM_MAX_SECONDS}s · "
+        f"pullback {PAPER_RECLAIM_MIN_PULLBACK*100:.2f}%–"
+        f"{PAPER_RECLAIM_MAX_PULLBACK*100:.2f}% · "
+        f"anti-chase ≤ {PAPER_RECLAIM_MAX_CHASE*100:.2f}%.\n"
+        f"Forward PAPER lane: {PAPER_VALIDATION_ENABLED} · A+ INSTANT LONG/SHORT · "
+        f"directional 3m ≥ {PAPER_EDGE_MIN*100:.2f}% · must retest and reclaim · "
         f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
         f"visible in Telegram · never LIVE automatically · need "
         f"{PAPER_LANE_REQUIRED_OUTCOMES} new forward outcomes.\n"
-        f"Professional cohort policy: A+ LONG remains visible · B and every SHORT remain "
-        f"visible SHADOW research only · no automatic criteria changes before 50 PAPER closes.\n"
+        f"Professional cohort policy: CONTROL/WATCH is visible but cannot train · "
+        f"B and MARKET_DUMP remain visible SHADOW research only · "
+        f"no automatic criteria changes before 50 reclaim PAPER closes.\n"
         f"Strategy circuit breaker: {STRATEGY_CIRCUIT_BREAKER_ENABLED} · "
         f"rolling {STRATEGY_GUARD_WINDOW} outcomes · weak strategies stay in SHADOW.\n"
-        f"MARKET_DUMP_SHORT requalification: {MARKET_DUMP_SHORT_REQUALIFY} · "
-        f"needs ≥ {STRATEGY_RECOVERY_MIN_PROFITS} TP3+ in newest "
-        f"{STRATEGY_RECOVERY_WINDOW} and expectancy ≥ {STRATEGY_RECOVERY_MIN_EXPECTANCY_R:+.2f}R.\n"
+        f"MARKET_DUMP_SHORT: visible research SHADOW only; cannot enter PAPER/model/LIVE.\n"
         f"Near-miss SHADOW: {SHADOW_PROBE_ENABLED} · up to {SHADOW_PROBE_PER_SCAN}/scan · "
         f"max {SHADOW_PROBE_MAX_ACTIVE} active · never LIVE · no symbol quarantine impact.\n"
         f"Evidence guard v{guard_state.version}: active={guard_state.active} · "
@@ -6864,11 +7123,11 @@ async def scan_loop():
         f"per side={'unlimited' if MAX_LIVE_SIGNALS_PER_SIDE_24H <= 0 else MAX_LIVE_SIGNALS_PER_SIDE_24H} · "
         f"forced spacing={'none' if MIN_LIVE_SIGNAL_SPACING_SECONDS <= 0 else f'{MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min'} · "
         f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
-        f"Adaptive: frozen during the 50-trade forward cohort; after it closes, "
+        f"Adaptive: frozen during the 50-trade reclaim cohort; after it closes, "
         f"guarded independent validation is required.\n"
-        f"Model data policy: real LIVE + registered visible PAPER only; "
-        f"ordinary SHADOW remains diagnostic and cannot promote a model.\n"
-        f"Telegram transparency: LIVE entries/results visible · PAPER entries/results visible · "
+        f"Model data policy: real LIVE + registered pullback/reclaim PAPER only; "
+        f"CONTROL and ordinary SHADOW remain diagnostic and cannot promote a model.\n"
+        f"Telegram transparency: WATCH/control visible · PAPER entries/results visible · "
         f"ordinary SHADOW entries/results visible={VISIBLE_SHADOW_NOTIFICATIONS}.\n"
         f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
         f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
@@ -6886,7 +7145,9 @@ async def scan_loop():
         f"ALL={source_counts['all']}.\n"
         f"Eligible model data={model_data_count} · next model analysis at "
         f"{next_model_analysis_target()} eligible outcomes.\n"
-        f"Forward PAPER collected: {int(paper_metrics.get('n', 0))}/"
+        f"CONTROL/WATCH collected: {int(control_metrics.get('n', 0))} · "
+        f"{_metrics_line(control_metrics)}.\n"
+        f"Pullback/Reclaim PAPER collected: {int(paper_metrics.get('n', 0))}/"
         f"{PAPER_LANE_REQUIRED_OUTCOMES} · {_metrics_line(paper_metrics)} · unique symbols="
         f"{int(paper_metrics.get('unique_symbols', 0))}.\n"
         f"Next JSON backup at {((source_counts['all'] // max(1, AUTO_BACKUP_EVERY_CLOSED)) + 1) * max(1, AUTO_BACKUP_EVERY_CLOSED)} total outcomes.\n"
