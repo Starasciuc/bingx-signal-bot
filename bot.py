@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.0
+# VERIFIED GITHUB DEPLOY FILE — V17.1
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -79,7 +79,7 @@ ADAPTIVE_CONFIRMATION_SELECTED = int(os.getenv("ADAPTIVE_CONFIRMATION_SELECTED",
 ADAPTIVE_INITIAL_LIVE_FRACTION = float(os.getenv("ADAPTIVE_INITIAL_LIVE_FRACTION", "0.25"))
 ADAPTIVE_LIVE_FRACTION_STEP = float(os.getenv("ADAPTIVE_LIVE_FRACTION_STEP", "0.25"))
 MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
-MODEL_DATA_POLICY = "v17_confirmed_evidence_reclaim_paper_only_v3"
+MODEL_DATA_POLICY = "v17_1_confirmed_moderate_reclaim_paper_only_v1"
 # Guarded live is the default: the model still cannot block anything until it has
 # passed the independent holdout checks below. Set true to observe forever.
 SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "false").lower() == "true"
@@ -125,6 +125,9 @@ EVIDENCE_ROLLBACK_SUCCESS_DROP = float(
 )
 
 ADAPTIVE_SEED_PATH = os.getenv("ADAPTIVE_SEED_PATH", "adaptive_seed.json")
+ADAPTIVE_SEED_DISCOVERY_ENABLED = os.getenv(
+    "ADAPTIVE_SEED_DISCOVERY_ENABLED", "false"
+).lower() == "true"
 
 # Never let learning touch these safety-critical settings.
 LOCKED_SAFETY_KEYS = {
@@ -2019,7 +2022,7 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "live_model_guard_passed": "live-проверка не выявила ухудшения",
     "feature_schema_changed": "добавлены новые признаки качества; старые исходы сохранены",
     "model_dataset_policy_changed": "модель сброшена безопасно: обычный SHADOW исключён из обучения",
-    "forward_validation_freeze": "критерии зафиксированы до 50 независимых A+ pullback/reclaim PAPER-исходов",
+    "forward_validation_freeze": "критерии зафиксированы до 75 независимых V17.1 moderate/reclaim PAPER-исходов",
     "seed_restored_feature_upgrade": "50 исходов восстановлены; следующая проверка продолжится по графику",
     "evidence_not_enough_comparison_rows": "для честной проверки фильтра пока мало отправленных или shadow-исходов",
     "evidence_too_many_profitable_signals_blocked": "фильтр начал пропускать слишком много TP3+ сигналов",
@@ -2055,7 +2058,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
 
     lines = [
         title,
-        f"Данных модели (только подтверждённый V17 PAPER): {closed_count}",
+        f"Данных модели (только подтверждённый V17.1 PAPER): {closed_count}",
         f"ВСЕХ наблюдений, включая диагностический SHADOW: {all_closed_count}",
         f"ДАННЫЕ МОДЕЛИ: {_metrics_line(dataset)}",
         f"Причина: {_adaptive_reason_ru(reason)}",
@@ -2063,7 +2066,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
     if all_dataset:
         lines.append(f"ВСЯ ТЕЛЕМЕТРИЯ: {_metrics_line(all_dataset)}")
     if paper_dataset:
-        lines.append(f"PULLBACK/RECLAIM PAPER: {_metrics_line(paper_dataset)}")
+        lines.append(f"MODERATE/RECLAIM PAPER V17.1: {_metrics_line(paper_dataset)}")
     if reason == "forward_validation_freeze":
         lines.append(
             f"Зафиксированная проверка: {int(report.get('paper_collected', 0) or 0)}/"
@@ -2420,9 +2423,11 @@ def format_source_audit_message(window: int = 25) -> str:
     lines.extend(
         [
             "",
-            f"CONTROL/WATCH V17: {_metrics_line(control_metrics)}",
-            f"EVIDENCE/RECLAIM PAPER V17: {_metrics_line(reclaim_metrics)} · "
-            f"собрано {int(reclaim_metrics.get('n', 0))}/{PAPER_LANE_REQUIRED_OUTCOMES}",
+            f"CONTROL/WATCH V17.1: {_metrics_line(control_metrics)}",
+            f"MODERATE/RECLAIM PAPER V17.1: {_metrics_line(reclaim_metrics)} · "
+            f"собрано {int(reclaim_metrics.get('n', 0))}/"
+            f"{paper_progress_target(int(reclaim_metrics.get('n', 0) or 0))}",
+            watch_audit_summary(),
         ]
     )
 
@@ -2512,7 +2517,7 @@ def build_export_payload() -> Dict[str, Any]:
             if not item.get("learning_recorded") and not item.get("stats_recorded")
         ]
     return {
-        "export_schema": 5,
+        "export_schema": 6,
         "exported_at": int(time.time()),
         "app": globals().get("APP_NAME", "adaptive futures bot"),
         "deploy_marker": globals().get("DEPLOY_MARKER", "unknown"),
@@ -2547,8 +2552,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.0 EVIDENCE REBUILD FORWARD"
-DEPLOY_MARKER = "V17_0_EVIDENCE_REBUILD_FORWARD_400_2026_08_05"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V17.1 MODERATE RECLAIM AUDIT"
+DEPLOY_MARKER = "V17_1_MODERATE_RECLAIM_AUDIT_475_2026_08_10"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2610,8 +2615,10 @@ PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "tru
 VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
     "VISIBLE_SHADOW_NOTIFICATIONS", "true"
 ).lower() == "true"
-PAPER_VALIDATION_REASON = "evidence_reclaim_v17"
-PAPER_CONTROL_REASON = "evidence_control_v17"
+PAPER_VALIDATION_REASON = "moderate_reclaim_v17_1"
+PAPER_CONTROL_REASON = "moderate_control_v17_1"
+LEGACY_V17_PAPER_VALIDATION_REASON = "evidence_reclaim_v17"
+LEGACY_V17_CONTROL_REASON = "evidence_control_v17"
 LEGACY_PAPER_VALIDATION_REASON = "quality_forward_v16_9"
 PAPER_INSTANT_STRATEGIES = {
     "LONG": "PRO_INSTANT_EDGE_LONG",
@@ -2624,7 +2631,11 @@ PAPER_RECLAIM_STRATEGIES = {
 # The detector still needs a real directional impulse, but entry is no longer
 # allowed at the first hot print.  It must survive the retest state machine.
 PAPER_EDGE_MIN = float(os.getenv("PAPER_EDGE_MIN", "0.0120"))
-PAPER_EDGE_MAX = float(os.getenv("PAPER_EDGE_MAX", "0.2000"))
+PAPER_EDGE_MAX = float(os.getenv("PAPER_EDGE_MAX", "0.0300"))
+PAPER_MAX_DIRECTIONAL_15M = float(
+    os.getenv("PAPER_MAX_DIRECTIONAL_15M", "0.0400")
+)
+PAPER_MAX_VOL1 = float(os.getenv("PAPER_MAX_VOL1", "2.50"))
 PAPER_LONG_MIN_DIRECTIONAL_15M = float(
     os.getenv("PAPER_LONG_MIN_DIRECTIONAL_15M", "0.0115")
 )
@@ -2636,7 +2647,18 @@ PAPER_SHORT_MIN_DIRECTIONAL_3M = float(
 PAPER_SHORT_MIN_DIRECTIONAL_15M = float(
     os.getenv("PAPER_SHORT_MIN_DIRECTIONAL_15M", "0.0280")
 )
-PAPER_LANE_REQUIRED_OUTCOMES = int(os.getenv("PAPER_LANE_REQUIRED_OUTCOMES", "50"))
+PAPER_PILOT_REQUIRED_OUTCOMES = int(
+    os.getenv("PAPER_PILOT_REQUIRED_OUTCOMES", "25")
+)
+# Model training remains frozen until the 25-trade pilot and another 50
+# unchanged forward outcomes have closed. Reports are still sent every 25.
+PAPER_LANE_REQUIRED_OUTCOMES = int(os.getenv("PAPER_LANE_REQUIRED_OUTCOMES", "75"))
+PAPER_MIN_UNIQUE_SYMBOLS_PILOT = int(
+    os.getenv("PAPER_MIN_UNIQUE_SYMBOLS_PILOT", "15")
+)
+PAPER_PILOT_MIN_EXPECTANCY_R = float(
+    os.getenv("PAPER_PILOT_MIN_EXPECTANCY_R", "0.15")
+)
 PAPER_SYMBOL_COOLDOWN_SECONDS = int(
     os.getenv("PAPER_SYMBOL_COOLDOWN_SECONDS", "43200")
 )
@@ -2658,6 +2680,13 @@ PAPER_RECLAIM_MAX_CHASE = float(os.getenv("PAPER_RECLAIM_MAX_CHASE", "0.0035"))
 PAPER_RECLAIM_MIN_3M = float(os.getenv("PAPER_RECLAIM_MIN_3M", "0.0005"))
 PAPER_RECLAIM_MIN_VOL1 = float(os.getenv("PAPER_RECLAIM_MIN_VOL1", "0.45"))
 PAPER_RECLAIM_MIN_RANGE1 = float(os.getenv("PAPER_RECLAIM_MIN_RANGE1", "0.65"))
+PAPER_PENDING_MONITOR_SECONDS = int(
+    os.getenv("PAPER_PENDING_MONITOR_SECONDS", "10")
+)
+PAPER_CONFIRM_LATCH_SECONDS = int(
+    os.getenv("PAPER_CONFIRM_LATCH_SECONDS", "60")
+)
+PAPER_CHECKPOINT_EVERY = int(os.getenv("PAPER_CHECKPOINT_EVERY", "5"))
 PAPER_BREAKEVEN_AFTER_TP1 = os.getenv(
     "PAPER_BREAKEVEN_AFTER_TP1", "true"
 ).lower() == "true"
@@ -2985,6 +3014,7 @@ TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
 STATE_IO_LOCK = threading.RLock()
 SCAN_RUN_LOCK = threading.Lock()
 TRACK_RUN_LOCK = threading.Lock()
+PENDING_RUN_LOCK = threading.Lock()
 LONG_STATS_CACHE: Dict[str, Any] = {"ts": 0.0, "value": (True, "not evaluated")}
 
 # ============================================================
@@ -3010,9 +3040,32 @@ def base_asset(symbol: str) -> str:
     return normalize_symbol(symbol).split("-")[0]
 
 
+def default_watch_audit() -> Dict[str, Any]:
+    return {
+        "version": "V17.1",
+        "started": 0,
+        "pullback_seen": 0,
+        "reclaim_seen": 0,
+        "confirmed": 0,
+        "rejected": {
+            "no_pullback": 0,
+            "no_reclaim": 0,
+            "pullback_too_deep": 0,
+            "reprice_or_rr": 0,
+            "quality_gate": 0,
+            "other": 0,
+        },
+        "by_side": {
+            "LONG": {"started": 0, "confirmed": 0, "rejected": 0},
+            "SHORT": {"started": 0, "confirmed": 0, "rejected": 0},
+        },
+        "recent": [],
+    }
+
+
 def default_state() -> Dict[str, Any]:
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "active_signals": [],
         "pending_signals": [],
         "shadow_signals": [],
@@ -3035,6 +3088,10 @@ def default_state() -> Dict[str, Any]:
         "last_backup_closed_count": 0,
         "last_source_audit_closed_count": 0,
         "last_forward_report_count": 0,
+        "last_paper_checkpoint_count": 0,
+        "last_paper_cohort_report_count": 0,
+        "watch_audit_v17_1": default_watch_audit(),
+        "last_pending_monitor": {},
         "last_scan": {},
         "last_diag_ts": 0,
         "last_error": "",
@@ -3065,10 +3122,16 @@ def load_state() -> Dict[str, Any]:
         base.setdefault("last_backup_closed_count", 0)
         base.setdefault("last_source_audit_closed_count", 0)
         base.setdefault("last_forward_report_count", 0)
+        base.setdefault("last_paper_checkpoint_count", 0)
+        base.setdefault("last_paper_cohort_report_count", 0)
+        audit = base.setdefault("watch_audit_v17_1", default_watch_audit())
+        if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.1":
+            base["watch_audit_v17_1"] = default_watch_audit()
+        base.setdefault("last_pending_monitor", {})
         stats = base.setdefault("stats", {})
         for bucket, value in default_state()["stats"].items():
             stats.setdefault(bucket, value.copy() if isinstance(value, dict) else value)
-        base["schema_version"] = 4
+        base["schema_version"] = 5
         return base
     except Exception:
         return default_state()
@@ -3091,18 +3154,25 @@ def save_state() -> None:
 
 
 def _adaptive_seed_candidates() -> List[Path]:
+    """Return the configured seed first and avoid ambiguous JSON auto-picks.
+
+    V17.0 searched every JSON in the repository and selected the largest one.
+    That made duplicate/old backup names capable of restoring the wrong cohort.
+    V17.1 loads only ADAPTIVE_SEED_PATH unless discovery is explicitly enabled.
+    """
     candidates: List[Path] = []
     configured = Path(ADAPTIVE_SEED_PATH)
     if not configured.is_absolute():
         configured = Path.cwd() / configured
     candidates.append(configured)
 
-    roots = [Path.cwd(), Path(__file__).resolve().parent]
-    for root in roots:
-        try:
-            candidates.extend(sorted(root.glob("*.json")))
-        except Exception:
-            continue
+    if ADAPTIVE_SEED_DISCOVERY_ENABLED:
+        roots = [Path.cwd(), Path(__file__).resolve().parent]
+        for root in roots:
+            try:
+                candidates.extend(sorted(root.glob("*.json")))
+            except Exception:
+                continue
 
     state_path = Path(STATE_FILE)
     if not state_path.is_absolute():
@@ -3247,8 +3317,7 @@ def restore_adaptive_seed_if_empty() -> Dict[str, Any]:
         eligible_count = int(
             conn.execute(
                 "SELECT COUNT(*) AS n FROM adaptive_trades "
-                "WHERE lower(COALESCE(source, 'live'))='live' "
-                "OR COALESCE(decision_reason, '')=?",
+                "WHERE COALESCE(decision_reason, '')=?",
                 (PAPER_VALIDATION_REASON,),
             ).fetchone()["n"]
             or 0
@@ -3262,17 +3331,28 @@ def restore_adaptive_seed_if_empty() -> Dict[str, Any]:
         )
     except Exception:
         restored_model = ModelState()
+    seed_policy_valid = str(raw_model.get("data_policy", "")) == MODEL_DATA_POLICY
     model_shape_valid = (
         len(restored_model.weights) == len(FEATURE_NAMES) + 1
         and len(restored_model.mean) == len(FEATURE_NAMES)
         and len(restored_model.std) == len(FEATURE_NAMES)
     )
-    if not model_shape_valid:
+    if not model_shape_valid or not seed_policy_valid:
         restored_model.active = False
         restored_model.weights = [0.0] * (len(FEATURE_NAMES) + 1)
         restored_model.mean = [0.0] * len(FEATURE_NAMES)
         restored_model.std = [1.0] * len(FEATURE_NAMES)
-        restored_model.last_candidate_reason = "feature_schema_changed"
+        restored_model.version = 0
+        restored_model.last_trained_closed_count = 0
+        restored_model.last_attempted_closed_count = 0
+        restored_model.candidate_pass_streak = 0
+        restored_model.candidate_selected_total = 0
+        restored_model.deployment_fraction = 0.0
+        restored_model.last_candidate_reason = (
+            "feature_schema_changed"
+            if not model_shape_valid
+            else "v17_1_clean_forward_dataset"
+        )
     seed_marker = str(payload.get("deploy_marker", "") or "")
     restored_model.trained_rows = eligible_count
     if not seed_marker.startswith(("V16_8_", "V16_9_", "V17_")):
@@ -3290,6 +3370,8 @@ def restore_adaptive_seed_if_empty() -> Dict[str, Any]:
             eligible_count,
             int(restored_model.last_attempted_closed_count or eligible_count),
         )
+    restored_model.data_policy = MODEL_DATA_POLICY
+    restored_model.trained_rows = eligible_count
     if restored_model.active and float(restored_model.deployment_fraction or 0) <= 0:
         restored_model.deployment_fraction = min(1.0, max(0.05, ADAPTIVE_INITIAL_LIVE_FRACTION))
     _save_model_state(restored_model)
@@ -3467,7 +3549,7 @@ def adaptive_source_counts() -> Dict[str, int]:
 
 
 def adaptive_model_data_count() -> int:
-    """Rows allowed to influence V17: its own confirmed PAPER cohort only."""
+    """Rows allowed to influence V17.1: its own confirmed PAPER cohort only."""
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         row = conn.execute(
@@ -3522,6 +3604,91 @@ def next_model_analysis_target() -> int:
     return max(normal_target, adaptive_model_data_count() + remaining)
 
 
+def paper_progress_target(paper_count: Optional[int] = None) -> int:
+    count = (
+        int(paper_validation_metrics().get("n", 0) or 0)
+        if paper_count is None
+        else int(paper_count)
+    )
+    return (
+        max(1, PAPER_PILOT_REQUIRED_OUTCOMES)
+        if count < PAPER_PILOT_REQUIRED_OUTCOMES
+        else max(PAPER_PILOT_REQUIRED_OUTCOMES, PAPER_LANE_REQUIRED_OUTCOMES)
+    )
+
+
+def format_paper_cohort_report(window: int = 25) -> str:
+    """Fixed-gate forward report. It never changes strategy parameters."""
+    size = max(1, int(window))
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        all_rows = conn.execute(
+            "SELECT id, result, pnl_r, symbol, side FROM adaptive_trades "
+            "WHERE COALESCE(decision_reason, '')=? "
+            "ORDER BY closed_at ASC, id ASC",
+            (PAPER_VALIDATION_REASON,),
+        ).fetchall()
+    recent = all_rows[-size:]
+    cumulative = _outcome_metrics(all_rows)
+    block = _outcome_metrics(recent)
+    unique_block = len(
+        {normalize_symbol(str(row["symbol"] or "?")) for row in recent}
+    )
+    unique_total = len(
+        {normalize_symbol(str(row["symbol"] or "?")) for row in all_rows}
+    )
+    n_total = int(cumulative.get("n", 0) or 0)
+    first_id = int(recent[0]["id"]) if recent else 0
+    last_id = int(recent[-1]["id"]) if recent else 0
+
+    if n_total == PAPER_PILOT_REQUIRED_OUTCOMES:
+        passed = bool(
+            int(cumulative.get("profit", 0) or 0) >= 13
+            and int(cumulative.get("sl", 0) or 0) <= 7
+            and int(cumulative.get("expired", 0) or 0) <= 5
+            and float(cumulative.get("expectancy_r", 0.0) or 0.0)
+            >= PAPER_PILOT_MIN_EXPECTANCY_R
+            and unique_total >= PAPER_MIN_UNIQUE_SYMBOLS_PILOT
+        )
+        stage = "ПИЛОТ 25/25"
+        decision = (
+            "ПИЛОТ ПРОШЁЛ: параметры остаются неизменными ещё на 50 PAPER."
+            if passed
+            else "ПИЛОТ НЕ ПРОШЁЛ: LIVE запрещён; требуется разбор причин, не автоподстройка."
+        )
+    elif n_total >= PAPER_LANE_REQUIRED_OUTCOMES:
+        passed = bool(
+            int(cumulative.get("profit", 0) or 0) >= 40
+            and int(cumulative.get("profit", 0) or 0)
+            > int(cumulative.get("sl", 0) or 0)
+            + int(cumulative.get("expired", 0) or 0)
+            and float(cumulative.get("expectancy_r", 0.0) or 0.0)
+            >= PAPER_PILOT_MIN_EXPECTANCY_R
+        )
+        stage = f"ПОЛНАЯ ПРОВЕРКА {n_total}/{PAPER_LANE_REQUIRED_OUTCOMES}"
+        decision = (
+            "PAPER ПРОШЁЛ: можно готовить отдельный ограниченный micro-LIVE-аудит."
+            if passed
+            else "PAPER НЕ ПРОШЁЛ: реальные деньги запрещены; champion не меняется."
+        )
+    else:
+        passed = float(block.get("expectancy_r", 0.0) or 0.0) > 0
+        stage = f"ПРОМЕЖУТОЧНЫЙ БЛОК {n_total}/{PAPER_LANE_REQUIRED_OUTCOMES}"
+        decision = "Параметры остаются замороженными до полной forward-проверки."
+
+    return (
+        "🧾 V17.1 — ОТЧЁТ ПОДТВЕРЖДЁННЫХ PAPER\n"
+        f"Этап: {stage}\n"
+        f"Последний блок: ID {first_id}–{last_id} · {_metrics_line(block)} · "
+        f"уникальных монет {unique_block}\n"
+        f"Накоплено V17.1 PAPER: {_metrics_line(cumulative)} · "
+        f"уникальных монет {unique_total}\n"
+        f"{watch_audit_summary()}\n"
+        f"Решение: {decision}\n"
+        "Важно: отчёт ничего не меняет автоматически и не разрешает реальную торговлю."
+    )
+
+
 def closed_outcome_progress_message(
     signal: Dict[str, Any], result: str, source: Optional[str] = None
 ) -> str:
@@ -3534,6 +3701,8 @@ def closed_outcome_progress_message(
     metrics = _source_breakdown(rows)
     control_metrics = control_validation_metrics()
     paper_metrics = paper_validation_metrics()
+    paper_count = int(paper_metrics.get("n", 0) or 0)
+    paper_target = paper_progress_target(paper_count)
     total = int(metrics["all"]["n"])
     last_backup = int(STATE.get("last_backup_closed_count", 0) or 0)
     next_backup = max(last_backup + max(1, AUTO_BACKUP_EVERY_CLOSED), total)
@@ -3555,9 +3724,10 @@ def closed_outcome_progress_message(
         f"LIVE: {_metrics_line(metrics['live'])}\n"
         f"SHADOW/PAPER: {_metrics_line(metrics['shadow'])}\n"
         f"CONTROL/WATCH: {_metrics_line(control_metrics)}\n"
-        f"PULLBACK/RECLAIM PAPER: {_metrics_line(paper_metrics)} · "
-        f"{int(paper_metrics.get('n', 0))}/{PAPER_LANE_REQUIRED_OUTCOMES}\n"
-        f"Допустимых для модели V17 PAPER: {adaptive_model_data_count()}\n"
+        f"MODERATE/RECLAIM PAPER V17.1: {_metrics_line(paper_metrics)} · "
+        f"{paper_count}/{paper_target}\n"
+        f"Допустимых для модели V17.1 PAPER: {adaptive_model_data_count()}\n"
+        f"{watch_audit_summary()}\n"
         f"{backup_line}"
     )
 
@@ -3568,32 +3738,72 @@ def maybe_send_auto_backup() -> Dict[str, Any]:
     try:
         closed_count = adaptive_closed_count()
         last_count = int(STATE.get("last_backup_closed_count", 0) or 0)
-        if closed_count < AUTO_BACKUP_EVERY_CLOSED:
-            return {"attempted": False, "sent": False, "closed_count": closed_count}
-        if closed_count - last_count < AUTO_BACKUP_EVERY_CLOSED:
+        paper_count = int(paper_validation_metrics().get("n", 0) or 0)
+        last_paper_checkpoint = int(
+            STATE.get("last_paper_checkpoint_count", 0) or 0
+        )
+        total_due = bool(
+            closed_count >= AUTO_BACKUP_EVERY_CLOSED
+            and closed_count - last_count >= AUTO_BACKUP_EVERY_CLOSED
+        )
+        paper_due = bool(
+            PAPER_CHECKPOINT_EVERY > 0
+            and paper_count > 0
+            and paper_count - last_paper_checkpoint >= PAPER_CHECKPOINT_EVERY
+        )
+        last_paper_report = int(
+            STATE.get("last_paper_cohort_report_count", 0) or 0
+        )
+        report_due = bool(
+            paper_count > 0
+            and paper_count % max(1, RETRAIN_EVERY) == 0
+            and paper_count > last_paper_report
+        )
+        if not total_due and not paper_due and not report_due:
             return {
                 "attempted": False,
                 "sent": False,
                 "closed_count": closed_count,
                 "last_backup": last_count,
+                "paper_count": paper_count,
+                "last_paper_checkpoint": last_paper_checkpoint,
             }
         last_audit_count = int(STATE.get("last_source_audit_closed_count", 0) or 0)
-        if closed_count - last_audit_count >= AUTO_BACKUP_EVERY_CLOSED:
+        if total_due and closed_count - last_audit_count >= AUTO_BACKUP_EVERY_CLOSED:
             if send_telegram(format_source_audit_message(AUTO_BACKUP_EVERY_CLOSED)):
                 STATE["last_source_audit_closed_count"] = closed_count
                 save_state()
-        filename = f"adaptive_backup_{closed_count}_{int(time.time())}.json"
+        if report_due and send_telegram(format_paper_cohort_report(RETRAIN_EVERY)):
+            STATE["last_paper_cohort_report_count"] = paper_count
+            STATE["last_forward_report_count"] = paper_count
+            save_state()
+
+        filename_prefix = "adaptive_backup" if total_due else "adaptive_checkpoint"
+        filename = (
+            f"{filename_prefix}_{closed_count}_paper{paper_count}_{int(time.time())}.json"
+        )
+        caption_reason = (
+            f"full {AUTO_BACKUP_EVERY_CLOSED}-outcome backup"
+            if total_due
+            else f"emergency PAPER checkpoint {paper_count}"
+        )
         if send_telegram_document(
             build_export_bytes(),
             filename,
-            f"🧠 Backup adaptive data · {closed_count} learning outcomes (LIVE + SHADOW)",
+            f"🧠 V17.1 {caption_reason} · total {closed_count} · confirmed PAPER {paper_count}",
         ):
-            STATE["last_backup_closed_count"] = closed_count
+            if total_due:
+                STATE["last_backup_closed_count"] = closed_count
+            if paper_due:
+                STATE["last_paper_checkpoint_count"] = paper_count
             save_state()
             return {
                 "attempted": True,
                 "sent": True,
                 "closed_count": closed_count,
+                "paper_count": paper_count,
+                "total_due": total_due,
+                "paper_due": paper_due,
                 "filename": filename,
             }
         return {
@@ -5384,11 +5594,13 @@ def data_entry_quality_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 def paper_pullback_challenger_eligible(trade: Dict[str, Any]) -> bool:
-    """Select a pre-registered V17 evidence impulse for WATCH, never LIVE."""
+    """Select the fixed V17.1 moderate-impulse cohort for WATCH, never LIVE."""
     side = str(trade.get("side", "")).upper()
     direction = 1.0 if side == "LONG" else -1.0
     directional_3m = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
     directional_15m = direction * float(trade.get("ch15m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 0.0) or 0.0)
+    range1 = float(trade.get("range1", 0.0) or 0.0)
     vol5 = float(trade.get("volume_ratio", trade.get("vol5", 0.0)) or 0.0)
     common = bool(
         PAPER_VALIDATION_ENABLED
@@ -5397,6 +5609,9 @@ def paper_pullback_challenger_eligible(trade: Dict[str, Any]) -> bool:
         and str(trade.get("strategy", "")).upper() == PAPER_INSTANT_STRATEGIES[side]
         and str(trade.get("grade", "")).upper() == "A+"
         and PAPER_EDGE_MIN <= directional_3m <= PAPER_EDGE_MAX
+        and directional_15m <= PAPER_MAX_DIRECTIONAL_15M
+        and DATA_MIN_VOL1 <= vol1 <= PAPER_MAX_VOL1
+        and range1 >= DATA_MIN_RANGE1
     )
     if not common:
         return False
@@ -5533,6 +5748,8 @@ def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
             "near_miss_probe",
             PAPER_VALIDATION_REASON,
             PAPER_CONTROL_REASON,
+            LEGACY_V17_PAPER_VALIDATION_REASON,
+            LEGACY_V17_CONTROL_REASON,
             LEGACY_PAPER_VALIDATION_REASON,
         } or decision_reason.startswith(("v16_9_", "v16_9_1_")):
             continue
@@ -5713,7 +5930,7 @@ def analyze_symbol(
             continue
         trade["trader_pattern_reason"] = t_reason
 
-        # V17 fixed forward experiment. B and MARKET_DUMP are diagnostic rejects,
+        # V17.1 fixed forward experiment. B and MARKET_DUMP are diagnostic rejects,
         # not pseudo-trades. An eligible A+ INSTANT setup is first registered
         # as a CONTROL observation, then must form a bounded pullback/reclaim
         # before a separate PAPER entry exists.  Nothing in this block is LIVE.
@@ -5741,14 +5958,14 @@ def analyze_symbol(
                     trade["paper_validation_lane"] = PAPER_VALIDATION_REASON
                     trade["watch_impulse"] = directional_3m
                     trade["paper_validation_origin"] = (
-                        f"registered V17 A+ INSTANT {side}: directional 3m "
-                        f"{directional_3m*100:+.2f}% · evidence gate passed · "
+                        f"registered V17.1 moderate A+ INSTANT {side}: directional 3m "
+                        f"{directional_3m*100:+.2f}% · 15m/Vol1 ceilings passed · "
                         "WATCH for dynamic pullback/reclaim · "
                         f"{independence_reason}"
                     )
                     candidates.append(trade)
-                    blocks["v17_evidence_watch_candidate"] = blocks.get(
-                        "v17_evidence_watch_candidate", 0
+                    blocks["v17_1_moderate_watch_candidate"] = blocks.get(
+                        "v17_1_moderate_watch_candidate", 0
                     ) + 1
                     if len(near_miss) < 8:
                         near_miss.append(
@@ -5756,17 +5973,17 @@ def analyze_symbol(
                             f"3m {directional_3m*100:+.2f}%"
                         )
                     continue
-                blocks["v17_correlated_repeat"] = blocks.get(
-                    "v17_correlated_repeat", 0
+                blocks["v17_1_correlated_repeat"] = blocks.get(
+                    "v17_1_correlated_repeat", 0
                 ) + 1
                 trade["paper_validation_origin"] = independence_reason
                 continue
 
-            blocks["v17_a_plus_evidence_gate_reject"] = blocks.get(
-                "v17_a_plus_evidence_gate_reject", 0
+            blocks["v17_1_moderate_gate_reject"] = blocks.get(
+                "v17_1_moderate_gate_reject", 0
             ) + 1
             trade["paper_validation_origin"] = (
-                "A+ did not pass the pre-registered side-specific V17 evidence gate"
+                "A+ did not pass the fixed V17.1 moderate impulse/volume gate"
             )
             continue
 
@@ -5903,7 +6120,7 @@ def build_signal_message(s: Dict[str, Any]) -> str:
 
 def build_paper_signal_message(s: Dict[str, Any]) -> str:
     return (
-        "📋 PAPER-ВХОД V17.0 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
+        "📋 PAPER-ВХОД V17.1 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
         f"{s['side']} {display_symbol(s['symbol'])} · {s['grade']} · Score {s['score']}\n"
         f"Стратегия: {s['strategy']}\n"
         "Статус: откат удержан, EMA/price reclaim подтверждён; только PAPER.\n\n"
@@ -5944,19 +6161,27 @@ def build_paper_result_message(
         f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
         f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
         "Это результат подтверждённого виртуального входа, не реальная сделка.\n"
-        f"Evidence/Reclaim PAPER V17: {_metrics_line(paper_metrics)} · "
-        f"собрано {int(paper_metrics.get('n', 0))}/{max(1, PAPER_LANE_REQUIRED_OUTCOMES)} · "
+        f"Moderate/Reclaim PAPER V17.1: {_metrics_line(paper_metrics)} · "
+        f"собрано {int(paper_metrics.get('n', 0))}/"
+        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
         f"уникальных монет {int(paper_metrics.get('unique_symbols', 0))}."
     )
 
 
 def build_control_signal_message(s: Dict[str, Any]) -> str:
     return (
-        "🔬 CONTROL/WATCH V17 — НЕ ЯВЛЯЕТСЯ ВХОДОМ\n"
+        "🔬 CONTROL/WATCH V17.1 — НЕ ЯВЛЯЕТСЯ ВХОДОМ\n"
         f"{s.get('side', '?')} {display_symbol(s.get('symbol', '?'))} · "
         f"{s.get('grade', '?')} · Score {s.get('score', '?')}\n"
         f"Исходный импульс: {s.get('strategy', '?')}\n"
         f"Контрольная цена: {format_price(s.get('entry'))}\n"
+        f"3m: {float(s.get('watch_impulse', s.get('ch3m_1m', 0.0)) or 0.0)*100:+.2f}% · "
+        f"15m: {float(s.get('ch15m', 0.0) or 0.0)*100:+.2f}% · "
+        f"Vol1 x{float(s.get('vol1', 0.0) or 0.0):.2f} · "
+        f"Range1 x{float(s.get('range1', 0.0) or 0.0):.2f}\n"
+        f"Допустимый откат: "
+        f"{float(s.get('pending_min_pullback', 0.0) or 0.0)*100:.2f}%–"
+        f"{float(s.get('pending_max_pullback', 0.0) or 0.0)*100:.2f}%\n"
         f"TP3 reference: {format_price(s.get('tp3'))} · SL reference: {format_price(s.get('sl'))}\n"
         "Бот теперь ждёт ограниченный откат и новый reclaim. Если подтверждения не будет, "
         "настоящий PAPER-вход не создаётся. Контрольный исход не обучает модель."
@@ -6032,7 +6257,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     control_metrics = control_validation_metrics()
     paper_metrics = paper_validation_metrics()
     return (
-        f"🧪 Диагностика V17.0 Evidence Rebuild Forward\n"
+        f"🧪 Диагностика V17.1 Moderate Reclaim Audit\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -6045,9 +6270,11 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
         f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"LIVE история: {wr_text(STATE.get('stats', {}).get('total', {}))}\n"
-        f"CONTROL/WATCH V17: {_metrics_line(control_metrics)}\n"
-        f"PULLBACK/RECLAIM PAPER: {_metrics_line(paper_metrics)} · "
-        f"{int(paper_metrics.get('n', 0))}/{PAPER_LANE_REQUIRED_OUTCOMES}\n\n"
+        f"CONTROL/WATCH V17.1: {_metrics_line(control_metrics)}\n"
+        f"MODERATE/RECLAIM PAPER: {_metrics_line(paper_metrics)} · "
+        f"{int(paper_metrics.get('n', 0))}/"
+        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))}\n"
+        f"{watch_audit_summary()}\n\n"
         f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
         f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
         ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
@@ -6178,7 +6405,83 @@ def pending_key(signal: Dict[str, Any]) -> str:
     return shadow_key(signal)
 
 
-def add_pending_signal(signal: Dict[str, Any]) -> bool:
+def _watch_audit_state() -> Dict[str, Any]:
+    audit = STATE.setdefault("watch_audit_v17_1", default_watch_audit())
+    if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.1":
+        audit = default_watch_audit()
+        STATE["watch_audit_v17_1"] = audit
+    audit.setdefault("rejected", default_watch_audit()["rejected"].copy())
+    audit.setdefault("by_side", default_watch_audit()["by_side"].copy())
+    audit.setdefault("recent", [])
+    return audit
+
+
+def record_watch_audit(
+    item: Dict[str, Any], event: str, detail: str = ""
+) -> None:
+    """Persist the V17.1 WATCH funnel so JSON backups explain every loss."""
+    audit = _watch_audit_state()
+    side = str(item.get("side", "UNKNOWN")).upper()
+    side_state = audit.setdefault("by_side", {}).setdefault(
+        side, {"started": 0, "confirmed": 0, "rejected": 0}
+    )
+    rejected = audit.setdefault("rejected", {})
+    if event == "started":
+        audit["started"] = int(audit.get("started", 0) or 0) + 1
+        side_state["started"] = int(side_state.get("started", 0) or 0) + 1
+    elif event == "pullback_seen":
+        audit["pullback_seen"] = int(audit.get("pullback_seen", 0) or 0) + 1
+    elif event == "reclaim_seen":
+        audit["reclaim_seen"] = int(audit.get("reclaim_seen", 0) or 0) + 1
+    elif event == "confirmed":
+        audit["confirmed"] = int(audit.get("confirmed", 0) or 0) + 1
+        side_state["confirmed"] = int(side_state.get("confirmed", 0) or 0) + 1
+    elif event.startswith("rejected:"):
+        reason = event.split(":", 1)[1] or "other"
+        rejected[reason] = int(rejected.get(reason, 0) or 0) + 1
+        side_state["rejected"] = int(side_state.get("rejected", 0) or 0) + 1
+
+    recent = audit.setdefault("recent", [])
+    recent.append(
+        {
+            "ts": now_ts(),
+            "symbol": normalize_symbol(str(item.get("symbol", "?"))),
+            "side": side,
+            "event": event,
+            "detail": str(detail or "")[:280],
+            "age_seconds": max(
+                0,
+                now_ts() - int(item.get("pending_started_at", now_ts()) or now_ts()),
+            ),
+            "pullback": float(item.get("pending_retest_depth", 0.0) or 0.0),
+            "recovery": float(item.get("reclaim_recovery", 0.0) or 0.0),
+        }
+    )
+    if len(recent) > 80:
+        del recent[:-80]
+
+
+def watch_audit_summary() -> str:
+    audit = _watch_audit_state()
+    rejected = audit.get("rejected", {})
+    rejected_total = sum(int(value or 0) for value in rejected.values())
+    reasons = ", ".join(
+        f"{key}={int(value or 0)}"
+        for key, value in sorted(
+            rejected.items(), key=lambda item: -int(item[1] or 0)
+        )
+        if int(value or 0) > 0
+    ) or "нет"
+    return (
+        f"WATCH V17.1: started={int(audit.get('started', 0) or 0)} · "
+        f"pullback={int(audit.get('pullback_seen', 0) or 0)} · "
+        f"reclaim={int(audit.get('reclaim_seen', 0) or 0)} · "
+        f"PAPER={int(audit.get('confirmed', 0) or 0)} · "
+        f"rejected={rejected_total} ({reasons})"
+    )
+
+
+def _add_pending_signal_impl(signal: Dict[str, Any]) -> bool:
     if not PRE_LIVE_CONFIRMATION_ENABLED:
         return False
     pending = STATE.setdefault("pending_signals", [])
@@ -6191,11 +6494,15 @@ def add_pending_signal(signal: Dict[str, Any]) -> bool:
     item["pending_started_at"] = now_ts()
     item["pending_reference_entry"] = float(signal.get("entry", 0.0) or 0.0)
     item["pending_status"] = "waiting_confirmation"
+    item["pending_stage"] = "seeking_pullback"
     item["pending_retest_seen"] = False
+    item["pending_reclaim_seen"] = False
     item["pending_retest_depth"] = 0.0
     reference = float(item.get("pending_reference_entry", 0.0) or 0.0)
     item["pending_extreme_price"] = reference
     item["pending_retest_price"] = reference
+    item["pending_last_price"] = reference
+    item["pending_last_candle_time"] = 0.0
     impulse = max(PAPER_EDGE_MIN, abs(float(item.get("watch_impulse", 0.0) or 0.0)))
     item["pending_min_pullback"] = max(
         PAPER_RECLAIM_MIN_PULLBACK,
@@ -6208,11 +6515,17 @@ def add_pending_signal(signal: Dict[str, Any]) -> bool:
     pending.append(item)
     # The immediate impulse is a paired visible CONTROL.  It remains separate
     # from a later reclaim entry and is never eligible for model promotion.
-    if not add_shadow_signal(signal, PAPER_CONTROL_REASON):
+    if not add_shadow_signal(item, PAPER_CONTROL_REASON):
         pending.pop()
         return False
+    record_watch_audit(item, "started", str(item.get("paper_validation_origin", "")))
     save_state()
     return True
+
+
+def add_pending_signal(signal: Dict[str, Any]) -> bool:
+    with PENDING_RUN_LOCK:
+        return _add_pending_signal_impl(signal)
 
 
 def send_watch_status(item: Dict[str, Any], status: str, detail: str) -> None:
@@ -6231,7 +6544,7 @@ def _candle_time_seconds(candle: Dict[str, Any]) -> float:
     return raw / 1000.0 if raw > 10_000_000_000 else raw
 
 
-def process_pending_signals(
+def _process_pending_signals_impl(
     blocks: Dict[str, int], near_miss: List[str]
 ) -> List[Dict[str, Any]]:
     if not PRE_LIVE_CONFIRMATION_ENABLED:
@@ -6253,7 +6566,17 @@ def process_pending_signals(
             key = "paper_reclaim_watch_expired" if is_paper else "pre_live_confirmation_expired"
             blocks[key] = blocks.get(key, 0) + 1
             if is_paper:
-                send_watch_status(item, "ОТКЛОНЁН", "За 5 минут не сформировался подтверждённый reclaim.")
+                if not bool(item.get("pending_retest_seen")):
+                    reason = "no_pullback"
+                    detail = "За 5 минут не появился допустимый откат."
+                elif not bool(item.get("pending_reclaim_seen")):
+                    reason = "no_reclaim"
+                    detail = "Откат был, но за 5 минут цена не вернула EMA9/35% отката."
+                else:
+                    reason = "quality_gate"
+                    detail = "Reclaim был, но подтверждение свечи/потока не сложилось в допустимом окне."
+                record_watch_audit(item, f"rejected:{reason}", detail)
+                send_watch_status(item, "ОТКЛОНЁН", detail)
             continue
 
         symbol = str(item.get("symbol", ""))
@@ -6280,37 +6603,71 @@ def process_pending_signals(
         ema9 = ema(closes(c1[-30:]), 9)
 
         if is_paper:
+            # V17.1 is a real state machine. Tick samples arrive from the
+            # dedicated 10-second monitor. Completed 1m candles that opened
+            # after WATCH started provide high/low evidence that a 60-second
+            # universe scan used to miss.
             previous_extreme = float(item.get("pending_extreme_price", reference) or reference)
+            extreme = previous_extreme
+            retest_price = float(item.get("pending_retest_price", extreme) or extreme)
+            retest_seen = bool(item.get("pending_retest_seen"))
+            last_candle_time = float(item.get("pending_last_candle_time", 0.0) or 0.0)
+
+            # Use only completed candles. If a new extreme formed inside a
+            # candle, its close is chronologically after that extreme and is a
+            # safe first retest point. This avoids guessing high/low ordering.
+            completed_after_watch = []
+            for candle in c1[:-1]:
+                candle_time = _candle_time_seconds(candle)
+                if candle_time < started or candle_time <= last_candle_time:
+                    continue
+                completed_after_watch.append(candle)
+            for candle in completed_after_watch:
+                candle_high = float(candle.get("high", candle.get("close", price)) or price)
+                candle_low = float(candle.get("low", candle.get("close", price)) or price)
+                candle_close = float(candle.get("close", price) or price)
+                if side == "LONG":
+                    if not retest_seen and candle_high >= extreme:
+                        extreme = candle_high
+                        retest_price = min(candle_high, candle_close)
+                    else:
+                        retest_price = min(retest_price, candle_low)
+                else:
+                    if not retest_seen and candle_low <= extreme:
+                        extreme = candle_low
+                        retest_price = max(candle_low, candle_close)
+                    else:
+                        retest_price = max(retest_price, candle_high)
+                last_candle_time = max(
+                    last_candle_time, _candle_time_seconds(candle)
+                )
+
+            # Add the current 10-second price sample. Before the pullback is
+            # latched the directional extreme can advance; afterwards the
+            # anchor stays fixed and only the deepest retest is updated.
             if side == "LONG":
-                if price >= previous_extreme:
+                if not retest_seen and price >= extreme:
                     extreme = price
                     retest_price = price
                 else:
-                    extreme = previous_extreme
-                    retest_price = min(
-                        float(item.get("pending_retest_price", extreme) or extreme),
-                        price,
-                    )
-                retest_depth = max(0.0, (extreme - retest_price) / max(extreme, 1e-12))
-                reclaim_span = max(extreme - retest_price, reference * 1e-8)
-                recovery = max(0.0, min(1.0, (price - retest_price) / reclaim_span))
+                    retest_price = min(retest_price, price)
+                retest_depth = max(
+                    0.0, (extreme - retest_price) / max(extreme, 1e-12)
+                )
             else:
-                if price <= previous_extreme:
+                if not retest_seen and price <= extreme:
                     extreme = price
                     retest_price = price
                 else:
-                    extreme = previous_extreme
-                    retest_price = max(
-                        float(item.get("pending_retest_price", extreme) or extreme),
-                        price,
-                    )
-                retest_depth = max(0.0, (retest_price - extreme) / max(extreme, 1e-12))
-                reclaim_span = max(retest_price - extreme, reference * 1e-8)
-                recovery = max(0.0, min(1.0, (retest_price - price) / reclaim_span))
+                    retest_price = max(retest_price, price)
+                retest_depth = max(
+                    0.0, (retest_price - extreme) / max(extreme, 1e-12)
+                )
 
             item["pending_extreme_price"] = extreme
             item["pending_retest_price"] = retest_price
-            item["reclaim_recovery"] = recovery
+            item["pending_last_price"] = price
+            item["pending_last_candle_time"] = last_candle_time
             deepest = max(float(item.get("pending_retest_depth", 0.0) or 0.0), retest_depth)
             item["pending_retest_depth"] = deepest
             min_pullback = float(
@@ -6321,16 +6678,29 @@ def process_pending_signals(
                 item.get("pending_max_pullback", PAPER_RECLAIM_MAX_PULLBACK)
                 or PAPER_RECLAIM_MAX_PULLBACK
             )
-            if min_pullback <= deepest <= max_pullback:
+            if min_pullback <= deepest <= max_pullback and not retest_seen:
                 item["pending_retest_seen"] = True
+                item["pending_retest_seen_at"] = current_ts
+                item["pending_stage"] = "seeking_reclaim"
+                retest_seen = True
+                record_watch_audit(
+                    item,
+                    "pullback_seen",
+                    f"pullback {deepest*100:.2f}% within "
+                    f"{min_pullback*100:.2f}%–{max_pullback*100:.2f}%",
+                )
 
             if deepest > max_pullback:
                 blocks["paper_reclaim_too_deep"] = blocks.get("paper_reclaim_too_deep", 0) + 1
+                detail = (
+                    f"Откат {deepest*100:.2f}% глубже разрешённых "
+                    f"{max_pullback*100:.2f}% для этого импульса."
+                )
+                record_watch_audit(item, "rejected:pullback_too_deep", detail)
                 send_watch_status(
                     item,
                     "ОТКЛОНЁН",
-                    f"Откат {deepest*100:.2f}% глубже разрешённых "
-                    f"{max_pullback*100:.2f}% для этого импульса.",
+                    detail,
                 )
                 continue
             if not bool(item.get("pending_retest_seen")):
@@ -6354,19 +6724,64 @@ def process_pending_signals(
                     and location <= PRE_LIVE_CLOSE_SHORT
                     and price < ema9
                 )
-            confirmed_now = bool(
+            reclaim_span = max(abs(extreme - retest_price), reference * 1e-8)
+            recovery = (
+                (price - retest_price) / reclaim_span
+                if side == "LONG"
+                else (retest_price - price) / reclaim_span
+            )
+            recovery = max(0.0, min(1.0, recovery))
+            item["reclaim_recovery"] = recovery
+            directional_floor = (
+                PAPER_LONG_MIN_DIRECTIONAL_15M * 0.50
+                if side == "LONG"
+                else PAPER_SHORT_MIN_DIRECTIONAL_15M * 0.50
+            )
+            directional_ok = bool(
                 directional_3m >= PAPER_RECLAIM_MIN_3M
-                and directional_15m
-                >= (
-                    PAPER_LONG_MIN_DIRECTIONAL_15M * 0.50
-                    if side == "LONG"
-                    else PAPER_SHORT_MIN_DIRECTIONAL_15M * 0.50
-                )
-                and vol1 >= PAPER_RECLAIM_MIN_VOL1
+                and directional_15m >= directional_floor
+                and directional_15m <= PAPER_MAX_DIRECTIONAL_15M
+                and PAPER_RECLAIM_ENTRY_FLOOR
+                <= directional_move
+                <= PAPER_RECLAIM_MAX_CHASE
+            )
+            reclaim_core = bool(
+                recovery >= PAPER_RECLAIM_MIN_RECOVERY
+                and ((side == "LONG" and price > ema9) or (side == "SHORT" and price < ema9))
+            )
+            flow_ok = bool(
+                vol1 >= PAPER_RECLAIM_MIN_VOL1
+                and vol1 <= PAPER_MAX_VOL1
                 and range1 >= PAPER_RECLAIM_MIN_RANGE1
                 and range5_now >= 0.75
-                and recovery >= PAPER_RECLAIM_MIN_RECOVERY
-                and candle_ok
+            )
+            if reclaim_core:
+                if not bool(item.get("pending_reclaim_seen")):
+                    record_watch_audit(
+                        item,
+                        "reclaim_seen",
+                        f"recovery {recovery*100:.0f}% and EMA9 reclaimed",
+                    )
+                item["pending_reclaim_seen"] = True
+                item["pending_reclaim_seen_at"] = current_ts
+                item["pending_stage"] = "quality_confirmation"
+            if candle_ok:
+                item["pending_candle_ok_at"] = current_ts
+            if flow_ok:
+                item["pending_flow_ok_at"] = current_ts
+
+            def latch_recent(key: str) -> bool:
+                timestamp = int(item.get(key, 0) or 0)
+                return bool(
+                    timestamp > 0
+                    and current_ts - timestamp <= max(1, PAPER_CONFIRM_LATCH_SECONDS)
+                )
+
+            confirmed_now = bool(
+                directional_ok
+                and latch_recent("pending_reclaim_seen_at")
+                and latch_recent("pending_candle_ok_at")
+                and latch_recent("pending_flow_ok_at")
             )
         else:
             if directional_move <= -max(0.0, PRE_LIVE_MAX_ADVERSE_MOVE):
@@ -6423,7 +6838,7 @@ def process_pending_signals(
             setup["setup_mode"] = f"INSTANT_PULLBACK_RECLAIM_{side}"
             setup["paper_validation_lane"] = PAPER_VALIDATION_REASON
             setup["paper_validation_origin"] = (
-                f"V17 confirmed {side}: impulse → dynamic pullback "
+                f"V17.1 confirmed {side}: moderate impulse → dynamic pullback "
                 f"{float(item.get('pending_retest_depth', 0.0) or 0.0)*100:.2f}% → "
                 f"EMA9/price reclaim after {age}s; move vs WATCH {directional_move*100:+.2f}%"
             )
@@ -6431,7 +6846,9 @@ def process_pending_signals(
         if not refreshed:
             blocks["pre_live_reprice_sl_block"] = blocks.get("pre_live_reprice_sl_block", 0) + 1
             if is_paper:
-                send_watch_status(item, "ОТКЛОНЁН", "После нового входа защитный SL/RR не прошёл проверку.")
+                detail = "После нового входа защитный SL/RR не прошёл проверку."
+                record_watch_audit(item, "rejected:reprice_or_rr", detail)
+                send_watch_status(item, "ОТКЛОНЁН", detail)
             continue
         quality_ok, quality_block, quality_reason = professional_quality_gate(refreshed, symbol)
         if not quality_ok:
@@ -6439,6 +6856,9 @@ def process_pending_signals(
             if len(near_miss) < 8:
                 near_miss.append(quality_reason)
             if is_paper:
+                record_watch_audit(
+                    item, "rejected:quality_gate", quality_reason
+                )
                 send_watch_status(item, "ОТКЛОНЁН", quality_reason)
             continue
         if refreshed.get("paper_validation_only"):
@@ -6449,12 +6869,36 @@ def process_pending_signals(
             strategy_ok, _ = strategy_circuit_breaker(refreshed)
             if not strategy_ok:
                 blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
+                if is_paper:
+                    record_watch_audit(
+                        item,
+                        "rejected:other",
+                        "strategy circuit breaker rejected refreshed setup",
+                    )
                 continue
+        if is_paper:
+            record_watch_audit(
+                item,
+                "confirmed",
+                f"entry confirmed after {age}s; pullback "
+                f"{float(item.get('pending_retest_depth', 0.0) or 0.0)*100:.2f}%",
+            )
         confirmed.append(refreshed)
 
     STATE["pending_signals"] = remaining
     save_state()
     return confirmed
+
+
+def process_pending_signals(
+    blocks: Dict[str, int], near_miss: List[str]
+) -> List[Dict[str, Any]]:
+    if not PENDING_RUN_LOCK.acquire(blocking=False):
+        return []
+    try:
+        return _process_pending_signals_impl(blocks, near_miss)
+    finally:
+        PENDING_RUN_LOCK.release()
 
 
 def add_active_signal(s: Dict[str, Any]) -> None:
@@ -6814,6 +7258,8 @@ def safe_record_learning_result(
                 "near_miss_probe",
                 PAPER_VALIDATION_REASON,
                 PAPER_CONTROL_REASON,
+                LEGACY_V17_PAPER_VALIDATION_REASON,
+                LEGACY_V17_CONTROL_REASON,
                 LEGACY_PAPER_VALIDATION_REASON,
             } and not shadow_reason.startswith(("v16_9_", "v16_9_1_")):
                 update_symbol_outcome_guard(signal, result, source=source)
@@ -6906,7 +7352,7 @@ def track_shadow_signals() -> bool:
             signal["tp1_protected"] = True
             changed = True
 
-        # Once TP2 traded, a V17 PAPER position may not turn into a full loss.
+        # Once TP2 traded, a V17.1 PAPER position may not turn into a full loss.
         # Lock approximately TP1 (after a fee/slippage buffer) while TP3 remains
         # the only positive classification used by the quality target.
         if (
@@ -7170,8 +7616,8 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: CLEAN EVIDENCE/RECLAIM FORWARD PAPER + VISIBLE CONTROL.\n"
-        f"Логика: pre-registered A+ evidence → WATCH → dynamic pullback from post-WATCH extreme → EMA9/price reclaim → "
+        f"Mode: FIXED MODERATE IMPULSE/RECLAIM FORWARD PAPER + FULL WATCH AUDIT.\n"
+        f"Логика: moderate A+ impulse → WATCH → sampled/candle pullback → latched EMA9/price reclaim → "
         f"confirmed PAPER entry → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
@@ -7180,27 +7626,32 @@ async def scan_loop():
         f"Opportunity engine: analyze up to {MAX_ANALYZE_SYMBOLS} contracts · "
         f"deep-check {HOT_SYMBOLS_TO_ANALYZE} hot names (minimum pool {MIN_HOT_CANDIDATES}) · "
         f"parallel workers {HOT_SCAN_WORKERS}/{DEEP_SCAN_WORKERS}.\n"
-        f"Legacy evidence gate remains diagnostic: Vol1 ≥ x{DATA_MIN_VOL1:.2f} · "
-        f"Range1 ≥ x{DATA_MIN_RANGE1:.2f} · directional 3m ≥ {DATA_MIN_DIRECTIONAL_3M*100:.2f}%.\n"
+        f"Fixed V17.1 WATCH gate: directional 3m {PAPER_EDGE_MIN*100:.2f}%–"
+        f"{PAPER_EDGE_MAX*100:.2f}% · directional 15m ≤ {PAPER_MAX_DIRECTIONAL_15M*100:.2f}% · "
+        f"Vol1 x{DATA_MIN_VOL1:.2f}–x{PAPER_MAX_VOL1:.2f} · "
+        f"Range1 ≥ x{DATA_MIN_RANGE1:.2f}.\n"
         f"Evidence imbalance path: active · qualifying setups bypass obsolete no_fast templates, "
         f"but still pass RR/structure/confirmation/model checks.\n"
         f"Dynamic pullback/reclaim confirmation: {PRE_LIVE_CONFIRMATION_ENABLED} · "
+        f"dedicated monitor every {PAPER_PENDING_MONITOR_SECONDS}s · "
         f"WATCH {PAPER_RECLAIM_MIN_SECONDS}–{PAPER_RECLAIM_MAX_SECONDS}s · "
         f"pullback = {PAPER_RECLAIM_MIN_IMPULSE_FRACTION*100:.0f}%–"
         f"{PAPER_RECLAIM_MAX_IMPULSE_FRACTION*100:.0f}% of impulse, bounded by "
         f"{PAPER_RECLAIM_MIN_PULLBACK*100:.2f}%–{PAPER_RECLAIM_MAX_PULLBACK*100:.2f}% · "
-        f"recovery ≥ {PAPER_RECLAIM_MIN_RECOVERY*100:.0f}%.\n"
+        f"recovery ≥ {PAPER_RECLAIM_MIN_RECOVERY*100:.0f}% · "
+        f"quality latches ≤ {PAPER_CONFIRM_LATCH_SECONDS}s.\n"
         f"Forward PAPER lane: {PAPER_VALIDATION_ENABLED} · A+ INSTANT only · "
         f"LONG: 15m ≥ {PAPER_LONG_MIN_DIRECTIONAL_15M*100:.2f}%, Vol5 x"
         f"{PAPER_LONG_MIN_VOL5:.2f}–x{PAPER_LONG_MAX_VOL5:.2f} · "
         f"SHORT: 3m ≥ {PAPER_SHORT_MIN_DIRECTIONAL_3M*100:.2f}%, "
         f"15m ≥ {PAPER_SHORT_MIN_DIRECTIONAL_15M*100:.2f}% · must retest and reclaim · "
         f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
-        f"visible in Telegram · never LIVE automatically · need "
-        f"{PAPER_LANE_REQUIRED_OUTCOMES} new forward outcomes.\n"
+        f"visible in Telegram · never LIVE automatically · pilot "
+        f"{PAPER_PILOT_REQUIRED_OUTCOMES}, full unchanged forward cohort "
+        f"{PAPER_LANE_REQUIRED_OUTCOMES}.\n"
         f"Professional cohort policy: CONTROL/WATCH is visible but cannot train · "
         f"B and MARKET_DUMP are diagnostic rejects, not trades · "
-        f"no automatic criteria changes before 50 reclaim PAPER closes.\n"
+        f"no automatic criteria changes before {PAPER_LANE_REQUIRED_OUTCOMES} reclaim PAPER closes.\n"
         f"Strategy circuit breaker: {STRATEGY_CIRCUIT_BREAKER_ENABLED} · "
         f"rolling {STRATEGY_GUARD_WINDOW} outcomes · weak strategies stay in SHADOW.\n"
         f"MARKET_DUMP_SHORT: excluded by the 400-outcome audit; cannot enter PAPER/model/LIVE.\n"
@@ -7215,23 +7666,25 @@ async def scan_loop():
         f"per side={'unlimited' if MAX_LIVE_SIGNALS_PER_SIDE_24H <= 0 else MAX_LIVE_SIGNALS_PER_SIDE_24H} · "
         f"forced spacing={'none' if MIN_LIVE_SIGNAL_SPACING_SECONDS <= 0 else f'{MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min'} · "
         f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
-        f"Adaptive: frozen during the 50-trade reclaim cohort; after it closes, "
+        f"Adaptive: frozen during the {PAPER_LANE_REQUIRED_OUTCOMES}-trade reclaim cohort; after it closes, "
         f"guarded independent validation is required.\n"
-        f"Model data policy: only new registered V17 reclaim PAPER; "
-        f"all 400 restored outcomes, CONTROL and ordinary SHADOW are audit-only.\n"
+        f"Model data policy: only new registered V17.1 moderate/reclaim PAPER; "
+        f"all {source_counts['all']} restored outcomes, old V17, CONTROL and ordinary SHADOW are audit-only.\n"
         f"Telegram transparency: WATCH/control visible · PAPER entries/results visible · "
         f"ordinary SHADOW entries/results visible={VISIBLE_SHADOW_NOTIFICATIONS}.\n"
         f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
         f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
         f"Model activation guard: at least {MIN_SELECTED_LIVE_TEST_ROWS} selected confirmed "
-        f"V17 PAPER outcomes in the independent test · TP3+ majority · positive expectancy · "
+        f"V17.1 PAPER outcomes in the independent test · TP3+ majority · positive expectancy · "
         f"{ADAPTIVE_CONFIRMATION_PASSES} consecutive passes and "
         f"{ADAPTIVE_CONFIRMATION_SELECTED} selected outcomes.\n"
         f"Adaptive model: active={model_state.active} · version={model_state.version} · "
         f"LIVE fraction={float(model_state.deployment_fraction or 0)*100:.0f}%.\n"
         f"Audit: before/after every {LIVE_AUDIT_EVERY} closed model decisions · "
         f"automatic rollback: {AUTO_ROLLBACK_ENABLED}.\n"
-        f"Shadow candidates: {SHADOW_TRACKING_ENABLED} · automatic JSON backup every {AUTO_BACKUP_EVERY_CLOSED} outcomes.\n"
+        f"Shadow candidates: {SHADOW_TRACKING_ENABLED} · full JSON every "
+        f"{AUTO_BACKUP_EVERY_CLOSED} total outcomes · PAPER checkpoint every "
+        f"{PAPER_CHECKPOINT_EVERY} confirmed entries.\n"
         f"Seed JSON: {restored_text}.\n"
         f"Restored sources: LIVE={source_counts['live']} · SHADOW={source_counts['shadow']} · "
         f"ALL={source_counts['all']}.\n"
@@ -7239,9 +7692,11 @@ async def scan_loop():
         f"{next_model_analysis_target()} eligible outcomes.\n"
         f"CONTROL/WATCH collected: {int(control_metrics.get('n', 0))} · "
         f"{_metrics_line(control_metrics)}.\n"
-        f"Evidence/Reclaim PAPER collected: {int(paper_metrics.get('n', 0))}/"
-        f"{PAPER_LANE_REQUIRED_OUTCOMES} · {_metrics_line(paper_metrics)} · unique symbols="
+        f"Moderate/Reclaim PAPER V17.1 collected: {int(paper_metrics.get('n', 0))}/"
+        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
+        f"{_metrics_line(paper_metrics)} · unique symbols="
         f"{int(paper_metrics.get('unique_symbols', 0))}.\n"
+        f"{watch_audit_summary()}.\n"
         f"Next JSON backup at {((source_counts['all'] // max(1, AUTO_BACKUP_EVERY_CLOSED)) + 1) * max(1, AUTO_BACKUP_EVERY_CLOSED)} total outcomes.\n"
         f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH} · {storage_warning}."
     )
@@ -7276,6 +7731,48 @@ async def track_loop():
         await asyncio.sleep(AUTO_TRACK_SECONDS)
 
 
+def monitor_pending_and_dispatch() -> Dict[str, Any]:
+    """Check WATCH candidates without waiting for the full 80-symbol scan."""
+    blocks: Dict[str, int] = {}
+    near_miss: List[str] = []
+    confirmed = process_pending_signals(blocks, near_miss)
+    paper_sent = 0
+    non_paper_confirmed = 0
+    for candidate in confirmed:
+        if bool(candidate.get("paper_validation_only")):
+            if set_confirmed_paper_signal(candidate):
+                send_telegram(build_paper_signal_message(candidate))
+                paper_sent += 1
+        else:
+            # PRO_QUALITY_FORWARD_ENABLED means this branch should stay empty.
+            # Preserve diagnostics rather than silently turning it into LIVE.
+            non_paper_confirmed += 1
+    status = {
+        "ts": now_ts(),
+        "pending_active": len(STATE.get("pending_signals", [])),
+        "confirmed": len(confirmed),
+        "paper_sent": paper_sent,
+        "non_paper_confirmed": non_paper_confirmed,
+        "blocks": blocks,
+        "near_miss": near_miss[:8],
+    }
+    STATE["last_pending_monitor"] = status
+    save_state()
+    return status
+
+
+async def pending_monitor_loop():
+    await asyncio.sleep(max(3, PAPER_PENDING_MONITOR_SECONDS))
+    while True:
+        try:
+            if PRE_LIVE_CONFIRMATION_ENABLED:
+                await asyncio.to_thread(monitor_pending_and_dispatch)
+        except Exception as e:
+            STATE["last_error"] = f"pending_monitor_loop: {repr(e)}"
+            save_state()
+        await asyncio.sleep(max(3, PAPER_PENDING_MONITOR_SECONDS))
+
+
 @app.on_event("startup")
 async def startup_event():
     global STATE, SEED_RESTORE_INFO
@@ -7291,6 +7788,7 @@ async def startup_event():
         save_state()
     asyncio.create_task(scan_loop())
     asyncio.create_task(track_loop())
+    asyncio.create_task(pending_monitor_loop())
 
 
 @app.get("/")
@@ -7299,7 +7797,8 @@ def root():
         f"<h3>{APP_NAME}</h3>"
         f"<p>{DEPLOY_MARKER}</p>"
         f"<p>Use /health /version /scan /auto-status /stats /adaptive-report "
-        f"/source-audit /adaptive-retrain /adaptive-events /export-data /telegram-backup /test-telegram</p>"
+        f"/source-audit /watch-audit /adaptive-retrain /adaptive-events "
+        f"/export-data /telegram-backup /test-telegram</p>"
     )
 
 
@@ -7325,6 +7824,9 @@ def auto_status():
         "app": APP_NAME,
         "deploy": DEPLOY_MARKER,
         "active_signals": STATE.get("active_signals", []),
+        "pending_signals": STATE.get("pending_signals", []),
+        "last_pending_monitor": STATE.get("last_pending_monitor", {}),
+        "watch_audit_v17_1": STATE.get("watch_audit_v17_1", {}),
         "last_scan": STATE.get("last_scan", {}),
         "last_error": STATE.get("last_error", ""),
         "stats": STATE.get("stats", {}),
@@ -7358,6 +7860,20 @@ def source_audit_endpoint(window: int = Query(25, ge=1, le=100)):
         return HTMLResponse("<pre>" + format_source_audit_message(window) + "</pre>")
     except Exception as e:
         return HTMLResponse("<pre>Source audit error: " + repr(e) + "</pre>", status_code=500)
+
+
+@app.get("/watch-audit")
+def watch_audit_endpoint():
+    try:
+        return JSONResponse(
+            {
+                "summary": watch_audit_summary(),
+                "audit": STATE.get("watch_audit_v17_1", default_watch_audit()),
+                "last_pending_monitor": STATE.get("last_pending_monitor", {}),
+            }
+        )
+    except Exception as e:
+        return JSONResponse({"error": repr(e)}, status_code=500)
 
 
 @app.get("/adaptive-retrain")
