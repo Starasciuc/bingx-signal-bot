@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.1
+# VERIFIED GITHUB DEPLOY FILE — V17.1.1
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2552,8 +2552,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.1 MODERATE RECLAIM AUDIT"
-DEPLOY_MARKER = "V17_1_MODERATE_RECLAIM_AUDIT_475_2026_08_10"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V17.1.1 MODERATE RECLAIM + RELIABLE TELEGRAM"
+DEPLOY_MARKER = "V17_1_1_RELIABLE_TELEGRAM_475_2026_08_11"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2561,6 +2561,36 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+# --- V17.1.1 reliable Telegram transport ---
+# Diagnostics are replaceable and are not queued. Trade/WATCH/PAPER/result
+# messages are retried immediately and then stored in a small ordered outbox.
+# The outbox is persisted in STATE_FILE when persistent storage is available.
+TELEGRAM_SEND_ATTEMPTS = max(1, int(os.getenv("TELEGRAM_SEND_ATTEMPTS", "3")))
+TELEGRAM_CONNECT_TIMEOUT = max(
+    1.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5"))
+)
+TELEGRAM_READ_TIMEOUT = max(
+    2.0, float(os.getenv("TELEGRAM_READ_TIMEOUT", "15"))
+)
+TELEGRAM_RETRY_BASE_SECONDS = max(
+    0.1, float(os.getenv("TELEGRAM_RETRY_BASE_SECONDS", "0.8"))
+)
+TELEGRAM_OUTBOX_ENABLED = os.getenv(
+    "TELEGRAM_OUTBOX_ENABLED", "true"
+).lower() == "true"
+TELEGRAM_OUTBOX_FLUSH_SECONDS = max(
+    5, int(os.getenv("TELEGRAM_OUTBOX_FLUSH_SECONDS", "15"))
+)
+TELEGRAM_OUTBOX_BATCH = max(
+    1, int(os.getenv("TELEGRAM_OUTBOX_BATCH", "6"))
+)
+TELEGRAM_OUTBOX_MAX = max(
+    10, int(os.getenv("TELEGRAM_OUTBOX_MAX", "120"))
+)
+TELEGRAM_OUTBOX_MAX_BACKOFF = max(
+    30, int(os.getenv("TELEGRAM_OUTBOX_MAX_BACKOFF", "300"))
+)
 
 STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_29_local_stop_dump_scalper.json")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
@@ -3015,6 +3045,8 @@ STATE_IO_LOCK = threading.RLock()
 SCAN_RUN_LOCK = threading.Lock()
 TRACK_RUN_LOCK = threading.Lock()
 PENDING_RUN_LOCK = threading.Lock()
+TELEGRAM_SEND_LOCK = threading.Lock()
+TELEGRAM_OUTBOX_FLUSH_LOCK = threading.Lock()
 LONG_STATS_CACHE: Dict[str, Any] = {"ts": 0.0, "value": (True, "not evaluated")}
 
 # ============================================================
@@ -3063,9 +3095,24 @@ def default_watch_audit() -> Dict[str, Any]:
     }
 
 
+def default_telegram_delivery() -> Dict[str, Any]:
+    return {
+        "version": "V17.1.1",
+        "immediate_sent": 0,
+        "queued": 0,
+        "delivered_from_queue": 0,
+        "failed_attempts": 0,
+        "dropped_diagnostics": 0,
+        "last_success_at": 0,
+        "last_failure_at": 0,
+        "last_error": "",
+        "last_mode": "not_started",
+    }
+
+
 def default_state() -> Dict[str, Any]:
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "active_signals": [],
         "pending_signals": [],
         "shadow_signals": [],
@@ -3092,6 +3139,8 @@ def default_state() -> Dict[str, Any]:
         "last_paper_cohort_report_count": 0,
         "watch_audit_v17_1": default_watch_audit(),
         "last_pending_monitor": {},
+        "telegram_outbox": [],
+        "telegram_delivery": default_telegram_delivery(),
         "last_scan": {},
         "last_diag_ts": 0,
         "last_error": "",
@@ -3128,10 +3177,26 @@ def load_state() -> Dict[str, Any]:
         if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.1":
             base["watch_audit_v17_1"] = default_watch_audit()
         base.setdefault("last_pending_monitor", {})
+        outbox = base.setdefault("telegram_outbox", [])
+        if not isinstance(outbox, list):
+            base["telegram_outbox"] = []
+        delivery = base.setdefault(
+            "telegram_delivery", default_telegram_delivery()
+        )
+        if (
+            not isinstance(delivery, dict)
+            or str(delivery.get("version", "")) != "V17.1.1"
+        ):
+            previous_delivery = delivery if isinstance(delivery, dict) else {}
+            delivery = default_telegram_delivery()
+            for key in delivery:
+                if key in previous_delivery and key != "version":
+                    delivery[key] = previous_delivery[key]
+            base["telegram_delivery"] = delivery
         stats = base.setdefault("stats", {})
         for bucket, value in default_state()["stats"].items():
             stats.setdefault(bucket, value.copy() if isinstance(value, dict) else value)
-        base["schema_version"] = 5
+        base["schema_version"] = 6
         return base
     except Exception:
         return default_state()
@@ -3476,51 +3541,366 @@ def build_stats_text() -> str:
     return "\n".join(lines)
 
 # ============================================================
-# Telegram / API
+# Telegram / API — V17.1.1 reliable ordered delivery
 # ============================================================
 
-def send_telegram(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        STATE["last_error"] = "Telegram env missing: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+def _telegram_delivery_state() -> Dict[str, Any]:
+    delivery = STATE.setdefault("telegram_delivery", default_telegram_delivery())
+    if (
+        not isinstance(delivery, dict)
+        or str(delivery.get("version", "")) != "V17.1.1"
+    ):
+        delivery = default_telegram_delivery()
+        STATE["telegram_delivery"] = delivery
+    for key, value in default_telegram_delivery().items():
+        delivery.setdefault(key, value)
+    return delivery
+
+
+def telegram_outbox_depth() -> int:
+    outbox = STATE.setdefault("telegram_outbox", [])
+    return len(outbox) if isinstance(outbox, list) else 0
+
+
+def _telegram_message_key(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _telegram_replaceable_message(text: str) -> bool:
+    """Diagnostics are superseded by the next scan and must not block trades."""
+    return str(text or "").lstrip().startswith("🧪 Диагностика")
+
+
+def _telegram_clear_stale_main_error() -> None:
+    current_error = str(STATE.get("last_error", "") or "")
+    if current_error.startswith("Telegram "):
+        STATE["last_error"] = ""
+
+
+def _telegram_record_success(mode: str, attempts_used: int = 1) -> None:
+    with STATE_IO_LOCK:
+        delivery = _telegram_delivery_state()
+        delivery["failed_attempts"] = int(
+            delivery.get("failed_attempts", 0) or 0
+        ) + max(0, int(attempts_used or 1) - 1)
+        if mode == "outbox":
+            delivery["delivered_from_queue"] = int(
+                delivery.get("delivered_from_queue", 0) or 0
+            ) + 1
+        else:
+            delivery["immediate_sent"] = int(
+                delivery.get("immediate_sent", 0) or 0
+            ) + 1
+        delivery["last_success_at"] = now_ts()
+        delivery["last_error"] = ""
+        delivery["last_mode"] = mode
+        _telegram_clear_stale_main_error()
         save_state()
-        return False
+
+
+def _telegram_record_failure(error: str, attempts_used: int, mode: str) -> None:
+    with STATE_IO_LOCK:
+        delivery = _telegram_delivery_state()
+        delivery["failed_attempts"] = int(
+            delivery.get("failed_attempts", 0) or 0
+        ) + max(1, int(attempts_used or 1))
+        delivery["last_failure_at"] = now_ts()
+        delivery["last_error"] = str(error or "unknown Telegram failure")[:500]
+        delivery["last_mode"] = mode
+        STATE["last_error"] = f"Telegram {mode}: {delivery['last_error']}"
+        save_state()
+
+
+def _telegram_post_text(
+    text: str,
+    attempts_override: Optional[int] = None,
+    read_timeout_override: Optional[float] = None,
+) -> Tuple[bool, str, int]:
+    """Perform bounded immediate retries without mutating the outbox."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return (
+            False,
+            "env missing: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
+            1,
+        )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]}, timeout=10)
-        if not r.ok:
-            STATE["last_error"] = f"Telegram error {r.status_code}: {r.text[:250]}"
+    last_error = "unknown Telegram error"
+    attempts_used = 0
+    max_attempts = max(
+        1,
+        int(
+            TELEGRAM_SEND_ATTEMPTS
+            if attempts_override is None
+            else attempts_override
+        ),
+    )
+    read_timeout = max(
+        2.0,
+        float(
+            TELEGRAM_READ_TIMEOUT
+            if read_timeout_override is None
+            else read_timeout_override
+        ),
+    )
+    with TELEGRAM_SEND_LOCK:
+        for attempt in range(max_attempts):
+            attempts_used = attempt + 1
+            try:
+                response = requests.post(
+                    url,
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]},
+                    timeout=(TELEGRAM_CONNECT_TIMEOUT, read_timeout),
+                )
+                if response.ok:
+                    return True, "", attempts_used
+                last_error = (
+                    f"HTTP {response.status_code}: "
+                    f"{str(getattr(response, 'text', ''))[:250]}"
+                )
+                retryable = response.status_code in {
+                    408, 409, 425, 429, 500, 502, 503, 504
+                }
+                if not retryable:
+                    break
+            except Exception as exc:
+                last_error = repr(exc)
+            if attempt + 1 < max_attempts:
+                time.sleep(TELEGRAM_RETRY_BASE_SECONDS * (2 ** attempt))
+    return False, last_error, attempts_used
+
+
+def _queue_telegram_message(text: str, error: str = "") -> bool:
+    if not TELEGRAM_OUTBOX_ENABLED or _telegram_replaceable_message(text):
+        return False
+    message = str(text or "")[:3900]
+    message_id = _telegram_message_key(message)
+    with STATE_IO_LOCK:
+        outbox = STATE.setdefault("telegram_outbox", [])
+        if not isinstance(outbox, list):
+            outbox = []
+            STATE["telegram_outbox"] = outbox
+        for item in outbox:
+            if str(item.get("id", "")) == message_id:
+                item["last_error"] = str(error or item.get("last_error", ""))[:500]
+                item["next_retry_at"] = min(
+                    int(item.get("next_retry_at", now_ts()) or now_ts()),
+                    now_ts() + TELEGRAM_OUTBOX_FLUSH_SECONDS,
+                )
+                save_state()
+                return True
+        if len(outbox) >= TELEGRAM_OUTBOX_MAX:
+            delivery = _telegram_delivery_state()
+            delivery["last_error"] = (
+                f"outbox full ({len(outbox)}/{TELEGRAM_OUTBOX_MAX})"
+            )
+            STATE["last_error"] = f"Telegram outbox: {delivery['last_error']}"
             save_state()
             return False
-        return True
-    except Exception as e:
-        STATE["last_error"] = f"Telegram exception: {repr(e)}"
+        outbox.append(
+            {
+                "id": message_id,
+                "text": message,
+                "created_at": now_ts(),
+                "attempts": 0,
+                "next_retry_at": now_ts() + TELEGRAM_OUTBOX_FLUSH_SECONDS,
+                "last_error": str(error or "")[:500],
+            }
+        )
+        delivery = _telegram_delivery_state()
+        delivery["queued"] = int(delivery.get("queued", 0) or 0) + 1
+        delivery["last_mode"] = "queued"
+        STATE["last_error"] = (
+            f"Telegram queued: critical message saved; outbox={len(outbox)}"
+        )
         save_state()
+    return True
+
+
+def send_telegram(text: str) -> bool:
+    """Accept a Telegram message for immediate or guaranteed queued delivery.
+
+    True means delivered now OR durably accepted into the ordered outbox. This
+    prevents milestone reports from being duplicated while a temporary timeout
+    is recovering.
+    """
+    message = str(text or "")[:3900]
+    replaceable = _telegram_replaceable_message(message)
+
+    # Do not let a new result overtake an earlier queued entry. A diagnostic is
+    # discarded while the critical outbox is non-empty; the next scan will
+    # create a fresh one after entries/results have been delivered.
+    if TELEGRAM_OUTBOX_ENABLED and telegram_outbox_depth() > 0:
+        if replaceable:
+            with STATE_IO_LOCK:
+                delivery = _telegram_delivery_state()
+                delivery["dropped_diagnostics"] = int(
+                    delivery.get("dropped_diagnostics", 0) or 0
+                ) + 1
+                delivery["last_mode"] = "diagnostic_deferred_for_outbox"
+                save_state()
+            return False
+        return _queue_telegram_message(
+            message, "ordered behind an earlier undelivered notification"
+        )
+
+    ok, error, attempts_used = _telegram_post_text(
+        message,
+        attempts_override=1 if replaceable else None,
+        read_timeout_override=min(6.0, TELEGRAM_READ_TIMEOUT)
+        if replaceable
+        else None,
+    )
+    if ok:
+        _telegram_record_success("immediate", attempts_used)
+        return True
+
+    _telegram_record_failure(error, attempts_used, "immediate")
+    if replaceable:
+        with STATE_IO_LOCK:
+            delivery = _telegram_delivery_state()
+            delivery["dropped_diagnostics"] = int(
+                delivery.get("dropped_diagnostics", 0) or 0
+            ) + 1
+            save_state()
         return False
+    return _queue_telegram_message(message, error)
+
+
+def _format_queued_message(item: Dict[str, Any]) -> str:
+    text = str(item.get("text", "") or "")
+    created_at = int(item.get("created_at", now_ts()) or now_ts())
+    delay = max(0, now_ts() - created_at)
+    if delay < 30:
+        return text[:3900]
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(created_at))
+    prefix = f"⏳ ПОВТОРНАЯ ДОСТАВКА · создано {stamp} · задержка {delay}с\n"
+    return (prefix + text)[:3900]
+
+
+def flush_telegram_outbox() -> Dict[str, Any]:
+    if not TELEGRAM_OUTBOX_ENABLED:
+        return {"attempted": False, "reason": "disabled", "remaining": 0}
+    if not TELEGRAM_OUTBOX_FLUSH_LOCK.acquire(blocking=False):
+        return {
+            "attempted": False,
+            "reason": "already_running",
+            "remaining": telegram_outbox_depth(),
+        }
+    delivered = 0
+    try:
+        for _ in range(TELEGRAM_OUTBOX_BATCH):
+            with STATE_IO_LOCK:
+                outbox = STATE.setdefault("telegram_outbox", [])
+                if not isinstance(outbox, list) or not outbox:
+                    break
+                item = dict(outbox[0])
+                if int(item.get("next_retry_at", 0) or 0) > now_ts():
+                    break
+
+            ok, error, attempts_used = _telegram_post_text(
+                _format_queued_message(item)
+            )
+            message_id = str(item.get("id", ""))
+            if ok:
+                with STATE_IO_LOCK:
+                    current_outbox = STATE.setdefault("telegram_outbox", [])
+                    if (
+                        isinstance(current_outbox, list)
+                        and current_outbox
+                        and str(current_outbox[0].get("id", "")) == message_id
+                    ):
+                        current_outbox.pop(0)
+                    _telegram_record_success("outbox", attempts_used)
+                delivered += 1
+                continue
+
+            with STATE_IO_LOCK:
+                current_outbox = STATE.setdefault("telegram_outbox", [])
+                if (
+                    isinstance(current_outbox, list)
+                    and current_outbox
+                    and str(current_outbox[0].get("id", "")) == message_id
+                ):
+                    attempts = int(current_outbox[0].get("attempts", 0) or 0) + 1
+                    current_outbox[0]["attempts"] = attempts
+                    current_outbox[0]["last_error"] = str(error or "")[:500]
+                    backoff = min(
+                        TELEGRAM_OUTBOX_MAX_BACKOFF,
+                        TELEGRAM_OUTBOX_FLUSH_SECONDS * (2 ** min(attempts, 5)),
+                    )
+                    current_outbox[0]["next_retry_at"] = now_ts() + backoff
+                _telegram_record_failure(error, attempts_used, "outbox")
+            break
+        return {
+            "attempted": True,
+            "delivered": delivered,
+            "remaining": telegram_outbox_depth(),
+        }
+    finally:
+        TELEGRAM_OUTBOX_FLUSH_LOCK.release()
+
+
+def telegram_delivery_summary() -> str:
+    delivery = _telegram_delivery_state()
+    last_success = int(delivery.get("last_success_at", 0) or 0)
+    success_age = (
+        f"{max(0, now_ts() - last_success)}с назад"
+        if last_success
+        else "ещё не было"
+    )
+    return (
+        "Telegram V17.1.1: "
+        f"outbox={telegram_outbox_depth()} · "
+        f"сразу={int(delivery.get('immediate_sent', 0) or 0)} · "
+        f"из очереди={int(delivery.get('delivered_from_queue', 0) or 0)} · "
+        f"ошибок попыток={int(delivery.get('failed_attempts', 0) or 0)} · "
+        f"последняя успешная={success_age}"
+    )
 
 
 def send_telegram_document(data: bytes, filename: str, caption: str = "") -> bool:
+    """Retry JSON documents immediately; milestone logic retries them later."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        STATE["last_error"] = "Telegram env missing for document backup"
-        save_state()
+        _telegram_record_failure("env missing for document backup", 1, "document")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-    try:
-        files = {
-            "document": (filename, io.BytesIO(data), "application/json"),
-        }
-        form = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:900]}
-        response = requests.post(url, data=form, files=files, timeout=30)
-        if not response.ok:
-            STATE["last_error"] = (
-                f"Telegram document error {response.status_code}: {response.text[:250]}"
-            )
-            save_state()
-            return False
-        return True
-    except Exception as e:
-        STATE["last_error"] = f"Telegram document exception: {repr(e)}"
-        save_state()
-        return False
+    last_error = "unknown Telegram document error"
+    attempts_used = 0
+    with TELEGRAM_SEND_LOCK:
+        for attempt in range(TELEGRAM_SEND_ATTEMPTS):
+            attempts_used = attempt + 1
+            try:
+                files = {
+                    "document": (filename, io.BytesIO(data), "application/json"),
+                }
+                form = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:900]}
+                response = requests.post(
+                    url,
+                    data=form,
+                    files=files,
+                    timeout=(
+                        TELEGRAM_CONNECT_TIMEOUT,
+                        max(30.0, TELEGRAM_READ_TIMEOUT),
+                    ),
+                )
+                if response.ok:
+                    _telegram_record_success("document", attempts_used)
+                    return True
+                last_error = (
+                    f"HTTP {response.status_code}: "
+                    f"{str(getattr(response, 'text', ''))[:250]}"
+                )
+                retryable = response.status_code in {
+                    408, 409, 425, 429, 500, 502, 503, 504
+                }
+                if not retryable:
+                    break
+            except Exception as exc:
+                last_error = repr(exc)
+            if attempt + 1 < TELEGRAM_SEND_ATTEMPTS:
+                time.sleep(TELEGRAM_RETRY_BASE_SECONDS * (2 ** attempt))
+    _telegram_record_failure(last_error, attempts_used, "document")
+    return False
 
 
 def admin_authorized(key: str) -> bool:
@@ -6257,7 +6637,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     control_metrics = control_validation_metrics()
     paper_metrics = paper_validation_metrics()
     return (
-        f"🧪 Диагностика V17.1 Moderate Reclaim Audit\n"
+        f"🧪 Диагностика V17.1.1 Moderate Reclaim + Reliable Telegram\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -6278,6 +6658,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
         f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
         f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
         ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
+        f"\n\n{telegram_delivery_summary()}" +
         f"\n\nLast error: {STATE.get('last_error', '')}"
     )
 
@@ -7672,6 +8053,9 @@ async def scan_loop():
         f"all {source_counts['all']} restored outcomes, old V17, CONTROL and ordinary SHADOW are audit-only.\n"
         f"Telegram transparency: WATCH/control visible · PAPER entries/results visible · "
         f"ordinary SHADOW entries/results visible={VISIBLE_SHADOW_NOTIFICATIONS}.\n"
+        f"Reliable Telegram V17.1.1: immediate retries={TELEGRAM_SEND_ATTEMPTS} · "
+        f"ordered outbox={TELEGRAM_OUTBOX_ENABLED} · flush every "
+        f"{TELEGRAM_OUTBOX_FLUSH_SECONDS}s · diagnostics are replaceable and never block trades.\n"
         f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
         f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
         f"Model activation guard: at least {MIN_SELECTED_LIVE_TEST_ROWS} selected confirmed "
@@ -7773,6 +8157,17 @@ async def pending_monitor_loop():
         await asyncio.sleep(max(3, PAPER_PENDING_MONITOR_SECONDS))
 
 
+async def telegram_outbox_loop():
+    await asyncio.sleep(2)
+    while True:
+        try:
+            await asyncio.to_thread(flush_telegram_outbox)
+        except Exception as exc:
+            STATE["last_error"] = f"telegram_outbox_loop: {repr(exc)}"
+            save_state()
+        await asyncio.sleep(TELEGRAM_OUTBOX_FLUSH_SECONDS)
+
+
 @app.on_event("startup")
 async def startup_event():
     global STATE, SEED_RESTORE_INFO
@@ -7786,6 +8181,7 @@ async def startup_event():
     except Exception as e:
         STATE["last_error"] = f"adaptive DB init error: {repr(e)}"
         save_state()
+    asyncio.create_task(telegram_outbox_loop())
     asyncio.create_task(scan_loop())
     asyncio.create_task(track_loop())
     asyncio.create_task(pending_monitor_loop())
@@ -7798,7 +8194,7 @@ def root():
         f"<p>{DEPLOY_MARKER}</p>"
         f"<p>Use /health /version /scan /auto-status /stats /adaptive-report "
         f"/source-audit /watch-audit /adaptive-retrain /adaptive-events "
-        f"/export-data /telegram-backup /test-telegram</p>"
+        f"/export-data /telegram-backup /telegram-status /test-telegram</p>"
     )
 
 
@@ -7827,9 +8223,36 @@ def auto_status():
         "pending_signals": STATE.get("pending_signals", []),
         "last_pending_monitor": STATE.get("last_pending_monitor", {}),
         "watch_audit_v17_1": STATE.get("watch_audit_v17_1", {}),
+        "telegram_outbox_depth": telegram_outbox_depth(),
+        "telegram_delivery": STATE.get("telegram_delivery", {}),
         "last_scan": STATE.get("last_scan", {}),
         "last_error": STATE.get("last_error", ""),
         "stats": STATE.get("stats", {}),
+    })
+
+
+@app.get("/telegram-status")
+def telegram_status_endpoint():
+    queued = STATE.get("telegram_outbox", [])
+    oldest = queued[0] if isinstance(queued, list) and queued else None
+    return JSONResponse({
+        "ok": True,
+        "app": APP_NAME,
+        "deploy": DEPLOY_MARKER,
+        "summary": telegram_delivery_summary(),
+        "outbox_depth": telegram_outbox_depth(),
+        "delivery": STATE.get("telegram_delivery", {}),
+        "oldest_queued": (
+            {
+                "id": oldest.get("id"),
+                "created_at": oldest.get("created_at"),
+                "attempts": oldest.get("attempts"),
+                "next_retry_at": oldest.get("next_retry_at"),
+                "last_error": oldest.get("last_error"),
+            }
+            if isinstance(oldest, dict)
+            else None
+        ),
     })
 
 
@@ -7941,8 +8364,15 @@ def telegram_backup_endpoint(key: str = Query("")):
 
 @app.get("/test-telegram")
 def test_telegram():
-    ok = send_telegram(f"✅ Test Telegram OK\n{APP_NAME}\n{DEPLOY_MARKER}")
-    return {"sent": ok, "last_error": STATE.get("last_error", "")}
+    accepted = send_telegram(
+        f"✅ Test Telegram OK\n{APP_NAME}\n{DEPLOY_MARKER}"
+    )
+    return {
+        "accepted": accepted,
+        "outbox_depth": telegram_outbox_depth(),
+        "delivery": STATE.get("telegram_delivery", {}),
+        "last_error": STATE.get("last_error", ""),
+    }
 
 
 if __name__ == "__main__":
