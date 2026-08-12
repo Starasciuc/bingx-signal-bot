@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.2
+# VERIFIED GITHUB DEPLOY FILE — V17.2.1
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -79,7 +79,7 @@ ADAPTIVE_CONFIRMATION_SELECTED = int(os.getenv("ADAPTIVE_CONFIRMATION_SELECTED",
 ADAPTIVE_INITIAL_LIVE_FRACTION = float(os.getenv("ADAPTIVE_INITIAL_LIVE_FRACTION", "0.25"))
 ADAPTIVE_LIVE_FRACTION_STEP = float(os.getenv("ADAPTIVE_LIVE_FRACTION_STEP", "0.25"))
 MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
-MODEL_DATA_POLICY = "v17_2_liquidity_first_dual_paper_only_v1"
+MODEL_DATA_POLICY = "v17_2_1_measured_edge_forward_only_v1"
 # Guarded live is the default: the model still cannot block anything until it has
 # passed the independent holdout checks below. Set true to observe forever.
 SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "false").lower() == "true"
@@ -189,6 +189,10 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "liquidity_unique_fraction",
     "atr1_pct",
     "normalized_directional_move",
+    # V17.2.1 adds executable-liquidity evidence at the exact entry moment.
+    # These are measured from the public BingX best bid/ask or depth endpoint.
+    "book_spread_bps",
+    "book_depth_log",
 )
 
 
@@ -557,6 +561,12 @@ def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
         "liquidity_unique_fraction": _clip(trade.get("liquidity_unique_fraction"), 0.0, 1.0),
         "atr1_pct": _clip(trade.get("atr1_pct"), 0.0, 0.03) / 0.03,
         "normalized_directional_move": _clip(trade.get("normalized_directional_move"), 0.0, 6.0) / 6.0,
+        "book_spread_bps": _clip(trade.get("book_spread_bps"), 0.0, 100.0) / 100.0,
+        "book_depth_log": _clip(
+            math.log1p(max(0.0, _clip(trade.get("book_depth_usdt"), 0.0, 1e18))),
+            0.0,
+            30.0,
+        ) / 30.0,
     }
     raw_score = features["score"] * 100.0
     raw_vol1 = features["vol1"] * 8.0
@@ -2044,7 +2054,7 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "live_model_guard_passed": "live-проверка не выявила ухудшения",
     "feature_schema_changed": "добавлены новые признаки качества; старые исходы сохранены",
     "model_dataset_policy_changed": "модель сброшена безопасно: обычный SHADOW исключён из обучения",
-    "forward_validation_freeze": "критерии зафиксированы до 50 независимых V17.2 liquidity-first PAPER-исходов",
+    "forward_validation_freeze": "критерии зафиксированы до 50 независимых V17.2.1 measured-edge PAPER-исходов",
     "seed_restored_feature_upgrade": "50 исходов восстановлены; следующая проверка продолжится по графику",
     "evidence_not_enough_comparison_rows": "для честной проверки фильтра пока мало отправленных или shadow-исходов",
     "evidence_too_many_profitable_signals_blocked": "фильтр начал пропускать слишком много TP3+ сигналов",
@@ -2080,7 +2090,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
 
     lines = [
         title,
-        f"Данных модели (только подтверждённый V17.2 PAPER): {closed_count}",
+        f"Данных модели (только V17.2.1 measured-edge PAPER): {closed_count}",
         f"ВСЕХ наблюдений, включая диагностический SHADOW: {all_closed_count}",
         f"ДАННЫЕ МОДЕЛИ: {_metrics_line(dataset)}",
         f"Причина: {_adaptive_reason_ru(reason)}",
@@ -2088,7 +2098,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
     if all_dataset:
         lines.append(f"ВСЯ ТЕЛЕМЕТРИЯ: {_metrics_line(all_dataset)}")
     if paper_dataset:
-        lines.append(f"LIQUIDITY DUAL PAPER V17.2: {_metrics_line(paper_dataset)}")
+        lines.append(f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(paper_dataset)}")
     if reason == "forward_validation_freeze":
         lines.append(
             f"Зафиксированная проверка: {int(report.get('paper_collected', 0) or 0)}/"
@@ -2445,8 +2455,8 @@ def format_source_audit_message(window: int = 25) -> str:
     lines.extend(
         [
             "",
-            f"CONTROL/WATCH V17.2: {_metrics_line(control_metrics)}",
-            f"LIQUIDITY DUAL PAPER V17.2: {_metrics_line(reclaim_metrics)} · "
+            f"CONTROL V17.2.1: {_metrics_line(control_metrics)}",
+            f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(reclaim_metrics)} · "
             f"собрано {int(reclaim_metrics.get('n', 0))}/"
             f"{paper_progress_target(int(reclaim_metrics.get('n', 0) or 0))}",
             watch_audit_summary(),
@@ -2574,8 +2584,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2 LIQUIDITY-FIRST DUAL PAPER"
-DEPLOY_MARKER = "V17_2_LIQUIDITY_FIRST_DUAL_PAPER_475_2026_08_11"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2.1 MEASURED EDGE FORWARD"
+DEPLOY_MARKER = "V17_2_1_MEASURED_EDGE_FORWARD_500_2026_08_12"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2637,15 +2647,15 @@ DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
 # --- Signal limits ---
 A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
 B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "1"))
 MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
 STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
 # Zero means unlimited. Quality gates, pair cooldown, strategy protection and
 # the maximum number of simultaneously active trades remain in force.
-MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "0"))
-MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "0"))
-MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "0"))
+MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "3"))
+MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "2"))
+MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "3600"))
 MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
 
 # --- V17.2 liquidity-first, dual-setup forward validation ---
@@ -2667,8 +2677,9 @@ PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "tru
 VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
     "VISIBLE_SHADOW_NOTIFICATIONS", "true"
 ).lower() == "true"
-PAPER_VALIDATION_REASON = "liquidity_dual_paper_v17_2"
-PAPER_CONTROL_REASON = "liquidity_control_v17_2"
+PAPER_VALIDATION_REASON = "measured_edge_paper_v17_2_1"
+PAPER_CONTROL_REASON = "measured_edge_control_v17_2_1"
+REAL_MONEY_LIVE_REASON = "measured_edge_micro_live_v17_2_1"
 LEGACY_V17_1_PAPER_VALIDATION_REASON = "moderate_reclaim_v17_1"
 LEGACY_V17_1_CONTROL_REASON = "moderate_control_v17_1"
 LEGACY_V17_PAPER_VALIDATION_REASON = "evidence_reclaim_v17"
@@ -2739,6 +2750,69 @@ V17_2_MAX_NEW_WATCH_PER_SCAN = int(
     os.getenv("V17_2_MAX_NEW_WATCH_PER_SCAN", "3")
 )
 V17_2_MAX_PENDING_WATCH = int(os.getenv("V17_2_MAX_PENDING_WATCH", "12"))
+
+# V17.2.1 measured cohort.  These values are not guessed from the five failed
+# V17.2 reclaim trades.  They are the deliberately rounded boundaries of the
+# strongest comparable A+ INSTANT cohort in the complete 500-outcome archive:
+# 23 matches, 17 TP3+, 2 SL, 4 expired, +0.786R average.  Because that is a
+# retrospective result, every new match remains PAPER until the independent
+# forward gate below is satisfied.
+MEASURED_MIN_VOL1 = float(os.getenv("MEASURED_MIN_VOL1", "1.00"))
+MEASURED_MAX_VOL1 = float(os.getenv("MEASURED_MAX_VOL1", "2.00"))
+MEASURED_MIN_RANGE1 = float(os.getenv("MEASURED_MIN_RANGE1", "1.50"))
+MEASURED_MAX_RANGE1 = float(os.getenv("MEASURED_MAX_RANGE1", "3.00"))
+MEASURED_MIN_DIRECTIONAL_3M = float(
+    os.getenv("MEASURED_MIN_DIRECTIONAL_3M", "0.0120")
+)
+MEASURED_MAX_DIRECTIONAL_3M = float(
+    os.getenv("MEASURED_MAX_DIRECTIONAL_3M", "0.0500")
+)
+MEASURED_MIN_DIRECTIONAL_15M = float(
+    os.getenv("MEASURED_MIN_DIRECTIONAL_15M", "0.0100")
+)
+MEASURED_MAX_DIRECTIONAL_15M = float(
+    os.getenv("MEASURED_MAX_DIRECTIONAL_15M", "0.0530")
+)
+MEASURED_MIN_VOL5 = float(os.getenv("MEASURED_MIN_VOL5", "0.40"))
+MEASURED_MAX_VOL5 = float(os.getenv("MEASURED_MAX_VOL5", "1.60"))
+MEASURED_MIN_RANGE5 = float(os.getenv("MEASURED_MIN_RANGE5", "0.70"))
+MEASURED_MIN_LIQUIDITY_RANK = float(
+    os.getenv("MEASURED_MIN_LIQUIDITY_RANK", "0.35")
+)
+MEASURED_MIN_QUOTE_60M = float(os.getenv("MEASURED_MIN_QUOTE_60M", "50000"))
+MEASURED_MAX_BOOK_SPREAD_BPS = float(
+    os.getenv("MEASURED_MAX_BOOK_SPREAD_BPS", "15.0")
+)
+MEASURED_MIN_BOOK_DEPTH_USDT = float(
+    os.getenv("MEASURED_MIN_BOOK_DEPTH_USDT", "500")
+)
+
+# Real-money alerts are two-key guarded: the environment flag alone is not
+# enough.  The new forward cohort must also pass all readiness tests.  This bot
+# remains a signal bot and never places an exchange order.
+REAL_MONEY_SIGNALS = os.getenv("REAL_MONEY_SIGNALS", "false").lower() == "true"
+REAL_MONEY_MIN_FORWARD = int(os.getenv("REAL_MONEY_MIN_FORWARD", "50"))
+REAL_MONEY_MIN_UNIQUE_SYMBOLS = int(
+    os.getenv("REAL_MONEY_MIN_UNIQUE_SYMBOLS", "25")
+)
+REAL_MONEY_MIN_SUCCESS_RATE = float(
+    os.getenv("REAL_MONEY_MIN_SUCCESS_RATE", "0.50")
+)
+REAL_MONEY_MIN_EXPECTANCY_R = float(
+    os.getenv("REAL_MONEY_MIN_EXPECTANCY_R", "0.20")
+)
+REAL_MONEY_RECENT_WINDOW = int(os.getenv("REAL_MONEY_RECENT_WINDOW", "25"))
+MICRO_LIVE_RISK_MULT = float(os.getenv("MICRO_LIVE_RISK_MULT", "0.02"))
+MICRO_LIVE_GUARD_MIN_OUTCOMES = int(
+    os.getenv("MICRO_LIVE_GUARD_MIN_OUTCOMES", "5")
+)
+MICRO_LIVE_GUARD_WINDOW = int(os.getenv("MICRO_LIVE_GUARD_WINDOW", "10"))
+MICRO_LIVE_MAX_NONPROFIT_STREAK = int(
+    os.getenv("MICRO_LIVE_MAX_NONPROFIT_STREAK", "3")
+)
+MICRO_LIVE_MAX_DRAWDOWN_R = float(
+    os.getenv("MICRO_LIVE_MAX_DRAWDOWN_R", "3.0")
+)
 # The detector still needs a real directional impulse, but entry is no longer
 # allowed at the first hot print.  It must survive the retest state machine.
 PAPER_EDGE_MIN = float(os.getenv("PAPER_EDGE_MIN", "0.0120"))
@@ -2759,10 +2833,10 @@ PAPER_SHORT_MIN_DIRECTIONAL_15M = float(
     os.getenv("PAPER_SHORT_MIN_DIRECTIONAL_15M", "0.0280")
 )
 PAPER_PILOT_REQUIRED_OUTCOMES = int(
-    os.getenv("PAPER_PILOT_REQUIRED_OUTCOMES", "10")
+    os.getenv("PAPER_PILOT_REQUIRED_OUTCOMES", "25")
 )
 PAPER_REVIEW_REQUIRED_OUTCOMES = int(
-    os.getenv("PAPER_REVIEW_REQUIRED_OUTCOMES", "25")
+    os.getenv("PAPER_REVIEW_REQUIRED_OUTCOMES", "50")
 )
 # Twenty-five trades are a manual quality review, not enough evidence to let a
 # model touch signals.  Promotion stays frozen until at least 50 unchanged,
@@ -2945,6 +3019,7 @@ LOCAL_STOP_MODES = {
     "V17_2_SWEEP_REVERSAL_LONG", "V17_2_SWEEP_REVERSAL_SHORT",
     "V17_2_CONFIRMED_CONTINUATION_LONG", "V17_2_CONFIRMED_CONTINUATION_SHORT",
     "V17_2_CONFIRMED_REVERSAL_LONG", "V17_2_CONFIRMED_REVERSAL_SHORT",
+    "V17_2_1_MEASURED_EDGE_LONG", "V17_2_1_MEASURED_EDGE_SHORT",
 }
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 # A+ did not outperform B in the newest 50 outcomes. Grade still ranks a setup,
@@ -3164,7 +3239,7 @@ def base_asset(symbol: str) -> str:
 
 def default_watch_audit() -> Dict[str, Any]:
     return {
-        "version": "V17.2",
+        "version": "V17.2.1",
         "liquidity_checked": 0,
         "liquidity_passed": 0,
         "liquidity_rejected": 0,
@@ -3185,8 +3260,7 @@ def default_watch_audit() -> Dict[str, Any]:
             "SHORT": {"started": 0, "confirmed": 0, "rejected": 0},
         },
         "by_lane": {
-            "CONTINUATION": {"started": 0, "confirmed": 0, "rejected": 0},
-            "SWEEP_REVERSAL": {"started": 0, "confirmed": 0, "rejected": 0},
+            "MEASURED_EDGE": {"started": 0, "confirmed": 0, "rejected": 0},
         },
         "recent": [],
     }
@@ -3271,7 +3345,7 @@ def load_state() -> Dict[str, Any]:
         base.setdefault("last_paper_checkpoint_count", 0)
         base.setdefault("last_paper_cohort_report_count", 0)
         audit = base.setdefault("watch_audit_v17_2", default_watch_audit())
-        if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2":
+        if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.1":
             base["watch_audit_v17_2"] = default_watch_audit()
         base.setdefault("last_pending_monitor", {})
         outbox = base.setdefault("telegram_outbox", [])
@@ -4053,7 +4127,7 @@ def paper_validation_metrics() -> Dict[str, Any]:
 
 
 def paper_lane_metrics() -> Dict[str, Dict[str, Any]]:
-    """Separate continuation and reversal evidence inside the V17.2 cohort."""
+    """V17.2.1 has one frozen measured A+ impulse cohort."""
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         rows = conn.execute(
@@ -4061,12 +4135,7 @@ def paper_lane_metrics() -> Dict[str, Dict[str, Any]]:
             "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
             (PAPER_VALIDATION_REASON,),
         ).fetchall()
-    grouped: Dict[str, List[Any]] = {"CONTINUATION": [], "SWEEP_REVERSAL": []}
-    for row in rows:
-        strategy = str(row["strategy"] or "").upper()
-        lane = "SWEEP_REVERSAL" if "REVERSAL" in strategy else "CONTINUATION"
-        grouped[lane].append(row)
-    return {lane: _outcome_metrics(values) for lane, values in grouped.items()}
+    return {"MEASURED_EDGE": _outcome_metrics(rows)}
 
 
 def control_validation_metrics() -> Dict[str, Any]:
@@ -4083,6 +4152,124 @@ def control_validation_metrics() -> Dict[str, Any]:
         {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
     )
     return metrics
+
+
+def micro_live_circuit_breaker() -> Dict[str, Any]:
+    """Stop new real-money alerts after a small, explicit evidence failure.
+
+    This guard is deliberately independent of the adaptive model.  Once it
+    blocks, new candidates go back to visible PAPER until the deployment is
+    reviewed; changing the model cannot silently reset real-money losses.
+    """
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, result, pnl_r, symbol FROM adaptive_trades "
+            "WHERE COALESCE(decision_reason, '')=? "
+            "ORDER BY closed_at ASC, id ASC",
+            (REAL_MONEY_LIVE_REASON,),
+        ).fetchall()
+
+    window_size = max(1, MICRO_LIVE_GUARD_WINDOW)
+    recent_rows = rows[-window_size:]
+    recent = _outcome_metrics(recent_rows)
+    nonprofit_streak = 0
+    for row in reversed(rows):
+        if str(row["result"] or "") == "profit":
+            break
+        nonprofit_streak += 1
+
+    equity = peak = 0.0
+    max_drawdown = 0.0
+    for row in rows:
+        equity += float(row["pnl_r"] or 0.0)
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+
+    enough_for_window_test = len(recent_rows) >= max(
+        1, MICRO_LIVE_GUARD_MIN_OUTCOMES
+    )
+    checks = {
+        "nonprofit_streak_ok": nonprofit_streak
+        < max(1, MICRO_LIVE_MAX_NONPROFIT_STREAK),
+        "drawdown_ok": max_drawdown <= MICRO_LIVE_MAX_DRAWDOWN_R,
+        "rolling_tp3_majority": (
+            not enough_for_window_test
+            or float(recent.get("success_rate", 0.0) or 0.0) > 0.50
+        ),
+        "rolling_expectancy_positive": (
+            not enough_for_window_test
+            or float(recent.get("expectancy_r", 0.0) or 0.0) > 0.0
+        ),
+    }
+    allowed = all(checks.values())
+    return {
+        "allowed": allowed,
+        "checks": checks,
+        "closed_micro_live": len(rows),
+        "recent": recent,
+        "recent_window": window_size,
+        "nonprofit_streak": nonprofit_streak,
+        "max_drawdown_r": max_drawdown,
+    }
+
+
+def real_money_readiness() -> Dict[str, Any]:
+    """Evidence gate for limited LIVE alerts; it never places exchange orders."""
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, result, pnl_r, symbol FROM adaptive_trades "
+            "WHERE COALESCE(decision_reason, '')=? "
+            "ORDER BY closed_at ASC, id ASC",
+            (PAPER_VALIDATION_REASON,),
+        ).fetchall()
+
+    cumulative = _outcome_metrics(rows)
+    recent_window = max(1, REAL_MONEY_RECENT_WINDOW)
+    recent_rows = rows[-recent_window:]
+    recent = _outcome_metrics(recent_rows)
+    unique_symbols = len(
+        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
+    )
+    equity = peak = 0.0
+    max_drawdown = 0.0
+    for row in rows:
+        equity += float(row["pnl_r"] or 0.0)
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+
+    total = int(cumulative.get("n", 0) or 0)
+    success = float(cumulative.get("success_rate", 0.0) or 0.0)
+    expectancy = float(cumulative.get("expectancy_r", 0.0) or 0.0)
+    recent_success = float(recent.get("success_rate", 0.0) or 0.0)
+    recent_expectancy = float(recent.get("expectancy_r", 0.0) or 0.0)
+    micro_live_guard = micro_live_circuit_breaker()
+    checks = {
+        "enough_forward": total >= max(1, REAL_MONEY_MIN_FORWARD),
+        "enough_unique_symbols": unique_symbols >= max(1, REAL_MONEY_MIN_UNIQUE_SYMBOLS),
+        "tp3_majority": success > REAL_MONEY_MIN_SUCCESS_RATE,
+        "positive_expectancy": expectancy >= REAL_MONEY_MIN_EXPECTANCY_R,
+        "recent_block_complete": len(recent_rows) >= recent_window,
+        "recent_tp3_majority": recent_success > REAL_MONEY_MIN_SUCCESS_RATE,
+        "recent_positive_expectancy": recent_expectancy > 0.0,
+        "drawdown_guard": max_drawdown <= 5.0,
+        "micro_live_circuit": bool(micro_live_guard.get("allowed")),
+    }
+    ready = all(checks.values())
+    return {
+        "ready": ready,
+        "live_flag": REAL_MONEY_SIGNALS,
+        "live_enabled": bool(ready and REAL_MONEY_SIGNALS),
+        "checks": checks,
+        "cumulative": cumulative,
+        "recent": recent,
+        "unique_symbols": unique_symbols,
+        "max_drawdown_r": max_drawdown,
+        "required_forward": REAL_MONEY_MIN_FORWARD,
+        "required_unique_symbols": REAL_MONEY_MIN_UNIQUE_SYMBOLS,
+        "micro_live_circuit": micro_live_guard,
+    }
 
 
 def next_model_analysis_target() -> int:
@@ -4146,7 +4333,7 @@ def format_paper_cohort_report(window: int = 25) -> str:
         )
         stage = f"РАННИЙ ЧЕКПОИНТ {n_total}/{PAPER_PILOT_REQUIRED_OUTCOMES}"
         decision = (
-            "РАННИЙ ЧЕКПОИНТ ПОЛОЖИТЕЛЬНЫЙ: продолжаем без изменения правил до 25 PAPER."
+            "РАННИЙ ЧЕКПОИНТ ПОЛОЖИТЕЛЬНЫЙ: продолжаем без изменения правил до 50 PAPER."
             if passed
             else "РАННИЙ ЧЕКПОИНТ СЛАБЫЙ: LIVE запрещён; параметры не меняются до ручного разбора."
         )
@@ -4159,11 +4346,11 @@ def format_paper_cohort_report(window: int = 25) -> str:
             >= PAPER_PILOT_MIN_EXPECTANCY_R
             and unique_total >= max(12, PAPER_MIN_UNIQUE_SYMBOLS_PILOT)
         )
-        stage = f"РУЧНОЙ QUALITY REVIEW {n_total}/{PAPER_REVIEW_REQUIRED_OUTCOMES}"
+        stage = f"ПОЛНАЯ FORWARD-ПРОВЕРКА {n_total}/{PAPER_REVIEW_REQUIRED_OUTCOMES}"
         decision = (
-            "25 PAPER прошли цель качества; продолжаем неизменную выборку до 50, LIVE всё ещё запрещён."
+            "50 PAPER прошли первичную цель; окончательное решение принимает отдельный readiness gate."
             if passed
-            else "25 PAPER не доказали преимущество; реальные деньги запрещены, нужен разбор двух линий."
+            else "50 PAPER не доказали преимущество; реальные деньги запрещены."
         )
     elif n_total >= PAPER_LANE_REQUIRED_OUTCOMES:
         passed = bool(
@@ -4175,7 +4362,7 @@ def format_paper_cohort_report(window: int = 25) -> str:
         )
         stage = f"ПОЛНАЯ ПРОВЕРКА {n_total}/{PAPER_LANE_REQUIRED_OUTCOMES}"
         decision = (
-            "PAPER ПРОШЁЛ: можно готовить отдельный ограниченный micro-LIVE-аудит."
+            "PAPER ПРОШЁЛ: проверяем последние 25, разнообразие символов и drawdown перед micro-LIVE."
             if passed
             else "PAPER НЕ ПРОШЁЛ: реальные деньги запрещены; champion не меняется."
         )
@@ -4185,14 +4372,13 @@ def format_paper_cohort_report(window: int = 25) -> str:
         decision = "Параметры остаются замороженными до полной forward-проверки."
 
     return (
-        "🧾 V17.2 — ОТЧЁТ ПОДТВЕРЖДЁННЫХ PAPER\n"
+        "🧾 V17.2.1 — ОТЧЁТ MEASURED EDGE PAPER\n"
         f"Этап: {stage}\n"
         f"Последний блок: ID {first_id}–{last_id} · {_metrics_line(block)} · "
         f"уникальных монет {unique_block}\n"
-        f"Накоплено V17.2 PAPER: {_metrics_line(cumulative)} · "
+        f"Накоплено V17.2.1 PAPER: {_metrics_line(cumulative)} · "
         f"уникальных монет {unique_total}\n"
-        f"CONTINUATION: {_metrics_line(lanes['CONTINUATION'])}\n"
-        f"SWEEP/REVERSAL: {_metrics_line(lanes['SWEEP_REVERSAL'])}\n"
+        f"MEASURED EDGE: {_metrics_line(lanes['MEASURED_EDGE'])}\n"
         f"{watch_audit_summary()}\n"
         f"Решение: {decision}\n"
         "Важно: отчёт ничего не меняет автоматически и не разрешает реальную торговлю."
@@ -4211,6 +4397,7 @@ def closed_outcome_progress_message(
     metrics = _source_breakdown(rows)
     control_metrics = control_validation_metrics()
     paper_metrics = paper_validation_metrics()
+    readiness = real_money_readiness()
     paper_count = int(paper_metrics.get("n", 0) or 0)
     paper_target = paper_progress_target(paper_count)
     total = int(metrics["all"]["n"])
@@ -4233,10 +4420,12 @@ def closed_outcome_progress_message(
         f"ВСЕГО: {_metrics_line(metrics['all'])}\n"
         f"LIVE: {_metrics_line(metrics['live'])}\n"
         f"SHADOW/PAPER: {_metrics_line(metrics['shadow'])}\n"
-        f"CONTROL/WATCH V17.2: {_metrics_line(control_metrics)}\n"
-        f"LIQUIDITY DUAL PAPER V17.2: {_metrics_line(paper_metrics)} · "
+        f"CONTROL V17.2.1: {_metrics_line(control_metrics)}\n"
+        f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(paper_metrics)} · "
         f"{paper_count}/{paper_target}\n"
-        f"Допустимых для модели V17.2 PAPER: {adaptive_model_data_count()}\n"
+        f"Допустимых для модели V17.2.1 PAPER: {adaptive_model_data_count()}\n"
+        f"Готовность micro-LIVE: {readiness.get('ready', False)} · "
+        f"разрешающий флаг: {readiness.get('live_flag', False)}\n"
         f"{watch_audit_summary()}\n"
         f"{backup_line}"
     )
@@ -4310,7 +4499,7 @@ def maybe_send_auto_backup() -> Dict[str, Any]:
         if send_telegram_document(
             build_export_bytes(),
             filename,
-            f"🧠 V17.2 {caption_reason} · total {closed_count} · confirmed PAPER {paper_count}",
+            f"🧠 V17.2.1 {caption_reason} · total {closed_count} · measured PAPER {paper_count}",
         ):
             if total_due:
                 STATE["last_backup_closed_count"] = closed_count
@@ -4360,6 +4549,97 @@ def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dic
     STATE["last_error"] = last_err or "unknown API error"
     save_state()
     return None
+
+
+def _book_level(level: Any) -> Tuple[float, float]:
+    """Read one public order-book level across BingX response variants."""
+    try:
+        if isinstance(level, dict):
+            price = float(level.get("price") or level.get("p") or 0.0)
+            quantity = float(
+                level.get("quantity") or level.get("qty") or level.get("q") or 0.0
+            )
+            return price, quantity
+        if isinstance(level, (list, tuple)) and len(level) >= 2:
+            return float(level[0]), float(level[1])
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def execution_book_snapshot(symbol: str) -> Dict[str, Any]:
+    """Best bid/ask and shallow executable depth at the candidate moment.
+
+    The endpoint is called only after the candle setup passes, so it does not
+    overload the market-data allowance during the universe scan.  A failed or
+    malformed book is a rejection for real-grade PAPER; unknown execution cost
+    must never be interpreted as good liquidity.
+    """
+    normalized = normalize_symbol(symbol)
+    bid = ask = bid_qty = ask_qty = 0.0
+    response = get_json(
+        "/openApi/swap/v2/quote/bookTicker", {"symbol": normalized}
+    )
+    data: Any = response.get("data") if isinstance(response, dict) else None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if isinstance(data, dict):
+        try:
+            bid = float(data.get("bidPrice") or data.get("bid") or 0.0)
+            ask = float(data.get("askPrice") or data.get("ask") or 0.0)
+            bid_qty = float(
+                data.get("bidQty") or data.get("bidQuantity") or 0.0
+            )
+            ask_qty = float(
+                data.get("askQty") or data.get("askQuantity") or 0.0
+            )
+        except Exception:
+            bid = ask = bid_qty = ask_qty = 0.0
+
+    # Fallback also gives several levels for a less fragile depth estimate.
+    bids: List[Any] = []
+    asks: List[Any] = []
+    depth_response: Optional[Dict[str, Any]] = None
+    if bid <= 0 or ask <= bid or bid_qty <= 0 or ask_qty <= 0:
+        depth_response = get_json(
+            "/openApi/swap/v2/quote/depth",
+            {"symbol": normalized, "limit": 5},
+        )
+    depth_data: Any = (
+        depth_response.get("data") if isinstance(depth_response, dict) else None
+    )
+    if isinstance(depth_data, dict):
+        bids = list(depth_data.get("bids") or [])[:5]
+        asks = list(depth_data.get("asks") or [])[:5]
+        if bids and asks:
+            bid, bid_qty = _book_level(bids[0])
+            ask, ask_qty = _book_level(asks[0])
+
+    if bid <= 0 or ask <= bid:
+        return {
+            "ok": False,
+            "reason": "public BingX bid/ask unavailable",
+            "spread_bps": 999.0,
+            "depth_usdt": 0.0,
+        }
+
+    mid = (bid + ask) / 2.0
+    spread_bps = (ask - bid) / max(mid, 1e-12) * 10_000.0
+    if bids and asks:
+        bid_depth = sum(price * qty for price, qty in map(_book_level, bids))
+        ask_depth = sum(price * qty for price, qty in map(_book_level, asks))
+    else:
+        bid_depth = bid * max(0.0, bid_qty)
+        ask_depth = ask * max(0.0, ask_qty)
+    depth_usdt = min(bid_depth, ask_depth)
+    return {
+        "ok": True,
+        "reason": "book available",
+        "bid": bid,
+        "ask": ask,
+        "spread_bps": spread_bps,
+        "depth_usdt": depth_usdt,
+    }
 
 
 def parse_klines(raw: Any) -> Optional[List[Dict[str, float]]]:
@@ -4806,7 +5086,16 @@ def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
     LIQUIDITY_SCAN_CACHE.clear()
     scored: List[Tuple[float, str, str, Dict[str, Any]]] = []
     notes: List[str] = []
-    scan_symbols = symbols[:MAX_ANALYZE_SYMBOLS]
+    # Rotate through the complete contract universe instead of repeatedly
+    # checking the same cached first 220 names for ten minutes.  Quality bases
+    # remain in the universe, while every listed contract gets a timely pass.
+    if symbols:
+        cursor = int(STATE.get("symbol_scan_cursor", 0) or 0) % len(symbols)
+        take = min(len(symbols), max(1, MAX_ANALYZE_SYMBOLS))
+        scan_symbols = [symbols[(cursor + offset) % len(symbols)] for offset in range(take)]
+        STATE["symbol_scan_cursor"] = (cursor + take) % len(symbols)
+    else:
+        scan_symbols = []
 
     # V16.6.5: network-bound candle requests must not run one symbol at a time.
     # The old sequential pass took more than three minutes, so a live impulse
@@ -6042,6 +6331,120 @@ def v17_2_paper_risk_gate(
     )
 
 
+def measured_edge_entry_gate(
+    setup: Dict[str, Any],
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+) -> Tuple[bool, str]:
+    """Frozen V17.2.1 cohort and real execution-cost check.
+
+    The measured candle band comes from the complete archive; the order-book
+    check is new forward evidence and is intentionally unavailable to the old
+    rows.  A candidate must pass both.  No parameter in this function is
+    changed automatically while the 50-outcome cohort is being collected.
+    """
+    side = str(setup.get("side", "")).upper()
+    direction = 1.0 if side == "LONG" else -1.0
+    grade = str(setup.get("grade", "B")).upper()
+    strategy = str(setup.get("strategy", "")).upper()
+    directional_3m = direction * float(setup.get("ch3m_1m", 0.0) or 0.0)
+    directional_15m = direction * float(setup.get("ch15m", 0.0) or 0.0)
+    vol1 = float(setup.get("vol1", 0.0) or 0.0)
+    range1 = float(setup.get("range1", 0.0) or 0.0)
+    vol5 = float(setup.get("volume_ratio", 0.0) or 0.0)
+    range5 = float(setup.get("range_ratio", 0.0) or 0.0)
+
+    failures: List[str] = []
+    if grade != "A+":
+        failures.append("grade is not A+")
+    if strategy != PAPER_INSTANT_STRATEGIES.get(side, ""):
+        failures.append("not PRO_INSTANT_EDGE")
+    if not MEASURED_MIN_VOL1 <= vol1 <= MEASURED_MAX_VOL1:
+        failures.append(
+            f"Vol1 x{vol1:.2f} outside x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f}"
+        )
+    if not MEASURED_MIN_RANGE1 <= range1 <= MEASURED_MAX_RANGE1:
+        failures.append(
+            f"Range1 x{range1:.2f} outside x{MEASURED_MIN_RANGE1:.2f}–x{MEASURED_MAX_RANGE1:.2f}"
+        )
+    if not MEASURED_MIN_DIRECTIONAL_3M <= directional_3m <= MEASURED_MAX_DIRECTIONAL_3M:
+        failures.append(
+            f"directional 3m {directional_3m*100:.2f}% outside "
+            f"{MEASURED_MIN_DIRECTIONAL_3M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_3M*100:.2f}%"
+        )
+    if not MEASURED_MIN_DIRECTIONAL_15M <= directional_15m <= MEASURED_MAX_DIRECTIONAL_15M:
+        failures.append(
+            f"directional 15m {directional_15m*100:.2f}% outside "
+            f"{MEASURED_MIN_DIRECTIONAL_15M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_15M*100:.2f}%"
+        )
+    if not MEASURED_MIN_VOL5 <= vol5 <= MEASURED_MAX_VOL5:
+        failures.append(
+            f"Vol5 x{vol5:.2f} outside x{MEASURED_MIN_VOL5:.2f}–x{MEASURED_MAX_VOL5:.2f}"
+        )
+    if range5 < MEASURED_MIN_RANGE5:
+        failures.append(f"Range5 x{range5:.2f} < x{MEASURED_MIN_RANGE5:.2f}")
+    if failures:
+        return False, "; ".join(failures)
+
+    liquidity = candle_liquidity_snapshot(symbol, c1, c5)
+    cached = LIQUIDITY_SCAN_CACHE.get(normalize_symbol(symbol), {})
+    rank = float(cached.get("rank_percentile", 0.0) or 0.0)
+    quote_60m = float(liquidity.get("quote_60m", 0.0) or 0.0)
+    if not bool(liquidity.get("ok")):
+        return False, f"liquidity continuity rejected: {liquidity.get('reason', 'unknown')}"
+    if rank < MEASURED_MIN_LIQUIDITY_RANK:
+        return False, f"liquidity rank p{rank*100:.0f} below p{MEASURED_MIN_LIQUIDITY_RANK*100:.0f}"
+    if quote_60m < MEASURED_MIN_QUOTE_60M:
+        return False, (
+            f"60m quote-turnover proxy {quote_60m:.0f} < {MEASURED_MIN_QUOTE_60M:.0f}"
+        )
+
+    book = execution_book_snapshot(symbol)
+    spread_bps = float(book.get("spread_bps", 999.0) or 999.0)
+    depth_usdt = float(book.get("depth_usdt", 0.0) or 0.0)
+    if not bool(book.get("ok")):
+        return False, str(book.get("reason", "order book unavailable"))
+    if spread_bps > MEASURED_MAX_BOOK_SPREAD_BPS:
+        return False, (
+            f"spread {spread_bps:.1f} bps > {MEASURED_MAX_BOOK_SPREAD_BPS:.1f} bps"
+        )
+    if depth_usdt < MEASURED_MIN_BOOK_DEPTH_USDT:
+        return False, (
+            f"visible depth {depth_usdt:.0f} USDT < {MEASURED_MIN_BOOK_DEPTH_USDT:.0f}"
+        )
+
+    mark_entry = float(setup.get("entry", 0.0) or 0.0)
+    executable_entry = float(
+        book.get("ask" if side == "LONG" else "bid", mark_entry) or mark_entry
+    )
+    if executable_entry <= 0:
+        return False, "invalid executable bid/ask"
+    setup["execution_mark_entry"] = mark_entry
+    setup["entry"] = executable_entry
+    setup["book_spread_bps"] = spread_bps
+    setup["book_depth_usdt"] = depth_usdt
+    setup["liquidity_quote_60m"] = quote_60m
+    setup["liquidity_rank_percentile"] = rank
+    setup["liquidity_active_fraction"] = float(
+        liquidity.get("active_fraction", 0.0) or 0.0
+    )
+    setup["liquidity_unique_fraction"] = float(
+        liquidity.get("unique_fraction", 0.0) or 0.0
+    )
+    setup["atr1_pct"] = float(liquidity.get("atr1_pct", 0.0) or 0.0)
+    setup["normalized_directional_move"] = directional_3m / max(
+        float(setup["atr1_pct"] or 0.0), 1e-6
+    )
+    setup["paper_setup_lane"] = "MEASURED_EDGE"
+    setup["watch_impulse"] = directional_3m
+    return True, (
+        f"measured cohort passed: Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
+        f"3m {directional_3m*100:.2f}%, 15m {directional_15m*100:.2f}%, "
+        f"spread {spread_bps:.1f} bps, depth {depth_usdt:.0f} USDT, liq p{rank*100:.0f}"
+    )
+
+
 def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
     side = setup["side"]
     entry = setup["entry"]
@@ -6750,11 +7153,11 @@ def analyze_symbol(
         blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
         return None
 
-    # V17.2 is a clean forward experiment.  It does not pass through the old
-    # no_fast / MARKET_DUMP / TP5-feasibility funnel: those rules generated the
-    # negative 400-outcome history and then made V17.1 silent.  Every candidate
-    # below is still PAPER-only and must survive the independent WATCH state
-    # machine plus the TP3-aligned risk gate.
+    # V17.2.1 tests one frozen, measured hypothesis.  The complete 500-outcome
+    # audit showed that late retest/reclaim entries destroyed the edge, while a
+    # moderate A+ INSTANT band was the only sizable historical cohort with TP3+
+    # majority and positive expectancy.  New matches are immediate PAPER at an
+    # executable bid/ask; old outcomes remain audit-only.
     if PRO_QUALITY_FORWARD_ENABLED:
         forward_candidates: List[Dict[str, Any]] = []
         for side in ("LONG", "SHORT"):
@@ -6764,56 +7167,135 @@ def analyze_symbol(
             if side == "SHORT" and not ALLOW_SHORT:
                 blocks["short_disabled"] = blocks.get("short_disabled", 0) + 1
                 continue
-            setup, setup_reason = v17_2_dual_paper_setup(
-                symbol, c1, c5, c15, c1h, btc, side
-            )
+            setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
             if not setup:
-                if setup_reason.startswith("liquidity rejected"):
-                    key = "v17_2_liquidity_block"
-                elif setup_reason.startswith("flow rejected"):
-                    key = "v17_2_flow_block"
-                else:
-                    key = f"v17_2_no_setup_{side.lower()}"
+                key = f"v17_2_1_no_instant_{side.lower()}"
                 blocks[key] = blocks.get(key, 0) + 1
                 continue
 
-            independent, independence_reason = paper_symbol_independence_gate(setup)
-            if not independent:
-                blocks["v17_2_correlated_repeat"] = blocks.get(
-                    "v17_2_correlated_repeat", 0
+            entry_ok, entry_reason = measured_edge_entry_gate(
+                setup, symbol, c1, c5
+            )
+            if not entry_ok:
+                blocks["v17_2_1_measured_band_block"] = blocks.get(
+                    "v17_2_1_measured_band_block", 0
                 ) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(
+                        f"{display_symbol(symbol)} {side}: {entry_reason}"
+                    )
                 continue
+
             trade = calculate_fast_trade(setup, c1, c5)
             if not trade:
-                blocks["v17_2_sl_structure_block"] = blocks.get(
-                    "v17_2_sl_structure_block", 0
+                blocks["v17_2_1_sl_structure_block"] = blocks.get(
+                    "v17_2_1_sl_structure_block", 0
                 ) + 1
                 continue
+
+            quality_ok, quality_block, quality_reason = professional_quality_gate(
+                trade, symbol
+            )
+            if not quality_ok:
+                blocks[quality_block] = blocks.get(quality_block, 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(quality_reason)
+                continue
+            trader_ok, trader_block, trader_reason = trader_pattern_gate(
+                trade, symbol, c1, c5, c15, btc
+            )
+            if not trader_ok:
+                blocks[trader_block] = blocks.get(trader_block, 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(trader_reason)
+                continue
+
             risk_ok, risk_reason = v17_2_paper_risk_gate(trade, symbol, c1, c5)
             if not risk_ok:
-                blocks["v17_2_tp3_risk_block"] = blocks.get(
-                    "v17_2_tp3_risk_block", 0
+                blocks["v17_2_1_tp3_risk_block"] = blocks.get(
+                    "v17_2_1_tp3_risk_block", 0
                 ) + 1
                 if len(near_miss) < 8:
                     near_miss.append(
                         f"{display_symbol(symbol)} {side}: {risk_reason}"
                     )
                 continue
+
+            independent, independence_reason = paper_symbol_independence_gate(trade)
+            if not independent:
+                blocks["v17_2_1_correlated_repeat"] = blocks.get(
+                    "v17_2_1_correlated_repeat", 0
+                ) + 1
+                continue
+
+            trade["strategy"] = f"PRO_MEASURED_EDGE_{side}"
+            trade["trade_type"] = f"MEASURED A+ EDGE {side}"
+            trade["setup_mode"] = f"V17_2_1_MEASURED_EDGE_{side}"
+            trade["paper_setup_lane"] = "MEASURED_EDGE"
+            trade["paper_validation_lane"] = PAPER_VALIDATION_REASON
+            trade["paper_validation_immediate"] = True
             trade["v17_2_risk_reason"] = risk_reason
             trade["paper_validation_origin"] = (
-                f"{trade.get('paper_validation_origin', '')} · {risk_reason} · "
+                f"V17.2.1 frozen measured A+ cohort · {entry_reason} · "
+                f"{quality_reason} · {trader_reason} · {risk_reason} · "
                 f"{independence_reason}"
             )
+            # A promoted model may only influence a stable canary fraction of
+            # LIVE alerts.  It never removes a candidate from the visible PAPER
+            # baseline, which avoids selection bias in the next audit.
+            try:
+                adaptive_ok, adaptive_reason, adaptive_probability = adaptive_gate(
+                    trade
+                )
+                trade["adaptive_selection_reason"] = adaptive_reason
+                if adaptive_probability is not None:
+                    trade["adaptive_probability"] = adaptive_probability
+            except Exception as exc:
+                adaptive_ok = False
+                adaptive_reason = f"adaptive safety fallback to PAPER: {repr(exc)}"
+                trade["adaptive_selection_reason"] = adaptive_reason
+                STATE["last_error"] = adaptive_reason
+
+            readiness = real_money_readiness()
+            live_enabled = bool(readiness.get("live_enabled")) and bool(adaptive_ok)
+            trade["paper_validation_only"] = not live_enabled
+            if live_enabled:
+                symbol_ok, symbol_reason = symbol_quarantine_gate(trade)
+                if not symbol_ok:
+                    blocks["micro_live_symbol_quarantine"] = blocks.get(
+                        "micro_live_symbol_quarantine", 0
+                    ) + 1
+                    continue
+                cooldown_allowed, cooldown_reason = cooldown_ok(
+                    symbol, trade["strategy"]
+                )
+                if not cooldown_allowed:
+                    blocks["micro_live_cooldown"] = blocks.get(
+                        "micro_live_cooldown", 0
+                    ) + 1
+                    continue
+                trade["symbol_quarantine_reason"] = symbol_reason
+                trade["adaptive_reason"] = REAL_MONEY_LIVE_REASON
+                trade["risk_mult"] = min(
+                    float(trade.get("risk_mult", MICRO_LIVE_RISK_MULT) or MICRO_LIVE_RISK_MULT),
+                    MICRO_LIVE_RISK_MULT,
+                )
+            else:
+                trade["adaptive_reason"] = (
+                    f"PAPER lock: {int(readiness.get('cumulative', {}).get('n', 0) or 0)}/"
+                    f"{REAL_MONEY_MIN_FORWARD} new outcomes; live flag={REAL_MONEY_SIGNALS}; "
+                    f"model={adaptive_reason}"
+                )
             forward_candidates.append(trade)
-            lane = str(trade.get("paper_setup_lane", "?"))
-            blocks[f"v17_2_watch_{lane.lower()}"] = blocks.get(
-                f"v17_2_watch_{lane.lower()}", 0
+            blocks["v17_2_1_measured_candidate"] = blocks.get(
+                "v17_2_1_measured_candidate", 0
             ) + 1
             if len(near_miss) < 8:
                 near_miss.append(
-                    f"{display_symbol(symbol)} {side}: {lane} WATCH · "
-                    f"A{'+' if trade.get('grade') == 'A+' else ''} · "
-                    f"3m {float(trade.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}%"
+                    f"{display_symbol(symbol)} {side}: MEASURED A+ "
+                    f"{'micro-LIVE' if live_enabled else 'PAPER'} · "
+                    f"3m {float(trade.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}% · "
+                    f"spread {float(trade.get('book_spread_bps', 0.0) or 0.0):.1f} bps"
                 )
         if not forward_candidates:
             return None
@@ -6825,7 +7307,20 @@ def analyze_symbol(
             ),
             reverse=True,
         )
-        return forward_candidates[0]
+        selected = forward_candidates[0]
+        audit_item = dict(selected)
+        audit_item["pending_started_at"] = now_ts()
+        record_watch_audit(
+            audit_item,
+            "started",
+            str(selected.get("paper_validation_origin", "measured candidate")),
+        )
+        record_watch_audit(
+            audit_item,
+            "confirmed",
+            str(selected.get("v17_2_risk_reason", "risk passed")),
+        )
+        return selected
 
     candidates: List[Dict[str, Any]] = []
     shadow_observed = False
@@ -7061,8 +7556,13 @@ def format_price(x: Optional[float]) -> str:
 
 def build_signal_message(s: Dict[str, Any]) -> str:
     arrow = "🟢" if s["side"] == "LONG" else "🔴"
+    live_header = (
+        "🛡 ОГРАНИЧЕННЫЙ MICRO-LIVE СИГНАЛ — forward gate пройден\n"
+        if str(s.get("strategy", "")).startswith("PRO_MEASURED_EDGE_")
+        else ""
+    )
     return (
-        f"{arrow} {s['side']} {display_symbol(s['symbol'])}\n"
+        f"{live_header}{arrow} {s['side']} {display_symbol(s['symbol'])}\n"
         f"Класс: {s['grade']} · Score {s['score']} · {s['trade_type']}\n"
         f"Стратегия: {s['strategy']}\n\n"
         f"Вход: {format_price(s['entry'])}\n"
@@ -7074,7 +7574,7 @@ def build_signal_message(s: Dict[str, Any]) -> str:
         f"Учёт результата: TP1/TP2 промежуточные; profit только после TP3.\n"
         f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
         f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
-        f"Риск: multiplier x{s['risk_mult']:.2f}\n"
+        f"Риск: multiplier x{s['risk_mult']:.2f}; для первого micro-LIVE рисковать не более 0.10% счёта\n"
         f"Evidence guard: {s.get('evidence_guard_reason', 'not evaluated')}\n"
         f"Symbol guard: {s.get('symbol_quarantine_reason', 'no history')}\n"
         f"Adaptive: {s.get('adaptive_reason', 'warm-up')}\n\n"
@@ -7088,11 +7588,11 @@ def build_signal_message(s: Dict[str, Any]) -> str:
 
 def build_paper_signal_message(s: Dict[str, Any]) -> str:
     return (
-        "📋 PAPER-ВХОД V17.2 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
+        "📋 PAPER-ВХОД V17.2.1 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
         f"{s['side']} {display_symbol(s['symbol'])} · {s['grade']} · Score {s['score']}\n"
-        f"Линия: {s.get('paper_setup_lane', 'CONTINUATION')}\n"
+        f"Линия: {s.get('paper_setup_lane', 'MEASURED_EDGE')}\n"
         f"Стратегия: {s['strategy']}\n"
-        "Статус: откат удержан, EMA/price reclaim подтверждён; только PAPER.\n\n"
+        "Статус: своевременный A+ impulse прошёл фиксированный measured-фильтр и проверку исполнения; только PAPER.\n\n"
         f"Вход наблюдения: {format_price(s['entry'])}\n"
         f"TP1: {format_price(s['tp1'])}\n"
         f"TP2: {format_price(s['tp2'])}\n"
@@ -7100,11 +7600,14 @@ def build_paper_signal_message(s: Dict[str, Any]) -> str:
         f"TP4: {format_price(s['tp4'])}\n"
         f"TP5: {format_price(s['tp5'])}\n"
         f"SL: {format_price(s['sl'])}\n\n"
-        f"WATCH → entry: {int(s.get('pending_confirmation_seconds', 0) or 0)}с · "
-        f"движение {float(s.get('pending_confirmation_move', 0.0) or 0.0)*100:+.2f}%\n"
-        f"Глубина отката: {float(s.get('pending_retest_depth', 0.0) or 0.0)*100:.2f}%\n"
+        f"Исполняемый вход: {'ASK' if s.get('side') == 'LONG' else 'BID'} · "
+        f"spread {float(s.get('book_spread_bps', 0.0) or 0.0):.1f} bps · "
+        f"видимая глубина ≈ {float(s.get('book_depth_usdt', 0.0) or 0.0):.0f} USDT\n"
+        f"Vol1 x{float(s.get('vol1', 0.0) or 0.0):.2f} · "
+        f"Range1 x{float(s.get('range1', 0.0) or 0.0):.2f} · "
+        f"3m {float(s.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}%\n"
         f"Почему PAPER: {s.get('paper_validation_origin', 'forward challenger')}\n"
-        f"Следующий отчёт: {paper_progress_target(int(paper_validation_metrics().get('n', 0) or 0))} закрытых V17.2 PAPER."
+        f"Следующий отчёт: {paper_progress_target(int(paper_validation_metrics().get('n', 0) or 0))} закрытых V17.2.1 PAPER."
     )
 
 
@@ -7130,7 +7633,7 @@ def build_paper_result_message(
         f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
         f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
         "Это результат подтверждённого виртуального входа, не реальная сделка.\n"
-        f"Liquidity Dual PAPER V17.2: {_metrics_line(paper_metrics)} · "
+        f"Measured Edge PAPER V17.2.1: {_metrics_line(paper_metrics)} · "
         f"собрано {int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
         f"уникальных монет {int(paper_metrics.get('unique_symbols', 0))}."
@@ -7226,8 +7729,9 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     near = scan.get("near_miss", [])[:8]
     control_metrics = control_validation_metrics()
     paper_metrics = paper_validation_metrics()
+    readiness = real_money_readiness()
     return (
-        f"🧪 Диагностика V17.2 Liquidity-First Dual PAPER\n"
+        f"🧪 Диагностика V17.2.1 Measured Edge Forward\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -7240,10 +7744,13 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
         f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"LIVE история: {wr_text(STATE.get('stats', {}).get('total', {}))}\n"
-        f"CONTROL/WATCH V17.2: {_metrics_line(control_metrics)}\n"
-        f"LIQUIDITY DUAL PAPER V17.2: {_metrics_line(paper_metrics)} · "
+        f"CONTROL V17.2.1: {_metrics_line(control_metrics)}\n"
+        f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(paper_metrics)} · "
         f"{int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))}\n"
+        f"Micro-LIVE readiness: ready={readiness.get('ready', False)} · "
+        f"env flag={readiness.get('live_flag', False)} · "
+        f"enabled={readiness.get('live_enabled', False)}\n"
         f"{watch_audit_summary()}\n\n"
         f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
         f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
@@ -7378,7 +7885,7 @@ def pending_key(signal: Dict[str, Any]) -> str:
 
 def _watch_audit_state() -> Dict[str, Any]:
     audit = STATE.setdefault("watch_audit_v17_2", default_watch_audit())
-    if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2":
+    if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.1":
         audit = default_watch_audit()
         STATE["watch_audit_v17_2"] = audit
     audit.setdefault("rejected", default_watch_audit()["rejected"].copy())
@@ -7391,7 +7898,7 @@ def _watch_audit_state() -> Dict[str, Any]:
 def record_watch_audit(
     item: Dict[str, Any], event: str, detail: str = ""
 ) -> None:
-    """Persist the V17.2 WATCH funnel so JSON backups explain every loss."""
+    """Persist the V17.2.1 measured-entry funnel for every JSON backup."""
     audit = _watch_audit_state()
     side = str(item.get("side", "UNKNOWN")).upper()
     lane = str(item.get("paper_setup_lane", "CONTINUATION")).upper()
@@ -7460,7 +7967,7 @@ def watch_audit_summary() -> str:
         )
     lane_text = ", ".join(lane_bits) or "нет"
     return (
-        f"WATCH V17.2: liquidity={int(audit.get('liquidity_passed', 0) or 0)}/"
+        f"FUNNEL V17.2.1: liquidity={int(audit.get('liquidity_passed', 0) or 0)}/"
         f"{int(audit.get('liquidity_checked', 0) or 0)} · "
         f"started={int(audit.get('started', 0) or 0)} · "
         f"pullback={int(audit.get('pullback_seen', 0) or 0)} · "
@@ -8506,19 +9013,42 @@ def _track_active_signals_impl() -> None:
                 safe_record_learning_result(signal, "profit", source="live")
             changed = True
 
-        # TP1 and TP2 are intermediate. Full stop risk and the time-stop remain
-        # active until TP3. Only TP3 locks a positive statistical outcome.
+        # TP1 and TP2 remain intermediate labels: only TP3 is a positive
+        # outcome.  Capital protection is separate from labelling, however.
+        # After TP1 the stop moves to an execution-cost-adjusted breakeven; after
+        # TP2 it locks roughly TP1.  A protected exit is recorded conservatively
+        # as ``expired`` with its actual PnL, never as a TP3 profit.
         if not signal.get("tp3_hit"):
-            if sl_hit(side, price, signal["sl"]):
-                signal["_closing_price"] = signal["sl"]
-                if apply_result(signal, "sl"):
-                    safe_record_learning_result(signal, "sl", source="live")
+            protected_stop = signal.get("protected_sl")
+            effective_sl = float(
+                protected_stop if protected_stop is not None else signal["sl"]
+            )
+            if sl_hit(side, price, effective_sl):
+                protected_exit = protected_stop is not None
+                result = "expired" if protected_exit else "sl"
+                signal["protected_exit"] = protected_exit
+                signal["_closing_price"] = effective_sl
+                result_r = _estimate_pnl_r(signal, result)
+                if apply_result(signal, result):
+                    safe_record_learning_result(signal, result, source="live")
+                if protected_exit:
+                    title = "🛡 ЗАЩИТНЫЙ ВЫХОД ПОСЛЕ TP1/TP2"
+                    detail = (
+                        f"Защитный stop: {format_price(effective_sl)}\n"
+                        f"Фактический итог: {result_r:+.2f}R; для TP3-статистики = expired."
+                    )
+                else:
+                    title = "❌ STOP LOSS"
+                    detail = (
+                        f"SL: {format_price(effective_sl)}\n"
+                        f"Фактический итог: {result_r:+.2f}R."
+                    )
                 send_telegram(
-                    f"❌ Stop Loss\n"
+                    f"{title}\n"
                     f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
                     f"Стратегия: {signal['strategy']}\n"
                     f"Вход: {format_price(signal['entry'])}\n"
-                    f"SL: {format_price(signal['sl'])}\n"
+                    f"{detail}\n"
                     f"Текущая цена: {format_price(price)}\n\n"
                     f"{build_stats_text()}"
                 )
@@ -8540,6 +9070,41 @@ def _track_active_signals_impl() -> None:
                         f"Текущая цена: {format_price(price)}\n"
                         f"Сделка станет положительной только при TP3."
                     )
+
+            if signal.get("tp1_hit") and signal.get("protected_sl") is None:
+                entry = float(signal.get("entry", price) or price)
+                fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
+                candidate_stop = (
+                    entry * (1.0 + fee_buffer)
+                    if side == "LONG"
+                    else entry * (1.0 - fee_buffer)
+                )
+                signal["protected_sl"] = (
+                    max(float(signal["sl"]), candidate_stop)
+                    if side == "LONG"
+                    else min(float(signal["sl"]), candidate_stop)
+                )
+                signal["tp1_protected"] = True
+                changed = True
+
+            if signal.get("tp2_hit") and not signal.get("tp2_protected"):
+                fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
+                tp1 = float(signal.get("tp1", signal.get("entry", price)) or price)
+                candidate_stop = (
+                    tp1 * (1.0 - fee_buffer)
+                    if side == "LONG"
+                    else tp1 * (1.0 + fee_buffer)
+                )
+                current_stop = float(
+                    signal.get("protected_sl", signal["sl"]) or signal["sl"]
+                )
+                signal["protected_sl"] = (
+                    max(current_stop, candidate_stop)
+                    if side == "LONG"
+                    else min(current_stop, candidate_stop)
+                )
+                signal["tp2_protected"] = True
+                changed = True
 
             if target_hit(side, price, signal["tp3"]):
                 signal["tp3_hit"] = True
@@ -8653,6 +9218,7 @@ async def scan_loop():
     model_data_count = adaptive_model_data_count()
     paper_metrics = paper_validation_metrics()
     control_metrics = control_validation_metrics()
+    readiness = real_money_readiness()
     restored_count = int(SEED_RESTORE_INFO.get("restored", 0) or 0)
     restored_text = (
         f"restored {restored_count} outcomes from {SEED_RESTORE_INFO.get('source', 'JSON')}"
@@ -8669,57 +9235,62 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: LIQUIDITY-FIRST + TWO VISIBLE FORWARD PAPER LANES.\n"
-        f"Логика: continuous/liquid tape → CONTINUATION или SWEEP/REVERSAL WATCH → "
-        f"retest/reclaim → подтверждённый PAPER-вход → 5 TP.\n"
+        f"Mode: MEASURED A+ EDGE FORWARD + GUARDED MICRO-LIVE.\n"
+        f"Логика: свежий A+ INSTANT импульс → измеренный диапазон объёма/амплитуды → "
+        f"проверка публичного bid/ask и глубины → своевременный PAPER-вход → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
         f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
         f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
-        f"Risk multiplier: A x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}; это PAPER, не размер реальной позиции.\n"
+        f"Risk multiplier: PAPER A+ x{A_RISK_MULT:.2f}; первый micro-LIVE x{MICRO_LIVE_RISK_MULT:.2f} и не более 0.10% счёта на риск.\n"
         f"Opportunity engine: analyze up to {MAX_ANALYZE_SYMBOLS} contracts · "
         f"deep-check up to {HOT_SYMBOLS_TO_ANALYZE} liquidity-qualified names · "
         f"parallel workers {HOT_SCAN_WORKERS}/{DEEP_SCAN_WORKERS}.\n"
+        f"Universe rotation: every scan advances through the full contract list; no fixed first-220 blind spot.\n"
         f"Liquidity gate: top {V17_2_LIQUIDITY_KEEP_FRACTION*100:.0f}% by relative turnover/continuity · "
         f"active candles ≥ {V17_2_MIN_ACTIVE_CANDLE_FRACTION*100:.0f}% · "
         f"anomalies Vol1 > x{V17_2_MAX_CURRENT_VOL_RATIO:.0f} or Range1 > x{V17_2_MAX_CURRENT_RANGE_RATIO:.0f} rejected.\n"
-        f"CONTINUATION lane: directional 3m ≥ max({V17_2_MIN_ABS_MOVE*100:.2f}%, "
-        f"{V17_2_MIN_ATR_MOVE:.2f} ATR1) · 15m {V17_2_CONT_MIN_15M*100:.2f}%–"
-        f"{V17_2_CONT_MAX_15M*100:.2f}% · EMA9/EMA21/VWAP alignment.\n"
-        f"SWEEP/REVERSAL lane: prior stretch ≥ {V17_2_REVERSAL_MIN_STRETCH*100:.2f}% · "
-        f"counter 3m ≥ {V17_2_REVERSAL_MIN_COUNTER*100:.2f}% · real sweep + reclaim.\n"
-        f"Retest confirmation: {PRE_LIVE_CONFIRMATION_ENABLED} · "
-        f"dedicated monitor every {PAPER_PENDING_MONITOR_SECONDS}s · "
-        f"lane-specific WATCH 12–240s · pullback up to 55%–60% of impulse · "
-        f"recovery 42%–50% · TP3 feasibility and local-SL gate mandatory · "
-        f"new WATCH ≤ {V17_2_MAX_NEW_WATCH_PER_SCAN}/scan, active WATCH ≤ {V17_2_MAX_PENDING_WATCH}.\n"
-        f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A/A+ LONG and SHORT · "
+        f"Measured entry: A+ PRO_INSTANT only · Vol1 x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f} · "
+        f"Range1 x{MEASURED_MIN_RANGE1:.2f}–x{MEASURED_MAX_RANGE1:.2f} · directional 3m "
+        f"{MEASURED_MIN_DIRECTIONAL_3M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_3M*100:.2f}% · "
+        f"15m {MEASURED_MIN_DIRECTIONAL_15M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_15M*100:.2f}%.\n"
+        f"Execution gate: spread ≤ {MEASURED_MAX_BOOK_SPREAD_BPS:.1f} bps · visible depth ≥ "
+        f"{MEASURED_MIN_BOOK_DEPTH_USDT:.0f} USDT/side · 60m turnover proxy ≥ {MEASURED_MIN_QUOTE_60M:.0f}.\n"
+        f"Anti-chase: no delayed 90%–100% reclaim entry; the failed V17.2 retest path is excluded.\n"
+        f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
         f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
-        f"visible in Telegram · target throughput {V17_2_TARGET_PAPER_PER_DAY_MIN}–"
-        f"{V17_2_TARGET_PAPER_PER_DAY_MAX}/day is a monitoring target, never a forced quota.\n"
-        f"Reports: early checkpoint at {PAPER_PILOT_REQUIRED_OUTCOMES} · manual quality review at "
+        f"every entry/result visible in Telegram; no forced daily PAPER quota.\n"
+        f"Reports: first quality checkpoint at {PAPER_PILOT_REQUIRED_OUTCOMES} · full review at "
         f"{PAPER_REVIEW_REQUIRED_OUTCOMES} · model remains frozen until at least "
         f"{PAPER_LANE_REQUIRED_OUTCOMES} unchanged PAPER outcomes.\n"
-        f"Data separation: WATCH/control is visible but cannot train · old {source_counts['all']} outcomes, "
-        f"ordinary SHADOW and all pre-V17.2 rows are audit-only.\n"
-        f"LIVE/real-money path: OFF in this build; no setup can become LIVE automatically.\n"
+        f"Data separation: old {source_counts['all']} outcomes and every pre-V17.2.1 row are audit-only; "
+        f"only new measured PAPER can train.\n"
+        f"Real-money readiness: ready={readiness.get('ready', False)} · env flag REAL_MONEY_SIGNALS="
+        f"{readiness.get('live_flag', False)} · enabled={readiness.get('live_enabled', False)}. "
+        f"Both evidence and manual flag are mandatory. This code never places exchange orders.\n"
+        f"Micro-LIVE safety when enabled: ≤ {MAX_LIVE_SIGNALS_24H}/24h · ≤ "
+        f"{MAX_LIVE_SIGNALS_PER_SIDE_24H}/side · spacing ≥ {MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min · "
+        f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
+        f"Micro-LIVE kill switch: after {MICRO_LIVE_MAX_NONPROFIT_STREAK} consecutive "
+        f"non-profit outcomes, drawdown > {MICRO_LIVE_MAX_DRAWDOWN_R:.1f}R, or a weak "
+        f"rolling {MICRO_LIVE_GUARD_WINDOW}-outcome block, new LIVE alerts stop and return to PAPER.\n"
         f"Reliable Telegram V17.1.1: immediate retries={TELEGRAM_SEND_ATTEMPTS} · "
         f"ordered outbox={TELEGRAM_OUTBOX_ENABLED} · flush every "
         f"{TELEGRAM_OUTBOX_FLUSH_SECONDS}s · diagnostics are replaceable and never block trades.\n"
         f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
         f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
         f"Adaptive model: active={model_state.active} · version={model_state.version} · "
-        f"LIVE fraction forced to 0% by PAPER-only routing.\n"
+        f"LIVE routing remains locked until readiness passes.\n"
         f"Shadow candidates: {SHADOW_TRACKING_ENABLED} · full JSON every "
         f"{AUTO_BACKUP_EVERY_CLOSED} total outcomes · PAPER checkpoint every "
         f"{PAPER_CHECKPOINT_EVERY} confirmed entries.\n"
         f"Seed JSON: {restored_text}.\n"
         f"Restored sources: LIVE={source_counts['live']} · SHADOW={source_counts['shadow']} · "
         f"ALL={source_counts['all']}.\n"
-        f"Eligible V17.2 model data={model_data_count} · minimum before analysis "
+        f"Eligible V17.2.1 model data={model_data_count} · minimum before analysis "
         f"{PAPER_LANE_REQUIRED_OUTCOMES}.\n"
-        f"CONTROL/WATCH collected: {int(control_metrics.get('n', 0))} · "
+        f"CONTROL collected: {int(control_metrics.get('n', 0))} · "
         f"{_metrics_line(control_metrics)}.\n"
-        f"Liquidity Dual PAPER V17.2 collected: {int(paper_metrics.get('n', 0))}/"
+        f"Measured Edge PAPER V17.2.1 collected: {int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
         f"{_metrics_line(paper_metrics)} · unique symbols="
         f"{int(paper_metrics.get('unique_symbols', 0))}.\n"
@@ -8835,7 +9406,7 @@ def root():
     return HTMLResponse(
         f"<h3>{APP_NAME}</h3>"
         f"<p>{DEPLOY_MARKER}</p>"
-        f"<p>Use /health /version /scan /auto-status /stats /adaptive-report "
+        f"<p>Use /health /version /scan /auto-status /readiness /stats /adaptive-report "
         f"/source-audit /watch-audit /adaptive-retrain /adaptive-events "
         f"/export-data /telegram-backup /telegram-status /test-telegram</p>"
     )
@@ -8843,11 +9414,14 @@ def root():
 
 @app.get("/health")
 def health():
+    readiness = real_money_readiness()
     return {
         "ok": True,
         "app": APP_NAME,
         "deploy": DEPLOY_MARKER,
         "active": len(STATE.get("active_signals", [])),
+        "real_money_ready": bool(readiness.get("ready")),
+        "real_money_enabled": bool(readiness.get("live_enabled")),
         "last_error": STATE.get("last_error", ""),
     }
 
@@ -8859,6 +9433,7 @@ def version():
 
 @app.get("/auto-status")
 def auto_status():
+    readiness = real_money_readiness()
     return JSONResponse({
         "app": APP_NAME,
         "deploy": DEPLOY_MARKER,
@@ -8868,9 +9443,25 @@ def auto_status():
         "watch_audit_v17_2": STATE.get("watch_audit_v17_2", {}),
         "telegram_outbox_depth": telegram_outbox_depth(),
         "telegram_delivery": STATE.get("telegram_delivery", {}),
+        "paper_metrics_v17_2_1": paper_validation_metrics(),
+        "real_money_readiness": readiness,
         "last_scan": STATE.get("last_scan", {}),
         "last_error": STATE.get("last_error", ""),
         "stats": STATE.get("stats", {}),
+    })
+
+
+@app.get("/readiness")
+def readiness_endpoint():
+    """Human-auditable two-key gate; this endpoint never enables trading."""
+    return JSONResponse({
+        "app": APP_NAME,
+        "deploy": DEPLOY_MARKER,
+        "warning": (
+            "Signal-only service: no exchange orders are placed. REAL_MONEY_SIGNALS "
+            "remains ineffective until every evidence check passes."
+        ),
+        "readiness": real_money_readiness(),
     })
 
 
