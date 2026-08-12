@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.2.1
+# VERIFIED GITHUB DEPLOY FILE — V17.2.2
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -79,7 +79,7 @@ ADAPTIVE_CONFIRMATION_SELECTED = int(os.getenv("ADAPTIVE_CONFIRMATION_SELECTED",
 ADAPTIVE_INITIAL_LIVE_FRACTION = float(os.getenv("ADAPTIVE_INITIAL_LIVE_FRACTION", "0.25"))
 ADAPTIVE_LIVE_FRACTION_STEP = float(os.getenv("ADAPTIVE_LIVE_FRACTION_STEP", "0.25"))
 MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
-MODEL_DATA_POLICY = "v17_2_1_measured_edge_forward_only_v1"
+MODEL_DATA_POLICY = "v17_2_2_direct_measured_forward_only_v1"
 # Guarded live is the default: the model still cannot block anything until it has
 # passed the independent holdout checks below. Set true to observe forever.
 SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "false").lower() == "true"
@@ -189,7 +189,7 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "liquidity_unique_fraction",
     "atr1_pct",
     "normalized_directional_move",
-    # V17.2.1 adds executable-liquidity evidence at the exact entry moment.
+    # V17.2.2 adds executable-liquidity evidence at the exact entry moment.
     # These are measured from the public BingX best bid/ask or depth endpoint.
     "book_spread_bps",
     "book_depth_log",
@@ -2054,7 +2054,7 @@ ADAPTIVE_REASON_RU: Dict[str, str] = {
     "live_model_guard_passed": "live-проверка не выявила ухудшения",
     "feature_schema_changed": "добавлены новые признаки качества; старые исходы сохранены",
     "model_dataset_policy_changed": "модель сброшена безопасно: обычный SHADOW исключён из обучения",
-    "forward_validation_freeze": "критерии зафиксированы до 50 независимых V17.2.1 measured-edge PAPER-исходов",
+    "forward_validation_freeze": "критерии зафиксированы до 50 независимых V17.2.2 direct-measured PAPER-исходов",
     "seed_restored_feature_upgrade": "50 исходов восстановлены; следующая проверка продолжится по графику",
     "evidence_not_enough_comparison_rows": "для честной проверки фильтра пока мало отправленных или shadow-исходов",
     "evidence_too_many_profitable_signals_blocked": "фильтр начал пропускать слишком много TP3+ сигналов",
@@ -2090,7 +2090,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
 
     lines = [
         title,
-        f"Данных модели (только V17.2.1 measured-edge PAPER): {closed_count}",
+        f"Данных модели (только V17.2.2 direct-measured PAPER): {closed_count}",
         f"ВСЕХ наблюдений, включая диагностический SHADOW: {all_closed_count}",
         f"ДАННЫЕ МОДЕЛИ: {_metrics_line(dataset)}",
         f"Причина: {_adaptive_reason_ru(reason)}",
@@ -2098,7 +2098,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
     if all_dataset:
         lines.append(f"ВСЯ ТЕЛЕМЕТРИЯ: {_metrics_line(all_dataset)}")
     if paper_dataset:
-        lines.append(f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(paper_dataset)}")
+        lines.append(f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(paper_dataset)}")
     if reason == "forward_validation_freeze":
         lines.append(
             f"Зафиксированная проверка: {int(report.get('paper_collected', 0) or 0)}/"
@@ -2455,8 +2455,8 @@ def format_source_audit_message(window: int = 25) -> str:
     lines.extend(
         [
             "",
-            f"CONTROL V17.2.1: {_metrics_line(control_metrics)}",
-            f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(reclaim_metrics)} · "
+            f"CONTROL V17.2.2: {_metrics_line(control_metrics)}",
+            f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(reclaim_metrics)} · "
             f"собрано {int(reclaim_metrics.get('n', 0))}/"
             f"{paper_progress_target(int(reclaim_metrics.get('n', 0) or 0))}",
             watch_audit_summary(),
@@ -2584,8 +2584,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2.1 MEASURED EDGE FORWARD"
-DEPLOY_MARKER = "V17_2_1_MEASURED_EDGE_FORWARD_500_2026_08_12"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2.2 DIRECT MEASURED ENTRY"
+DEPLOY_MARKER = "V17_2_2_DIRECT_MEASURED_ENTRY_500_2026_08_12"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2677,9 +2677,11 @@ PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "tru
 VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
     "VISIBLE_SHADOW_NOTIFICATIONS", "true"
 ).lower() == "true"
-PAPER_VALIDATION_REASON = "measured_edge_paper_v17_2_1"
-PAPER_CONTROL_REASON = "measured_edge_control_v17_2_1"
-REAL_MONEY_LIVE_REASON = "measured_edge_micro_live_v17_2_1"
+PAPER_VALIDATION_REASON = "direct_measured_paper_v17_2_2"
+PAPER_CONTROL_REASON = "direct_measured_control_v17_2_2"
+REAL_MONEY_LIVE_REASON = "direct_measured_micro_live_v17_2_2"
+LEGACY_V17_2_1_PAPER_VALIDATION_REASON = "measured_edge_paper_v17_2_1"
+LEGACY_V17_2_1_CONTROL_REASON = "measured_edge_control_v17_2_1"
 LEGACY_V17_1_PAPER_VALIDATION_REASON = "moderate_reclaim_v17_1"
 LEGACY_V17_1_CONTROL_REASON = "moderate_control_v17_1"
 LEGACY_V17_PAPER_VALIDATION_REASON = "evidence_reclaim_v17"
@@ -2688,6 +2690,10 @@ LEGACY_PAPER_VALIDATION_REASON = "quality_forward_v16_9"
 PAPER_INSTANT_STRATEGIES = {
     "LONG": "PRO_INSTANT_EDGE_LONG",
     "SHORT": "PRO_INSTANT_EDGE_SHORT",
+}
+DIRECT_MEASURED_STRATEGIES = {
+    "LONG": "PRO_DIRECT_MEASURED_LONG",
+    "SHORT": "PRO_DIRECT_MEASURED_SHORT",
 }
 PAPER_RECLAIM_STRATEGIES = {
     "LONG": "PRO_LIQUIDITY_RECLAIM_LONG",
@@ -2751,18 +2757,19 @@ V17_2_MAX_NEW_WATCH_PER_SCAN = int(
 )
 V17_2_MAX_PENDING_WATCH = int(os.getenv("V17_2_MAX_PENDING_WATCH", "12"))
 
-# V17.2.1 measured cohort.  These values are not guessed from the five failed
-# V17.2 reclaim trades.  They are the deliberately rounded boundaries of the
-# strongest comparable A+ INSTANT cohort in the complete 500-outcome archive:
-# 23 matches, 17 TP3+, 2 SL, 4 expired, +0.786R average.  Because that is a
-# retrospective result, every new match remains PAPER until the independent
-# forward gate below is satisfied.
-MEASURED_MIN_VOL1 = float(os.getenv("MEASURED_MIN_VOL1", "1.00"))
-MEASURED_MAX_VOL1 = float(os.getenv("MEASURED_MAX_VOL1", "2.00"))
+# V17.2.2 direct measured cohort.  Unlike V17.2.1, this detector does not call
+# the legacy instant_edge_setup first.  The fixed boundaries below were frozen
+# after a chronological archive audit: 37 proxy matches in all 500 outcomes
+# (21 TP3+, 4 SL, 12 expired), with 18 matches in the newest 150-outcome blind
+# block (12 TP3+, 2 SL, 4 expired).  The rows came from older implementations,
+# so this is a hypothesis, not proof.  Every new match remains visible PAPER
+# until a fresh, independent 50-outcome cohort passes the readiness gate.
+MEASURED_MIN_VOL1 = float(os.getenv("MEASURED_MIN_VOL1", "0.80"))
+MEASURED_MAX_VOL1 = float(os.getenv("MEASURED_MAX_VOL1", "1.60"))
 MEASURED_MIN_RANGE1 = float(os.getenv("MEASURED_MIN_RANGE1", "1.50"))
 MEASURED_MAX_RANGE1 = float(os.getenv("MEASURED_MAX_RANGE1", "3.00"))
 MEASURED_MIN_DIRECTIONAL_3M = float(
-    os.getenv("MEASURED_MIN_DIRECTIONAL_3M", "0.0120")
+    os.getenv("MEASURED_MIN_DIRECTIONAL_3M", "0.0080")
 )
 MEASURED_MAX_DIRECTIONAL_3M = float(
     os.getenv("MEASURED_MAX_DIRECTIONAL_3M", "0.0500")
@@ -2771,11 +2778,21 @@ MEASURED_MIN_DIRECTIONAL_15M = float(
     os.getenv("MEASURED_MIN_DIRECTIONAL_15M", "0.0100")
 )
 MEASURED_MAX_DIRECTIONAL_15M = float(
-    os.getenv("MEASURED_MAX_DIRECTIONAL_15M", "0.0530")
+    os.getenv("MEASURED_MAX_DIRECTIONAL_15M", "0.0600")
 )
 MEASURED_MIN_VOL5 = float(os.getenv("MEASURED_MIN_VOL5", "0.40"))
-MEASURED_MAX_VOL5 = float(os.getenv("MEASURED_MAX_VOL5", "1.60"))
+MEASURED_MAX_VOL5 = float(os.getenv("MEASURED_MAX_VOL5", "2.50"))
 MEASURED_MIN_RANGE5 = float(os.getenv("MEASURED_MIN_RANGE5", "0.70"))
+MEASURED_MAX_30M_CHASE = float(os.getenv("MEASURED_MAX_30M_CHASE", "0.1000"))
+MEASURED_MIN_BODY_FRACTION = float(
+    os.getenv("MEASURED_MIN_BODY_FRACTION", "0.25")
+)
+MEASURED_LONG_MIN_CLOSE_LOCATION = float(
+    os.getenv("MEASURED_LONG_MIN_CLOSE_LOCATION", "0.55")
+)
+MEASURED_SHORT_MAX_CLOSE_LOCATION = float(
+    os.getenv("MEASURED_SHORT_MAX_CLOSE_LOCATION", "0.45")
+)
 MEASURED_MIN_LIQUIDITY_RANK = float(
     os.getenv("MEASURED_MIN_LIQUIDITY_RANK", "0.35")
 )
@@ -2802,6 +2819,15 @@ REAL_MONEY_MIN_EXPECTANCY_R = float(
     os.getenv("REAL_MONEY_MIN_EXPECTANCY_R", "0.20")
 )
 REAL_MONEY_RECENT_WINDOW = int(os.getenv("REAL_MONEY_RECENT_WINDOW", "25"))
+REAL_MONEY_MIN_SIDE_FORWARD = int(
+    os.getenv("REAL_MONEY_MIN_SIDE_FORWARD", "15")
+)
+REAL_MONEY_SIDE_RECENT_WINDOW = int(
+    os.getenv("REAL_MONEY_SIDE_RECENT_WINDOW", "10")
+)
+REAL_MONEY_MIN_SIDE_EXPECTANCY_R = float(
+    os.getenv("REAL_MONEY_MIN_SIDE_EXPECTANCY_R", "0.10")
+)
 MICRO_LIVE_RISK_MULT = float(os.getenv("MICRO_LIVE_RISK_MULT", "0.02"))
 MICRO_LIVE_GUARD_MIN_OUTCOMES = int(
     os.getenv("MICRO_LIVE_GUARD_MIN_OUTCOMES", "5")
@@ -3020,6 +3046,7 @@ LOCAL_STOP_MODES = {
     "V17_2_CONFIRMED_CONTINUATION_LONG", "V17_2_CONFIRMED_CONTINUATION_SHORT",
     "V17_2_CONFIRMED_REVERSAL_LONG", "V17_2_CONFIRMED_REVERSAL_SHORT",
     "V17_2_1_MEASURED_EDGE_LONG", "V17_2_1_MEASURED_EDGE_SHORT",
+    "V17_2_2_DIRECT_MEASURED_LONG", "V17_2_2_DIRECT_MEASURED_SHORT",
 }
 FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
 # A+ did not outperform B in the newest 50 outcomes. Grade still ranks a setup,
@@ -3239,20 +3266,17 @@ def base_asset(symbol: str) -> str:
 
 def default_watch_audit() -> Dict[str, Any]:
     return {
-        "version": "V17.2.1",
+        "version": "V17.2.2",
         "liquidity_checked": 0,
         "liquidity_passed": 0,
         "liquidity_rejected": 0,
         "started": 0,
-        "pullback_seen": 0,
-        "reclaim_seen": 0,
+        "execution_passed": 0,
         "confirmed": 0,
         "rejected": {
-            "no_pullback": 0,
-            "no_reclaim": 0,
-            "pullback_too_deep": 0,
-            "reprice_or_rr": 0,
-            "quality_gate": 0,
+            "execution_book": 0,
+            "risk_rr": 0,
+            "symbol_repeat": 0,
             "other": 0,
         },
         "by_side": {
@@ -3260,7 +3284,7 @@ def default_watch_audit() -> Dict[str, Any]:
             "SHORT": {"started": 0, "confirmed": 0, "rejected": 0},
         },
         "by_lane": {
-            "MEASURED_EDGE": {"started": 0, "confirmed": 0, "rejected": 0},
+            "DIRECT_MEASURED": {"started": 0, "confirmed": 0, "rejected": 0},
         },
         "recent": [],
     }
@@ -3345,7 +3369,7 @@ def load_state() -> Dict[str, Any]:
         base.setdefault("last_paper_checkpoint_count", 0)
         base.setdefault("last_paper_cohort_report_count", 0)
         audit = base.setdefault("watch_audit_v17_2", default_watch_audit())
-        if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.1":
+        if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.2":
             base["watch_audit_v17_2"] = default_watch_audit()
         base.setdefault("last_pending_monitor", {})
         outbox = base.setdefault("telegram_outbox", [])
@@ -4127,7 +4151,7 @@ def paper_validation_metrics() -> Dict[str, Any]:
 
 
 def paper_lane_metrics() -> Dict[str, Dict[str, Any]]:
-    """V17.2.1 has one frozen measured A+ impulse cohort."""
+    """V17.2.2 has one frozen direct measured A+ cohort."""
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         rows = conn.execute(
@@ -4135,7 +4159,7 @@ def paper_lane_metrics() -> Dict[str, Dict[str, Any]]:
             "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
             (PAPER_VALIDATION_REASON,),
         ).fetchall()
-    return {"MEASURED_EDGE": _outcome_metrics(rows)}
+    return {"DIRECT_MEASURED": _outcome_metrics(rows)}
 
 
 def control_validation_metrics() -> Dict[str, Any]:
@@ -4164,7 +4188,7 @@ def micro_live_circuit_breaker() -> Dict[str, Any]:
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT id, result, pnl_r, symbol FROM adaptive_trades "
+            "SELECT id, result, pnl_r, symbol, side FROM adaptive_trades "
             "WHERE COALESCE(decision_reason, '')=? "
             "ORDER BY closed_at ASC, id ASC",
             (REAL_MONEY_LIVE_REASON,),
@@ -4245,6 +4269,37 @@ def real_money_readiness() -> Dict[str, Any]:
     recent_success = float(recent.get("success_rate", 0.0) or 0.0)
     recent_expectancy = float(recent.get("expectancy_r", 0.0) or 0.0)
     micro_live_guard = micro_live_circuit_breaker()
+    by_side: Dict[str, Dict[str, Any]] = {}
+    for side in ("LONG", "SHORT"):
+        side_rows = [row for row in rows if str(row["side"] or "").upper() == side]
+        side_recent_window = max(1, REAL_MONEY_SIDE_RECENT_WINDOW)
+        side_recent_rows = side_rows[-side_recent_window:]
+        side_metrics = _outcome_metrics(side_rows)
+        side_recent = _outcome_metrics(side_recent_rows)
+        side_checks = {
+            "enough_side_forward": len(side_rows) >= max(1, REAL_MONEY_MIN_SIDE_FORWARD),
+            "side_tp3_majority": float(side_metrics.get("success_rate", 0.0) or 0.0)
+            > REAL_MONEY_MIN_SUCCESS_RATE,
+            "side_expectancy": float(side_metrics.get("expectancy_r", 0.0) or 0.0)
+            >= REAL_MONEY_MIN_SIDE_EXPECTANCY_R,
+            "side_recent_complete": len(side_recent_rows) >= side_recent_window,
+            "side_recent_tp3_majority": float(
+                side_recent.get("success_rate", 0.0) or 0.0
+            )
+            > REAL_MONEY_MIN_SUCCESS_RATE,
+            "side_recent_expectancy": float(
+                side_recent.get("expectancy_r", 0.0) or 0.0
+            )
+            > 0.0,
+        }
+        by_side[side] = {
+            "ready": all(side_checks.values()),
+            "checks": side_checks,
+            "cumulative": side_metrics,
+            "recent": side_recent,
+            "required": REAL_MONEY_MIN_SIDE_FORWARD,
+            "recent_window": side_recent_window,
+        }
     checks = {
         "enough_forward": total >= max(1, REAL_MONEY_MIN_FORWARD),
         "enough_unique_symbols": unique_symbols >= max(1, REAL_MONEY_MIN_UNIQUE_SYMBOLS),
@@ -4268,6 +4323,7 @@ def real_money_readiness() -> Dict[str, Any]:
         "max_drawdown_r": max_drawdown,
         "required_forward": REAL_MONEY_MIN_FORWARD,
         "required_unique_symbols": REAL_MONEY_MIN_UNIQUE_SYMBOLS,
+        "by_side": by_side,
         "micro_live_circuit": micro_live_guard,
     }
 
@@ -4372,13 +4428,13 @@ def format_paper_cohort_report(window: int = 25) -> str:
         decision = "Параметры остаются замороженными до полной forward-проверки."
 
     return (
-        "🧾 V17.2.1 — ОТЧЁТ MEASURED EDGE PAPER\n"
+        "🧾 V17.2.2 — ОТЧЁТ DIRECT MEASURED PAPER\n"
         f"Этап: {stage}\n"
         f"Последний блок: ID {first_id}–{last_id} · {_metrics_line(block)} · "
         f"уникальных монет {unique_block}\n"
-        f"Накоплено V17.2.1 PAPER: {_metrics_line(cumulative)} · "
+        f"Накоплено V17.2.2 PAPER: {_metrics_line(cumulative)} · "
         f"уникальных монет {unique_total}\n"
-        f"MEASURED EDGE: {_metrics_line(lanes['MEASURED_EDGE'])}\n"
+        f"DIRECT MEASURED: {_metrics_line(lanes['DIRECT_MEASURED'])}\n"
         f"{watch_audit_summary()}\n"
         f"Решение: {decision}\n"
         "Важно: отчёт ничего не меняет автоматически и не разрешает реальную торговлю."
@@ -4420,10 +4476,10 @@ def closed_outcome_progress_message(
         f"ВСЕГО: {_metrics_line(metrics['all'])}\n"
         f"LIVE: {_metrics_line(metrics['live'])}\n"
         f"SHADOW/PAPER: {_metrics_line(metrics['shadow'])}\n"
-        f"CONTROL V17.2.1: {_metrics_line(control_metrics)}\n"
-        f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(paper_metrics)} · "
+        f"CONTROL V17.2.2: {_metrics_line(control_metrics)}\n"
+        f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(paper_metrics)} · "
         f"{paper_count}/{paper_target}\n"
-        f"Допустимых для модели V17.2.1 PAPER: {adaptive_model_data_count()}\n"
+        f"Допустимых для модели V17.2.2 PAPER: {adaptive_model_data_count()}\n"
         f"Готовность micro-LIVE: {readiness.get('ready', False)} · "
         f"разрешающий флаг: {readiness.get('live_flag', False)}\n"
         f"{watch_audit_summary()}\n"
@@ -4499,7 +4555,7 @@ def maybe_send_auto_backup() -> Dict[str, Any]:
         if send_telegram_document(
             build_export_bytes(),
             filename,
-            f"🧠 V17.2.1 {caption_reason} · total {closed_count} · measured PAPER {paper_count}",
+            f"🧠 V17.2.2 {caption_reason} · total {closed_count} · direct PAPER {paper_count}",
         ):
             if total_due:
                 STATE["last_backup_closed_count"] = closed_count
@@ -6297,6 +6353,182 @@ def v17_2_dual_paper_setup(
     }, "ok"
 
 
+def direct_measured_setup(
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    c1h: List[Dict[str, float]],
+    btc: Dict[str, Any],
+    side: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Independent V17.2.2 entry detector.
+
+    This path deliberately does not call ``instant_edge_setup`` or any legacy
+    trader template.  It first applies the one frozen archive hypothesis, then
+    demands evidence that the current 1m candle is still closing in the same
+    direction around EMA9/VWAP.  Execution liquidity and TP3 risk are checked
+    separately after this function returns.
+    """
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 30:
+        return None, "candles"
+    side = str(side).upper()
+    if side not in DIRECT_MEASURED_STRATEGIES:
+        return None, "side"
+
+    direction = 1.0 if side == "LONG" else -1.0
+    price = float(c1[-1]["close"])
+    last = c1[-1]
+    ch3 = percent_change(c1, 3)
+    ch15 = percent_change(c5, 3)
+    ch30 = percent_change(c5, 6)
+    directional_3m = direction * ch3
+    directional_15m = direction * ch15
+    directional_30m = direction * ch30
+    vol1 = volume_ratio(c1, 20)
+    range1 = candle_range_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range5 = candle_range_ratio(c5, 20)
+
+    fixed_band = bool(
+        MEASURED_MIN_DIRECTIONAL_3M
+        <= directional_3m
+        <= MEASURED_MAX_DIRECTIONAL_3M
+        and MEASURED_MIN_DIRECTIONAL_15M
+        <= directional_15m
+        <= MEASURED_MAX_DIRECTIONAL_15M
+        and directional_30m <= MEASURED_MAX_30M_CHASE
+        and MEASURED_MIN_VOL1 <= vol1 <= MEASURED_MAX_VOL1
+        and MEASURED_MIN_RANGE1 <= range1 <= MEASURED_MAX_RANGE1
+        and MEASURED_MIN_VOL5 <= vol5 <= MEASURED_MAX_VOL5
+        and range5 >= MEASURED_MIN_RANGE5
+    )
+    if not fixed_band:
+        return None, "fixed_band"
+
+    location = close_location(last)
+    body_fraction = abs(last["close"] - last["open"]) / max(
+        last["high"] - last["low"], 1e-12
+    )
+    directional_candle = bool(
+        (side == "LONG" and last["close"] > last["open"])
+        or (side == "SHORT" and last["close"] < last["open"])
+    )
+    close_quality = bool(
+        location >= MEASURED_LONG_MIN_CLOSE_LOCATION
+        if side == "LONG"
+        else location <= MEASURED_SHORT_MAX_CLOSE_LOCATION
+    )
+    recent_closes = [float(row["close"]) for row in c1[-4:]]
+    directional_steps = sum(
+        1
+        for previous, current in zip(recent_closes, recent_closes[1:])
+        if direction * (current - previous) > 0
+    )
+    continuing_now = bool(
+        directional_steps >= 2
+        and direction * (recent_closes[-1] - recent_closes[-2]) > 0
+    )
+    ema9 = ema(closes(c1), 9)
+    current_vwap = vwap(c1, 30)
+    aligned = bool(
+        (side == "LONG" and price >= ema9 and price >= current_vwap)
+        or (side == "SHORT" and price <= ema9 and price <= current_vwap)
+    )
+    if not (
+        directional_candle
+        and close_quality
+        and body_fraction >= MEASURED_MIN_BODY_FRACTION
+        and continuing_now
+        and aligned
+    ):
+        return None, "current_structure"
+
+    score = 90
+    score += min(4, int(max(0.0, directional_3m - MEASURED_MIN_DIRECTIONAL_3M) * 250))
+    score += min(3, int(max(0.0, directional_15m - MEASURED_MIN_DIRECTIONAL_15M) * 100))
+    score += min(2, directional_steps - 1)
+    score += 1 if body_fraction >= 0.45 else 0
+    score = min(100, max(90, score))
+    level = (
+        min(row["low"] for row in c1[-10:])
+        if side == "LONG"
+        else max(row["high"] for row in c1[-10:])
+    )
+    reason = (
+        f"V17.2.2 DIRECT MEASURED {side}: frozen band + live continuation; "
+        f"3m {directional_3m*100:.2f}%, 15m {directional_15m*100:.2f}%, "
+        f"Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, Vol5 x{vol5:.2f}, "
+        f"Range5 x{range5:.2f}, closeLoc {location:.2f}, body {body_fraction:.2f}."
+    )
+    return {
+        "symbol": normalize_symbol(symbol),
+        "side": side,
+        "strategy": DIRECT_MEASURED_STRATEGIES[side],
+        "trade_type": f"DIRECT MEASURED A+ {side}",
+        "score": score,
+        "grade": "A+",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": prior_compression_ratio(c5),
+        "ch15m": ch15,
+        "ch30m": ch30,
+        "ch3m_1m": ch3,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": percent_change(c1, 2),
+        "setup_mode": f"V17_2_2_DIRECT_MEASURED_{side}",
+        "t1h": trend_state(c1h),
+        "btc_text": btc.get("text", ""),
+        "paper_setup_lane": "DIRECT_MEASURED",
+        "paper_validation_only": True,
+        "paper_validation_immediate": True,
+        "paper_validation_lane": PAPER_VALIDATION_REASON,
+        "watch_impulse": directional_3m,
+        "paper_validation_origin": reason,
+    }, "direct_band_and_structure_passed"
+
+
+def direct_measured_risk_gate(
+    trade: Dict[str, Any],
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+) -> Tuple[bool, str]:
+    """V17.2.2 safety check aligned with the TP3 accounting rule."""
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    sl = float(trade.get("sl", entry) or entry)
+    if entry <= 0:
+        return False, "invalid entry"
+    sl_move = abs(entry - sl) / entry
+    tp3_rr = TP3_MOVE / max(sl_move, 1e-12)
+    if not LOCAL_SCALP_MIN_SL_MOVE <= sl_move <= LOCAL_SCALP_MAX_SL_MOVE * 1.02:
+        return False, f"local SL {sl_move*100:.2f}% outside safety band"
+    if tp3_rr < 1.25:
+        return False, f"TP3 RR {tp3_rr:.2f} < 1.25"
+    if float(trade.get("ladder_rr", 0.0) or 0.0) < 1.20:
+        return False, f"ladder RR {float(trade.get('ladder_rr', 0.0) or 0.0):.2f} < 1.20"
+    recent_high = max(row["high"] for row in c5[-6:])
+    recent_low = min(row["low"] for row in c5[-6:])
+    recent_range = (recent_high - recent_low) / entry
+    atr_capacity = atr(c5, 14) / entry * 3.0
+    feasible_move = max(recent_range, atr_capacity)
+    if feasible_move < TP3_MOVE * 0.75:
+        return False, (
+            f"TP3 capacity {feasible_move*100:.2f}% < "
+            f"{TP3_MOVE*0.75*100:.2f}%"
+        )
+    return True, (
+        f"direct TP3 risk passed: SL {sl_move*100:.2f}%, TP3 RR {tp3_rr:.2f}, "
+        f"capacity {feasible_move*100:.2f}%, ladder RR "
+        f"{float(trade.get('ladder_rr', 0.0) or 0.0):.2f}"
+    )
+
+
 def v17_2_paper_risk_gate(
     trade: Dict[str, Any],
     symbol: str,
@@ -6337,7 +6569,7 @@ def measured_edge_entry_gate(
     c1: List[Dict[str, float]],
     c5: List[Dict[str, float]],
 ) -> Tuple[bool, str]:
-    """Frozen V17.2.1 cohort and real execution-cost check.
+    """Frozen V17.2.2 cohort and real execution-cost check.
 
     The measured candle band comes from the complete archive; the order-book
     check is new forward evidence and is intentionally unavailable to the old
@@ -6358,8 +6590,8 @@ def measured_edge_entry_gate(
     failures: List[str] = []
     if grade != "A+":
         failures.append("grade is not A+")
-    if strategy != PAPER_INSTANT_STRATEGIES.get(side, ""):
-        failures.append("not PRO_INSTANT_EDGE")
+    if strategy != DIRECT_MEASURED_STRATEGIES.get(side, ""):
+        failures.append("not PRO_DIRECT_MEASURED")
     if not MEASURED_MIN_VOL1 <= vol1 <= MEASURED_MAX_VOL1:
         failures.append(
             f"Vol1 x{vol1:.2f} outside x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f}"
@@ -6436,10 +6668,10 @@ def measured_edge_entry_gate(
     setup["normalized_directional_move"] = directional_3m / max(
         float(setup["atr1_pct"] or 0.0), 1e-6
     )
-    setup["paper_setup_lane"] = "MEASURED_EDGE"
+    setup["paper_setup_lane"] = "DIRECT_MEASURED"
     setup["watch_impulse"] = directional_3m
     return True, (
-        f"measured cohort passed: Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
+        f"direct measured cohort passed: Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
         f"3m {directional_3m*100:.2f}%, 15m {directional_15m*100:.2f}%, "
         f"spread {spread_bps:.1f} bps, depth {depth_usdt:.0f} USDT, liq p{rank*100:.0f}"
     )
@@ -7040,6 +7272,8 @@ def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
             "near_miss_probe",
             PAPER_VALIDATION_REASON,
             PAPER_CONTROL_REASON,
+            LEGACY_V17_2_1_PAPER_VALIDATION_REASON,
+            LEGACY_V17_2_1_CONTROL_REASON,
             LEGACY_V17_1_PAPER_VALIDATION_REASON,
             LEGACY_V17_1_CONTROL_REASON,
             LEGACY_V17_PAPER_VALIDATION_REASON,
@@ -7153,11 +7387,11 @@ def analyze_symbol(
         blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
         return None
 
-    # V17.2.1 tests one frozen, measured hypothesis.  The complete 500-outcome
-    # audit showed that late retest/reclaim entries destroyed the edge, while a
-    # moderate A+ INSTANT band was the only sizable historical cohort with TP3+
-    # majority and positive expectancy.  New matches are immediate PAPER at an
-    # executable bid/ask; old outcomes remain audit-only.
+    # V17.2.2 evaluates the frozen measured hypothesis directly.  It does not
+    # depend on instant_edge_setup or on the older trader-pattern templates,
+    # which were the reason V17.2.1 reported tens of thousands of checks but no
+    # started PAPER candidates.  New matches remain visible PAPER until the
+    # independent readiness gate is satisfied.
     if PRO_QUALITY_FORWARD_ENABLED:
         forward_candidates: List[Dict[str, Any]] = []
         for side in ("LONG", "SHORT"):
@@ -7167,54 +7401,53 @@ def analyze_symbol(
             if side == "SHORT" and not ALLOW_SHORT:
                 blocks["short_disabled"] = blocks.get("short_disabled", 0) + 1
                 continue
-            setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
+            setup, detector_reason = direct_measured_setup(
+                symbol, c1, c5, c15, c1h, btc, side
+            )
             if not setup:
-                key = f"v17_2_1_no_instant_{side.lower()}"
+                key = f"v17_2_2_{detector_reason}_{side.lower()}"
                 blocks[key] = blocks.get(key, 0) + 1
                 continue
+
+            audit_item = dict(setup)
+            audit_item["pending_started_at"] = now_ts()
+            record_watch_audit(audit_item, "started", detector_reason)
 
             entry_ok, entry_reason = measured_edge_entry_gate(
                 setup, symbol, c1, c5
             )
             if not entry_ok:
-                blocks["v17_2_1_measured_band_block"] = blocks.get(
-                    "v17_2_1_measured_band_block", 0
+                blocks["v17_2_2_execution_block"] = blocks.get(
+                    "v17_2_2_execution_block", 0
                 ) + 1
+                record_watch_audit(
+                    audit_item, "rejected:execution_book", entry_reason
+                )
                 if len(near_miss) < 8:
                     near_miss.append(
                         f"{display_symbol(symbol)} {side}: {entry_reason}"
                     )
                 continue
+            record_watch_audit(setup, "execution_passed", entry_reason)
 
             trade = calculate_fast_trade(setup, c1, c5)
             if not trade:
-                blocks["v17_2_1_sl_structure_block"] = blocks.get(
-                    "v17_2_1_sl_structure_block", 0
+                blocks["v17_2_2_sl_structure_block"] = blocks.get(
+                    "v17_2_2_sl_structure_block", 0
                 ) + 1
+                record_watch_audit(
+                    setup, "rejected:risk_rr", "trade construction failed"
+                )
                 continue
 
-            quality_ok, quality_block, quality_reason = professional_quality_gate(
-                trade, symbol
+            risk_ok, risk_reason = direct_measured_risk_gate(
+                trade, symbol, c1, c5
             )
-            if not quality_ok:
-                blocks[quality_block] = blocks.get(quality_block, 0) + 1
-                if len(near_miss) < 8:
-                    near_miss.append(quality_reason)
-                continue
-            trader_ok, trader_block, trader_reason = trader_pattern_gate(
-                trade, symbol, c1, c5, c15, btc
-            )
-            if not trader_ok:
-                blocks[trader_block] = blocks.get(trader_block, 0) + 1
-                if len(near_miss) < 8:
-                    near_miss.append(trader_reason)
-                continue
-
-            risk_ok, risk_reason = v17_2_paper_risk_gate(trade, symbol, c1, c5)
             if not risk_ok:
-                blocks["v17_2_1_tp3_risk_block"] = blocks.get(
-                    "v17_2_1_tp3_risk_block", 0
+                blocks["v17_2_2_tp3_risk_block"] = blocks.get(
+                    "v17_2_2_tp3_risk_block", 0
                 ) + 1
+                record_watch_audit(trade, "rejected:risk_rr", risk_reason)
                 if len(near_miss) < 8:
                     near_miss.append(
                         f"{display_symbol(symbol)} {side}: {risk_reason}"
@@ -7223,21 +7456,24 @@ def analyze_symbol(
 
             independent, independence_reason = paper_symbol_independence_gate(trade)
             if not independent:
-                blocks["v17_2_1_correlated_repeat"] = blocks.get(
-                    "v17_2_1_correlated_repeat", 0
+                blocks["v17_2_2_correlated_repeat"] = blocks.get(
+                    "v17_2_2_correlated_repeat", 0
                 ) + 1
+                record_watch_audit(
+                    trade, "rejected:symbol_repeat", independence_reason
+                )
                 continue
 
-            trade["strategy"] = f"PRO_MEASURED_EDGE_{side}"
-            trade["trade_type"] = f"MEASURED A+ EDGE {side}"
-            trade["setup_mode"] = f"V17_2_1_MEASURED_EDGE_{side}"
-            trade["paper_setup_lane"] = "MEASURED_EDGE"
+            trade["strategy"] = DIRECT_MEASURED_STRATEGIES[side]
+            trade["trade_type"] = f"DIRECT MEASURED A+ {side}"
+            trade["setup_mode"] = f"V17_2_2_DIRECT_MEASURED_{side}"
+            trade["paper_setup_lane"] = "DIRECT_MEASURED"
             trade["paper_validation_lane"] = PAPER_VALIDATION_REASON
             trade["paper_validation_immediate"] = True
             trade["v17_2_risk_reason"] = risk_reason
             trade["paper_validation_origin"] = (
-                f"V17.2.1 frozen measured A+ cohort · {entry_reason} · "
-                f"{quality_reason} · {trader_reason} · {risk_reason} · "
+                f"V17.2.2 independent direct measured cohort · "
+                f"{detector_reason} · {entry_reason} · {risk_reason} · "
                 f"{independence_reason}"
             )
             # A promoted model may only influence a stable canary fraction of
@@ -7257,7 +7493,15 @@ def analyze_symbol(
                 STATE["last_error"] = adaptive_reason
 
             readiness = real_money_readiness()
-            live_enabled = bool(readiness.get("live_enabled")) and bool(adaptive_ok)
+            side_readiness = (
+                readiness.get("by_side", {}).get(side, {})
+                if isinstance(readiness.get("by_side", {}), dict)
+                else {}
+            )
+            side_ready = bool(side_readiness.get("ready"))
+            live_enabled = bool(
+                readiness.get("live_enabled") and side_ready and adaptive_ok
+            )
             trade["paper_validation_only"] = not live_enabled
             if live_enabled:
                 symbol_ok, symbol_reason = symbol_quarantine_gate(trade)
@@ -7265,34 +7509,48 @@ def analyze_symbol(
                     blocks["micro_live_symbol_quarantine"] = blocks.get(
                         "micro_live_symbol_quarantine", 0
                     ) + 1
-                    continue
-                cooldown_allowed, cooldown_reason = cooldown_ok(
-                    symbol, trade["strategy"]
-                )
-                if not cooldown_allowed:
-                    blocks["micro_live_cooldown"] = blocks.get(
-                        "micro_live_cooldown", 0
-                    ) + 1
-                    continue
-                trade["symbol_quarantine_reason"] = symbol_reason
-                trade["adaptive_reason"] = REAL_MONEY_LIVE_REASON
-                trade["risk_mult"] = min(
-                    float(trade.get("risk_mult", MICRO_LIVE_RISK_MULT) or MICRO_LIVE_RISK_MULT),
-                    MICRO_LIVE_RISK_MULT,
-                )
+                    live_enabled = False
+                    trade["paper_validation_only"] = True
+                    trade["adaptive_reason"] = (
+                        f"PAPER downgrade: {symbol_reason}"
+                    )
+                else:
+                    cooldown_allowed, cooldown_reason = cooldown_ok(
+                        symbol, trade["strategy"]
+                    )
+                    if not cooldown_allowed:
+                        blocks["micro_live_cooldown"] = blocks.get(
+                            "micro_live_cooldown", 0
+                        ) + 1
+                        live_enabled = False
+                        trade["paper_validation_only"] = True
+                        trade["adaptive_reason"] = (
+                            f"PAPER downgrade: {cooldown_reason}"
+                        )
+                    else:
+                        trade["symbol_quarantine_reason"] = symbol_reason
+                        trade["adaptive_reason"] = REAL_MONEY_LIVE_REASON
+                        trade["risk_mult"] = min(
+                            float(
+                                trade.get("risk_mult", MICRO_LIVE_RISK_MULT)
+                                or MICRO_LIVE_RISK_MULT
+                            ),
+                            MICRO_LIVE_RISK_MULT,
+                        )
             else:
                 trade["adaptive_reason"] = (
                     f"PAPER lock: {int(readiness.get('cumulative', {}).get('n', 0) or 0)}/"
                     f"{REAL_MONEY_MIN_FORWARD} new outcomes; live flag={REAL_MONEY_SIGNALS}; "
-                    f"model={adaptive_reason}"
+                    f"side {side} ready={side_ready}; model={adaptive_reason}"
                 )
             forward_candidates.append(trade)
-            blocks["v17_2_1_measured_candidate"] = blocks.get(
-                "v17_2_1_measured_candidate", 0
+            record_watch_audit(trade, "confirmed", risk_reason)
+            blocks["v17_2_2_direct_candidate"] = blocks.get(
+                "v17_2_2_direct_candidate", 0
             ) + 1
             if len(near_miss) < 8:
                 near_miss.append(
-                    f"{display_symbol(symbol)} {side}: MEASURED A+ "
+                    f"{display_symbol(symbol)} {side}: DIRECT MEASURED A+ "
                     f"{'micro-LIVE' if live_enabled else 'PAPER'} · "
                     f"3m {float(trade.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}% · "
                     f"spread {float(trade.get('book_spread_bps', 0.0) or 0.0):.1f} bps"
@@ -7307,20 +7565,7 @@ def analyze_symbol(
             ),
             reverse=True,
         )
-        selected = forward_candidates[0]
-        audit_item = dict(selected)
-        audit_item["pending_started_at"] = now_ts()
-        record_watch_audit(
-            audit_item,
-            "started",
-            str(selected.get("paper_validation_origin", "measured candidate")),
-        )
-        record_watch_audit(
-            audit_item,
-            "confirmed",
-            str(selected.get("v17_2_risk_reason", "risk passed")),
-        )
-        return selected
+        return forward_candidates[0]
 
     candidates: List[Dict[str, Any]] = []
     shadow_observed = False
@@ -7558,7 +7803,7 @@ def build_signal_message(s: Dict[str, Any]) -> str:
     arrow = "🟢" if s["side"] == "LONG" else "🔴"
     live_header = (
         "🛡 ОГРАНИЧЕННЫЙ MICRO-LIVE СИГНАЛ — forward gate пройден\n"
-        if str(s.get("strategy", "")).startswith("PRO_MEASURED_EDGE_")
+        if str(s.get("strategy", "")).startswith("PRO_DIRECT_MEASURED_")
         else ""
     )
     return (
@@ -7588,11 +7833,11 @@ def build_signal_message(s: Dict[str, Any]) -> str:
 
 def build_paper_signal_message(s: Dict[str, Any]) -> str:
     return (
-        "📋 PAPER-ВХОД V17.2.1 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
+        "📋 PAPER-ВХОД V17.2.2 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
         f"{s['side']} {display_symbol(s['symbol'])} · {s['grade']} · Score {s['score']}\n"
-        f"Линия: {s.get('paper_setup_lane', 'MEASURED_EDGE')}\n"
+        f"Линия: {s.get('paper_setup_lane', 'DIRECT_MEASURED')}\n"
         f"Стратегия: {s['strategy']}\n"
-        "Статус: своевременный A+ impulse прошёл фиксированный measured-фильтр и проверку исполнения; только PAPER.\n\n"
+        "Статус: независимый A+ detector прошёл фиксированный диапазон, текущую структуру и проверку исполнения; только PAPER.\n\n"
         f"Вход наблюдения: {format_price(s['entry'])}\n"
         f"TP1: {format_price(s['tp1'])}\n"
         f"TP2: {format_price(s['tp2'])}\n"
@@ -7607,7 +7852,7 @@ def build_paper_signal_message(s: Dict[str, Any]) -> str:
         f"Range1 x{float(s.get('range1', 0.0) or 0.0):.2f} · "
         f"3m {float(s.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}%\n"
         f"Почему PAPER: {s.get('paper_validation_origin', 'forward challenger')}\n"
-        f"Следующий отчёт: {paper_progress_target(int(paper_validation_metrics().get('n', 0) or 0))} закрытых V17.2.1 PAPER."
+        f"Следующий отчёт: {paper_progress_target(int(paper_validation_metrics().get('n', 0) or 0))} закрытых V17.2.2 PAPER."
     )
 
 
@@ -7633,7 +7878,7 @@ def build_paper_result_message(
         f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
         f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
         "Это результат подтверждённого виртуального входа, не реальная сделка.\n"
-        f"Measured Edge PAPER V17.2.1: {_metrics_line(paper_metrics)} · "
+        f"Direct Measured PAPER V17.2.2: {_metrics_line(paper_metrics)} · "
         f"собрано {int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
         f"уникальных монет {int(paper_metrics.get('unique_symbols', 0))}."
@@ -7731,7 +7976,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     paper_metrics = paper_validation_metrics()
     readiness = real_money_readiness()
     return (
-        f"🧪 Диагностика V17.2.1 Measured Edge Forward\n"
+        f"🧪 Диагностика V17.2.2 Direct Measured Entry\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -7744,8 +7989,8 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
         f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"LIVE история: {wr_text(STATE.get('stats', {}).get('total', {}))}\n"
-        f"CONTROL V17.2.1: {_metrics_line(control_metrics)}\n"
-        f"MEASURED EDGE PAPER V17.2.1: {_metrics_line(paper_metrics)} · "
+        f"CONTROL V17.2.2: {_metrics_line(control_metrics)}\n"
+        f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(paper_metrics)} · "
         f"{int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))}\n"
         f"Micro-LIVE readiness: ready={readiness.get('ready', False)} · "
@@ -7885,7 +8130,7 @@ def pending_key(signal: Dict[str, Any]) -> str:
 
 def _watch_audit_state() -> Dict[str, Any]:
     audit = STATE.setdefault("watch_audit_v17_2", default_watch_audit())
-    if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.1":
+    if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.2":
         audit = default_watch_audit()
         STATE["watch_audit_v17_2"] = audit
     audit.setdefault("rejected", default_watch_audit()["rejected"].copy())
@@ -7898,10 +8143,17 @@ def _watch_audit_state() -> Dict[str, Any]:
 def record_watch_audit(
     item: Dict[str, Any], event: str, detail: str = ""
 ) -> None:
-    """Persist the V17.2.1 measured-entry funnel for every JSON backup."""
+    with STATE_IO_LOCK:
+        _record_watch_audit_locked(item, event, detail)
+
+
+def _record_watch_audit_locked(
+    item: Dict[str, Any], event: str, detail: str = ""
+) -> None:
+    """Persist the V17.2.2 direct-entry funnel for every JSON backup."""
     audit = _watch_audit_state()
     side = str(item.get("side", "UNKNOWN")).upper()
-    lane = str(item.get("paper_setup_lane", "CONTINUATION")).upper()
+    lane = str(item.get("paper_setup_lane", "DIRECT_MEASURED")).upper()
     side_state = audit.setdefault("by_side", {}).setdefault(
         side, {"started": 0, "confirmed": 0, "rejected": 0}
     )
@@ -7913,10 +8165,8 @@ def record_watch_audit(
         audit["started"] = int(audit.get("started", 0) or 0) + 1
         side_state["started"] = int(side_state.get("started", 0) or 0) + 1
         lane_state["started"] = int(lane_state.get("started", 0) or 0) + 1
-    elif event == "pullback_seen":
-        audit["pullback_seen"] = int(audit.get("pullback_seen", 0) or 0) + 1
-    elif event == "reclaim_seen":
-        audit["reclaim_seen"] = int(audit.get("reclaim_seen", 0) or 0) + 1
+    elif event == "execution_passed":
+        audit["execution_passed"] = int(audit.get("execution_passed", 0) or 0) + 1
     elif event == "confirmed":
         audit["confirmed"] = int(audit.get("confirmed", 0) or 0) + 1
         side_state["confirmed"] = int(side_state.get("confirmed", 0) or 0) + 1
@@ -7967,11 +8217,10 @@ def watch_audit_summary() -> str:
         )
     lane_text = ", ".join(lane_bits) or "нет"
     return (
-        f"FUNNEL V17.2.1: liquidity={int(audit.get('liquidity_passed', 0) or 0)}/"
+        f"FUNNEL V17.2.2: liquidity={int(audit.get('liquidity_passed', 0) or 0)}/"
         f"{int(audit.get('liquidity_checked', 0) or 0)} · "
-        f"started={int(audit.get('started', 0) or 0)} · "
-        f"pullback={int(audit.get('pullback_seen', 0) or 0)} · "
-        f"reclaim={int(audit.get('reclaim_seen', 0) or 0)} · "
+        f"detected={int(audit.get('started', 0) or 0)} · "
+        f"execution={int(audit.get('execution_passed', 0) or 0)} · "
         f"PAPER={int(audit.get('confirmed', 0) or 0)} · "
         f"rejected={rejected_total} ({reasons}) · lanes: {lane_text}"
     )
@@ -8816,6 +9065,8 @@ def safe_record_learning_result(
                 "near_miss_probe",
                 PAPER_VALIDATION_REASON,
                 PAPER_CONTROL_REASON,
+                LEGACY_V17_2_1_PAPER_VALIDATION_REASON,
+                LEGACY_V17_2_1_CONTROL_REASON,
                 LEGACY_V17_1_PAPER_VALIDATION_REASON,
                 LEGACY_V17_1_CONTROL_REASON,
                 LEGACY_V17_PAPER_VALIDATION_REASON,
@@ -9249,7 +9500,7 @@ async def scan_loop():
         f"Liquidity gate: top {V17_2_LIQUIDITY_KEEP_FRACTION*100:.0f}% by relative turnover/continuity · "
         f"active candles ≥ {V17_2_MIN_ACTIVE_CANDLE_FRACTION*100:.0f}% · "
         f"anomalies Vol1 > x{V17_2_MAX_CURRENT_VOL_RATIO:.0f} or Range1 > x{V17_2_MAX_CURRENT_RANGE_RATIO:.0f} rejected.\n"
-        f"Measured entry: A+ PRO_INSTANT only · Vol1 x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f} · "
+        f"Direct measured entry: independent of legacy instant/no_fast templates · Vol1 x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f} · "
         f"Range1 x{MEASURED_MIN_RANGE1:.2f}–x{MEASURED_MAX_RANGE1:.2f} · directional 3m "
         f"{MEASURED_MIN_DIRECTIONAL_3M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_3M*100:.2f}% · "
         f"15m {MEASURED_MIN_DIRECTIONAL_15M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_15M*100:.2f}%.\n"
@@ -9262,11 +9513,14 @@ async def scan_loop():
         f"Reports: first quality checkpoint at {PAPER_PILOT_REQUIRED_OUTCOMES} · full review at "
         f"{PAPER_REVIEW_REQUIRED_OUTCOMES} · model remains frozen until at least "
         f"{PAPER_LANE_REQUIRED_OUTCOMES} unchanged PAPER outcomes.\n"
-        f"Data separation: old {source_counts['all']} outcomes and every pre-V17.2.1 row are audit-only; "
-        f"only new measured PAPER can train.\n"
+        f"Data separation: old {source_counts['all']} outcomes and every pre-V17.2.2 row are audit-only; "
+        f"only new direct-measured PAPER can train.\n"
         f"Real-money readiness: ready={readiness.get('ready', False)} · env flag REAL_MONEY_SIGNALS="
         f"{readiness.get('live_flag', False)} · enabled={readiness.get('live_enabled', False)}. "
         f"Both evidence and manual flag are mandatory. This code never places exchange orders.\n"
+        f"Side guard: LONG and SHORT are admitted separately after ≥ "
+        f"{REAL_MONEY_MIN_SIDE_FORWARD} fresh outcomes/side, TP3+ majority, positive expectancy "
+        f"and a positive newest {REAL_MONEY_SIDE_RECENT_WINDOW}-outcome side block.\n"
         f"Micro-LIVE safety when enabled: ≤ {MAX_LIVE_SIGNALS_24H}/24h · ≤ "
         f"{MAX_LIVE_SIGNALS_PER_SIDE_24H}/side · spacing ≥ {MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min · "
         f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
@@ -9286,11 +9540,11 @@ async def scan_loop():
         f"Seed JSON: {restored_text}.\n"
         f"Restored sources: LIVE={source_counts['live']} · SHADOW={source_counts['shadow']} · "
         f"ALL={source_counts['all']}.\n"
-        f"Eligible V17.2.1 model data={model_data_count} · minimum before analysis "
+        f"Eligible V17.2.2 model data={model_data_count} · minimum before analysis "
         f"{PAPER_LANE_REQUIRED_OUTCOMES}.\n"
         f"CONTROL collected: {int(control_metrics.get('n', 0))} · "
         f"{_metrics_line(control_metrics)}.\n"
-        f"Measured Edge PAPER V17.2.1 collected: {int(paper_metrics.get('n', 0))}/"
+        f"Direct Measured PAPER V17.2.2 collected: {int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
         f"{_metrics_line(paper_metrics)} · unique symbols="
         f"{int(paper_metrics.get('unique_symbols', 0))}.\n"
@@ -9443,7 +9697,7 @@ def auto_status():
         "watch_audit_v17_2": STATE.get("watch_audit_v17_2", {}),
         "telegram_outbox_depth": telegram_outbox_depth(),
         "telegram_delivery": STATE.get("telegram_delivery", {}),
-        "paper_metrics_v17_2_1": paper_validation_metrics(),
+        "paper_metrics_v17_2_2": paper_validation_metrics(),
         "real_money_readiness": readiness,
         "last_scan": STATE.get("last_scan", {}),
         "last_error": STATE.get("last_error", ""),
