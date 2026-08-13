@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.2.2
+# VERIFIED GITHUB DEPLOY FILE — V17.2.3 READINESS ROW HOTFIX
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2584,8 +2584,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2.2 DIRECT MEASURED ENTRY"
-DEPLOY_MARKER = "V17_2_2_DIRECT_MEASURED_ENTRY_500_2026_08_12"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2.3 DIRECT MEASURED + READINESS HOTFIX"
+DEPLOY_MARKER = "V17_2_3_READINESS_ROW_HOTFIX_2026_08_13"
 
 app = FastAPI(title=APP_NAME)
 
@@ -4243,7 +4243,11 @@ def real_money_readiness() -> Dict[str, Any]:
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT id, result, pnl_r, symbol FROM adaptive_trades "
+            # `side` is required below for the independent LONG/SHORT
+            # readiness cohorts.  V17.2.2 omitted it from this projection,
+            # so the first eligible PAPER row raised
+            # IndexError('No item with that key') on every later scan.
+            "SELECT id, result, pnl_r, symbol, side FROM adaptive_trades "
             "WHERE COALESCE(decision_reason, '')=? "
             "ORDER BY closed_at ASC, id ASC",
             (PAPER_VALIDATION_REASON,),
@@ -7976,7 +7980,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     paper_metrics = paper_validation_metrics()
     readiness = real_money_readiness()
     return (
-        f"🧪 Диагностика V17.2.2 Direct Measured Entry\n"
+        f"🧪 Диагностика V17.2.3 Direct Measured + Readiness Hotfix\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
