@@ -1,9873 +1,1640 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.2.3 READINESS ROW HOTFIX
-# Render must start this exact root file with: uvicorn bot:app ...
-import os
-import time
-import json
-import random
+from __future__ import annotations
+
+"""
+V18.1 Execution-Accurate Visible Research Recorder
+BingX USDT-M perpetual markets.
+
+RESEARCH / PAPER ONLY:
+- no authenticated exchange endpoints
+- cannot place, modify, or cancel orders
+- every newly recorded broad candidate is visible in Telegram
+- PAPER is the stricter executable cohort
+- OBSERVER is the rejected broad cohort
+- only TP3+ is a profitable outcome
+- primary legacy result remains 6 minutes
+- path is sampled from executable BBO every ~2 seconds
+- missed horizons are marked DATA_GAP instead of inventing historical prices
+
+The goal is not to manufacture a high win rate. The goal is to verify whether
+a stronger "fresh continuation" gate can produce TP3+ > SL + expired on a
+clean forward sample before a separately reviewed micro-LIVE build exists.
+"""
+
 import asyncio
-import io
-import secrets
 import hashlib
+import io
+import json
+import math
+import os
+import secrets
+import sqlite3
+import statistics
+import threading
+import time
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 
+# ---------------------------------------------------------------------------
+# Immutable V18.1 protocol
+# ---------------------------------------------------------------------------
 
-# ============================================================
-# SAFE ADAPTIVE LEARNING LAYER
-# ============================================================
+APP_NAME = "Professional Futures Research Bot V18.1 EXECUTION ACCURATE VISIBLE"
+DEPLOY_MARKER = "V18_1_EXECUTION_ACCURATE_VISIBLE_2026_08_13"
+EXPORT_SCHEMA = "v18_1_research_export_v1"
+COHORT_ID = "V18_1_FRESH_LIQUID_MOMENTUM_FIXED_V1"
 
-"""
-adaptive_learning.py
+TARGET_MOVES: Tuple[float, ...] = (0.0065, 0.0120, 0.0185, 0.0260, 0.0350)
+TP1_MOVE, TP2_MOVE, TP3_MOVE, TP4_MOVE, TP5_MOVE = TARGET_MOVES
 
-Safe adaptive layer for a futures signal bot.
+HORIZONS_SECONDS: Tuple[int, ...] = (60, 180, 360, 600, 900, 1800)
+PRIMARY_HORIZON_SECONDS = 360
+FINAL_HORIZON_SECONDS = 1800
+MAX_HORIZON_LATENESS_SECONDS = 8
 
-What it does:
-- Stores every closed signal and its feature snapshot in SQLite.
-- Retrains after MIN_TRAIN_TRADES closed trades and then every RETRAIN_EVERY trades.
-- Uses a simple logistic model implemented with the Python standard library.
-- Uses chronological train, calibration, and independent newest-test blocks.
-- Promotes a challenger only if it beats both the baseline and current champion.
-- Learns a probability threshold that maximizes an expectancy-style objective.
-- Sends a Telegram report for every scheduled training attempt, including failures.
-- Audits each promoted model on later closed decisions and compares before/after.
-- Automatically rolls back a promoted model only after a guarded live-data failure.
-- Never changes leverage, stop-loss safety limits, API permissions, or source code.
+# Broad recorder: deliberately permissive. Every created broad episode is
+# visible in Telegram, whether it becomes PAPER or OBSERVER.
+BROAD_MIN_DIRECTIONAL_3M = 0.0035
+BROAD_MAX_DIRECTIONAL_3M = 0.0500
+BROAD_MIN_DIRECTIONAL_15M = 0.0050
+BROAD_MAX_DIRECTIONAL_15M = 0.0800
 
-This module does NOT guarantee profit and must be used in paper/shadow mode first.
-"""
+# Stronger PAPER continuation gate. Designed to attack the old failure mode:
+# weak/late impulses that quickly become expired or reverse into SL.
+PAPER_MIN_DIRECTIONAL_1M = 0.0012
+PAPER_MAX_DIRECTIONAL_1M = 0.0090
+PAPER_MIN_DIRECTIONAL_3M = 0.0065
+PAPER_MAX_DIRECTIONAL_3M = 0.0280
+PAPER_MIN_DIRECTIONAL_15M = 0.0090
+PAPER_MAX_DIRECTIONAL_15M = 0.0500
+PAPER_MIN_ACCELERATION = 0.22        # d3 must be >= 22% of d15
+PAPER_MAX_D3_SHARE_OF_D15 = 0.78    # avoids one-bar exhaustion
+PAPER_MIN_VOL1 = 0.95
+PAPER_MAX_VOL1 = 2.80
+PAPER_MIN_RANGE1 = 1.15
+PAPER_MAX_RANGE1 = 4.00
+PAPER_MIN_BODY_FRACTION = 0.38
+PAPER_LONG_MIN_CLOSE_LOCATION = 0.65
+PAPER_SHORT_MAX_CLOSE_LOCATION = 0.35
+PAPER_MAX_VWAP_DISTANCE = 0.0180
+PAPER_MAX_SPREAD_BPS = 10.0
+PAPER_MIN_DEPTH_USDT = 5_000.0
+PAPER_MIN_24H_QUOTE_VOLUME_USDT = 10_000_000.0
+PAPER_MIN_TP3_RR = 1.45
 
-import json
-import math
-import os
-import random
-import sqlite3
-import threading
-import time
-from dataclasses import asdict, dataclass, fields
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+MIN_24H_QUOTE_VOLUME_USDT = 3_000_000.0
+MIN_ACTIVE_CANDLE_FRACTION = 0.82
+MIN_UNIQUE_CLOSE_FRACTION = 0.35
+MAX_UNIVERSE = 100
+SCAN_WORKERS = 8
+MAX_OPEN_EPISODES = 180
+
+# We still avoid sending the identical symbol/side every scan.
+OBSERVER_SYMBOL_COOLDOWN_SECONDS = 30 * 60
+PAPER_SYMBOL_COOLDOWN_SECONDS = 3 * 60 * 60
+INDEPENDENT_CLUSTER_SECONDS = 15 * 60
+
+MIN_STOP_MOVE = 0.0080
+MAX_STOP_MOVE = 0.0127
+ATR_STOP_MULTIPLIER = 2.00
+
+# Conservative execution costs for readiness accounting.
+TAKER_FEE_PER_SIDE = 0.0005
+ROUND_TRIP_FEE_MOVE = TAKER_FEE_PER_SIDE * 2.0
+ASSUMED_ENTRY_SLIPPAGE_BPS = 4.0
+ASSUMED_EXIT_SLIPPAGE_BPS = 4.0
+ASSUMED_SLIPPAGE_MOVE = (
+    ASSUMED_ENTRY_SLIPPAGE_BPS + ASSUMED_EXIT_SLIPPAGE_BPS
+) / 10_000.0
+ROUND_TRIP_COST_MOVE = ROUND_TRIP_FEE_MOVE + ASSUMED_SLIPPAGE_MOVE
+
+# Research gate. Passing NEVER enables money in this program.
+REVIEW_MIN_INDEPENDENT_PAPER = 150
+REVIEW_MIN_UNIQUE_SYMBOLS = 30
+REVIEW_MIN_UNIQUE_CLUSTERS = 75
+REVIEW_MIN_TP3_RATE = 0.52
+REVIEW_MIN_EXPECTANCY_R = 0.15
+REVIEW_MIN_PROFIT_FACTOR = 1.30
+REVIEW_MAX_DRAWDOWN_R = 8.0
+REVIEW_RECENT_WINDOW = 50
+
+PROTOCOL_MANIFEST = {
+    "cohort_id": COHORT_ID,
+    "targets": TARGET_MOVES,
+    "horizons": HORIZONS_SECONDS,
+    "primary_horizon": PRIMARY_HORIZON_SECONDS,
+    "max_horizon_lateness": MAX_HORIZON_LATENESS_SECONDS,
+    "broad_3m": [BROAD_MIN_DIRECTIONAL_3M, BROAD_MAX_DIRECTIONAL_3M],
+    "broad_15m": [BROAD_MIN_DIRECTIONAL_15M, BROAD_MAX_DIRECTIONAL_15M],
+    "paper_1m": [PAPER_MIN_DIRECTIONAL_1M, PAPER_MAX_DIRECTIONAL_1M],
+    "paper_3m": [PAPER_MIN_DIRECTIONAL_3M, PAPER_MAX_DIRECTIONAL_3M],
+    "paper_15m": [PAPER_MIN_DIRECTIONAL_15M, PAPER_MAX_DIRECTIONAL_15M],
+    "paper_acceleration": [PAPER_MIN_ACCELERATION, PAPER_MAX_D3_SHARE_OF_D15],
+    "paper_vol1": [PAPER_MIN_VOL1, PAPER_MAX_VOL1],
+    "paper_range1": [PAPER_MIN_RANGE1, PAPER_MAX_RANGE1],
+    "paper_body": PAPER_MIN_BODY_FRACTION,
+    "paper_vwap_distance": PAPER_MAX_VWAP_DISTANCE,
+    "spread_bps": PAPER_MAX_SPREAD_BPS,
+    "depth_usdt": PAPER_MIN_DEPTH_USDT,
+    "paper_min_24h_quote_volume": PAPER_MIN_24H_QUOTE_VOLUME_USDT,
+    "fees_round_trip": ROUND_TRIP_FEE_MOVE,
+    "assumed_slippage_round_trip": ASSUMED_SLIPPAGE_MOVE,
+    "cost_round_trip": ROUND_TRIP_COST_MOVE,
+    "stop_bounds": [MIN_STOP_MOVE, MAX_STOP_MOVE],
+}
+PROTOCOL_HASH = hashlib.sha256(
+    json.dumps(PROTOCOL_MANIFEST, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()[:16]
 
 
-DB_PATH = os.getenv("ADAPTIVE_DB_PATH", "adaptive_bot.sqlite3")
-# Begin the first error-analysis cycle after 50 outcomes. The independent newest
-# test still decides whether the challenger is strong enough to affect signals.
-MIN_TRAIN_TRADES = int(os.getenv("ADAPTIVE_MIN_TRAIN_TRADES", "50"))
-RETRAIN_EVERY = int(os.getenv("ADAPTIVE_RETRAIN_EVERY", "25"))
-MAX_TRAIN_ROWS = int(os.getenv("ADAPTIVE_MAX_TRAIN_ROWS", "1500"))
-VALIDATION_FRACTION = float(os.getenv("ADAPTIVE_VALIDATION_FRACTION", "0.20"))
-MIN_VALIDATION_ROWS = int(os.getenv("ADAPTIVE_MIN_VALIDATION_ROWS", "10"))
-MIN_CALIBRATION_ROWS = int(os.getenv("ADAPTIVE_MIN_CALIBRATION_ROWS", "10"))
-MIN_POSITIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_POSITIVE_ROWS", "5"))
-MIN_NEGATIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_NEGATIVE_ROWS", "5"))
-MIN_MODEL_IMPROVEMENT = float(os.getenv("ADAPTIVE_MIN_MODEL_IMPROVEMENT", "0.010"))
-MIN_EXPECTANCY_IMPROVEMENT_R = float(os.getenv("ADAPTIVE_MIN_EXPECTANCY_IMPROVEMENT_R", "0.05"))
-MIN_SELECTED_TEST_ROWS = int(os.getenv("ADAPTIVE_MIN_SELECTED_TEST_ROWS", "5"))
-MIN_SELECTED_LIVE_TEST_ROWS = int(os.getenv("ADAPTIVE_MIN_SELECTED_LIVE_TEST_ROWS", "5"))
-MIN_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MIN_SIGNAL_PROBABILITY", "0.60"))
-MAX_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MAX_SIGNAL_PROBABILITY", "0.82"))
-MIN_VALIDATION_COVERAGE = float(os.getenv("ADAPTIVE_MIN_VALIDATION_COVERAGE", "0.25"))
-# The user's explicit target: TP3+ must be a strict majority of all closed
-# outcomes selected by a challenger (more than SL and expired combined).
-ADAPTIVE_TARGET_SUCCESS_RATE = float(os.getenv("ADAPTIVE_TARGET_SUCCESS_RATE", "0.50"))
-ADAPTIVE_CONFIRMATION_PASSES = int(os.getenv("ADAPTIVE_CONFIRMATION_PASSES", "2"))
-ADAPTIVE_CONFIRMATION_SELECTED = int(os.getenv("ADAPTIVE_CONFIRMATION_SELECTED", "20"))
-ADAPTIVE_INITIAL_LIVE_FRACTION = float(os.getenv("ADAPTIVE_INITIAL_LIVE_FRACTION", "0.25"))
-ADAPTIVE_LIVE_FRACTION_STEP = float(os.getenv("ADAPTIVE_LIVE_FRACTION_STEP", "0.25"))
-MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
-MODEL_DATA_POLICY = "v17_2_2_direct_measured_forward_only_v1"
-# Guarded live is the default: the model still cannot block anything until it has
-# passed the independent holdout checks below. Set true to observe forever.
-SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "false").lower() == "true"
-ROUND_TRIP_COST_MOVE = float(os.getenv("ROUND_TRIP_COST_MOVE", "0.0012"))
+# ---------------------------------------------------------------------------
+# Environment/runtime
+# ---------------------------------------------------------------------------
 
-# Post-promotion audit. A "decision" is either a live signal accepted by the
-# active model or a model-blocked candidate that is followed in shadow. Accepted
-# candidates that were not sent only because all live slots were occupied are
-# excluded, so they cannot distort the live comparison.
-LIVE_AUDIT_ENABLED = os.getenv("ADAPTIVE_LIVE_AUDIT_ENABLED", "true").lower() == "true"
-LIVE_AUDIT_EVERY = int(os.getenv("ADAPTIVE_LIVE_AUDIT_EVERY", "25"))
-LIVE_AUDIT_BASELINE_WINDOW = int(os.getenv("ADAPTIVE_LIVE_AUDIT_BASELINE_WINDOW", "50"))
-LIVE_AUDIT_MIN_LIVE = int(os.getenv("ADAPTIVE_LIVE_AUDIT_MIN_LIVE", "10"))
-LIVE_AUDIT_MIN_BASELINE = int(os.getenv("ADAPTIVE_LIVE_AUDIT_MIN_BASELINE", "15"))
-AUTO_ROLLBACK_ENABLED = os.getenv("ADAPTIVE_AUTO_ROLLBACK", "true").lower() == "true"
-ROLLBACK_EXPECTANCY_DROP_R = float(os.getenv("ADAPTIVE_ROLLBACK_EXPECTANCY_DROP_R", "0.15"))
-ROLLBACK_SUCCESS_DROP = float(os.getenv("ADAPTIVE_ROLLBACK_SUCCESS_DROP", "0.08"))
-ROLLBACK_SEVERE_EXPECTANCY_R = float(os.getenv("ADAPTIVE_ROLLBACK_SEVERE_EXPECTANCY_R", "-0.20"))
-ROLLBACK_MIN_BLOCKED = int(os.getenv("ADAPTIVE_ROLLBACK_MIN_BLOCKED", "10"))
-ROLLBACK_HARMFUL_BLOCK_WIN_RATE = float(
-    os.getenv("ADAPTIVE_ROLLBACK_HARMFUL_BLOCK_WIN_RATE", "0.45")
-)
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except Exception:
+        return max(minimum, default)
 
-# Legacy evidence guard retained for audit compatibility. These defaults come from the user's first 50 closed
-# outcomes: every candidate below Score 99 or with raw 1m volume ratio <= 0.80
-# was non-profitable. The rule is still audited on NEW outcomes and can disable
-# itself if shadow tracking shows that it is rejecting profitable TP3+ trades.
-EVIDENCE_GUARD_ENABLED = os.getenv("EVIDENCE_GUARD_ENABLED", "false").lower() == "true"
-EVIDENCE_GUARD_VERSION = 1
-EVIDENCE_MIN_SCORE = float(os.getenv("EVIDENCE_MIN_SCORE", "99"))
-EVIDENCE_MIN_VOL1 = float(os.getenv("EVIDENCE_MIN_VOL1", "0.80"))
-EVIDENCE_AUDIT_ENABLED = os.getenv("EVIDENCE_AUDIT_ENABLED", "true").lower() == "true"
-EVIDENCE_AUDIT_EVERY = int(os.getenv("EVIDENCE_AUDIT_EVERY", "25"))
-EVIDENCE_AUDIT_BASELINE_WINDOW = int(os.getenv("EVIDENCE_AUDIT_BASELINE_WINDOW", "50"))
-EVIDENCE_AUDIT_MIN_ACCEPTED = int(os.getenv("EVIDENCE_AUDIT_MIN_ACCEPTED", "8"))
-EVIDENCE_AUDIT_MIN_BLOCKED = int(os.getenv("EVIDENCE_AUDIT_MIN_BLOCKED", "5"))
-EVIDENCE_ROLLBACK_WINNERS = int(os.getenv("EVIDENCE_ROLLBACK_WINNERS", "2"))
-EVIDENCE_ROLLBACK_EXPECTANCY_DROP_R = float(
-    os.getenv("EVIDENCE_ROLLBACK_EXPECTANCY_DROP_R", "0.15")
-)
-EVIDENCE_ROLLBACK_SUCCESS_DROP = float(
-    os.getenv("EVIDENCE_ROLLBACK_SUCCESS_DROP", "0.08")
-)
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except Exception:
+        return max(minimum, default)
 
-ADAPTIVE_SEED_PATH = os.getenv("ADAPTIVE_SEED_PATH", "adaptive_seed.json")
-ADAPTIVE_SEED_DISCOVERY_ENABLED = os.getenv(
-    "ADAPTIVE_SEED_DISCOVERY_ENABLED", "false"
-).lower() == "true"
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").rstrip("/")
+DB_PATH = os.getenv("RESEARCH_DB_PATH", "research_v18_1.sqlite3")
+SEED_PATH = os.getenv("RESEARCH_SEED_PATH", "adaptive_seed.json")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
+PORT = _env_int("PORT", 10000, 1)
 
-# Never let learning touch these safety-critical settings.
-LOCKED_SAFETY_KEYS = {
-    "LEVERAGE",
-    "MAX_SL_MOVE",
-    "LOCAL_SCALP_MAX_SL_MOVE",
-    "MAX_ACTIVE_SIGNALS",
-    "MAX_SIGNALS_PER_SCAN",
+SCAN_INTERVAL_SECONDS = _env_int("SCAN_INTERVAL_SECONDS", 60, 30)
+# Critical change: execution path from 15s -> 2s.
+TRACK_INTERVAL_SECONDS = _env_int("TRACK_INTERVAL_SECONDS", 2, 1)
+DIAGNOSTIC_INTERVAL_SECONDS = _env_int("DIAGNOSTIC_INTERVAL_SECONDS", 1800, 300)
+REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 10.0, 3.0)
+API_RETRIES = _env_int("API_RETRIES", 3, 1)
+BACKUP_EVERY_PRIMARY = _env_int("BACKUP_EVERY_PRIMARY", 25, 5)
+PAPER_CHECKPOINT_EVERY = _env_int("PAPER_CHECKPOINT_EVERY", 5, 1)
+TELEGRAM_RETRIES = _env_int("TELEGRAM_RETRIES", 3, 1)
+
+DB_LOCK = threading.RLock()
+RUNTIME_LOCK = threading.RLock()
+SCAN_LOCK = threading.Lock()
+TRACK_LOCK = threading.Lock()
+CACHE_LOCK = threading.RLock()
+
+RUNTIME: Dict[str, Any] = {
+    "started_at": int(time.time()),
+    "scan_count": 0,
+    "last_scan": {},
+    "last_scan_at": 0,
+    "last_track_at": 0,
+    "last_diagnostic_at": 0,
+    "last_error": "",
+    "api_calls": 0,
+    "api_errors": 0,
+    "telegram_sent": 0,
+    "telegram_errors": 0,
+    "seed_restore": {},
 }
 
-FEATURE_NAMES: Tuple[str, ...] = (
-    "score",
-    "is_long",
-    "is_a_plus",
-    "ch3m_abs",
-    "ch15m_abs",
-    "ch30m_abs",
-    "vol1",
-    "vol5",
-    "range1",
-    "range5",
-    "rr_tp1",
-    "ladder_rr",
-    "final_rr",
-    "sl_price_move",
-    "btc_bull",
-    "btc_bear",
-    "is_reversal",
-    "is_dump",
-    "is_instant",
-    "is_aero",
-    "edge_3m",
-    "edge_15m",
-    "edge_30m",
-    "btc_alignment",
-    # Non-linear quality markers retained in V16.6. _vector_from_dict derives
-    # them for old V16.2 backups, so all 50 historical rows remain trainable.
-    "score_below_guard",
-    "vol1_below_guard",
-    "evidence_quality_pass",
-    "symbol_fail_streak",
-    # Retained for feature-schema compatibility. V17 does not train on
-    # ordinary diagnostic SHADOW rows; registered PAPER rows still carry 1.0.
-    "is_shadow",
-    # V17 records the actual post-WATCH path.  These fields did not exist in
-    # the 400-row archive, so the archive remains audit-only and cannot train
-    # the new model.
-    "watch_impulse",
-    "pullback_depth",
-    "reclaim_recovery",
-    "watch_age",
-    # V17.2 liquidity-first and dual-lane identity.  The restored archive does
-    # not contain these fields and is excluded by MODEL_DATA_POLICY.
-    "is_continuation_lane",
-    "is_sweep_reversal_lane",
-    "liquidity_rank",
-    "liquidity_log_turnover",
-    "liquidity_active_fraction",
-    "liquidity_unique_fraction",
-    "atr1_pct",
-    "normalized_directional_move",
-    # V17.2.2 adds executable-liquidity evidence at the exact entry moment.
-    # These are measured from the public BingX best bid/ask or depth endpoint.
-    "book_spread_bps",
-    "book_depth_log",
+def now_ts() -> int:
+    return int(time.time())
+
+def set_runtime_error(message: str) -> None:
+    with RUNTIME_LOCK:
+        RUNTIME["last_error"] = str(message)[:800]
+
+def runtime_snapshot() -> Dict[str, Any]:
+    with RUNTIME_LOCK:
+        return json.loads(json.dumps(RUNTIME, ensure_ascii=False, default=str))
+
+
+# ---------------------------------------------------------------------------
+# SQLite
+# ---------------------------------------------------------------------------
+
+EPISODE_COLUMNS: Tuple[str, ...] = (
+    "id", "episode_key", "cohort_id", "protocol_hash", "created_at",
+    "cluster_id", "symbol", "side", "tier", "visible_paper", "independent",
+    "quality_score", "paper_reject_reason", "entry_price", "entry_bid",
+    "entry_ask", "spread_bps", "depth_usdt", "quote_volume_24h",
+    "liquidity_rank", "stop_move", "tp1_move", "tp2_move", "tp3_move",
+    "tp4_move", "tp5_move", "features_json", "status", "primary_outcome",
+    "primary_pnl_r", "primary_closed_at", "primary_notified", "entry_notified",
+    "tp1_hit_at", "tp2_hit_at", "tp3_hit_at", "tp4_hit_at", "tp5_hit_at",
+    "sl_hit_at", "max_favorable_move", "max_adverse_move", "last_exit_price",
+    "last_seen_at", "data_gap_count", "path_samples", "max_sample_gap_seconds",
+    "finalized_at", "final_notified",
 )
 
+HORIZON_COLUMNS: Tuple[str, ...] = (
+    "episode_id", "horizon_seconds", "observed_at", "exit_price",
+    "net_move", "mfe_move", "mae_move", "tp1_hit", "tp2_hit", "tp3_hit",
+    "sl_hit", "outcome", "pnl_r", "lateness_seconds",
+)
 
-@dataclass
-class ModelState:
-    version: int = 0
-    active: bool = False
-    threshold: float = MIN_SIGNAL_PROBABILITY
-    trained_rows: int = 0
-    validation_rows: int = 0
-    base_logloss: float = 999.0
-    model_logloss: float = 999.0
-    validation_win_rate: float = 0.0
-    validation_coverage: float = 0.0
-    validation_selected_wr: float = 0.0
-    validation_selected_count: int = 0
-    weights: List[float] = None
-    mean: List[float] = None
-    std: List[float] = None
-    last_trained_closed_count: int = 0
-    last_attempted_closed_count: int = 0
-    validation_expectancy_r: float = 0.0
-    validation_baseline_expectancy_r: float = 0.0
-    last_candidate_reason: str = "warmup"
-    created_at: int = 0
-    parent_version: int = 0
-    activation_trade_id: int = 0
-    activation_closed_count: int = 0
-    last_live_audit_decision_count: int = 0
-    last_live_audit_at: int = 0
-    candidate_pass_streak: int = 0
-    candidate_selected_total: int = 0
-    deployment_fraction: float = 0.0
-    data_policy: str = MODEL_DATA_POLICY
-
-    def __post_init__(self) -> None:
-        if self.weights is None:
-            self.weights = [0.0] * (len(FEATURE_NAMES) + 1)
-        if self.mean is None:
-            self.mean = [0.0] * len(FEATURE_NAMES)
-        if self.std is None:
-            self.std = [1.0] * len(FEATURE_NAMES)
-
-
-@dataclass
-class EvidenceGuardState:
-    version: int = EVIDENCE_GUARD_VERSION
-    active: bool = EVIDENCE_GUARD_ENABLED
-    min_score: float = EVIDENCE_MIN_SCORE
-    min_vol1: float = EVIDENCE_MIN_VOL1
-    activation_trade_id: int = 0
-    activation_closed_count: int = 0
-    last_audit_decision_count: int = 0
-    last_audit_at: int = 0
-    created_at: int = 0
-    disabled_reason: str = ""
-
-
-_LOCK = threading.RLock()
-
-
-def _connect() -> sqlite3.Connection:
+def db_connect() -> sqlite3.Connection:
     path = Path(DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
-
-def init_adaptive_db() -> None:
-    with _LOCK, _connect() as conn:
+def init_db() -> None:
+    with DB_LOCK, db_connect() as conn:
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS adaptive_trades (
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS episodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id TEXT UNIQUE,
+                episode_key TEXT NOT NULL UNIQUE,
+                cohort_id TEXT NOT NULL,
+                protocol_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                closed_at INTEGER NOT NULL,
-                source TEXT NOT NULL DEFAULT 'live',
+                cluster_id INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
-                strategy TEXT NOT NULL,
-                grade TEXT NOT NULL,
-                result TEXT NOT NULL,
-                label INTEGER NOT NULL,
-                pnl_r REAL NOT NULL DEFAULT 0,
-                exit_price REAL,
-                mfe_r REAL NOT NULL DEFAULT 0,
-                mae_r REAL NOT NULL DEFAULT 0,
-                duration_minutes REAL NOT NULL DEFAULT 0,
+                tier TEXT NOT NULL,
+                visible_paper INTEGER NOT NULL DEFAULT 0,
+                independent INTEGER NOT NULL DEFAULT 0,
+                quality_score REAL NOT NULL DEFAULT 0,
+                paper_reject_reason TEXT NOT NULL DEFAULT '',
+                entry_price REAL NOT NULL,
+                entry_bid REAL NOT NULL DEFAULT 0,
+                entry_ask REAL NOT NULL DEFAULT 0,
+                spread_bps REAL NOT NULL DEFAULT 999,
+                depth_usdt REAL NOT NULL DEFAULT 0,
+                quote_volume_24h REAL NOT NULL DEFAULT 0,
+                liquidity_rank REAL NOT NULL DEFAULT 0,
+                stop_move REAL NOT NULL,
+                tp1_move REAL NOT NULL,
+                tp2_move REAL NOT NULL,
+                tp3_move REAL NOT NULL,
+                tp4_move REAL NOT NULL,
+                tp5_move REAL NOT NULL,
                 features_json TEXT NOT NULL,
-                model_version INTEGER NOT NULL DEFAULT 0,
-                model_probability REAL,
-                shadow_accepted INTEGER,
-                evidence_guard_version INTEGER NOT NULL DEFAULT 0,
-                evidence_guard_accepted INTEGER,
-                evidence_guard_reason TEXT,
-                decision_reason TEXT
+                status TEXT NOT NULL DEFAULT 'open',
+                primary_outcome TEXT,
+                primary_pnl_r REAL,
+                primary_closed_at INTEGER,
+                primary_notified INTEGER NOT NULL DEFAULT 0,
+                entry_notified INTEGER NOT NULL DEFAULT 0,
+                tp1_hit_at INTEGER,
+                tp2_hit_at INTEGER,
+                tp3_hit_at INTEGER,
+                tp4_hit_at INTEGER,
+                tp5_hit_at INTEGER,
+                sl_hit_at INTEGER,
+                max_favorable_move REAL NOT NULL DEFAULT 0,
+                max_adverse_move REAL NOT NULL DEFAULT 0,
+                last_exit_price REAL,
+                last_seen_at INTEGER,
+                data_gap_count INTEGER NOT NULL DEFAULT 0,
+                path_samples INTEGER NOT NULL DEFAULT 0,
+                max_sample_gap_seconds INTEGER NOT NULL DEFAULT 0,
+                finalized_at INTEGER,
+                final_notified INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_episodes_open
+            ON episodes(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_episodes_cohort_tier
+            ON episodes(cohort_id, tier, primary_closed_at);
+            CREATE INDEX IF NOT EXISTS idx_episodes_symbol_side
+            ON episodes(cohort_id, symbol, side, tier, created_at);
+
+            CREATE TABLE IF NOT EXISTS horizon_results (
+                episode_id INTEGER NOT NULL,
+                horizon_seconds INTEGER NOT NULL,
+                observed_at INTEGER NOT NULL,
+                exit_price REAL NOT NULL,
+                net_move REAL NOT NULL,
+                mfe_move REAL NOT NULL,
+                mae_move REAL NOT NULL,
+                tp1_hit INTEGER NOT NULL,
+                tp2_hit INTEGER NOT NULL,
+                tp3_hit INTEGER NOT NULL,
+                sl_hit INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                pnl_r REAL NOT NULL,
+                lateness_seconds INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (episode_id, horizon_seconds),
+                FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
             );
 
-            CREATE INDEX IF NOT EXISTS idx_adaptive_trades_closed
-            ON adaptive_trades(closed_at);
-
-            CREATE TABLE IF NOT EXISTS adaptive_model_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                state_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS adaptive_events (
+            CREATE TABLE IF NOT EXISTS outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                filename TEXT,
+                caption TEXT,
                 created_at INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                message TEXT NOT NULL,
-                payload_json TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS adaptive_model_versions (
-                version INTEGER PRIMARY KEY,
-                state_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                saved_at INTEGER NOT NULL,
-                note TEXT NOT NULL DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS adaptive_rule_guard_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                state_json TEXT NOT NULL
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NOT NULL DEFAULT 0
             );
             """
         )
-
-        # Migrate an existing V15 database in place. SQLite does not support
-        # ADD COLUMN IF NOT EXISTS on all Render Python images.
-        existing_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(adaptive_trades)").fetchall()
-        }
-        migrations = {
-            "source": "ALTER TABLE adaptive_trades ADD COLUMN source TEXT NOT NULL DEFAULT 'live'",
-            "exit_price": "ALTER TABLE adaptive_trades ADD COLUMN exit_price REAL",
-            "mfe_r": "ALTER TABLE adaptive_trades ADD COLUMN mfe_r REAL NOT NULL DEFAULT 0",
-            "mae_r": "ALTER TABLE adaptive_trades ADD COLUMN mae_r REAL NOT NULL DEFAULT 0",
-            "duration_minutes": "ALTER TABLE adaptive_trades ADD COLUMN duration_minutes REAL NOT NULL DEFAULT 0",
-            "evidence_guard_version": "ALTER TABLE adaptive_trades ADD COLUMN evidence_guard_version INTEGER NOT NULL DEFAULT 0",
-            "evidence_guard_accepted": "ALTER TABLE adaptive_trades ADD COLUMN evidence_guard_accepted INTEGER",
-            "evidence_guard_reason": "ALTER TABLE adaptive_trades ADD COLUMN evidence_guard_reason TEXT",
-            "decision_reason": "ALTER TABLE adaptive_trades ADD COLUMN decision_reason TEXT",
-        }
-        for column, statement in migrations.items():
-            if column not in existing_columns:
-                conn.execute(statement)
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_adaptive_trades_model_decision "
-            "ON adaptive_trades(model_version, source, shadow_accepted, id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_adaptive_trades_evidence_decision "
-            "ON adaptive_trades(evidence_guard_version, source, evidence_guard_accepted, id)"
-        )
-
-        row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
-        if row is None:
-            state = ModelState(created_at=int(time.time()))
-            conn.execute(
-                "INSERT INTO adaptive_model_state(id, state_json) VALUES(1, ?)",
-                (json.dumps(asdict(state), ensure_ascii=False),),
-            )
-        else:
-            try:
-                raw = json.loads(row["state_json"])
-                allowed = {field.name for field in fields(ModelState)}
-                state = ModelState(**{key: value for key, value in raw.items() if key in allowed})
-                if str(raw.get("data_policy", "legacy_all_sources")) != MODEL_DATA_POLICY:
-                    eligible_count = int(
-                        conn.execute(
-                            "SELECT COUNT(*) AS n FROM adaptive_trades "
-                            "WHERE COALESCE(decision_reason, '')=?",
-                            (PAPER_VALIDATION_REASON,),
-                        ).fetchone()["n"]
-                        or 0
-                    )
-                    state.active = False
-                    state.trained_rows = eligible_count
-                    state.last_trained_closed_count = 0
-                    state.last_attempted_closed_count = 0
-                    state.last_candidate_reason = "v17_clean_forward_dataset"
-                    state.candidate_pass_streak = 0
-                    state.candidate_selected_total = 0
-                    state.deployment_fraction = 0.0
-                    state.data_policy = MODEL_DATA_POLICY
-                    state.weights = [0.0] * (len(FEATURE_NAMES) + 1)
-                    state.mean = [0.0] * len(FEATURE_NAMES)
-                    state.std = [1.0] * len(FEATURE_NAMES)
-                    conn.execute(
-                        "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
-                        (json.dumps(asdict(state), ensure_ascii=False),),
-                    )
-            except Exception:
-                state = ModelState(created_at=int(time.time()))
-                conn.execute(
-                    "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
-                    (json.dumps(asdict(state), ensure_ascii=False),),
-                )
-
-        # When upgrading an already-active V16.1 model, begin its live audit
-        # after the upgrade instead of incorrectly treating old rows as live
-        # post-promotion evidence.
-        if state.active and state.activation_trade_id <= 0:
-            latest = conn.execute(
-                "SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS n FROM adaptive_trades"
-            ).fetchone()
-            state.activation_trade_id = int(latest["max_id"] or 0)
-            state.activation_closed_count = int(latest["n"] or 0)
-            state.last_live_audit_decision_count = 0
-            conn.execute(
-                "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
-                (json.dumps(asdict(state), ensure_ascii=False),),
-            )
-
-        initial_status = "active" if state.active else ("baseline" if state.version == 0 else "inactive")
-        conn.execute(
-            "INSERT OR IGNORE INTO adaptive_model_versions"
-            "(version, state_json, status, saved_at, note) VALUES(?,?,?,?,?)",
-            (
-                int(state.version),
-                json.dumps(asdict(state), ensure_ascii=False),
-                initial_status,
-                int(time.time()),
-                "database_initialized",
-            ),
-        )
-
-        guard_row = conn.execute(
-            "SELECT state_json FROM adaptive_rule_guard_state WHERE id = 1"
-        ).fetchone()
-        latest = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS n FROM adaptive_trades"
-        ).fetchone()
-        reset_guard = False
-        if guard_row is None:
-            guard = EvidenceGuardState(
-                activation_trade_id=int(latest["max_id"] or 0),
-                activation_closed_count=int(latest["n"] or 0),
-                created_at=int(time.time()),
-            )
-            reset_guard = True
-        else:
-            try:
-                raw_guard = json.loads(guard_row["state_json"])
-                allowed_guard = {field.name for field in fields(EvidenceGuardState)}
-                guard = EvidenceGuardState(
-                    **{key: value for key, value in raw_guard.items() if key in allowed_guard}
-                )
-            except Exception:
-                guard = EvidenceGuardState(
-                    activation_trade_id=int(latest["max_id"] or 0),
-                    activation_closed_count=int(latest["n"] or 0),
-                    created_at=int(time.time()),
-                )
-                reset_guard = True
-
-        # A threshold/version change is a new rule experiment and therefore
-        # receives a fresh before/after activation marker.
-        if (
-            int(guard.version) != EVIDENCE_GUARD_VERSION
-            or abs(float(guard.min_score) - EVIDENCE_MIN_SCORE) > 1e-9
-            or abs(float(guard.min_vol1) - EVIDENCE_MIN_VOL1) > 1e-9
-        ):
-            guard = EvidenceGuardState(
-                activation_trade_id=int(latest["max_id"] or 0),
-                activation_closed_count=int(latest["n"] or 0),
-                created_at=int(time.time()),
-            )
-            reset_guard = True
-
-        if not EVIDENCE_GUARD_ENABLED and guard.active:
-            guard.active = False
-            guard.disabled_reason = "disabled_by_environment"
-            reset_guard = True
-
-        if reset_guard:
-            conn.execute(
-                "INSERT INTO adaptive_rule_guard_state(id, state_json) VALUES(1, ?) "
-                "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json",
-                (json.dumps(asdict(guard), ensure_ascii=False),),
-            )
         conn.commit()
 
-
-def _clip(value: Any, low: float, high: float, default: float = 0.0) -> float:
+def meta_get(key: str, default: Any = None) -> Any:
+    init_db()
+    with DB_LOCK, db_connect() as conn:
+        row = conn.execute("SELECT value_json FROM meta WHERE key=?", (key,)).fetchone()
+    if not row:
+        return default
     try:
-        x = float(value)
-        if not math.isfinite(x):
-            return default
-        return min(high, max(low, x))
+        return json.loads(row["value_json"])
     except Exception:
         return default
 
-
-def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
-    side = str(trade.get("side", "")).upper()
-    grade = str(trade.get("grade", "")).upper()
-    mode = str(trade.get("setup_mode", "")).upper()
-    strategy = str(trade.get("strategy", "")).upper()
-    btc_text = str(trade.get("btc_text", "")).upper()
-    direction = 1.0 if side == "LONG" else -1.0
-    ch3m = _clip(trade.get("ch3m_1m"), -1, 1)
-    ch15m = _clip(trade.get("ch15m"), -1, 1)
-    ch30m = _clip(trade.get("ch30m"), -1, 1)
-    btc_bull = 1.0 if "BTC BULL" in btc_text else 0.0
-    btc_bear = 1.0 if "BTC BEAR" in btc_text else 0.0
-    btc_alignment = 0.0
-    if (side == "LONG" and btc_bull) or (side == "SHORT" and btc_bear):
-        btc_alignment = 1.0
-    elif (side == "LONG" and btc_bear) or (side == "SHORT" and btc_bull):
-        btc_alignment = -1.0
-
-    entry = _clip(trade.get("entry"), 1e-12, 1e18, 1.0)
-    sl = _clip(trade.get("sl"), 0.0, 1e18, entry)
-    sl_move = abs(entry - sl) / max(entry, 1e-12)
-
-    features = {
-        "score": _clip(trade.get("score"), 0, 100) / 100.0,
-        "is_long": 1.0 if side == "LONG" else 0.0,
-        "is_a_plus": 1.0 if grade == "A+" else 0.0,
-        "ch3m_abs": _clip(abs(ch3m), 0, 0.25) / 0.25,
-        "ch15m_abs": _clip(abs(ch15m), 0, 0.40) / 0.40,
-        "ch30m_abs": _clip(abs(ch30m), 0, 0.60) / 0.60,
-        "vol1": _clip(trade.get("vol1"), 0, 8) / 8.0,
-        "vol5": _clip(trade.get("volume_ratio", trade.get("vol5", 1.0)), 0, 8) / 8.0,
-        "range1": _clip(trade.get("range1"), 0, 8) / 8.0,
-        "range5": _clip(trade.get("range_ratio", trade.get("range5", 1.0)), 0, 8) / 8.0,
-        "rr_tp1": _clip(trade.get("rr"), 0, 5) / 5.0,
-        "ladder_rr": _clip(trade.get("ladder_rr"), 0, 6) / 6.0,
-        "final_rr": _clip(trade.get("final_rr"), 0, 8) / 8.0,
-        "sl_price_move": _clip(sl_move, 0, 0.08) / 0.08,
-        "btc_bull": btc_bull,
-        "btc_bear": btc_bear,
-        "is_reversal": 1.0 if "REVERSAL" in mode else 0.0,
-        "is_dump": 1.0 if "DUMP" in mode or "DUMP" in strategy else 0.0,
-        "is_instant": 1.0 if "INSTANT" in mode or "INSTANT" in strategy else 0.0,
-        "is_aero": 1.0 if "AERO" in mode or "AERO" in strategy else 0.0,
-        # Directional edge is positive when price pressure agrees with the trade.
-        "edge_3m": _clip(direction * ch3m, -0.25, 0.25) / 0.25,
-        "edge_15m": _clip(direction * ch15m, -0.40, 0.40) / 0.40,
-        "edge_30m": _clip(direction * ch30m, -0.60, 0.60) / 0.60,
-        "btc_alignment": btc_alignment,
-        "symbol_fail_streak": _clip(trade.get("symbol_fail_streak"), 0, 5) / 5.0,
-        "is_shadow": 1.0 if str(trade.get("signal_source", "live")).lower() == "shadow" else 0.0,
-        "watch_impulse": _clip(trade.get("watch_impulse"), 0.0, 0.25) / 0.25,
-        "pullback_depth": _clip(trade.get("pending_retest_depth"), 0.0, 0.05) / 0.05,
-        "reclaim_recovery": _clip(trade.get("reclaim_recovery"), 0.0, 1.0),
-        "watch_age": _clip(trade.get("pending_confirmation_seconds"), 0.0, 600.0) / 600.0,
-        "is_continuation_lane": 1.0 if str(trade.get("paper_setup_lane", "")).upper() == "CONTINUATION" else 0.0,
-        "is_sweep_reversal_lane": 1.0 if str(trade.get("paper_setup_lane", "")).upper() == "SWEEP_REVERSAL" else 0.0,
-        "liquidity_rank": _clip(trade.get("liquidity_rank_percentile"), 0.0, 1.0, 0.5),
-        "liquidity_log_turnover": _clip(
-            math.log1p(max(0.0, _clip(trade.get("liquidity_quote_60m"), 0.0, 1e30))),
-            0.0,
-            30.0,
-        ) / 30.0,
-        "liquidity_active_fraction": _clip(trade.get("liquidity_active_fraction"), 0.0, 1.0),
-        "liquidity_unique_fraction": _clip(trade.get("liquidity_unique_fraction"), 0.0, 1.0),
-        "atr1_pct": _clip(trade.get("atr1_pct"), 0.0, 0.03) / 0.03,
-        "normalized_directional_move": _clip(trade.get("normalized_directional_move"), 0.0, 6.0) / 6.0,
-        "book_spread_bps": _clip(trade.get("book_spread_bps"), 0.0, 100.0) / 100.0,
-        "book_depth_log": _clip(
-            math.log1p(max(0.0, _clip(trade.get("book_depth_usdt"), 0.0, 1e18))),
-            0.0,
-            30.0,
-        ) / 30.0,
-    }
-    raw_score = features["score"] * 100.0
-    raw_vol1 = features["vol1"] * 8.0
-    features["score_below_guard"] = 1.0 if raw_score < EVIDENCE_MIN_SCORE else 0.0
-    features["vol1_below_guard"] = 1.0 if raw_vol1 <= EVIDENCE_MIN_VOL1 else 0.0
-    features["evidence_quality_pass"] = (
-        1.0
-        if raw_score >= EVIDENCE_MIN_SCORE and raw_vol1 > EVIDENCE_MIN_VOL1
-        else 0.0
-    )
-    return features
-
-
-def _vector_from_dict(features: Dict[str, float]) -> List[float]:
-    # V16.2 backups do not contain the four fields below. Derive the three
-    # quality markers from the normalized historical score/vol1 values so the
-    # first 50 outcomes remain usable after the feature-schema upgrade.
-    compatible = dict(features or {})
-    raw_score = _clip(compatible.get("score"), 0, 1) * 100.0
-    raw_vol1 = _clip(compatible.get("vol1"), 0, 1) * 8.0
-    compatible.setdefault(
-        "score_below_guard", 1.0 if raw_score < EVIDENCE_MIN_SCORE else 0.0
-    )
-    compatible.setdefault(
-        "vol1_below_guard", 1.0 if raw_vol1 <= EVIDENCE_MIN_VOL1 else 0.0
-    )
-    compatible.setdefault(
-        "evidence_quality_pass",
-        1.0 if raw_score >= EVIDENCE_MIN_SCORE and raw_vol1 > EVIDENCE_MIN_VOL1 else 0.0,
-    )
-    compatible.setdefault("symbol_fail_streak", 0.0)
-    compatible.setdefault("is_shadow", 0.0)
-    return [float(compatible.get(name, 0.0)) for name in FEATURE_NAMES]
-
-
-def get_model_state() -> ModelState:
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
-        if row is None:
-            return ModelState()
-        raw = json.loads(row["state_json"])
-        allowed = {field.name for field in fields(ModelState)}
-        state = ModelState(**{key: value for key, value in raw.items() if key in allowed})
-        expected_weights = len(FEATURE_NAMES) + 1
-        if (
-            len(state.weights) != expected_weights
-            or len(state.mean) != len(FEATURE_NAMES)
-            or len(state.std) != len(FEATURE_NAMES)
-        ):
-            # Feature schema changed. Old trades remain useful, but old coefficients
-            # cannot be applied to the new vector and must return to warm-up.
-            state.active = False
-            state.weights = [0.0] * expected_weights
-            state.mean = [0.0] * len(FEATURE_NAMES)
-            state.std = [1.0] * len(FEATURE_NAMES)
-            state.last_candidate_reason = "feature_schema_changed"
-            conn.execute(
-                "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
-                (json.dumps(asdict(state), ensure_ascii=False),),
-            )
-            conn.commit()
-        if str(raw.get("data_policy", "legacy_all_sources")) != MODEL_DATA_POLICY:
-            eligible_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS n FROM adaptive_trades "
-                    "WHERE COALESCE(decision_reason, '')=?",
-                    (PAPER_VALIDATION_REASON,),
-                ).fetchone()["n"]
-                or 0
-            )
-            state.active = False
-            state.trained_rows = eligible_count
-            state.last_trained_closed_count = 0
-            state.last_attempted_closed_count = 0
-            state.last_candidate_reason = "v17_clean_forward_dataset"
-            state.candidate_pass_streak = 0
-            state.candidate_selected_total = 0
-            state.deployment_fraction = 0.0
-            state.data_policy = MODEL_DATA_POLICY
-            state.weights = [0.0] * (len(FEATURE_NAMES) + 1)
-            state.mean = [0.0] * len(FEATURE_NAMES)
-            state.std = [1.0] * len(FEATURE_NAMES)
-            conn.execute(
-                "UPDATE adaptive_model_state SET state_json=? WHERE id=1",
-                (json.dumps(asdict(state), ensure_ascii=False),),
-            )
-            conn.commit()
-        return state
-
-
-def _save_model_state(state: ModelState) -> None:
-    with _LOCK, _connect() as conn:
+def meta_set(key: str, value: Any) -> None:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    with DB_LOCK, db_connect() as conn:
         conn.execute(
-            "INSERT INTO adaptive_model_state(id, state_json) VALUES(1, ?) "
-            "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json",
-            (json.dumps(asdict(state), ensure_ascii=False),),
+            "INSERT INTO meta(key,value_json) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            (key, payload),
         )
         conn.commit()
 
+def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
 
-def _model_state_from_json(raw_json: str) -> Optional[ModelState]:
+def table_count(table: str) -> int:
+    if table not in {"episodes", "horizon_results", "outbox"}:
+        raise ValueError("unsupported table")
+    with DB_LOCK, db_connect() as conn:
+        return int(conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+
+def primary_count(tier: Optional[str] = None, independent_only: bool = False) -> int:
+    q = "SELECT COUNT(*) AS n FROM episodes WHERE cohort_id=? AND primary_outcome IS NOT NULL"
+    p: List[Any] = [COHORT_ID]
+    if tier:
+        q += " AND tier=?"
+        p.append(tier)
+    if independent_only:
+        q += " AND independent=1"
+    with DB_LOCK, db_connect() as conn:
+        return int(conn.execute(q, p).fetchone()["n"])
+
+def recent_episode_exists(symbol: str, side: str, tier: str, seconds: int) -> bool:
+    cutoff = now_ts() - max(0, seconds)
+    with DB_LOCK, db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM episodes WHERE cohort_id=? AND symbol=? AND side=? "
+            "AND tier=? AND created_at>=? LIMIT 1",
+            (COHORT_ID, symbol, side, tier, cutoff),
+        ).fetchone()
+    return row is not None
+
+def independent_slot_available(cluster_id: int, side: str) -> bool:
+    with DB_LOCK, db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM episodes WHERE cohort_id=? AND cluster_id=? "
+            "AND side=? AND tier='paper' AND independent=1 LIMIT 1",
+            (COHORT_ID, cluster_id, side),
+        ).fetchone()
+    return row is None
+
+def open_episode_count() -> int:
+    with DB_LOCK, db_connect() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS n FROM episodes WHERE cohort_id=? AND status='open'",
+            (COHORT_ID,),
+        ).fetchone()["n"])
+
+def insert_episode(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    created = int(candidate["created_at"])
+    key = hashlib.sha256(
+        f"{COHORT_ID}:{candidate['symbol']}:{candidate['side']}:{candidate['tier']}:{created}:{candidate['entry_price']:.12g}".encode()
+    ).hexdigest()
+    values = {
+        "episode_key": key,
+        "cohort_id": COHORT_ID,
+        "protocol_hash": PROTOCOL_HASH,
+        "created_at": created,
+        "cluster_id": int(candidate["cluster_id"]),
+        "symbol": candidate["symbol"],
+        "side": candidate["side"],
+        "tier": candidate["tier"],
+        "visible_paper": int(candidate["tier"] == "paper"),
+        "independent": int(bool(candidate.get("independent"))),
+        "quality_score": float(candidate.get("quality_score", 0.0)),
+        "paper_reject_reason": str(candidate.get("paper_reject_reason", ""))[:500],
+        "entry_price": float(candidate["entry_price"]),
+        "entry_bid": float(candidate.get("entry_bid", 0.0)),
+        "entry_ask": float(candidate.get("entry_ask", 0.0)),
+        "spread_bps": float(candidate.get("spread_bps", 999.0)),
+        "depth_usdt": float(candidate.get("depth_usdt", 0.0)),
+        "quote_volume_24h": float(candidate.get("quote_volume_24h", 0.0)),
+        "liquidity_rank": float(candidate.get("liquidity_rank", 0.0)),
+        "stop_move": float(candidate["stop_move"]),
+        "tp1_move": TP1_MOVE, "tp2_move": TP2_MOVE, "tp3_move": TP3_MOVE,
+        "tp4_move": TP4_MOVE, "tp5_move": TP5_MOVE,
+        "features_json": json.dumps(candidate["features"], ensure_ascii=False),
+        "status": "open",
+        "last_seen_at": created,
+    }
+    cols = tuple(values)
     try:
-        raw = json.loads(raw_json)
-        allowed = {field.name for field in fields(ModelState)}
-        state = ModelState(**{key: value for key, value in raw.items() if key in allowed})
-        if (
-            len(state.weights) != len(FEATURE_NAMES) + 1
-            or len(state.mean) != len(FEATURE_NAMES)
-            or len(state.std) != len(FEATURE_NAMES)
-        ):
-            return None
-        return state
-    except Exception:
-        return None
-
-
-def _save_model_snapshot(state: ModelState, status: str, note: str = "") -> None:
-    with _LOCK, _connect() as conn:
-        conn.execute(
-            "INSERT INTO adaptive_model_versions"
-            "(version, state_json, status, saved_at, note) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(version) DO UPDATE SET "
-            "state_json=excluded.state_json, status=excluded.status, "
-            "saved_at=excluded.saved_at, note=excluded.note",
-            (
-                int(state.version),
-                json.dumps(asdict(state), ensure_ascii=False),
-                str(status),
-                int(time.time()),
-                str(note),
-            ),
-        )
-        conn.commit()
-
-
-def _load_model_snapshot(version: int) -> Optional[ModelState]:
-    with _LOCK, _connect() as conn:
-        row = conn.execute(
-            "SELECT state_json FROM adaptive_model_versions WHERE version=?",
-            (int(version),),
-        ).fetchone()
-    return _model_state_from_json(row["state_json"]) if row else None
-
-
-def _next_model_version() -> int:
-    with _LOCK, _connect() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(version), 0) AS max_version FROM adaptive_model_versions"
-        ).fetchone()
-    return int(row["max_version"] or 0) + 1
-
-
-def _latest_trade_marker() -> Tuple[int, int]:
-    with _LOCK, _connect() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS n FROM adaptive_trades"
-        ).fetchone()
-    return int(row["max_id"] or 0), int(row["n"] or 0)
-
-
-def get_evidence_guard_state() -> EvidenceGuardState:
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        row = conn.execute(
-            "SELECT state_json FROM adaptive_rule_guard_state WHERE id = 1"
-        ).fetchone()
-    if row is None:
-        latest_id, latest_count = _latest_trade_marker()
-        state = EvidenceGuardState(
-            activation_trade_id=latest_id,
-            activation_closed_count=latest_count,
-            created_at=int(time.time()),
-        )
-        _save_evidence_guard_state(state)
-        return state
-    try:
-        raw = json.loads(row["state_json"])
-        allowed = {field.name for field in fields(EvidenceGuardState)}
-        return EvidenceGuardState(
-            **{key: value for key, value in raw.items() if key in allowed}
-        )
-    except Exception:
-        latest_id, latest_count = _latest_trade_marker()
-        state = EvidenceGuardState(
-            activation_trade_id=latest_id,
-            activation_closed_count=latest_count,
-            created_at=int(time.time()),
-        )
-        _save_evidence_guard_state(state)
-        return state
-
-
-def _save_evidence_guard_state(state: EvidenceGuardState) -> None:
-    with _LOCK, _connect() as conn:
-        conn.execute(
-            "INSERT INTO adaptive_rule_guard_state(id, state_json) VALUES(1, ?) "
-            "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json",
-            (json.dumps(asdict(state), ensure_ascii=False),),
-        )
-        conn.commit()
-
-
-def evidence_guard(trade: Dict[str, Any]) -> Tuple[bool, str]:
-    """Apply the auditable legacy Score/Vol1 rule before a live signal.
-
-    Rejected candidates are not discarded: analyze_symbol sends them to the
-    shadow tracker so the bot can measure missed TP3 winners and auto-disable
-    this guard if new evidence contradicts the first 50 outcomes.
-    """
-    state = get_evidence_guard_state()
-    score = float(trade.get("score", 0.0) or 0.0)
-    vol1 = float(trade.get("vol1", 0.0) or 0.0)
-    failures: List[str] = []
-    if score < float(state.min_score):
-        failures.append(f"Score {score:.0f} < {state.min_score:.0f}")
-    if vol1 <= float(state.min_vol1):
-        failures.append(f"Vol1 x{vol1:.2f} <= x{state.min_vol1:.2f}")
-
-    accepted = bool(not state.active or not failures)
-    if not state.active:
-        reason = f"evidence guard v{state.version} inactive ({state.disabled_reason or 'audit rollback'})"
-    elif accepted:
-        reason = (
-            f"evidence guard v{state.version} passed: Score {score:.0f}, "
-            f"Vol1 x{vol1:.2f}"
-        )
-    else:
-        reason = f"evidence guard v{state.version} blocked: " + "; ".join(failures)
-
-    trade["evidence_guard_version"] = int(state.version)
-    trade["evidence_guard_accepted"] = accepted
-    trade["evidence_guard_reason"] = reason
-    return accepted, reason
-
-
-def _event(event_type: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
-    with _LOCK, _connect() as conn:
-        conn.execute(
-            "INSERT INTO adaptive_events(created_at, event_type, message, payload_json) VALUES(?,?,?,?)",
-            (
-                int(time.time()),
-                event_type,
-                message,
-                json.dumps(payload or {}, ensure_ascii=False),
-            ),
-        )
-        conn.commit()
-
-
-def predict_probability(trade: Dict[str, Any]) -> Tuple[Optional[float], ModelState]:
-    state = get_model_state()
-    if not MODEL_ENABLED or not state.active or state.trained_rows < MIN_TRAIN_TRADES:
-        return None, state
-
-    x = _vector_from_dict(build_feature_dict(trade))
-    z = state.weights[0]
-    for i, value in enumerate(x):
-        normalized = (value - state.mean[i]) / max(state.std[i], 1e-8)
-        z += state.weights[i + 1] * normalized
-    z = max(-35.0, min(35.0, z))
-    return 1.0 / (1.0 + math.exp(-z)), state
-
-
-def adaptive_gate(trade: Dict[str, Any]) -> Tuple[bool, str, Optional[float]]:
-    probability, state = predict_probability(trade)
-    if probability is None:
-        return True, f"adaptive warm-up: {state.trained_rows}/{MIN_TRAIN_TRADES}", None
-
-    accepted = probability >= state.threshold
-    trade["adaptive_probability"] = probability
-    trade["adaptive_shadow_probability"] = probability
-
-    if SHADOW_ONLY:
-        trade["adaptive_shadow_accepted"] = accepted
-        trade["adaptive_model_version"] = state.version
-        return True, (
-            f"adaptive shadow v{state.version}: p={probability:.3f}, "
-            f"threshold={state.threshold:.3f}, would_accept={accepted}"
-        ), probability
-
-    # A newly promoted model begins as a canary. Only a stable fraction of
-    # candidates belongs to the model arm; the rest remains an untouched
-    # baseline control group. Successful live audits gradually expand it.
-    fraction = min(1.0, max(0.0, float(state.deployment_fraction or ADAPTIVE_INITIAL_LIVE_FRACTION)))
-    identity = str(
-        trade.get("signal_id")
-        or f"{trade.get('symbol','?')}:{trade.get('side','?')}:{trade.get('created_at',0)}:{trade.get('strategy','?')}"
-    )
-    cohort_value = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-    in_model_cohort = cohort_value < fraction
-    trade["adaptive_canary"] = in_model_cohort
-    if not in_model_cohort:
-        trade["adaptive_shadow_accepted"] = None
-        trade["adaptive_model_version"] = 0
-        return True, (
-            f"adaptive control group: model v{state.version} observes only; "
-            f"live fraction={fraction*100:.0f}%"
-        ), probability
-
-    trade["adaptive_shadow_accepted"] = accepted
-    trade["adaptive_model_version"] = state.version
-    return accepted, (
-        f"adaptive v{state.version}: p={probability:.3f}, "
-        f"threshold={state.threshold:.3f}, accepted={accepted}, "
-        f"live fraction={fraction*100:.0f}%"
-    ), probability
-
-
-def _estimate_pnl_r(signal: Dict[str, Any], result: str) -> float:
-    """Estimate the actually executable result in risk units.
-
-    A profit is recorded only at TP3. TP1 and TP2 are intermediate targets and
-    do not create a positive label. Expired trades use their observed exit price
-    instead of an invented constant value. Round-trip fees/slippage are included
-    through ROUND_TRIP_COST_MOVE.
-    """
-    entry = _clip(signal.get("entry"), 1e-12, 1e18, 1.0)
-    sl = _clip(signal.get("sl"), 0.0, 1e18, entry)
-    risk = max(abs(entry - sl), entry * 1e-8)
-    cost_r = entry * max(0.0, ROUND_TRIP_COST_MOVE) / risk
-
-    if result == "sl":
-        return -1.0 - cost_r
-    if result == "profit":
-        profit_target = _clip(signal.get(PROFIT_TARGET_KEY), 0.0, 1e18, entry)
-        return abs(profit_target - entry) / risk - cost_r
-
-    exit_price = _clip(signal.get("_closing_price"), 1e-12, 1e18, entry)
-    direction = 1.0 if str(signal.get("side", "")).upper() == "LONG" else -1.0
-    return direction * (exit_price - entry) / risk - cost_r
-
-
-def record_closed_trade(signal: Dict[str, Any], result: str, source: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Call this exactly once when a signal closes.
-
-    result:
-      profit -> label 1
-      sl      -> label 0
-      expired -> label 0 (conservative)
-    """
-    if result not in {"profit", "sl", "expired"}:
-        raise ValueError(f"Unsupported result: {result}")
-
-    init_adaptive_db()
-
-    created_at = int(signal.get("created_at", int(time.time())))
-    closed_at = int(time.time())
-    signal_id = str(
-        signal.get("signal_id")
-        or f"{signal.get('symbol','?')}:{signal.get('side','?')}:{created_at}:{signal.get('strategy','?')}"
-    )
-    features = build_feature_dict(signal)
-    probability = signal.get("adaptive_probability", signal.get("adaptive_shadow_probability"))
-    model_version = int(signal.get("adaptive_model_version", 0) or 0)
-    shadow_accepted = signal.get("adaptive_shadow_accepted")
-    evidence_guard_version = int(signal.get("evidence_guard_version", 0) or 0)
-    evidence_guard_accepted = signal.get("evidence_guard_accepted")
-    evidence_guard_reason = signal.get("evidence_guard_reason")
-    decision_reason = signal.get("shadow_reason") or signal.get("adaptive_reason")
-    label = 1 if result == "profit" else 0
-    pnl_r = _estimate_pnl_r(signal, result)
-    source = str(source or signal.get("signal_source", "live"))
-    exit_price = signal.get("_closing_price")
-    mfe_r = float(signal.get("mfe_r", 0.0) or 0.0)
-    mae_r = float(signal.get("mae_r", 0.0) or 0.0)
-    duration_minutes = max(0.0, (closed_at - created_at) / 60.0)
-
-    with _LOCK, _connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT OR IGNORE INTO adaptive_trades(
-                signal_id, created_at, closed_at, source, symbol, side, strategy, grade,
-                result, label, pnl_r, exit_price, mfe_r, mae_r, duration_minutes,
-                features_json, model_version,
-                model_probability, shadow_accepted,
-                evidence_guard_version, evidence_guard_accepted, evidence_guard_reason,
-                decision_reason
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                signal_id,
-                created_at,
-                closed_at,
-                source,
-                str(signal.get("symbol", "?")),
-                str(signal.get("side", "?")),
-                str(signal.get("strategy", "?")),
-                str(signal.get("grade", "?")),
-                result,
-                label,
-                pnl_r,
-                float(exit_price) if exit_price is not None else None,
-                mfe_r,
-                mae_r,
-                duration_minutes,
-                json.dumps(features, ensure_ascii=False),
-                model_version,
-                float(probability) if probability is not None else None,
-                int(bool(shadow_accepted)) if shadow_accepted is not None else None,
-                evidence_guard_version,
-                int(bool(evidence_guard_accepted)) if evidence_guard_accepted is not None else None,
-                str(evidence_guard_reason) if evidence_guard_reason is not None else None,
-                str(decision_reason) if decision_reason is not None else None,
-            ),
-        )
-        conn.commit()
-
-    if cursor.rowcount == 0:
-        return {"trained": False, "reason": "duplicate_signal", "inserted": False}
-
-    # Audit the currently active champion before a scheduled retraining can
-    # replace it on the same milestone outcome.
-    evidence_guard_audit = maybe_evidence_guard_audit()
-    live_audit = maybe_live_audit()
-    if live_audit and live_audit.get("action") == "rollback":
-        training_report = {
-            "attempted": False,
-            "trained": False,
-            "reason": "rollback_cooldown",
-            "closed_count": adaptive_closed_count(),
-        }
-    else:
-        training_report = maybe_retrain()
-    return {
-        "inserted": True,
-        "evidence_guard_audit": evidence_guard_audit,
-        "live_audit": live_audit,
-        "training_report": training_report,
-        **training_report,
-    }
-
-
-def _sigmoid(z: float) -> float:
-    z = max(-35.0, min(35.0, z))
-    return 1.0 / (1.0 + math.exp(-z))
-
-
-def _logloss(labels: Sequence[int], probabilities: Sequence[float]) -> float:
-    if not labels:
-        return 999.0
-    total = 0.0
-    for y, p in zip(labels, probabilities):
-        p = min(1.0 - 1e-7, max(1e-7, p))
-        total += -(y * math.log(p) + (1 - y) * math.log(1 - p))
-    return total / len(labels)
-
-
-def _mean_std(rows: Sequence[Sequence[float]]) -> Tuple[List[float], List[float]]:
-    n_features = len(FEATURE_NAMES)
-    means = [0.0] * n_features
-    for row in rows:
-        for j, value in enumerate(row):
-            means[j] += value
-    count = max(len(rows), 1)
-    means = [x / count for x in means]
-
-    stds = [0.0] * n_features
-    for row in rows:
-        for j, value in enumerate(row):
-            stds[j] += (value - means[j]) ** 2
-    stds = [math.sqrt(x / count) if x > 1e-10 else 1.0 for x in stds]
-    return means, stds
-
-
-def _normalize(rows: Sequence[Sequence[float]], mean: Sequence[float], std: Sequence[float]) -> List[List[float]]:
-    return [
-        [(value - mean[j]) / max(std[j], 1e-8) for j, value in enumerate(row)]
-        for row in rows
-    ]
-
-
-def _train_logistic(
-    x_train: Sequence[Sequence[float]],
-    y_train: Sequence[int],
-    epochs: int = 600,
-    learning_rate: float = 0.035,
-    l2: float = 0.04,
-) -> List[float]:
-    random.seed(1337)
-    n_features = len(FEATURE_NAMES)
-    weights = [0.0] * (n_features + 1)
-
-    positives = sum(y_train)
-    negatives = len(y_train) - positives
-    pos_weight = len(y_train) / max(2.0 * positives, 1.0)
-    neg_weight = len(y_train) / max(2.0 * negatives, 1.0)
-
-    order = list(range(len(x_train)))
-    for epoch in range(epochs):
-        random.shuffle(order)
-        lr = learning_rate / (1.0 + epoch / 300.0)
-        grad = [0.0] * len(weights)
-
-        for idx in order:
-            x = x_train[idx]
-            y = y_train[idx]
-            z = weights[0] + sum(weights[j + 1] * x[j] for j in range(n_features))
-            p = _sigmoid(z)
-            sample_weight = pos_weight if y == 1 else neg_weight
-            error = (p - y) * sample_weight
-            grad[0] += error
-            for j in range(n_features):
-                grad[j + 1] += error * x[j]
-
-        n = max(len(x_train), 1)
-        weights[0] -= lr * grad[0] / n
-        for j in range(1, len(weights)):
-            regularized = grad[j] / n + l2 * weights[j]
-            weights[j] -= lr * regularized
-
-    return weights
-
-
-def _predict_matrix(weights: Sequence[float], rows: Sequence[Sequence[float]]) -> List[float]:
-    out: List[float] = []
-    for row in rows:
-        z = weights[0] + sum(weights[j + 1] * row[j] for j in range(len(row)))
-        out.append(_sigmoid(z))
-    return out
-
-
-def _choose_threshold(labels: Sequence[int], probabilities: Sequence[float], pnl_r: Sequence[float]) -> Tuple[float, Dict[str, float]]:
-    best_threshold = MIN_SIGNAL_PROBABILITY
-    best_score = -1e9
-    best_metrics: Dict[str, float] = {}
-
-    low = int(MIN_SIGNAL_PROBABILITY * 100)
-    high = int(MAX_SIGNAL_PROBABILITY * 100)
-
-    for raw in range(low, high + 1):
-        threshold = raw / 100.0
-        chosen = [i for i, p in enumerate(probabilities) if p >= threshold]
-        coverage = len(chosen) / max(len(labels), 1)
-        if len(chosen) < 5 or coverage < MIN_VALIDATION_COVERAGE:
-            continue
-
-        wins = sum(labels[i] for i in chosen)
-        wr = wins / len(chosen)
-        expectancy = sum(pnl_r[i] for i in chosen) / len(chosen)
-
-        # Do not optimize a candidate that cannot meet the requested TP3-majority
-        # objective even on calibration data. Coverage still prevents a tiny,
-        # cherry-picked handful of signals from winning the search.
-        if wr <= ADAPTIVE_TARGET_SUCCESS_RATE:
-            continue
-
-        # Prefer expectancy and stability, not win-rate alone.
-        score = expectancy * 2.0 + wr * 0.5 + coverage * 0.15
-        if score > best_score:
-            best_score = score
-            best_threshold = threshold
-            best_metrics = {
-                "coverage": coverage,
-                "selected_wr": wr,
-                "selected_count": float(len(chosen)),
-                "expectancy_r": expectancy,
-                "objective": score,
-            }
-
-    if not best_metrics:
-        best_metrics = {
-            "coverage": 1.0,
-            "selected_wr": sum(labels) / max(len(labels), 1),
-            "selected_count": float(len(labels)),
-            "expectancy_r": sum(pnl_r) / max(len(pnl_r), 1),
-            "objective": -999.0,
-        }
-
-    return best_threshold, best_metrics
-
-
-def _selection_metrics(
-    labels: Sequence[int],
-    probabilities: Sequence[float],
-    pnl_r: Sequence[float],
-    threshold: float,
-) -> Dict[str, float]:
-    chosen = [i for i, probability in enumerate(probabilities) if probability >= threshold]
-    selected_count = len(chosen)
-    coverage = selected_count / max(len(labels), 1)
-    selected_wr = (
-        sum(labels[i] for i in chosen) / selected_count if selected_count else 0.0
-    )
-    expectancy = (
-        sum(pnl_r[i] for i in chosen) / selected_count if selected_count else -999.0
-    )
-    return {
-        "coverage": coverage,
-        "selected_wr": selected_wr,
-        "selected_count": float(selected_count),
-        "expectancy_r": expectancy,
-        "baseline_wr": sum(labels) / max(len(labels), 1),
-        "baseline_expectancy_r": sum(pnl_r) / max(len(pnl_r), 1),
-    }
-
-
-def _outcome_metrics(rows: Sequence[Any]) -> Dict[str, Any]:
-    profit = 0
-    sl = 0
-    expired = 0
-    pnl_values: List[float] = []
-    for row in rows:
-        result = str(row["result"] or "")
-        if result == "profit":
-            profit += 1
-        elif result == "sl":
-            sl += 1
-        else:
-            expired += 1
-        pnl_values.append(float(row["pnl_r"] or 0.0))
-
-    total = len(rows)
-    resolved = profit + sl
-    return {
-        "n": total,
-        "profit": profit,
-        "sl": sl,
-        "expired": expired,
-        "success_rate": profit / total if total else 0.0,
-        "resolved_wr": profit / resolved if resolved else 0.0,
-        "expectancy_r": sum(pnl_values) / total if total else 0.0,
-    }
-
-
-def _metrics_line(metrics: Dict[str, Any]) -> str:
-    return (
-        f"{int(metrics.get('profit', 0))} TP3+ / "
-        f"{int(metrics.get('sl', 0))} SL / "
-        f"{int(metrics.get('expired', 0))} expired · "
-        f"успех всех {float(metrics.get('success_rate', 0))*100:.1f}% · "
-        f"{float(metrics.get('expectancy_r', 0)):+.3f}R"
-    )
-
-
-def _source_breakdown(rows: Sequence[Any]) -> Dict[str, Dict[str, Any]]:
-    live_rows = [row for row in rows if str(row["source"] or "live") == "live"]
-    shadow_rows = [row for row in rows if str(row["source"] or "live") == "shadow"]
-    return {
-        "all": _outcome_metrics(rows),
-        "live": _outcome_metrics(live_rows),
-        "shadow": _outcome_metrics(shadow_rows),
-    }
-
-
-def _collect_evidence_guard_metrics(state: EvidenceGuardState) -> Dict[str, Any]:
-    baseline_limit = max(1, EVIDENCE_AUDIT_BASELINE_WINDOW)
-    with _LOCK, _connect() as conn:
-        baseline_rows = conn.execute(
-            """
-            SELECT id, result, label, pnl_r, source
-            FROM adaptive_trades
-            WHERE source='live' AND id <= ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (int(state.activation_trade_id), baseline_limit),
-        ).fetchall()
-        decision_rows = conn.execute(
-            """
-            SELECT id, result, label, pnl_r, source,
-                   evidence_guard_accepted, evidence_guard_reason
-            FROM adaptive_trades
-            WHERE id > ? AND evidence_guard_version = ?
-              AND (
-                    (source='live' AND evidence_guard_accepted=1)
-                    OR (source='shadow' AND evidence_guard_accepted=0)
-                  )
-            ORDER BY id ASC
-            """,
-            (int(state.activation_trade_id), int(state.version)),
-        ).fetchall()
-
-    accepted_rows = [
-        row
-        for row in decision_rows
-        if str(row["source"]) == "live" and int(row["evidence_guard_accepted"] or 0) == 1
-    ]
-    blocked_rows = [
-        row
-        for row in decision_rows
-        if str(row["source"]) == "shadow" and int(row["evidence_guard_accepted"] or 0) == 0
-    ]
-    return {
-        "guard_version": int(state.version),
-        "decision_count": len(decision_rows),
-        "baseline": _outcome_metrics(baseline_rows),
-        "accepted": _outcome_metrics(accepted_rows),
-        "blocked": _outcome_metrics(blocked_rows),
-    }
-
-
-def maybe_evidence_guard_audit(force: bool = False) -> Optional[Dict[str, Any]]:
-    if not EVIDENCE_AUDIT_ENABLED:
-        return None
-    state = get_evidence_guard_state()
-    if not state.active:
-        return None
-
-    metrics = _collect_evidence_guard_metrics(state)
-    decision_count = int(metrics["decision_count"])
-    audit_every = max(1, EVIDENCE_AUDIT_EVERY)
-    if (
-        not force
-        and decision_count - int(state.last_audit_decision_count or 0) < audit_every
-    ):
-        return None
-
-    baseline = metrics["baseline"]
-    accepted = metrics["accepted"]
-    blocked = metrics["blocked"]
-    enough_accepted = int(accepted["n"]) >= max(1, EVIDENCE_AUDIT_MIN_ACCEPTED)
-    enough_blocked = int(blocked["n"]) >= max(1, EVIDENCE_AUDIT_MIN_BLOCKED)
-    enough_baseline = int(baseline["n"]) >= 15
-
-    # The most direct proof of harm is a profitable shadow group that the rule
-    # refused. A second guarded condition catches broad before/after collapse.
-    harmful_blocking = (
-        enough_accepted
-        and enough_blocked
-        and int(blocked["profit"]) >= max(1, EVIDENCE_ROLLBACK_WINNERS)
-        and float(blocked["expectancy_r"]) > 0.0
-        and float(blocked["success_rate"])
-        >= float(accepted["success_rate"]) + 0.10
-    )
-    material_underperformance = (
-        enough_baseline
-        and enough_accepted
-        and float(baseline["expectancy_r"]) - float(accepted["expectancy_r"])
-        >= EVIDENCE_ROLLBACK_EXPECTANCY_DROP_R
-        and float(baseline["success_rate"]) - float(accepted["success_rate"])
-        >= EVIDENCE_ROLLBACK_SUCCESS_DROP
-    )
-
-    if not enough_accepted or not enough_blocked:
-        action = "collect_more"
-        reason = "evidence_not_enough_comparison_rows"
-    elif harmful_blocking:
-        action = "rollback"
-        reason = "evidence_too_many_profitable_signals_blocked"
-    elif material_underperformance:
-        action = "rollback"
-        reason = "evidence_guard_worse_than_baseline"
-    else:
-        action = "keep"
-        reason = "evidence_guard_passed"
-
-    state.last_audit_decision_count = decision_count
-    state.last_audit_at = int(time.time())
-    if action == "rollback":
-        state.active = False
-        state.disabled_reason = reason
-    _save_evidence_guard_state(state)
-
-    payload: Dict[str, Any] = {
-        **metrics,
-        "action": action,
-        "reason": reason,
-        "enough_baseline": enough_baseline,
-        "enough_accepted": enough_accepted,
-        "enough_blocked": enough_blocked,
-        "guard_active": bool(state.active),
-        "min_score": float(state.min_score),
-        "min_vol1": float(state.min_vol1),
-    }
-    _event(
-        "evidence_guard_audit",
-        "Evidence guard rolled back" if action == "rollback" else "Evidence guard audit completed",
-        payload,
-    )
-    return payload
-
-
-def _collect_live_audit_metrics(state: ModelState) -> Dict[str, Any]:
-    baseline_limit = max(1, LIVE_AUDIT_BASELINE_WINDOW)
-    with _LOCK, _connect() as conn:
-        baseline_rows = conn.execute(
-            """
-            SELECT id, result, label, pnl_r, source, shadow_accepted
-            FROM adaptive_trades
-            WHERE source='live' AND id <= ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (int(state.activation_trade_id), baseline_limit),
-        ).fetchall()
-        decision_rows = conn.execute(
-            """
-            SELECT id, result, label, pnl_r, source, shadow_accepted
-            FROM adaptive_trades
-            WHERE id > ? AND model_version = ?
-              AND (
-                    source='live'
-                    OR (source='shadow' AND shadow_accepted=0)
-                  )
-            ORDER BY id ASC
-            """,
-            (int(state.activation_trade_id), int(state.version)),
-        ).fetchall()
-
-    live_rows = [row for row in decision_rows if str(row["source"]) == "live"]
-    blocked_rows = [
-        row
-        for row in decision_rows
-        if str(row["source"]) == "shadow" and int(row["shadow_accepted"] or 0) == 0
-    ]
-    return {
-        "model_version": int(state.version),
-        "decision_count": len(decision_rows),
-        "baseline": _outcome_metrics(baseline_rows),
-        "live": _outcome_metrics(live_rows),
-        "blocked": _outcome_metrics(blocked_rows),
-    }
-
-
-def _rollback_to_parent(state: ModelState, closed_count: int, reason: str) -> Dict[str, Any]:
-    failed_version = int(state.version)
-    parent_version = int(state.parent_version or 0)
-    latest_id, latest_count = _latest_trade_marker()
-
-    state.last_live_audit_at = int(time.time())
-    _save_model_snapshot(state, "rolled_back", reason)
-
-    restored = _load_model_snapshot(parent_version)
-    if restored is None:
-        parent_version = 0
-        restored = ModelState(version=0, active=False, created_at=int(time.time()))
-
-    restored.active = bool(parent_version > 0)
-    restored.activation_trade_id = latest_id
-    restored.activation_closed_count = latest_count
-    restored.last_live_audit_decision_count = 0
-    restored.last_live_audit_at = int(time.time())
-    restored.last_attempted_closed_count = max(
-        int(restored.last_attempted_closed_count or 0), int(closed_count)
-    )
-    restored.last_candidate_reason = f"restored_after_v{failed_version}"
-    _save_model_state(restored)
-    _save_model_snapshot(
-        restored,
-        "active" if restored.active else "baseline",
-        f"restored_after_v{failed_version}",
-    )
-    return {
-        "from_version": failed_version,
-        "to_version": int(restored.version),
-        "to_active": bool(restored.active),
-    }
-
-
-def maybe_live_audit(force: bool = False) -> Optional[Dict[str, Any]]:
-    if not LIVE_AUDIT_ENABLED or SHADOW_ONLY:
-        return None
-    state = get_model_state()
-    if not state.active or state.version <= 0 or state.activation_trade_id < 0:
-        return None
-
-    metrics = _collect_live_audit_metrics(state)
-    decision_count = int(metrics["decision_count"])
-    audit_every = max(1, LIVE_AUDIT_EVERY)
-    if not force and decision_count - int(state.last_live_audit_decision_count or 0) < audit_every:
-        return None
-
-    baseline = metrics["baseline"]
-    live = metrics["live"]
-    blocked = metrics["blocked"]
-    enough_baseline = int(baseline["n"]) >= max(1, LIVE_AUDIT_MIN_BASELINE)
-    enough_live = int(live["n"]) >= max(1, LIVE_AUDIT_MIN_LIVE)
-
-    expectancy_drop = float(baseline["expectancy_r"]) - float(live["expectancy_r"])
-    success_drop = float(baseline["success_rate"]) - float(live["success_rate"])
-    material_underperformance = (
-        enough_baseline
-        and enough_live
-        and expectancy_drop >= ROLLBACK_EXPECTANCY_DROP_R
-        and success_drop >= ROLLBACK_SUCCESS_DROP
-    )
-    severe_negative = (
-        enough_baseline
-        and enough_live
-        and float(live["expectancy_r"]) <= ROLLBACK_SEVERE_EXPECTANCY_R
-        and float(baseline["expectancy_r"]) >= 0.0
-    )
-    harmful_blocking = (
-        enough_baseline
-        and enough_live
-        and int(blocked["n"]) >= max(1, ROLLBACK_MIN_BLOCKED)
-        and float(blocked["success_rate"]) >= ROLLBACK_HARMFUL_BLOCK_WIN_RATE
-        and float(blocked["success_rate"]) >= float(live["success_rate"]) + 0.10
-        and float(blocked["expectancy_r"]) > 0.0
-    )
-
-    if not enough_baseline or not enough_live:
-        action = "collect_more"
-        reason = "not_enough_live_comparison_rows"
-    elif AUTO_ROLLBACK_ENABLED and (material_underperformance or severe_negative or harmful_blocking):
-        action = "rollback"
-        if severe_negative:
-            reason = "severe_negative_live_expectancy"
-        elif harmful_blocking:
-            reason = "too_many_profitable_signals_blocked"
-        else:
-            reason = "live_model_worse_than_baseline"
-    else:
-        action = "keep"
-        reason = "live_model_guard_passed"
-
-    state.last_live_audit_decision_count = decision_count
-    state.last_live_audit_at = int(time.time())
-    rollback: Optional[Dict[str, Any]] = None
-    previous_fraction = float(state.deployment_fraction or ADAPTIVE_INITIAL_LIVE_FRACTION)
-    next_fraction = previous_fraction
-    if action == "rollback":
-        rollback = _rollback_to_parent(state, adaptive_closed_count(), reason)
-    else:
-        if action == "keep" and enough_live:
-            next_fraction = min(1.0, previous_fraction + max(0.0, ADAPTIVE_LIVE_FRACTION_STEP))
-            state.deployment_fraction = next_fraction
-        _save_model_state(state)
-        _save_model_snapshot(state, "active", f"live_audit:{reason}")
-
-    payload: Dict[str, Any] = {
-        **metrics,
-        "action": action,
-        "reason": reason,
-        "enough_baseline": enough_baseline,
-        "enough_live": enough_live,
-        "expectancy_drop_r": expectancy_drop,
-        "success_drop": success_drop,
-        "rollback": rollback,
-        "previous_deployment_fraction": previous_fraction,
-        "deployment_fraction": next_fraction,
-    }
-    _event(
-        "live_model_audit",
-        "Adaptive model rolled back" if action == "rollback" else "Adaptive live audit completed",
-        payload,
-    )
-    return payload
-
-
-def _predict_state_on_raw(state: ModelState, rows: Sequence[Sequence[float]]) -> List[float]:
-    if (
-        not state.active
-        or len(state.weights) != len(FEATURE_NAMES) + 1
-        or len(state.mean) != len(FEATURE_NAMES)
-        or len(state.std) != len(FEATURE_NAMES)
-    ):
-        return []
-    normalized = _normalize(rows, state.mean, state.std)
-    return _predict_matrix(state.weights, normalized)
-
-
-def _training_attempt_failed(
-    state: ModelState,
-    reason: str,
-    closed_count: int,
-    rows: Sequence[Any],
-    extra: Optional[Dict[str, Any]] = None,
-    all_rows: Optional[Sequence[Any]] = None,
-) -> Dict[str, Any]:
-    state.last_attempted_closed_count = int(closed_count)
-    state.last_candidate_reason = str(reason)
-    state.candidate_pass_streak = 0
-    state.candidate_selected_total = 0
-    _save_model_state(state)
-    _save_model_snapshot(
-        state,
-        "active" if state.active else ("baseline" if state.version == 0 else "inactive"),
-        f"training_attempt:{reason}",
-    )
-    payload: Dict[str, Any] = {
-        "attempted": True,
-        "trained": False,
-        "promoted": False,
-        "reason": reason,
-        "candidate_reason": reason,
-        "closed_count": int(closed_count),
-        "next_at": int(closed_count) + max(1, RETRAIN_EVERY),
-        "active": bool(state.active),
-        "version": int(state.version),
-        "training_data": _outcome_metrics(rows),
-        "source_breakdown": _source_breakdown(rows),
-        "model_data_policy": MODEL_DATA_POLICY,
-    }
-    if all_rows is not None:
-        payload["all_closed_count"] = len(all_rows)
-        payload["all_data"] = _outcome_metrics(all_rows)
-        payload["paper_validation_data"] = _outcome_metrics(
-            [
-                row for row in all_rows
-                if str(row["decision_reason"] or "") == PAPER_VALIDATION_REASON
-            ]
-        )
-    if extra:
-        payload.update(extra)
-    _event("model_training_attempt", "Adaptive training attempt postponed", payload)
-    return payload
-
-
-def maybe_retrain(force: bool = False) -> Dict[str, Any]:
-    init_adaptive_db()
-    state = get_model_state()
-
-    with _LOCK, _connect() as conn:
-        all_rows = conn.execute(
-            """
-            SELECT id, result, label, pnl_r, features_json,
-                   source, model_version, shadow_accepted, decision_reason,
-                   side, strategy
-            FROM adaptive_trades
-            ORDER BY closed_at ASC, id ASC
-            """
-        ).fetchall()
-
-    # V17 is a clean forward experiment.  The 400-row archive is retained for
-    # audit, but old LIVE/SHADOW outcomes came from changing strategies and are
-    # not valid training data for the new entry.  Only a confirmed V17 reclaim
-    # PAPER outcome can train this model.
-    rows = [
-        row for row in all_rows
-        if str(row["decision_reason"] or "") == PAPER_VALIDATION_REASON
-    ]
-    closed_count = len(rows)
-    paper_rows = [
-        row for row in all_rows
-        if str(row["decision_reason"] or "") == PAPER_VALIDATION_REASON
-    ]
-    if PRO_QUALITY_FORWARD_ENABLED and len(paper_rows) < PAPER_LANE_REQUIRED_OUTCOMES:
-        paper_count = len(paper_rows)
-        last_forward_report = int(STATE.get("last_forward_report_count", 0) or 0)
-        milestone_report = bool(
-            paper_count > 0
-            and paper_count % max(1, RETRAIN_EVERY) == 0
-            and paper_count > last_forward_report
-        )
-        if milestone_report:
-            STATE["last_forward_report_count"] = paper_count
-            save_state()
-        return {
-            "attempted": milestone_report,
-            "trained": False,
-            "promoted": False,
-            "reason": "forward_validation_freeze",
-            "candidate_reason": "forward_validation_freeze",
-            "closed_count": closed_count,
-            "all_closed_count": len(all_rows),
-            "needed": PAPER_LANE_REQUIRED_OUTCOMES,
-            "paper_collected": paper_count,
-            "training_data": _outcome_metrics(rows),
-            "all_data": _outcome_metrics(all_rows),
-            "paper_validation_data": _outcome_metrics(paper_rows),
-            "source_breakdown": _source_breakdown(rows),
-            "model_data_policy": MODEL_DATA_POLICY,
-            "next_at": closed_count + (PAPER_LANE_REQUIRED_OUTCOMES - paper_count),
-        }
-    if closed_count < MIN_TRAIN_TRADES:
-        return {
-            "attempted": bool(force),
-            "trained": False,
-            "reason": "warmup",
-            "closed_count": closed_count,
-            "needed": MIN_TRAIN_TRADES,
-            "training_data": _outcome_metrics(rows),
-            "source_breakdown": _source_breakdown(rows),
-            "all_closed_count": len(all_rows),
-            "all_data": _outcome_metrics(all_rows),
-            "model_data_policy": MODEL_DATA_POLICY,
-        }
-
-    last_attempt = max(state.last_attempted_closed_count, state.last_trained_closed_count)
-    if last_attempt > closed_count:
-        last_attempt = closed_count
-    if not force and last_attempt > 0 and closed_count - last_attempt < RETRAIN_EVERY:
-        return {
-            "attempted": False,
-            "trained": False,
-            "reason": "waiting_for_more_trades",
-            "closed_count": closed_count,
-            "next_at": last_attempt + RETRAIN_EVERY,
-            "all_closed_count": len(all_rows),
-            "model_data_policy": MODEL_DATA_POLICY,
-        }
-
-    rows = rows[-MAX_TRAIN_ROWS:]
-    labels = [int(row["label"]) for row in rows]
-    pnl_r = [float(row["pnl_r"]) for row in rows]
-    vectors: List[List[float]] = []
-    for row in rows:
-        feature_payload = json.loads(row["features_json"])
-        # Portable backups before V16.6.5 do not contain is_shadow inside the
-        # feature JSON, but the database source column is authoritative.
-        feature_payload["is_shadow"] = (
-            1.0 if str(row["source"] or "live").lower() == "shadow" else 0.0
-        )
-        vectors.append(_vector_from_dict(feature_payload))
-
-    positives = sum(labels)
-    negatives = len(labels) - positives
-    if positives < MIN_POSITIVE_ROWS or negatives < MIN_NEGATIVE_ROWS:
-        return _training_attempt_failed(
-            state,
-            "class_imbalance",
-            closed_count,
-            rows,
-            {"positives": positives, "negatives": negatives},
-            all_rows,
-        )
-
-    # Three chronological blocks prevent threshold selection from contaminating
-    # the final promotion test: train -> calibration -> independent newest test.
-    test_size = max(MIN_VALIDATION_ROWS, int(len(rows) * VALIDATION_FRACTION))
-    calibration_size = max(MIN_CALIBRATION_ROWS, int(len(rows) * VALIDATION_FRACTION))
-    max_holdout = len(rows) // 2
-    if test_size + calibration_size > max_holdout:
-        test_size = max(MIN_VALIDATION_ROWS, max_holdout // 2)
-        calibration_size = max_holdout - test_size
-    train_size = len(rows) - calibration_size - test_size
-
-    if train_size < 25 or calibration_size < 10 or test_size < 10:
-        return _training_attempt_failed(
-            state,
-            "split_too_small",
-            closed_count,
-            rows,
-            {
-                "train_rows": train_size,
-                "calibration_rows": calibration_size,
-                "validation_rows": test_size,
-            },
-            all_rows,
-        )
-
-    train_end = train_size
-    calibration_end = train_size + calibration_size
-    x_train_raw = vectors[:train_end]
-    y_train = labels[:train_end]
-    x_cal_raw = vectors[train_end:calibration_end]
-    y_cal = labels[train_end:calibration_end]
-    pnl_cal = pnl_r[train_end:calibration_end]
-    x_test_raw = vectors[calibration_end:]
-    y_test = labels[calibration_end:]
-    pnl_test = pnl_r[calibration_end:]
-
-    if sum(y_train) < 4 or (len(y_train) - sum(y_train)) < 4:
-        return _training_attempt_failed(
-            state,
-            "train_split_too_small",
-            closed_count,
-            rows,
-            {
-                "train_positives": int(sum(y_train)),
-                "train_negatives": int(len(y_train) - sum(y_train)),
-            },
-            all_rows,
-        )
-
-    mean, std = _mean_std(x_train_raw)
-    x_train = _normalize(x_train_raw, mean, std)
-    x_cal = _normalize(x_cal_raw, mean, std)
-    x_test = _normalize(x_test_raw, mean, std)
-
-    weights = _train_logistic(x_train, y_train)
-    cal_prob = _predict_matrix(weights, x_cal)
-    test_prob = _predict_matrix(weights, x_test)
-
-    train_base_rate = min(0.95, max(0.05, sum(y_train) / len(y_train)))
-    base_prob = [train_base_rate] * len(y_test)
-    base_loss = _logloss(y_test, base_prob)
-    model_loss = _logloss(y_test, test_prob)
-    improvement = base_loss - model_loss
-
-    threshold, calibration_metrics = _choose_threshold(y_cal, cal_prob, pnl_cal)
-    test_metrics = _selection_metrics(y_test, test_prob, pnl_test, threshold)
-    test_rows = rows[calibration_end:]
-    selected_test_indices = [
-        i for i, probability in enumerate(test_prob) if probability >= threshold
-    ]
-    test_baseline_outcomes = _outcome_metrics(test_rows)
-    test_candidate_outcomes = _outcome_metrics(
-        [test_rows[i] for i in selected_test_indices]
-    )
-    selected_forward_test_rows = [
-        test_rows[i]
-        for i in selected_test_indices
-        if str(test_rows[i]["decision_reason"] or "") == PAPER_VALIDATION_REASON
-    ]
-    test_forward_candidate_outcomes = _outcome_metrics(selected_forward_test_rows)
-    test_side_breakdown = {
-        "long": _outcome_metrics(
-            [row for row in test_rows if str(row["side"] or "").upper() == "LONG"]
-        ),
-        "short": _outcome_metrics(
-            [row for row in test_rows if str(row["side"] or "").upper() == "SHORT"]
-        ),
-    }
-    recent_strategy_breakdown = {
-        strategy_name: _outcome_metrics(
-            [
-                row for row in test_rows
-                if str(row["strategy"] or "") == strategy_name
-            ]
-        )
-        for strategy_name in sorted(
-            {str(row["strategy"] or "?") for row in test_rows}
-        )
-    }
-    forward_validation_ready = (
-        int(test_forward_candidate_outcomes["n"])
-        >= max(1, MIN_SELECTED_LIVE_TEST_ROWS)
-    )
-    forward_validation_positive = (
-        forward_validation_ready
-        and float(test_forward_candidate_outcomes["success_rate"])
-        > ADAPTIVE_TARGET_SUCCESS_RATE
-        and float(test_forward_candidate_outcomes["expectancy_r"]) > 0
-    )
-
-    enough_test_classes = min(sum(y_test), len(y_test) - sum(y_test)) >= 3
-    passes_absolute_gate = (
-        enough_test_classes
-        and improvement >= MIN_MODEL_IMPROVEMENT
-        and test_metrics["selected_count"] >= MIN_SELECTED_TEST_ROWS
-        and test_metrics["coverage"] >= MIN_VALIDATION_COVERAGE
-        and test_metrics["selected_wr"] > ADAPTIVE_TARGET_SUCCESS_RATE
-        and test_metrics["expectancy_r"] > 0
-        and test_metrics["expectancy_r"]
-        >= test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R
-        and test_metrics["selected_wr"] >= test_metrics["baseline_wr"]
-        and forward_validation_positive
-    )
-
-    champion_expectancy = test_metrics["baseline_expectancy_r"]
-    champion_count = len(y_test)
-    if state.active:
-        champion_prob = _predict_state_on_raw(state, x_test_raw)
-        if champion_prob:
-            champion_metrics = _selection_metrics(
-                y_test, champion_prob, pnl_test, state.threshold
+        with DB_LOCK, db_connect() as conn:
+            cur = conn.execute(
+                f"INSERT INTO episodes({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
+                tuple(values[c] for c in cols),
             )
-            if champion_metrics["selected_count"] >= MIN_SELECTED_TEST_ROWS:
-                champion_expectancy = champion_metrics["expectancy_r"]
-                champion_count = int(champion_metrics["selected_count"])
+            eid = int(cur.lastrowid)
+            conn.commit()
+            row = conn.execute("SELECT * FROM episodes WHERE id=?", (eid,)).fetchone()
+        return row_to_dict(row) if row else None
+    except sqlite3.IntegrityError:
+        return None
 
-    beats_champion = (
-        not state.active
-        or test_metrics["expectancy_r"]
-        >= champion_expectancy + MIN_EXPECTANCY_IMPROVEMENT_R
-    )
-    champion_live_audit_ready = True
-    champion_decision_count = 0
-    if state.active and LIVE_AUDIT_ENABLED and not SHADOW_ONLY:
-        champion_live_metrics = _collect_live_audit_metrics(state)
-        champion_decision_count = int(champion_live_metrics["decision_count"])
-        champion_live_audit_ready = champion_decision_count >= max(1, LIVE_AUDIT_EVERY)
-    confirmation_passed = bool(
-        passes_absolute_gate and beats_champion and champion_live_audit_ready
-    )
-    previous_streak = int(state.candidate_pass_streak or 0)
-    previous_selected = int(state.candidate_selected_total or 0)
-    candidate_pass_streak = previous_streak + 1 if confirmation_passed else 0
-    candidate_selected_total = (
-        previous_selected + int(test_metrics["selected_count"])
-        if confirmation_passed
-        else 0
-    )
-    confirmation_ready = (
-        candidate_pass_streak >= max(1, ADAPTIVE_CONFIRMATION_PASSES)
-        and candidate_selected_total >= max(1, ADAPTIVE_CONFIRMATION_SELECTED)
-    )
-    promote = bool(confirmation_passed and confirmation_ready)
-
-    failed_checks: List[str] = []
-    if not enough_test_classes:
-        failed_checks.append("independent_test_class_imbalance")
-    if improvement < MIN_MODEL_IMPROVEMENT:
-        failed_checks.append("logloss_not_better")
-    if test_metrics["selected_count"] < MIN_SELECTED_TEST_ROWS:
-        failed_checks.append("too_few_selected_test_rows")
-    if test_metrics["coverage"] < MIN_VALIDATION_COVERAGE:
-        failed_checks.append("coverage_too_low")
-    if test_metrics["selected_wr"] <= ADAPTIVE_TARGET_SUCCESS_RATE:
-        failed_checks.append("tp3_majority_not_reached")
-    if test_metrics["expectancy_r"] <= 0:
-        failed_checks.append("negative_test_expectancy")
-    if test_metrics["expectancy_r"] < test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R:
-        failed_checks.append("expectancy_not_better_than_baseline")
-    if not forward_validation_ready:
-        failed_checks.append("not_enough_forward_test_rows")
-    elif not forward_validation_positive:
-        failed_checks.append("selected_forward_test_failed")
-
-    if not enough_test_classes:
-        candidate_reason = "independent_test_class_imbalance"
-    elif improvement < MIN_MODEL_IMPROVEMENT:
-        candidate_reason = "logloss_not_better"
-    elif test_metrics["selected_count"] < MIN_SELECTED_TEST_ROWS:
-        candidate_reason = "too_few_selected_test_rows"
-    elif test_metrics["coverage"] < MIN_VALIDATION_COVERAGE:
-        candidate_reason = "coverage_too_low"
-    elif test_metrics["selected_wr"] <= ADAPTIVE_TARGET_SUCCESS_RATE:
-        candidate_reason = "tp3_majority_not_reached"
-    elif test_metrics["expectancy_r"] <= 0:
-        candidate_reason = "negative_test_expectancy"
-    elif test_metrics["expectancy_r"] < test_metrics["baseline_expectancy_r"] + MIN_EXPECTANCY_IMPROVEMENT_R:
-        candidate_reason = "expectancy_not_better_than_baseline"
-    elif not forward_validation_ready:
-        candidate_reason = "not_enough_forward_test_rows"
-    elif not forward_validation_positive:
-        candidate_reason = "selected_forward_test_failed"
-    elif not beats_champion:
-        candidate_reason = "champion_kept"
-    elif not champion_live_audit_ready:
-        candidate_reason = "champion_live_audit_pending"
-    elif not confirmation_ready:
-        candidate_reason = "candidate_confirmation_pending"
-    else:
-        candidate_reason = "promoted"
-
-    if promote:
-        parent_version = int(state.version) if state.active else 0
-        _save_model_snapshot(
-            state,
-            "archived" if state.active else "baseline",
-            "replaced_by_new_champion",
-        )
-        activation_trade_id = int(rows[-1]["id"]) if rows else 0
-        new_state = ModelState(
-            version=_next_model_version(),
-            active=True,
-            threshold=threshold,
-            trained_rows=len(rows),
-            validation_rows=len(y_test),
-            base_logloss=base_loss,
-            model_logloss=model_loss,
-            validation_win_rate=sum(y_test) / max(len(y_test), 1),
-            validation_coverage=test_metrics["coverage"],
-            validation_selected_wr=test_metrics["selected_wr"],
-            validation_selected_count=int(test_metrics["selected_count"]),
-            weights=list(weights),
-            mean=list(mean),
-            std=list(std),
-            last_trained_closed_count=closed_count,
-            last_attempted_closed_count=closed_count,
-            validation_expectancy_r=test_metrics["expectancy_r"],
-            validation_baseline_expectancy_r=test_metrics["baseline_expectancy_r"],
-            last_candidate_reason=candidate_reason,
-            created_at=int(time.time()),
-            parent_version=parent_version,
-            activation_trade_id=activation_trade_id,
-            activation_closed_count=closed_count,
-            last_live_audit_decision_count=0,
-            last_live_audit_at=0,
-            candidate_pass_streak=0,
-            candidate_selected_total=0,
-            deployment_fraction=min(1.0, max(0.05, ADAPTIVE_INITIAL_LIVE_FRACTION)),
-        )
-    elif state.active:
-        # A weaker challenger must never deactivate or overwrite the champion.
-        new_state = state
-        new_state.last_attempted_closed_count = closed_count
-        new_state.last_candidate_reason = candidate_reason
-        new_state.candidate_pass_streak = candidate_pass_streak
-        new_state.candidate_selected_total = candidate_selected_total
-    else:
-        # Keep the latest failed candidate metrics visible, but inactive.
-        new_state = ModelState(
-            version=state.version,
-            active=False,
-            threshold=threshold,
-            trained_rows=len(rows),
-            validation_rows=len(y_test),
-            base_logloss=base_loss,
-            model_logloss=model_loss,
-            validation_win_rate=sum(y_test) / max(len(y_test), 1),
-            validation_coverage=test_metrics["coverage"],
-            validation_selected_wr=test_metrics["selected_wr"],
-            validation_selected_count=int(test_metrics["selected_count"]),
-            weights=list(weights),
-            mean=list(mean),
-            std=list(std),
-            last_trained_closed_count=0,
-            last_attempted_closed_count=closed_count,
-            validation_expectancy_r=test_metrics["expectancy_r"],
-            validation_baseline_expectancy_r=test_metrics["baseline_expectancy_r"],
-            last_candidate_reason=candidate_reason,
-            created_at=int(time.time()),
-            candidate_pass_streak=candidate_pass_streak,
-            candidate_selected_total=candidate_selected_total,
-            deployment_fraction=0.0,
-        )
-    _save_model_state(new_state)
-    _save_model_snapshot(
-        new_state,
-        "active" if new_state.active else ("baseline" if new_state.version == 0 else "inactive"),
-        f"training_result:{candidate_reason}",
-    )
-
-    payload = {
-        "attempted": True,
-        "trained": True,
-        "version": new_state.version,
-        "active": new_state.active,
-        "promoted": promote,
-        "candidate_reason": candidate_reason,
-        "closed_count": closed_count,
-        "trained_rows": new_state.trained_rows,
-        "calibration_rows": len(y_cal),
-        "validation_rows": len(y_test),
-        "base_logloss": round(base_loss, 6),
-        "model_logloss": round(model_loss, 6),
-        "improvement": round(improvement, 6),
-        "threshold": round(threshold, 3),
-        "calibration_coverage": round(calibration_metrics["coverage"], 3),
-        "coverage": round(test_metrics["coverage"], 3),
-        "selected_wr": round(test_metrics["selected_wr"], 3),
-        "selected_count": int(test_metrics["selected_count"]),
-        "expectancy_r": round(test_metrics["expectancy_r"], 4),
-        "baseline_expectancy_r": round(test_metrics["baseline_expectancy_r"], 4),
-        "champion_expectancy_r": round(champion_expectancy, 4),
-        "champion_selected_count": champion_count,
-        "champion_live_audit_ready": champion_live_audit_ready,
-        "champion_decision_count": champion_decision_count,
-        "candidate_pass_streak": candidate_pass_streak,
-        "candidate_selected_total": candidate_selected_total,
-        "failed_checks": failed_checks,
-        "confirmation_passes_required": max(1, ADAPTIVE_CONFIRMATION_PASSES),
-        "confirmation_selected_required": max(1, ADAPTIVE_CONFIRMATION_SELECTED),
-        "deployment_fraction": float(new_state.deployment_fraction or 0.0),
-        "training_data": _outcome_metrics(rows),
-        "source_breakdown": _source_breakdown(rows),
-        "all_closed_count": len(all_rows),
-        "all_data": _outcome_metrics(all_rows),
-        "paper_validation_data": _outcome_metrics(
-            [
-                row for row in all_rows
-                if str(row["decision_reason"] or "") == PAPER_VALIDATION_REASON
-            ]
-        ),
-        "model_data_policy": MODEL_DATA_POLICY,
-        "test_baseline": test_baseline_outcomes,
-        "test_candidate": test_candidate_outcomes,
-        "test_forward_candidate": test_forward_candidate_outcomes,
-        "test_side_breakdown": test_side_breakdown,
-        "recent_strategy_breakdown": recent_strategy_breakdown,
-        "min_selected_live_test_rows": max(1, MIN_SELECTED_LIVE_TEST_ROWS),
-        "forward_validation_ready": forward_validation_ready,
-        "forward_validation_positive": forward_validation_positive,
-        "next_at": closed_count + max(1, RETRAIN_EVERY),
-        "shadow_only": SHADOW_ONLY,
-    }
-    _event(
-        "model_retrained",
-        "Adaptive challenger promoted" if promote else "Adaptive challenger rejected; champion kept",
-        payload,
-    )
-    return {"trained": True, **payload}
-
-
-ADAPTIVE_REASON_RU: Dict[str, str] = {
-    "warmup": "ещё не накоплено 50 результатов",
-    "class_imbalance": "слишком мало положительных или отрицательных примеров",
-    "split_too_small": "недостаточно данных для трёх независимых частей проверки",
-    "train_split_too_small": "в обучающей части недостаточно разных результатов",
-    "independent_test_class_imbalance": "в последней независимой проверке мало разных исходов",
-    "not_enough_selected_live_test_rows": "кандидат не набрал достаточно реальных LIVE-сделок для допуска",
-    "selected_live_test_failed": "отдельная проверка кандидата на реальных LIVE-сделках отрицательная",
-    "not_enough_forward_test_rows": "кандидат не набрал достаточно подтверждённых PAPER/LIVE-сделок в новой независимой проверке",
-    "selected_forward_test_failed": "подтверждённая PAPER/LIVE-проверка кандидата отрицательная",
-    "logloss_not_better": "прогноз новой модели не точнее базового",
-    "too_few_selected_test_rows": "новая модель выбрала слишком мало проверочных сигналов",
-    "coverage_too_low": "модель блокирует слишком большую часть сигналов",
-    "tp3_majority_not_reached": "TP3+ ещё не превышает сумму SL и expired на независимой проверке",
-    "negative_test_expectancy": "средний результат новой модели остаётся отрицательным",
-    "expectancy_not_better_than_baseline": "средний результат не лучше базовой стратегии",
-    "champion_kept": "действующая модель лучше нового кандидата",
-    "champion_live_audit_pending": "сначала нужен live-аудит действующей модели",
-    "candidate_confirmation_pending": "кандидат прошёл одну проверку, но ещё не набрал два подтверждения и 20 отобранных сигналов",
-    "promoted": "новая модель прошла все проверки",
-    "not_enough_live_comparison_rows": "для честного сравнения до/после пока мало live-сделок",
-    "severe_negative_live_expectancy": "реальный средний результат модели стал сильно отрицательным",
-    "too_many_profitable_signals_blocked": "модель заблокировала слишком много прибыльных сигналов",
-    "live_model_worse_than_baseline": "реальные результаты модели хуже предыдущей версии",
-    "live_model_guard_passed": "live-проверка не выявила ухудшения",
-    "feature_schema_changed": "добавлены новые признаки качества; старые исходы сохранены",
-    "model_dataset_policy_changed": "модель сброшена безопасно: обычный SHADOW исключён из обучения",
-    "forward_validation_freeze": "критерии зафиксированы до 50 независимых V17.2.2 direct-measured PAPER-исходов",
-    "seed_restored_feature_upgrade": "50 исходов восстановлены; следующая проверка продолжится по графику",
-    "evidence_not_enough_comparison_rows": "для честной проверки фильтра пока мало отправленных или shadow-исходов",
-    "evidence_too_many_profitable_signals_blocked": "фильтр начал пропускать слишком много TP3+ сигналов",
-    "evidence_guard_worse_than_baseline": "результаты после фильтра хуже исходной выборки",
-    "evidence_guard_passed": "новый защитный фильтр не показал ухудшения",
-}
-
-
-def _adaptive_reason_ru(reason: Any) -> str:
-    key = str(reason or "unknown")
-    return ADAPTIVE_REASON_RU.get(key, key)
-
-
-def format_training_attempt_message(report: Dict[str, Any]) -> str:
-    promoted = bool(report.get("promoted"))
-    trained = bool(report.get("trained"))
-    active = bool(report.get("active"))
-    version = int(report.get("version", 0) or 0)
-    closed_count = int(report.get("closed_count", 0) or 0)
-    all_closed_count = int(report.get("all_closed_count", closed_count) or 0)
-    reason = str(report.get("candidate_reason", report.get("reason", "unknown")))
-    dataset = report.get("training_data") or {}
-    all_dataset = report.get("all_data") or {}
-    paper_dataset = report.get("paper_validation_data") or {}
-    sources = report.get("source_breakdown") or {}
-
-    if promoted:
-        title = f"✅ НОВАЯ ADAPTIVE-МОДЕЛЬ V{version} ВКЛЮЧЕНА"
-    elif trained:
-        title = "🧠 Анализ завершён — кандидат отклонён"
-    else:
-        title = "🧠 Анализ выполнен — обучение отложено"
-
-    lines = [
-        title,
-        f"Данных модели (только V17.2.2 direct-measured PAPER): {closed_count}",
-        f"ВСЕХ наблюдений, включая диагностический SHADOW: {all_closed_count}",
-        f"ДАННЫЕ МОДЕЛИ: {_metrics_line(dataset)}",
-        f"Причина: {_adaptive_reason_ru(reason)}",
-    ]
-    if all_dataset:
-        lines.append(f"ВСЯ ТЕЛЕМЕТРИЯ: {_metrics_line(all_dataset)}")
-    if paper_dataset:
-        lines.append(f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(paper_dataset)}")
-    if reason == "forward_validation_freeze":
-        lines.append(
-            f"Зафиксированная проверка: {int(report.get('paper_collected', 0) or 0)}/"
-            f"{int(report.get('needed', PAPER_LANE_REQUIRED_OUTCOMES) or PAPER_LANE_REQUIRED_OUTCOMES)} "
-            "независимых A/A+ liquidity-first PAPER-исходов. "
-            "До завершения границы не меняются."
-        )
-    if sources:
-        lines.extend(
-            [
-                f"LIVE · реальные сигналы: {_metrics_line(sources.get('live') or {})}",
-                f"SHADOW · виртуальная проверка: {_metrics_line(sources.get('shadow') or {})}",
-            ]
-        )
-
-    baseline = report.get("test_baseline")
-    candidate = report.get("test_candidate")
-    forward_candidate = report.get("test_forward_candidate")
-    if baseline and candidate:
-        lines.extend(
-            [
-                "",
-                f"ДО · независимая проверка: {_metrics_line(baseline)}",
-                f"КАНДИДАТ · выбранные сигналы: {_metrics_line(candidate)}",
-                f"Порог допуска: {float(report.get('threshold', 0)):.3f} · "
-                f"покрытие {float(report.get('coverage', 0))*100:.1f}%",
-            ]
-        )
-        if forward_candidate:
-            lines.append(
-                f"FORWARD КАНДИДАТ · подтверждённые PAPER/LIVE: {_metrics_line(forward_candidate)} · "
-                f"нужно минимум {int(report.get('min_selected_live_test_rows', MIN_SELECTED_LIVE_TEST_ROWS))}."
-            )
-
-    failed_checks = [
-        _adaptive_reason_ru(item) for item in (report.get("failed_checks") or [])
-    ]
-    if failed_checks:
-        lines.append("Не пройдены проверки: " + "; ".join(failed_checks))
-
-    sides = report.get("test_side_breakdown") or {}
-    if sides:
-        lines.extend(
-            [
-                "",
-                f"LONG · новая проверка: {_metrics_line(sides.get('long') or {})}",
-                f"SHORT · новая проверка: {_metrics_line(sides.get('short') or {})}",
-            ]
-        )
-    strategies = report.get("recent_strategy_breakdown") or {}
-    if strategies:
-        lines.append("Стратегии · новая проверка:")
-        for strategy_name, strategy_metrics in strategies.items():
-            lines.append(f"• {strategy_name}: {_metrics_line(strategy_metrics or {})}")
-
-    if reason == "candidate_confirmation_pending":
-        lines.append(
-            f"Подтверждение: {int(report.get('candidate_pass_streak', 0))}/"
-            f"{int(report.get('confirmation_passes_required', ADAPTIVE_CONFIRMATION_PASSES))} проверок · "
-            f"отобрано суммарно {int(report.get('candidate_selected_total', 0))}/"
-            f"{int(report.get('confirmation_selected_required', ADAPTIVE_CONFIRMATION_SELECTED))}."
-        )
-
-    if promoted:
-        lines.extend(
-            [
-                "",
-                f"Решение: V{version} запущена ограниченно на "
-                f"{float(report.get('deployment_fraction', ADAPTIVE_INITIAL_LIVE_FRACTION))*100:.0f}% кандидатов.",
-                f"Следующий live-отчёт — после {max(1, LIVE_AUDIT_EVERY)} "
-                "закрытых решений этой модели.",
-            ]
-        )
-    elif active:
-        lines.append(f"Решение: действующая V{version} сохранена без изменений.")
-    else:
-        lines.append("Решение: базовая стратегия продолжает работать без adaptive-блокировки.")
-
-    if not trained:
-        lines.append(
-            f"Следующая автоматическая попытка: на {int(report.get('next_at', closed_count + RETRAIN_EVERY))} результатах."
-        )
-    return "\n".join(lines)
-
-
-def format_live_audit_message(report: Dict[str, Any]) -> str:
-    version = int(report.get("model_version", 0) or 0)
-    decisions = int(report.get("decision_count", 0) or 0)
-    baseline = report.get("baseline") or {}
-    live = report.get("live") or {}
-    blocked = report.get("blocked") or {}
-    action = str(report.get("action", "collect_more"))
-    reason = str(report.get("reason", "unknown"))
-    correctly_blocked = int(blocked.get("sl", 0)) + int(blocked.get("expired", 0))
-    missed_winners = int(blocked.get("profit", 0))
-
-    if action == "rollback":
-        title = f"↩️ LIVE-АУДИТ V{version}: АВТООТКАТ"
-    elif action == "keep":
-        title = f"✅ LIVE-АУДИТ V{version}: МОДЕЛЬ ОСТАВЛЕНА"
-    else:
-        title = f"📊 LIVE-АУДИТ V{version}: НУЖНО БОЛЬШЕ ДАННЫХ"
-
-    lines = [
-        title,
-        f"Закрытых решений модели: {decisions}",
-        "",
-        f"ДО · последние {int(baseline.get('n', 0))} live: {_metrics_line(baseline)}",
-        f"ПОСЛЕ · отправленные {int(live.get('n', 0))} live: {_metrics_line(live)}",
-        f"ЗАБЛОКИРОВАНО · {int(blocked.get('n', 0))}: {_metrics_line(blocked)}",
-        f"Правильно заблокировано: {correctly_blocked} · пропущено TP3+: {missed_winners}",
-        "",
-        f"Причина решения: {_adaptive_reason_ru(reason)}",
-    ]
-
-    rollback = report.get("rollback") or {}
-    if action == "rollback":
-        to_version = int(rollback.get("to_version", 0) or 0)
-        if bool(rollback.get("to_active")):
-            lines.append(f"Решение: V{version} отключена, восстановлена V{to_version}.")
-        else:
-            lines.append(f"Решение: V{version} отключена, восстановлена базовая стратегия.")
-    elif action == "keep":
-        lines.append(
-            f"Решение: V{version} оставлена; доля проверки увеличена с "
-            f"{float(report.get('previous_deployment_fraction', 0))*100:.0f}% до "
-            f"{float(report.get('deployment_fraction', 0))*100:.0f}%."
-        )
-    else:
-        need_live = max(0, max(1, LIVE_AUDIT_MIN_LIVE) - int(live.get("n", 0)))
-        need_baseline = max(0, max(1, LIVE_AUDIT_MIN_BASELINE) - int(baseline.get("n", 0)))
-        lines.append(
-            f"Решение: пока ничего не менять; нужно ещё live {need_live}, baseline {need_baseline}."
-        )
-    return "\n".join(lines)
-
-
-def format_evidence_guard_audit_message(report: Dict[str, Any]) -> str:
-    version = int(report.get("guard_version", EVIDENCE_GUARD_VERSION) or 0)
-    decisions = int(report.get("decision_count", 0) or 0)
-    baseline = report.get("baseline") or {}
-    accepted = report.get("accepted") or {}
-    blocked = report.get("blocked") or {}
-    action = str(report.get("action", "collect_more"))
-    reason = str(report.get("reason", "unknown"))
-    correctly_blocked = int(blocked.get("sl", 0)) + int(blocked.get("expired", 0))
-    missed_winners = int(blocked.get("profit", 0))
-
-    if action == "rollback":
-        title = f"↩️ АУДИТ V16.6 · RULE {version}: АВТООТКАТ"
-    elif action == "keep":
-        title = f"✅ АУДИТ V16.6 · RULE {version}: ФИЛЬТР ОСТАВЛЕН"
-    else:
-        title = f"📊 АУДИТ V16.6 · RULE {version}: НУЖНО БОЛЬШЕ ДАННЫХ"
-
-    lines = [
-        title,
-        f"Закрытых решений фильтра: {decisions}",
-        f"Правило: Score ≥ {float(report.get('min_score', EVIDENCE_MIN_SCORE)):.0f} · "
-        f"Vol1 > x{float(report.get('min_vol1', EVIDENCE_MIN_VOL1)):.2f}",
-        "",
-        f"ДО · последние {int(baseline.get('n', 0))} live: {_metrics_line(baseline)}",
-        f"ПОСЛЕ · отправленные {int(accepted.get('n', 0))}: {_metrics_line(accepted)}",
-        f"SHADOW-БЛОК · {int(blocked.get('n', 0))}: {_metrics_line(blocked)}",
-        f"Правильно заблокировано: {correctly_blocked} · пропущено TP3+: {missed_winners}",
-        "",
-        f"Причина решения: {_adaptive_reason_ru(reason)}",
-    ]
-    if action == "rollback":
-        lines.append("Решение: фильтр Score/Vol1 отключён; базовая логика продолжает работать.")
-    elif action == "keep":
-        lines.append("Решение: фильтр Score/Vol1 продолжает отбирать live-сигналы.")
-    else:
-        lines.append("Решение: пока ничего не менять; бот продолжит собирать shadow-сравнение.")
-    return "\n".join(lines)
-
-
-def adaptive_report() -> str:
-    init_adaptive_db()
-    state = get_model_state()
-    guard_state = get_evidence_guard_state()
-
-    with _LOCK, _connect() as conn:
-        total = conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"]
-        wins = conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades WHERE label=1").fetchone()["n"]
-        losses = total - wins
-        by_strategy = conn.execute(
-            """
-            SELECT strategy,
-                   COUNT(*) AS n,
-                   SUM(label) AS wins,
-                   AVG(pnl_r) AS expectancy_r
-            FROM adaptive_trades
-            GROUP BY strategy
-            HAVING COUNT(*) >= 3
-            ORDER BY expectancy_r DESC, n DESC
-            LIMIT 10
-            """
-        ).fetchall()
-        shadow = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS n,
-                SUM(CASE WHEN shadow_accepted=1 THEN 1 ELSE 0 END) AS accepted,
-                SUM(CASE WHEN shadow_accepted=1 AND label=1 THEN 1 ELSE 0 END) AS accepted_wins
-            FROM adaptive_trades
-            WHERE shadow_accepted IS NOT NULL
-            """
-        ).fetchone()
-        source_rows = conn.execute(
-            """
-            SELECT source, COUNT(*) AS n, SUM(label) AS wins, AVG(pnl_r) AS expectancy_r
-            FROM adaptive_trades
-            GROUP BY source
-            ORDER BY source
-            """
-        ).fetchall()
-
-    wr = wins / total * 100 if total else 0.0
-    lines = [
-        "🧠 ОТЧЁТ ADAPTIVE LEARNING",
-        f"Всего обучающих результатов: {total}",
-        f"TP3+: {wins} · SL/expired: {losses} · успех всех: {wr:.1f}%",
-        f"Model version: {state.version}",
-        f"Active: {state.active}",
-        f"Shadow only: {SHADOW_ONLY}",
-        f"Threshold: {state.threshold:.3f}",
-        f"Train rows: {state.trained_rows} · Validation rows: {state.validation_rows}",
-        f"Validation logloss: model {state.model_logloss:.4f} vs base {state.base_logloss:.4f}",
-        f"Validation selected WR: {state.validation_selected_wr*100:.1f}%",
-        f"Validation coverage: {state.validation_coverage*100:.1f}%",
-        f"Validation expectancy: {state.validation_expectancy_r:+.3f}R "
-        f"vs baseline {state.validation_baseline_expectancy_r:+.3f}R",
-        f"Last candidate: {state.last_candidate_reason}",
-        f"Adaptive LIVE-доля: {float(state.deployment_fraction or 0)*100:.0f}%",
-        "",
-        f"Evidence guard v{guard_state.version}: active={guard_state.active} · "
-        f"Score ≥ {guard_state.min_score:.0f} · Vol1 > x{guard_state.min_vol1:.2f}",
-        f"Evidence guard reason: {guard_state.disabled_reason or 'running'}",
-    ]
-
-    if guard_state.active and EVIDENCE_AUDIT_ENABLED:
-        guard_preview = _collect_evidence_guard_metrics(guard_state)
-        guard_pending = max(
-            0,
-            int(guard_preview["decision_count"])
-            - int(guard_state.last_audit_decision_count or 0),
-        )
-        lines.extend(
-            [
-                f"Evidence audit: {guard_pending}/{max(1, EVIDENCE_AUDIT_EVERY)} "
-                f"new decisions (total {int(guard_preview['decision_count'])})",
-                f"Guard before: {_metrics_line(guard_preview['baseline'])}",
-                f"Guard after live: {_metrics_line(guard_preview['accepted'])}",
-                f"Guard blocked shadow: {_metrics_line(guard_preview['blocked'])}",
-            ]
-        )
-
-    if source_rows:
-        lines.append("\nИсточники данных (не смешивать с реальными сделками):")
-        for row in source_rows:
-            n = int(row["n"] or 0)
-            w = int(row["wins"] or 0)
-            exp_r = float(row["expectancy_r"] or 0.0)
-            source_name = "LIVE · реальные сигналы" if str(row["source"]) == "live" else "SHADOW · виртуальные проверки"
-            lines.append(
-                f"{source_name}: {w}/{n} TP3+ · успех {w/max(n,1)*100:.1f}% · средний {exp_r:+.3f}R"
-            )
-
-    if shadow and shadow["n"]:
-        accepted = int(shadow["accepted"] or 0)
-        accepted_wins = int(shadow["accepted_wins"] or 0)
-        shadow_wr = accepted_wins / accepted * 100 if accepted else 0.0
-        lines.append(
-            f"Shadow decisions: {int(shadow['n'])} · accepted {accepted} · accepted WR {shadow_wr:.1f}%"
-        )
-
-    if by_strategy:
-        lines.append("\nStrategies:")
-        for row in by_strategy:
-            n = int(row["n"])
-            w = int(row["wins"] or 0)
-            exp_r = float(row["expectancy_r"] or 0.0)
-            lines.append(
-                f"{row['strategy']}: {w}/{n} wins · WR {w/n*100:.1f}% · expectancy {exp_r:+.3f}R"
-            )
-
-    guard_statuses = STATE.get("strategy_guard_status", {}) if isinstance(STATE, dict) else {}
-    if guard_statuses:
-        lines.append("\nStrategy circuit breaker:")
-        for strategy, item in sorted(guard_statuses.items()):
-            status = "LIVE allowed" if bool(item.get("accepted", True)) else "SHADOW only"
-            lines.append(f"{strategy}: {status}")
-
-    if total < MIN_TRAIN_TRADES:
-        lines.append(f"\nWarm-up: need {MIN_TRAIN_TRADES-total} more closed trades before first training.")
-    elif not state.active:
-        lines.append("\nModel is not allowed to block signals because validation improvement is not yet strong enough.")
-    elif LIVE_AUDIT_ENABLED and not SHADOW_ONLY:
-        live_preview = _collect_live_audit_metrics(state)
-        pending_decisions = max(
-            0,
-            int(live_preview["decision_count"])
-            - int(state.last_live_audit_decision_count or 0),
-        )
-        lines.extend(
-            [
-                f"\nLive audit V{state.version}: "
-                f"{pending_decisions}/{max(1, LIVE_AUDIT_EVERY)} new decisions toward next report "
-                f"(total {int(live_preview['decision_count'])})",
-                f"Before: {_metrics_line(live_preview['baseline'])}",
-                f"After live: {_metrics_line(live_preview['live'])}",
-                f"Blocked shadow: {_metrics_line(live_preview['blocked'])}",
-            ]
-        )
-
-    return "\n".join(lines)
-
-
-def format_source_audit_message(window: int = 25) -> str:
-    """Telegram-friendly proof of what was LIVE and what was only simulated."""
-    init_adaptive_db()
-    size = max(1, min(int(window), 100))
-    with _LOCK, _connect() as conn:
-        all_rows = conn.execute(
-            "SELECT result, pnl_r, source FROM adaptive_trades ORDER BY id ASC"
-        ).fetchall()
-        recent_rows = conn.execute(
-            "SELECT id, symbol, side, strategy, grade, result, pnl_r, source, decision_reason "
-            "FROM adaptive_trades ORDER BY id DESC LIMIT ?",
-            (size,),
-        ).fetchall()
-
-    recent_rows = list(reversed(recent_rows))
-    all_sources = _source_breakdown(all_rows)
-    recent_sources = _source_breakdown(recent_rows)
-    first_id = int(recent_rows[0]["id"]) if recent_rows else 0
-    last_id = int(recent_rows[-1]["id"]) if recent_rows else 0
-    lines = [
-        "🔎 LIVE / SHADOW — ПРОЗРАЧНЫЙ ОТЧЁТ",
-        f"Период: результаты {first_id}–{last_id} ({len(recent_rows)} исходов)",
-        "",
-        f"LIVE · реальные сигналы: {_metrics_line(recent_sources['live'])}",
-        f"SHADOW · виртуальные проверки: {_metrics_line(recent_sources['shadow'])}",
-        f"ВСЕГО в периоде: {_metrics_line(recent_sources['all'])}",
-        "",
-        f"Накоплено LIVE: {int(all_sources['live']['n'])} · "
-        f"SHADOW: {int(all_sources['shadow']['n'])} · "
-        f"ВСЕГО: {int(all_sources['all']['n'])}",
-    ]
-
-    control_metrics = control_validation_metrics()
-    reclaim_metrics = paper_validation_metrics()
-    lines.extend(
-        [
-            "",
-            f"CONTROL V17.2.2: {_metrics_line(control_metrics)}",
-            f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(reclaim_metrics)} · "
-            f"собрано {int(reclaim_metrics.get('n', 0))}/"
-            f"{paper_progress_target(int(reclaim_metrics.get('n', 0) or 0))}",
-            watch_audit_summary(),
-        ]
-    )
-
-    shadow_rows = [row for row in recent_rows if str(row["source"] or "") == "shadow"][-8:]
-    if shadow_rows:
-        lines.append("\nПоследние SHADOW (видимые виртуальные наблюдения, не LIVE):")
-        for row in shadow_rows:
-            reason = str(row["decision_reason"] or "shadow observation")
-            if len(reason) > 34:
-                reason = reason[:31] + "..."
-            lines.append(
-                f"• {row['symbol']} {row['side']} · {row['result']} · "
-                f"{float(row['pnl_r'] or 0):+.2f}R · {reason}"
-            )
-    else:
-        lines.append("\nВ этом периоде SHADOW-исходов не было.")
-
-    lines.append("\nВажно: улучшение считается реальным только после успешного ограниченного LIVE-аудита.")
-    return "\n".join(lines)
-
-
-def recent_adaptive_events(limit: int = 20) -> List[Dict[str, Any]]:
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
+def get_open_episodes() -> List[Dict[str, Any]]:
+    with DB_LOCK, db_connect() as conn:
         rows = conn.execute(
-            """
-            SELECT created_at, event_type, message, payload_json
-            FROM adaptive_events
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (max(1, min(limit, 100)),),
+            "SELECT * FROM episodes WHERE cohort_id=? AND status='open' ORDER BY created_at,id",
+            (COHORT_ID,),
         ).fetchall()
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        out.append(
-            {
-                "created_at": int(row["created_at"]),
-                "event_type": row["event_type"],
-                "message": row["message"],
-                "payload": json.loads(row["payload_json"] or "{}"),
-            }
+    return [row_to_dict(x) for x in rows]
+
+def get_episode(eid: int) -> Optional[Dict[str, Any]]:
+    with DB_LOCK, db_connect() as conn:
+        row = conn.execute("SELECT * FROM episodes WHERE id=?", (eid,)).fetchone()
+    return row_to_dict(row) if row else None
+
+def update_episode(eid: int, updates: Dict[str, Any]) -> None:
+    allowed = {
+        "tp1_hit_at","tp2_hit_at","tp3_hit_at","tp4_hit_at","tp5_hit_at",
+        "sl_hit_at","max_favorable_move","max_adverse_move","last_exit_price",
+        "last_seen_at","data_gap_count","path_samples","max_sample_gap_seconds",
+        "status","primary_outcome","primary_pnl_r","primary_closed_at",
+        "primary_notified","entry_notified","finalized_at","final_notified",
+    }
+    clean = {k:v for k,v in updates.items() if k in allowed}
+    if not clean:
+        return
+    with DB_LOCK, db_connect() as conn:
+        conn.execute(
+            f"UPDATE episodes SET {','.join(f'{k}=?' for k in clean)} WHERE id=?",
+            (*clean.values(), eid),
         )
-    return out
+        conn.commit()
+
+def horizon_exists(eid: int, horizon: int) -> bool:
+    with DB_LOCK, db_connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM horizon_results WHERE episode_id=? AND horizon_seconds=?",
+            (eid, horizon),
+        ).fetchone() is not None
+
+def insert_horizon(result: Dict[str, Any]) -> bool:
+    cols = HORIZON_COLUMNS
+    try:
+        with DB_LOCK, db_connect() as conn:
+            conn.execute(
+                f"INSERT INTO horizon_results({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
+                tuple(result[c] for c in cols),
+            )
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def primary_rows(tier: Optional[str]=None, independent_only: bool=False) -> List[Dict[str,Any]]:
+    q = (
+        "SELECT id AS episode_id,symbol,side,tier,independent,cluster_id,created_at,"
+        "primary_outcome AS outcome,primary_pnl_r AS pnl_r,data_gap_count,"
+        "path_samples,max_sample_gap_seconds,protocol_hash "
+        "FROM episodes WHERE cohort_id=? AND primary_outcome IS NOT NULL"
+    )
+    p: List[Any] = [COHORT_ID]
+    if tier:
+        q += " AND tier=?"
+        p.append(tier)
+    if independent_only:
+        q += " AND independent=1"
+    q += " ORDER BY created_at,id"
+    with DB_LOCK, db_connect() as conn:
+        return [row_to_dict(r) for r in conn.execute(q,p).fetchall()]
+
+def horizon_rows(horizon: int, tier: Optional[str]=None, independent_only: bool=False) -> List[Dict[str,Any]]:
+    q = (
+        "SELECT h.*,e.symbol,e.side,e.tier,e.independent,e.cluster_id,e.created_at,"
+        "e.protocol_hash,e.data_gap_count,e.path_samples,e.max_sample_gap_seconds "
+        "FROM horizon_results h JOIN episodes e ON e.id=h.episode_id "
+        "WHERE e.cohort_id=? AND h.horizon_seconds=?"
+    )
+    p: List[Any] = [COHORT_ID,horizon]
+    if tier:
+        q += " AND e.tier=?"
+        p.append(tier)
+    if independent_only:
+        q += " AND e.independent=1"
+    q += " ORDER BY e.created_at,e.id"
+    with DB_LOCK, db_connect() as conn:
+        return [row_to_dict(r) for r in conn.execute(q,p).fetchall()]
 
 
-def build_export_payload() -> Dict[str, Any]:
-    """Create a portable JSON backup without Telegram tokens or environment data."""
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        trade_rows = conn.execute(
-            "SELECT * FROM adaptive_trades ORDER BY closed_at ASC, id ASC"
-        ).fetchall()
-        event_rows = conn.execute(
-            "SELECT created_at, event_type, message, payload_json "
-            "FROM adaptive_events ORDER BY id DESC LIMIT 250"
-        ).fetchall()
-        version_rows = conn.execute(
-            "SELECT version, state_json, status, saved_at, note "
-            "FROM adaptive_model_versions ORDER BY version ASC"
-        ).fetchall()
+# ---------------------------------------------------------------------------
+# Seed/export
+# ---------------------------------------------------------------------------
 
-    trades: List[Dict[str, Any]] = []
-    for row in trade_rows:
-        item = dict(row)
-        item["features"] = json.loads(item.pop("features_json") or "{}")
-        trades.append(item)
+def restore_seed_if_empty() -> Dict[str,Any]:
+    init_db()
+    if table_count("episodes") > 0:
+        report = {"restored":0,"reason":"database_not_empty"}
+        RUNTIME["seed_restore"] = report
+        return report
+    path = Path(SEED_PATH)
+    if not path.exists():
+        report = {"restored":0,"reason":"seed_not_found","path":str(path)}
+        RUNTIME["seed_restore"] = report
+        return report
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        report = {"restored":0,"reason":f"seed_invalid:{exc!r}"}
+        RUNTIME["seed_restore"] = report
+        return report
 
-    events: List[Dict[str, Any]] = []
-    for row in event_rows:
-        item = dict(row)
-        item["payload"] = json.loads(item.pop("payload_json") or "{}")
-        events.append(item)
+    # V18.1 restores only the same schema/cohort. Old data is audit-only.
+    if payload.get("export_schema") == EXPORT_SCHEMA and payload.get("cohort_id") == COHORT_ID:
+        episodes = payload.get("episodes") or []
+        horizons = payload.get("horizon_results") or []
+        ie = ih = 0
+        with DB_LOCK, db_connect() as conn:
+            for row in episodes:
+                clean = {c:row.get(c) for c in EPISODE_COLUMNS if c in row}
+                cols = tuple(clean)
+                if not cols:
+                    continue
+                conn.execute(
+                    f"INSERT OR IGNORE INTO episodes({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
+                    tuple(clean[c] for c in cols),
+                )
+                ie += int(conn.execute("SELECT changes() n").fetchone()["n"])
+            for row in horizons:
+                clean = {c:row.get(c) for c in HORIZON_COLUMNS if c in row}
+                cols = tuple(clean)
+                if not cols:
+                    continue
+                conn.execute(
+                    f"INSERT OR IGNORE INTO horizon_results({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
+                    tuple(clean[c] for c in cols),
+                )
+                ih += int(conn.execute("SELECT changes() n").fetchone()["n"])
+            conn.commit()
+        report = {"restored":ie,"horizons":ih,"reason":"v18_1_backup_restored"}
+    else:
+        # Preserve a compact audit note but do not train/mix old results.
+        old_count = len(payload.get("episodes") or payload.get("adaptive_trades") or [])
+        meta_set("legacy_audit", {"count":old_count,"policy":"audit_only_never_training"})
+        report = {"restored":0,"legacy_audit_count":old_count,"reason":"old_schema_audit_only"}
+    RUNTIME["seed_restore"] = report
+    return report
 
-    model_versions: List[Dict[str, Any]] = []
-    for row in version_rows:
-        item = dict(row)
-        item["state"] = json.loads(item.pop("state_json") or "{}")
-        model_versions.append(item)
-
-    state_snapshot = json.loads(json.dumps(globals().get("STATE", {}), ensure_ascii=False))
-    # A backup can be triggered while track_shadow_signals is finishing a close.
-    # Never serialize an already-recorded outcome as if it were still active.
-    for bucket in ("shadow_signals", "active_signals"):
-        state_snapshot[bucket] = [
-            item for item in state_snapshot.get(bucket, [])
-            if not item.get("learning_recorded") and not item.get("stats_recorded")
-        ]
+def export_payload() -> Dict[str,Any]:
+    with DB_LOCK, db_connect() as conn:
+        episodes = [row_to_dict(r) for r in conn.execute("SELECT * FROM episodes ORDER BY id").fetchall()]
+        horizons = [row_to_dict(r) for r in conn.execute(
+            "SELECT * FROM horizon_results ORDER BY episode_id,horizon_seconds"
+        ).fetchall()]
     return {
-        "export_schema": 6,
-        "exported_at": int(time.time()),
-        "app": globals().get("APP_NAME", "adaptive futures bot"),
-        "deploy_marker": globals().get("DEPLOY_MARKER", "unknown"),
-        "state": state_snapshot,
-        "adaptive_model": asdict(get_model_state()),
-        "evidence_guard": asdict(get_evidence_guard_state()),
-        "adaptive_model_versions": model_versions,
-        "adaptive_trades": trades,
-        "adaptive_events": events,
+        "export_schema":EXPORT_SCHEMA,
+        "exported_at":now_ts(),
+        "app":APP_NAME,
+        "deploy_marker":DEPLOY_MARKER,
+        "protocol":PROTOCOL_MANIFEST,
+        "protocol_hash":PROTOCOL_HASH,
+        "cohort_id":COHORT_ID,
+        "legacy_audit":meta_get("legacy_audit",{}),
+        "episodes":episodes,
+        "horizon_results":horizons,
+        "runtime":runtime_snapshot(),
+        "warning":"RESEARCH/PAPER only. Rename newest same-schema backup to adaptive_seed.json before redeploy without persistent disk.",
     }
 
-
-def build_export_bytes() -> bytes:
-    return json.dumps(
-        build_export_payload(), ensure_ascii=False, indent=2
-    ).encode("utf-8")
+def export_bytes() -> bytes:
+    return json.dumps(export_payload(),ensure_ascii=False,indent=2,allow_nan=False).encode()
 
 
-# ============================================================
-# V13.28 — MARKET DUMP + AERO STYLE SCALPER
-# Professional goal:
-# Trade only short-lived market situations with immediate edge.
-# No trend prediction, no market phase guessing.
-#
-# Core idea:
-# hot coin -> fresh imbalance -> micro pullback/liquidity grab -> EMA/VWAP reclaim/reject
-# -> immediate continuation -> compact 5-target exit.
-#
-# If the trade does not start paying quickly, it is not the setup and gets expired.
-# Important: this bot sends signals/alerts. It does not guarantee profit.
-# V13.25 fix: adds a trader-pattern gate based on the user examples.
-# The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
-# ============================================================
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2.3 DIRECT MEASURED + READINESS HOTFIX"
-DEPLOY_MARKER = "V17_2_3_READINESS_ROW_HOTFIX_2026_08_13"
+def telegram_configured() -> bool:
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
-app = FastAPI(title=APP_NAME)
+def _tg_text(text: str) -> Tuple[bool,str]:
+    if not telegram_configured():
+        return False,"Telegram credentials not configured"
+    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    err="unknown"
+    for attempt in range(TELEGRAM_RETRIES):
+        try:
+            r=requests.post(url,data={
+                "chat_id":TELEGRAM_CHAT_ID,
+                "text":text,
+                "disable_web_page_preview":"true",
+            },timeout=REQUEST_TIMEOUT_SECONDS)
+            if r.ok:
+                RUNTIME["telegram_sent"] += 1
+                return True,""
+            err=f"HTTP {r.status_code}: {r.text[:180]}"
+        except Exception as exc:
+            err=repr(exc)
+        time.sleep(.35*(2**attempt))
+    RUNTIME["telegram_errors"] += 1
+    return False,err
 
-BINGX_BASE_URL = "https://open-api.bingx.com"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+def _tg_doc(data: bytes,filename: str,caption: str) -> Tuple[bool,str]:
+    if not telegram_configured():
+        return False,"Telegram credentials not configured"
+    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    err="unknown"
+    for attempt in range(TELEGRAM_RETRIES):
+        try:
+            r=requests.post(
+                url,
+                data={"chat_id":TELEGRAM_CHAT_ID,"caption":caption[:1024]},
+                files={"document":(filename,io.BytesIO(data),"application/json")},
+                timeout=max(20.0,REQUEST_TIMEOUT_SECONDS*2),
+            )
+            if r.ok:
+                RUNTIME["telegram_sent"] += 1
+                return True,""
+            err=f"HTTP {r.status_code}: {r.text[:180]}"
+        except Exception as exc:
+            err=repr(exc)
+        time.sleep(.5*(2**attempt))
+    RUNTIME["telegram_errors"] += 1
+    return False,err
 
-# --- V17.1.1 reliable Telegram transport ---
-# Diagnostics are replaceable and are not queued. Trade/WATCH/PAPER/result
-# messages are retried immediately and then stored in a small ordered outbox.
-# The outbox is persisted in STATE_FILE when persistent storage is available.
-TELEGRAM_SEND_ATTEMPTS = max(1, int(os.getenv("TELEGRAM_SEND_ATTEMPTS", "3")))
-TELEGRAM_CONNECT_TIMEOUT = max(
-    1.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5"))
-)
-TELEGRAM_READ_TIMEOUT = max(
-    2.0, float(os.getenv("TELEGRAM_READ_TIMEOUT", "15"))
-)
-TELEGRAM_RETRY_BASE_SECONDS = max(
-    0.1, float(os.getenv("TELEGRAM_RETRY_BASE_SECONDS", "0.8"))
-)
-TELEGRAM_OUTBOX_ENABLED = os.getenv(
-    "TELEGRAM_OUTBOX_ENABLED", "true"
-).lower() == "true"
-TELEGRAM_OUTBOX_FLUSH_SECONDS = max(
-    5, int(os.getenv("TELEGRAM_OUTBOX_FLUSH_SECONDS", "15"))
-)
-TELEGRAM_OUTBOX_BATCH = max(
-    1, int(os.getenv("TELEGRAM_OUTBOX_BATCH", "6"))
-)
-TELEGRAM_OUTBOX_MAX = max(
-    10, int(os.getenv("TELEGRAM_OUTBOX_MAX", "120"))
-)
-TELEGRAM_OUTBOX_MAX_BACKOFF = max(
-    30, int(os.getenv("TELEGRAM_OUTBOX_MAX_BACKOFF", "300"))
-)
+def enqueue_outbox(kind: str,payload: bytes,filename: str="",caption: str="") -> bool:
+    with DB_LOCK, db_connect() as conn:
+        conn.execute(
+            "INSERT INTO outbox(kind,payload,filename,caption,created_at,next_retry_at) VALUES(?,?,?,?,?,?)",
+            (kind,sqlite3.Binary(payload),filename,caption,now_ts(),now_ts()+15),
+        )
+        conn.commit()
+    return True
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_29_local_stop_dump_scalper.json")
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
+def send_text(text: str,critical: bool=True) -> bool:
+    ok,err=_tg_text(text)
+    if not ok:
+        set_runtime_error(f"Telegram text: {err}")
+        if critical and telegram_configured():
+            return enqueue_outbox("text",text.encode())
+    return ok
 
-# --- Scan stability ---
-AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
-AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "15"))
-AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "3"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
-API_RETRIES = int(os.getenv("API_RETRIES", "3"))
-API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.04"))
-MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
-MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "220"))
-HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "80"))
-MIN_HOT_CANDIDATES = int(os.getenv("MIN_HOT_CANDIDATES", "70"))
-HOT_SCAN_WORKERS = max(1, int(os.getenv("HOT_SCAN_WORKERS", "6")))
-DEEP_SCAN_WORKERS = max(1, int(os.getenv("DEEP_SCAN_WORKERS", "6")))
-DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
+def send_document(data: bytes,filename: str,caption: str,critical: bool=True) -> bool:
+    ok,err=_tg_doc(data,filename,caption)
+    if not ok:
+        set_runtime_error(f"Telegram document: {err}")
+        if critical and telegram_configured():
+            return enqueue_outbox("document",data,filename,caption)
+    return ok
 
-# --- Signal limits ---
-A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
-B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
-MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "1"))
-MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
-STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
-# Zero means unlimited. Quality gates, pair cooldown, strategy protection and
-# the maximum number of simultaneously active trades remain in force.
-MAX_LIVE_SIGNALS_24H = int(os.getenv("MAX_LIVE_SIGNALS_24H", "3"))
-MAX_LIVE_SIGNALS_PER_SIDE_24H = int(os.getenv("MAX_LIVE_SIGNALS_PER_SIDE_24H", "2"))
-MIN_LIVE_SIGNAL_SPACING_SECONDS = int(os.getenv("MIN_LIVE_SIGNAL_SPACING_SECONDS", "3600"))
-MAX_ADAPTIVE_CANARY_LIVE_24H = int(os.getenv("MAX_ADAPTIVE_CANARY_LIVE_24H", "2"))
-
-# --- V17.2 liquidity-first, dual-setup forward validation ---
-# The 400-outcome audit and the failed V17.1 WATCH day show two distinct faults:
-# raw hot ranking admits distorted microcaps, while one fixed 1.20% impulse gate
-# produces almost no confirmed entries.  V17.2 first ranks tape continuity and
-# approximate turnover, then watches either a normalized continuation/reclaim
-# or a genuine sweep/reversal.  Both lanes are visible PAPER only.
-DATA_ENTRY_GATE_ENABLED = os.getenv("DATA_ENTRY_GATE_ENABLED", "true").lower() == "true"
-DATA_MIN_VOL1 = float(os.getenv("DATA_MIN_VOL1", "1.00"))
-DATA_MIN_RANGE1 = float(os.getenv("DATA_MIN_RANGE1", "1.50"))
-DATA_MIN_DIRECTIONAL_3M = float(os.getenv("DATA_MIN_DIRECTIONAL_3M", "0.0080"))
-
-PAPER_VALIDATION_ENABLED = os.getenv("PAPER_VALIDATION_ENABLED", "true").lower() == "true"
-PAPER_PULLBACK_CHALLENGER_ENABLED = os.getenv(
-    "PAPER_PULLBACK_CHALLENGER_ENABLED", "true"
-).lower() == "true"
-PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "true"
-VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
-    "VISIBLE_SHADOW_NOTIFICATIONS", "true"
-).lower() == "true"
-PAPER_VALIDATION_REASON = "direct_measured_paper_v17_2_2"
-PAPER_CONTROL_REASON = "direct_measured_control_v17_2_2"
-REAL_MONEY_LIVE_REASON = "direct_measured_micro_live_v17_2_2"
-LEGACY_V17_2_1_PAPER_VALIDATION_REASON = "measured_edge_paper_v17_2_1"
-LEGACY_V17_2_1_CONTROL_REASON = "measured_edge_control_v17_2_1"
-LEGACY_V17_1_PAPER_VALIDATION_REASON = "moderate_reclaim_v17_1"
-LEGACY_V17_1_CONTROL_REASON = "moderate_control_v17_1"
-LEGACY_V17_PAPER_VALIDATION_REASON = "evidence_reclaim_v17"
-LEGACY_V17_CONTROL_REASON = "evidence_control_v17"
-LEGACY_PAPER_VALIDATION_REASON = "quality_forward_v16_9"
-PAPER_INSTANT_STRATEGIES = {
-    "LONG": "PRO_INSTANT_EDGE_LONG",
-    "SHORT": "PRO_INSTANT_EDGE_SHORT",
-}
-DIRECT_MEASURED_STRATEGIES = {
-    "LONG": "PRO_DIRECT_MEASURED_LONG",
-    "SHORT": "PRO_DIRECT_MEASURED_SHORT",
-}
-PAPER_RECLAIM_STRATEGIES = {
-    "LONG": "PRO_LIQUIDITY_RECLAIM_LONG",
-    "SHORT": "PRO_LIQUIDITY_RECLAIM_SHORT",
-}
-PAPER_REVERSAL_STRATEGIES = {
-    "LONG": "PRO_LIQUIDITY_SWEEP_REVERSAL_LONG",
-    "SHORT": "PRO_LIQUIDITY_SWEEP_REVERSAL_SHORT",
-}
-
-# Liquidity is estimated from the already downloaded candles: 60-minute quote
-# turnover proxy, active/unique prints and anomaly checks.  The relative rank
-# inside each scan is the primary filter, so this works across very different
-# token prices without pretending candle volume is identical on every market.
-V17_2_LIQUIDITY_FIRST_ENABLED = os.getenv(
-    "V17_2_LIQUIDITY_FIRST_ENABLED", "true"
-).lower() == "true"
-V17_2_LIQUIDITY_KEEP_FRACTION = float(
-    os.getenv("V17_2_LIQUIDITY_KEEP_FRACTION", "0.60")
-)
-V17_2_MIN_ACTIVE_CANDLE_FRACTION = float(
-    os.getenv("V17_2_MIN_ACTIVE_CANDLE_FRACTION", "0.82")
-)
-V17_2_MIN_UNIQUE_CLOSE_FRACTION = float(
-    os.getenv("V17_2_MIN_UNIQUE_CLOSE_FRACTION", "0.45")
-)
-V17_2_MAX_CURRENT_VOL_RATIO = float(
-    os.getenv("V17_2_MAX_CURRENT_VOL_RATIO", "12.0")
-)
-V17_2_MAX_CURRENT_RANGE_RATIO = float(
-    os.getenv("V17_2_MAX_CURRENT_RANGE_RATIO", "8.0")
-)
-V17_2_MAX_ATR1_PCT = float(os.getenv("V17_2_MAX_ATR1_PCT", "0.030"))
-V17_2_MIN_ABS_MOVE = float(os.getenv("V17_2_MIN_ABS_MOVE", "0.0045"))
-V17_2_MAX_ABS_MOVE = float(os.getenv("V17_2_MAX_ABS_MOVE", "0.0300"))
-V17_2_MIN_ATR_MOVE = float(os.getenv("V17_2_MIN_ATR_MOVE", "0.90"))
-V17_2_MAX_ATR_MOVE = float(os.getenv("V17_2_MAX_ATR_MOVE", "4.50"))
-V17_2_CONT_MIN_15M = float(os.getenv("V17_2_CONT_MIN_15M", "0.0030"))
-V17_2_CONT_MAX_15M = float(os.getenv("V17_2_CONT_MAX_15M", "0.0600"))
-V17_2_REVERSAL_MIN_STRETCH = float(
-    os.getenv("V17_2_REVERSAL_MIN_STRETCH", "0.0120")
-)
-V17_2_REVERSAL_MIN_COUNTER = float(
-    os.getenv("V17_2_REVERSAL_MIN_COUNTER", "0.0035")
-)
-V17_2_MIN_VOL1 = float(os.getenv("V17_2_MIN_VOL1", "0.55"))
-V17_2_MAX_VOL1 = float(os.getenv("V17_2_MAX_VOL1", "5.00"))
-V17_2_MIN_RANGE1 = float(os.getenv("V17_2_MIN_RANGE1", "0.80"))
-V17_2_MIN_VOL5 = float(os.getenv("V17_2_MIN_VOL5", "0.35"))
-V17_2_MIN_RANGE5 = float(os.getenv("V17_2_MIN_RANGE5", "0.65"))
-V17_2_A_MIN_SCORE = int(os.getenv("V17_2_A_MIN_SCORE", "82"))
-V17_2_A_PLUS_MIN_SCORE = int(os.getenv("V17_2_A_PLUS_MIN_SCORE", "90"))
-V17_2_TARGET_PAPER_PER_DAY_MIN = int(
-    os.getenv("V17_2_TARGET_PAPER_PER_DAY_MIN", "2")
-)
-V17_2_TARGET_PAPER_PER_DAY_MAX = int(
-    os.getenv("V17_2_TARGET_PAPER_PER_DAY_MAX", "6")
-)
-V17_2_MAX_NEW_WATCH_PER_SCAN = int(
-    os.getenv("V17_2_MAX_NEW_WATCH_PER_SCAN", "3")
-)
-V17_2_MAX_PENDING_WATCH = int(os.getenv("V17_2_MAX_PENDING_WATCH", "12"))
-
-# V17.2.2 direct measured cohort.  Unlike V17.2.1, this detector does not call
-# the legacy instant_edge_setup first.  The fixed boundaries below were frozen
-# after a chronological archive audit: 37 proxy matches in all 500 outcomes
-# (21 TP3+, 4 SL, 12 expired), with 18 matches in the newest 150-outcome blind
-# block (12 TP3+, 2 SL, 4 expired).  The rows came from older implementations,
-# so this is a hypothesis, not proof.  Every new match remains visible PAPER
-# until a fresh, independent 50-outcome cohort passes the readiness gate.
-MEASURED_MIN_VOL1 = float(os.getenv("MEASURED_MIN_VOL1", "0.80"))
-MEASURED_MAX_VOL1 = float(os.getenv("MEASURED_MAX_VOL1", "1.60"))
-MEASURED_MIN_RANGE1 = float(os.getenv("MEASURED_MIN_RANGE1", "1.50"))
-MEASURED_MAX_RANGE1 = float(os.getenv("MEASURED_MAX_RANGE1", "3.00"))
-MEASURED_MIN_DIRECTIONAL_3M = float(
-    os.getenv("MEASURED_MIN_DIRECTIONAL_3M", "0.0080")
-)
-MEASURED_MAX_DIRECTIONAL_3M = float(
-    os.getenv("MEASURED_MAX_DIRECTIONAL_3M", "0.0500")
-)
-MEASURED_MIN_DIRECTIONAL_15M = float(
-    os.getenv("MEASURED_MIN_DIRECTIONAL_15M", "0.0100")
-)
-MEASURED_MAX_DIRECTIONAL_15M = float(
-    os.getenv("MEASURED_MAX_DIRECTIONAL_15M", "0.0600")
-)
-MEASURED_MIN_VOL5 = float(os.getenv("MEASURED_MIN_VOL5", "0.40"))
-MEASURED_MAX_VOL5 = float(os.getenv("MEASURED_MAX_VOL5", "2.50"))
-MEASURED_MIN_RANGE5 = float(os.getenv("MEASURED_MIN_RANGE5", "0.70"))
-MEASURED_MAX_30M_CHASE = float(os.getenv("MEASURED_MAX_30M_CHASE", "0.1000"))
-MEASURED_MIN_BODY_FRACTION = float(
-    os.getenv("MEASURED_MIN_BODY_FRACTION", "0.25")
-)
-MEASURED_LONG_MIN_CLOSE_LOCATION = float(
-    os.getenv("MEASURED_LONG_MIN_CLOSE_LOCATION", "0.55")
-)
-MEASURED_SHORT_MAX_CLOSE_LOCATION = float(
-    os.getenv("MEASURED_SHORT_MAX_CLOSE_LOCATION", "0.45")
-)
-MEASURED_MIN_LIQUIDITY_RANK = float(
-    os.getenv("MEASURED_MIN_LIQUIDITY_RANK", "0.35")
-)
-MEASURED_MIN_QUOTE_60M = float(os.getenv("MEASURED_MIN_QUOTE_60M", "50000"))
-MEASURED_MAX_BOOK_SPREAD_BPS = float(
-    os.getenv("MEASURED_MAX_BOOK_SPREAD_BPS", "15.0")
-)
-MEASURED_MIN_BOOK_DEPTH_USDT = float(
-    os.getenv("MEASURED_MIN_BOOK_DEPTH_USDT", "500")
-)
-
-# Real-money alerts are two-key guarded: the environment flag alone is not
-# enough.  The new forward cohort must also pass all readiness tests.  This bot
-# remains a signal bot and never places an exchange order.
-REAL_MONEY_SIGNALS = os.getenv("REAL_MONEY_SIGNALS", "false").lower() == "true"
-REAL_MONEY_MIN_FORWARD = int(os.getenv("REAL_MONEY_MIN_FORWARD", "50"))
-REAL_MONEY_MIN_UNIQUE_SYMBOLS = int(
-    os.getenv("REAL_MONEY_MIN_UNIQUE_SYMBOLS", "25")
-)
-REAL_MONEY_MIN_SUCCESS_RATE = float(
-    os.getenv("REAL_MONEY_MIN_SUCCESS_RATE", "0.50")
-)
-REAL_MONEY_MIN_EXPECTANCY_R = float(
-    os.getenv("REAL_MONEY_MIN_EXPECTANCY_R", "0.20")
-)
-REAL_MONEY_RECENT_WINDOW = int(os.getenv("REAL_MONEY_RECENT_WINDOW", "25"))
-REAL_MONEY_MIN_SIDE_FORWARD = int(
-    os.getenv("REAL_MONEY_MIN_SIDE_FORWARD", "15")
-)
-REAL_MONEY_SIDE_RECENT_WINDOW = int(
-    os.getenv("REAL_MONEY_SIDE_RECENT_WINDOW", "10")
-)
-REAL_MONEY_MIN_SIDE_EXPECTANCY_R = float(
-    os.getenv("REAL_MONEY_MIN_SIDE_EXPECTANCY_R", "0.10")
-)
-MICRO_LIVE_RISK_MULT = float(os.getenv("MICRO_LIVE_RISK_MULT", "0.02"))
-MICRO_LIVE_GUARD_MIN_OUTCOMES = int(
-    os.getenv("MICRO_LIVE_GUARD_MIN_OUTCOMES", "5")
-)
-MICRO_LIVE_GUARD_WINDOW = int(os.getenv("MICRO_LIVE_GUARD_WINDOW", "10"))
-MICRO_LIVE_MAX_NONPROFIT_STREAK = int(
-    os.getenv("MICRO_LIVE_MAX_NONPROFIT_STREAK", "3")
-)
-MICRO_LIVE_MAX_DRAWDOWN_R = float(
-    os.getenv("MICRO_LIVE_MAX_DRAWDOWN_R", "3.0")
-)
-# The detector still needs a real directional impulse, but entry is no longer
-# allowed at the first hot print.  It must survive the retest state machine.
-PAPER_EDGE_MIN = float(os.getenv("PAPER_EDGE_MIN", "0.0120"))
-PAPER_EDGE_MAX = float(os.getenv("PAPER_EDGE_MAX", "0.0300"))
-PAPER_MAX_DIRECTIONAL_15M = float(
-    os.getenv("PAPER_MAX_DIRECTIONAL_15M", "0.0400")
-)
-PAPER_MAX_VOL1 = float(os.getenv("PAPER_MAX_VOL1", "2.50"))
-PAPER_LONG_MIN_DIRECTIONAL_15M = float(
-    os.getenv("PAPER_LONG_MIN_DIRECTIONAL_15M", "0.0115")
-)
-PAPER_LONG_MIN_VOL5 = float(os.getenv("PAPER_LONG_MIN_VOL5", "0.40"))
-PAPER_LONG_MAX_VOL5 = float(os.getenv("PAPER_LONG_MAX_VOL5", "1.20"))
-PAPER_SHORT_MIN_DIRECTIONAL_3M = float(
-    os.getenv("PAPER_SHORT_MIN_DIRECTIONAL_3M", "0.0165")
-)
-PAPER_SHORT_MIN_DIRECTIONAL_15M = float(
-    os.getenv("PAPER_SHORT_MIN_DIRECTIONAL_15M", "0.0280")
-)
-PAPER_PILOT_REQUIRED_OUTCOMES = int(
-    os.getenv("PAPER_PILOT_REQUIRED_OUTCOMES", "25")
-)
-PAPER_REVIEW_REQUIRED_OUTCOMES = int(
-    os.getenv("PAPER_REVIEW_REQUIRED_OUTCOMES", "50")
-)
-# Twenty-five trades are a manual quality review, not enough evidence to let a
-# model touch signals.  Promotion stays frozen until at least 50 unchanged,
-# registered V17.2 PAPER outcomes and the ordinary independent guards pass.
-PAPER_LANE_REQUIRED_OUTCOMES = int(os.getenv("PAPER_LANE_REQUIRED_OUTCOMES", "50"))
-PAPER_MIN_UNIQUE_SYMBOLS_PILOT = int(
-    os.getenv("PAPER_MIN_UNIQUE_SYMBOLS_PILOT", "7")
-)
-PAPER_PILOT_MIN_EXPECTANCY_R = float(
-    os.getenv("PAPER_PILOT_MIN_EXPECTANCY_R", "0.15")
-)
-PAPER_SYMBOL_COOLDOWN_SECONDS = int(
-    os.getenv("PAPER_SYMBOL_COOLDOWN_SECONDS", "21600")
-)
-# Pullback/reclaim observation window.  The six-minute trade time-stop begins
-# only after the confirmed PAPER entry, not while the setup is on WATCH.
-PAPER_RECLAIM_MIN_SECONDS = int(os.getenv("PAPER_RECLAIM_MIN_SECONDS", "20"))
-PAPER_RECLAIM_MAX_SECONDS = int(os.getenv("PAPER_RECLAIM_MAX_SECONDS", "300"))
-PAPER_RECLAIM_MIN_PULLBACK = float(os.getenv("PAPER_RECLAIM_MIN_PULLBACK", "0.0015"))
-PAPER_RECLAIM_MAX_PULLBACK = float(os.getenv("PAPER_RECLAIM_MAX_PULLBACK", "0.0180"))
-PAPER_RECLAIM_MIN_IMPULSE_FRACTION = float(
-    os.getenv("PAPER_RECLAIM_MIN_IMPULSE_FRACTION", "0.12")
-)
-PAPER_RECLAIM_MAX_IMPULSE_FRACTION = float(
-    os.getenv("PAPER_RECLAIM_MAX_IMPULSE_FRACTION", "0.60")
-)
-PAPER_RECLAIM_MIN_RECOVERY = float(os.getenv("PAPER_RECLAIM_MIN_RECOVERY", "0.42"))
-PAPER_RECLAIM_ENTRY_FLOOR = float(os.getenv("PAPER_RECLAIM_ENTRY_FLOOR", "-0.0005"))
-PAPER_RECLAIM_MAX_CHASE = float(os.getenv("PAPER_RECLAIM_MAX_CHASE", "0.0035"))
-PAPER_RECLAIM_MIN_3M = float(os.getenv("PAPER_RECLAIM_MIN_3M", "0.0005"))
-PAPER_RECLAIM_MIN_VOL1 = float(os.getenv("PAPER_RECLAIM_MIN_VOL1", "0.45"))
-PAPER_RECLAIM_MIN_RANGE1 = float(os.getenv("PAPER_RECLAIM_MIN_RANGE1", "0.65"))
-PAPER_PENDING_MONITOR_SECONDS = int(
-    os.getenv("PAPER_PENDING_MONITOR_SECONDS", "10")
-)
-PAPER_CONFIRM_LATCH_SECONDS = int(
-    os.getenv("PAPER_CONFIRM_LATCH_SECONDS", "60")
-)
-PAPER_CHECKPOINT_EVERY = int(os.getenv("PAPER_CHECKPOINT_EVERY", "5"))
-PAPER_BREAKEVEN_AFTER_TP1 = os.getenv(
-    "PAPER_BREAKEVEN_AFTER_TP1", "true"
-).lower() == "true"
-# Safety invariant for this build.  A Render environment variable cannot turn
-# an unvalidated V17.2 setup into a real/LIVE signal by accident.
-PRO_QUALITY_FORWARD_ENABLED = True
-
-# Weak strategies are paused only in LIVE. They continue producing SHADOW
-# outcomes and automatically recover when the newest rolling evidence improves.
-STRATEGY_CIRCUIT_BREAKER_ENABLED = os.getenv("STRATEGY_CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
-STRATEGY_GUARD_WINDOW = int(os.getenv("STRATEGY_GUARD_WINDOW", "10"))
-STRATEGY_GUARD_MIN_ROWS = int(os.getenv("STRATEGY_GUARD_MIN_ROWS", "8"))
-STRATEGY_GUARD_MAX_EXPECTANCY_R = float(os.getenv("STRATEGY_GUARD_MAX_EXPECTANCY_R", "-0.20"))
-STRATEGY_GUARD_MAX_SUCCESS_RATE = float(os.getenv("STRATEGY_GUARD_MAX_SUCCESS_RATE", "0.20"))
-STRATEGY_RECOVERY_WINDOW = int(os.getenv("STRATEGY_RECOVERY_WINDOW", "5"))
-STRATEGY_RECOVERY_MIN_PROFITS = int(os.getenv("STRATEGY_RECOVERY_MIN_PROFITS", "2"))
-STRATEGY_RECOVERY_MIN_EXPECTANCY_R = float(os.getenv("STRATEGY_RECOVERY_MIN_EXPECTANCY_R", "0.05"))
-# MARKET_DUMP_SHORT was persistently negative through outcome 150. It remains
-# SHADOW until the newest recovery window meets the ordinary recovery rule.
-MARKET_DUMP_SHORT_REQUALIFY = os.getenv(
-    "MARKET_DUMP_SHORT_REQUALIFY", "true"
-).lower() == "true"
-
-# A detected setup is not sent immediately. It must keep its direction for a
-# short observation window, remain near the original entry and confirm on 1m.
-PRE_LIVE_CONFIRMATION_ENABLED = os.getenv("PRE_LIVE_CONFIRMATION_ENABLED", "true").lower() == "true"
-PRE_LIVE_MIN_SECONDS = int(os.getenv("PRE_LIVE_MIN_SECONDS", "10"))
-PRE_LIVE_MAX_SECONDS = int(os.getenv("PRE_LIVE_MAX_SECONDS", "120"))
-PRE_LIVE_MIN_DIRECTIONAL_MOVE = float(os.getenv("PRE_LIVE_MIN_DIRECTIONAL_MOVE", "0.0008"))
-PRE_LIVE_MAX_CHASE_MOVE = float(os.getenv("PRE_LIVE_MAX_CHASE_MOVE", "0.0040"))
-PRE_LIVE_MAX_ADVERSE_MOVE = float(os.getenv("PRE_LIVE_MAX_ADVERSE_MOVE", "0.0035"))
-PRE_LIVE_MIN_VOL1 = float(os.getenv("PRE_LIVE_MIN_VOL1", "0.80"))
-PRE_LIVE_MIN_RANGE1 = float(os.getenv("PRE_LIVE_MIN_RANGE1", "1.00"))
-PRE_LIVE_CLOSE_LONG = float(os.getenv("PRE_LIVE_CLOSE_LONG", "0.58"))
-PRE_LIVE_CLOSE_SHORT = float(os.getenv("PRE_LIVE_CLOSE_SHORT", "0.42"))
-PRE_LIVE_MAX_ACTIVE = int(os.getenv("PRE_LIVE_MAX_ACTIVE", "28"))
-
-# A symbol that produces three consecutive non-profit outcomes is quarantined
-# for 12 hours. Shadow observation continues and any TP3+ clears the quarantine.
-SYMBOL_QUARANTINE_ENABLED = os.getenv("SYMBOL_QUARANTINE_ENABLED", "true").lower() == "true"
-SYMBOL_FAIL_LIMIT = int(os.getenv("SYMBOL_FAIL_LIMIT", "3"))
-SYMBOL_QUARANTINE_SECONDS = int(os.getenv("SYMBOL_QUARANTINE_SECONDS", "43200"))
-
-# Shadow candidates are hypothetical trades: they are never sent as live signals,
-# but their outcomes let the challenger learn from accepted and rejected examples.
-SHADOW_TRACKING_ENABLED = os.getenv("SHADOW_TRACKING_ENABLED", "true").lower() == "true"
-SHADOW_MAX_ACTIVE = int(os.getenv("SHADOW_MAX_ACTIVE", "40"))
-SHADOW_PAPER_RESERVED_SLOTS = int(os.getenv("SHADOW_PAPER_RESERVED_SLOTS", "6"))
-SHADOW_PER_SCAN = int(os.getenv("SHADOW_PER_SCAN", "6"))
-SHADOW_COOLDOWN_SECONDS = int(os.getenv("SHADOW_COOLDOWN_SECONDS", "600"))
-
-# V16.7: extra near-miss probes remain disabled. Forward learning now uses only
-# explicitly confirmed and visible PAPER candidates plus genuine LIVE results.
-# The implementation remains available for controlled experiments via env.
-SHADOW_PROBE_ENABLED = os.getenv("SHADOW_PROBE_ENABLED", "false").lower() == "true"
-SHADOW_PROBE_PER_SCAN = int(os.getenv("SHADOW_PROBE_PER_SCAN", "3"))
-SHADOW_PROBE_MAX_ACTIVE = int(os.getenv("SHADOW_PROBE_MAX_ACTIVE", "6"))
-SHADOW_PROBE_COOLDOWN_SECONDS = int(os.getenv("SHADOW_PROBE_COOLDOWN_SECONDS", "1800"))
-SHADOW_PROBE_MIN_DIRECTIONAL_3M = float(os.getenv("SHADOW_PROBE_MIN_DIRECTIONAL_3M", "0.0025"))
-SHADOW_PROBE_MIN_VOL1 = float(os.getenv("SHADOW_PROBE_MIN_VOL1", "0.25"))
-SHADOW_PROBE_MIN_RANGE1 = float(os.getenv("SHADOW_PROBE_MIN_RANGE1", "0.50"))
-SHADOW_PROBE_MIN_EVIDENCE_SCORE = float(os.getenv("SHADOW_PROBE_MIN_EVIDENCE_SCORE", "2.20"))
-LADDER_FOLLOWUP_MINUTES = int(os.getenv("LADDER_FOLLOWUP_MINUTES", "90"))
-AUTO_TELEGRAM_BACKUP = os.getenv("AUTO_TELEGRAM_BACKUP", "true").lower() == "true"
-AUTO_BACKUP_EVERY_CLOSED = int(os.getenv("AUTO_BACKUP_EVERY_CLOSED", "25"))
-
-# --- Fast burst requirements ---
-FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
-FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.0045"))        # 1.0% in 15m
-FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.0070"))        # 1.6% in 30m
-FAST_MAX_30M_MOVE = float(os.getenv("FAST_MAX_30M_MOVE", "0.090"))        # avoid late vertical chase
-FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "0.82"))   # current 5m range expansion
-FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "0.35")) # current 15m volume expansion
-FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.00055"))   # 0.15% last 3m direction
-# V13.19: fast scalps can be either continuation OR blow-off reversal.
-# Example from diagnostics: 30m +16%, last 3m -1% can be a valid SHORT scalp, not a rejection.
-REVERSAL_ENABLED = os.getenv("REVERSAL_ENABLED", "true").lower() == "true"
-REVERSAL_MIN_30M_MOVE = float(os.getenv("REVERSAL_MIN_30M_MOVE", "0.018"))
-REVERSAL_MIN_LIVE_COUNTER_MOVE = float(os.getenv("REVERSAL_MIN_LIVE_COUNTER_MOVE", "0.0012"))
-LIVE_BYPASS_VOLUME_MOVE = float(os.getenv("LIVE_BYPASS_VOLUME_MOVE", "0.0035"))
-LIVE_BYPASS_RANGE_RATIO = float(os.getenv("LIVE_BYPASS_RANGE_RATIO", "1.35"))
-FAST_MAX_SPREAD_PROXY = float(os.getenv("FAST_MAX_SPREAD_PROXY", "0.030"))# current 5m candle too wide/chase block
-EDGE_MIN_PRIOR_COMPRESSION = float(os.getenv("EDGE_MIN_PRIOR_COMPRESSION", "99.0")) # prior 5m range should be smaller before expansion
-EDGE_MIN_BREAKOUT_DISTANCE = float(os.getenv("EDGE_MIN_BREAKOUT_DISTANCE", "0.00005")) # 0.12% micro break beyond prior 1m structure
-EDGE_REQUIRE_MICRO_SWEEP = os.getenv("EDGE_REQUIRE_MICRO_SWEEP", "false").lower() == "true"
-
-# --- Realtime pressure gate ---
-# Previous versions expired because they detected a pattern after the flow had already died.
-# These filters require live 1m pressure at the exact signal moment.
-HOT_MIN_SCORE = float(os.getenv("HOT_MIN_SCORE", "14"))
-HOT_MIN_LIVE_MOVE_3M = float(os.getenv("HOT_MIN_LIVE_MOVE_3M", "0.0006"))
-HOT_MIN_LIVE_RANGE_OR_VOLUME = float(os.getenv("HOT_MIN_LIVE_RANGE_OR_VOLUME", "0.70"))
-HOT_STALE_PENALTY_ENABLED = os.getenv("HOT_STALE_PENALTY_ENABLED", "true").lower() == "true"
-REALTIME_MIN_1M_RANGE_RATIO = float(os.getenv("REALTIME_MIN_1M_RANGE_RATIO", "0.45"))
-REALTIME_MIN_1M_VOLUME_RATIO = float(os.getenv("REALTIME_MIN_1M_VOLUME_RATIO", "0.20"))
-REALTIME_MIN_2M_MOVE = float(os.getenv("REALTIME_MIN_2M_MOVE", "0.00045"))
-REALTIME_CLOSE_LOCATION_LONG = float(os.getenv("REALTIME_CLOSE_LOCATION_LONG", "0.57"))
-REALTIME_CLOSE_LOCATION_SHORT = float(os.getenv("REALTIME_CLOSE_LOCATION_SHORT", "0.43"))
-REALTIME_REQUIRE_TWO_1M_CANDLES = os.getenv("REALTIME_REQUIRE_TWO_1M_CANDLES", "false").lower() == "true"
-EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.50")) # recent 15m move should cover most of TP5 distance
-
-# --- Pullback/retest requirements ---
-PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0015"))                 # 0.25%
-PULLBACK_MAX = float(os.getenv("PULLBACK_MAX", "0.0400"))                 # 3.0%
-RECLAIM_BUFFER = float(os.getenv("RECLAIM_BUFFER", "0.0005"))
-CLOSE_LOCATION_MIN_LONG = float(os.getenv("CLOSE_LOCATION_MIN_LONG", "0.52"))
-CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.48"))
-
-# --- Compact ladder TPs for fast 10-minute realization style ---
-# These are intentionally more compact than slow ladder targets.
-# Trader-example ladder: AERO/PORTAL/HOME/VELVET style targets are not tiny 0.3% scalps.
-# TP1 should be reachable quickly, but TP5 should represent a real 3-4% move when volatility allows.
-TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0065"))
-TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0120"))
-TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0185"))
-TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0260"))
-TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0350"))
-
-# User accounting rule: TP1/TP2 are intermediate only. A signal becomes a
-# positive trade for statistics and learning only when TP3 is reached.
-PROFIT_TARGET_NUMBER = 3
-PROFIT_TARGET_KEY = "tp3"
-
-# --- Risk / stop ---
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
-MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0100"))                  # min 1.0% price risk
-MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # technical invalidation cap for example-style ladder
-
-# V13.29: for fast scalps we use a LOCAL execution stop, not the distant invalidation/averaging zone.
-# This keeps AERO-style / dump scalps alive while still blocking XMR-style wide-risk trades.
-LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
-LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0145"))  # 1.45% price risk cap; x20 ≈ 29% ROI
-LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0065"))  # keep stop not too tight
-LOCAL_STOP_MODES = {
-    "MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG",
-    "INSTANT_EVIDENCE_SHORT", "INSTANT_EVIDENCE_LONG",
-    "INSTANT_SHADOW_OBSERVATION_SHORT", "INSTANT_SHADOW_OBSERVATION_LONG",
-    "AERO_STYLE_SHORT", "AERO_STYLE_LONG",
-    "INSTANT_PULLBACK_RECLAIM_LONG", "INSTANT_PULLBACK_RECLAIM_SHORT",
-    "V17_2_CONTINUATION_LONG", "V17_2_CONTINUATION_SHORT",
-    "V17_2_SWEEP_REVERSAL_LONG", "V17_2_SWEEP_REVERSAL_SHORT",
-    "V17_2_CONFIRMED_CONTINUATION_LONG", "V17_2_CONFIRMED_CONTINUATION_SHORT",
-    "V17_2_CONFIRMED_REVERSAL_LONG", "V17_2_CONFIRMED_REVERSAL_SHORT",
-    "V17_2_1_MEASURED_EDGE_LONG", "V17_2_1_MEASURED_EDGE_SHORT",
-    "V17_2_2_DIRECT_MEASURED_LONG", "V17_2_2_DIRECT_MEASURED_SHORT",
-}
-FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
-# A+ did not outperform B in the newest 50 outcomes. Grade still ranks a setup,
-# but it cannot increase suggested risk until a fresh forward audit proves it.
-A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.08"))
-
-# --- V13.22 professional quality gate ---
-# Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
-MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "32.0"))
-MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
-MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.62"))
-MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
-MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.50"))
-MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.30"))
-STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0050"))
-STRONG_RANGE1 = float(os.getenv("STRONG_RANGE1", "1.25"))
-HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.25"))
-HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "13.0"))
-HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.70"))
-HEAVY_BASES = {
-    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK", "AVAX",
-    "DOT", "LTC", "BCH", "XMR", "GMX", "AAVE", "UNI", "ATOM", "ETC", "FIL"
-}
-
-# --- V13.24 Instant Edge fallback ---
-# This mode catches the examples-style micro-moment when the coin is moving NOW,
-# but the older pullback/EMA/VWAP setup is too slow and returns no_fast.
-# It is not a loose mode: final RR/SL/live-volume quality gate still applies after trade construction.
-INSTANT_EDGE_ENABLED = os.getenv("INSTANT_EDGE_ENABLED", "true").lower() == "true"
-INSTANT_MIN_1M3_MOVE = float(os.getenv("INSTANT_MIN_1M3_MOVE", "0.0055"))
-INSTANT_MIN_15M_MOVE = float(os.getenv("INSTANT_MIN_15M_MOVE", "0.0040"))
-INSTANT_MIN_VOL1 = float(os.getenv("INSTANT_MIN_VOL1", "0.45"))
-INSTANT_MIN_RANGE1 = float(os.getenv("INSTANT_MIN_RANGE1", "0.85"))
-INSTANT_MIN_VOL5 = float(os.getenv("INSTANT_MIN_VOL5", "0.55"))
-INSTANT_MIN_RANGE5 = float(os.getenv("INSTANT_MIN_RANGE5", "0.70"))
-INSTANT_CLOSE_LONG = float(os.getenv("INSTANT_CLOSE_LONG", "0.60"))
-INSTANT_CLOSE_SHORT = float(os.getenv("INSTANT_CLOSE_SHORT", "0.40"))
-INSTANT_MIN_BODY = float(os.getenv("INSTANT_MIN_BODY", "0.34"))
-INSTANT_MAX_30M_CHASE = float(os.getenv("INSTANT_MAX_30M_CHASE", "0.065"))
-INSTANT_ALLOW_STRONG_1M_EXCEPTION = os.getenv("INSTANT_ALLOW_STRONG_1M_EXCEPTION", "true").lower() == "true"
-
-# --- V13.25 trader-pattern quality gate ---
-# Built from the examples: AERO/PORTAL/HOME/WLD/VELVET are not random hot ticks.
-# They are either continuation after a controlled pullback/reject, or a leader/laggard relative-strength exception.
-TRADER_PATTERN_GATE_ENABLED = os.getenv("TRADER_PATTERN_GATE_ENABLED", "true").lower() == "true"
-TRADER_MIN_SCORE = int(os.getenv("TRADER_MIN_SCORE", "82"))
-TRADER_ALLOW_B_SCORE = os.getenv("TRADER_ALLOW_B_SCORE", "true").lower() == "true"
-TRADER_MIN_ABS_1M3 = float(os.getenv("TRADER_MIN_ABS_1M3", "0.0048"))
-TRADER_MIN_ABS_15M = float(os.getenv("TRADER_MIN_ABS_15M", "0.0055"))
-TRADER_MIN_ABS_30M = float(os.getenv("TRADER_MIN_ABS_30M", "0.0080"))
-TRADER_MIN_VOL1 = float(os.getenv("TRADER_MIN_VOL1", "0.52"))
-TRADER_MIN_VOL5 = float(os.getenv("TRADER_MIN_VOL5", "0.52"))
-TRADER_MIN_RANGE1 = float(os.getenv("TRADER_MIN_RANGE1", "0.85"))
-TRADER_MIN_RANGE5 = float(os.getenv("TRADER_MIN_RANGE5", "0.75"))
-TRADER_MIN_TP5_FEASIBILITY = float(os.getenv("TRADER_MIN_TP5_FEASIBILITY", "0.50"))
-TRADER_NEED_5M_DIRECTION = os.getenv("TRADER_NEED_5M_DIRECTION", "false").lower() == "true"
-TRADER_BLOCK_WEAK_CONTINUATION = os.getenv("TRADER_BLOCK_WEAK_CONTINUATION", "true").lower() == "true"
-TRADER_MAX_COUNTER_30M = float(os.getenv("TRADER_MAX_COUNTER_30M", "0.0100"))
-TRADER_REQUIRE_MICRO_BREAK = os.getenv("TRADER_REQUIRE_MICRO_BREAK", "true").lower() == "true"
-TRADER_CLOSE_LONG = float(os.getenv("TRADER_CLOSE_LONG", "0.57"))
-TRADER_CLOSE_SHORT = float(os.getenv("TRADER_CLOSE_SHORT", "0.43"))
-TRADER_HEAVY_ONLY_A_PLUS = os.getenv("TRADER_HEAVY_ONLY_A_PLUS", "true").lower() == "true"
-
-# --- V13.27 AERO-style trader gate ---
-# This is built from the user's AERO example: short after a controlled upper pullback/reject,
-# not a random late short at the bottom. It allows quality B+ trades if the tape shows a true
-# pullback -> rejection -> breakdown structure, while keeping RR/SL quality gate active.
-AERO_STYLE_GATE_ENABLED = os.getenv("AERO_STYLE_GATE_ENABLED", "true").lower() == "true"
-AERO_SHORT_ENABLED = os.getenv("AERO_SHORT_ENABLED", "true").lower() == "true"
-AERO_LONG_ENABLED = os.getenv("AERO_LONG_ENABLED", "true").lower() == "true"
-AERO_MIN_PULLBACK = float(os.getenv("AERO_MIN_PULLBACK", "0.0045"))       # recent high/low must be away from entry
-AERO_MAX_PULLBACK = float(os.getenv("AERO_MAX_PULLBACK", "0.0850"))       # avoid extreme manipulated spikes
-AERO_MIN_1M3 = float(os.getenv("AERO_MIN_1M3", "0.0038"))                 # current 3m pressure
-AERO_MIN_RECENT_RANGE = float(os.getenv("AERO_MIN_RECENT_RANGE", "0.0140")) # recent 30m range expansion
-AERO_MIN_VOL1 = float(os.getenv("AERO_MIN_VOL1", "0.35"))
-AERO_MIN_VOL5 = float(os.getenv("AERO_MIN_VOL5", "0.45"))
-AERO_MIN_RANGE1 = float(os.getenv("AERO_MIN_RANGE1", "0.60"))
-AERO_MIN_RANGE5 = float(os.getenv("AERO_MIN_RANGE5", "0.65"))
-AERO_CLOSE_SHORT = float(os.getenv("AERO_CLOSE_SHORT", "0.48"))
-AERO_CLOSE_LONG = float(os.getenv("AERO_CLOSE_LONG", "0.52"))
-AERO_REQUIRE_EMA_REJECT = os.getenv("AERO_REQUIRE_EMA_REJECT", "true").lower() == "true"
-AERO_ALLOW_B_SCORE = os.getenv("AERO_ALLOW_B_SCORE", "true").lower() == "true"
-
-# --- V13.28 Market Dump SHORT fallback ---
-# Used when BTC/ETH/alt market is actively selling off and old fast/aero gates are too
-# selective. This catches dump continuation, but still avoids shorting a dead bottom:
-# it needs live 1m pressure, 5m participation and fresh continuation/reject evidence.
-MARKET_DUMP_SHORT_ENABLED = os.getenv("MARKET_DUMP_SHORT_ENABLED", "true").lower() == "true"
-DUMP_MIN_1M3 = float(os.getenv("DUMP_MIN_1M3", "0.0048"))
-DUMP_MIN_15M = float(os.getenv("DUMP_MIN_15M", "0.0035"))
-DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.35"))
-DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.48"))
-DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.40"))
-DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.60"))
-DUMP_CLOSE_SHORT = float(os.getenv("DUMP_CLOSE_SHORT", "0.58"))
-DUMP_MIN_RECENT_RANGE = float(os.getenv("DUMP_MIN_RECENT_RANGE", "0.0100"))
-DUMP_MAX_LATE_30M = float(os.getenv("DUMP_MAX_LATE_30M", "0.095"))
-DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "false").lower() == "true"
+def flush_outbox(limit: int=5) -> Dict[str,int]:
+    if not telegram_configured():
+        return {"sent":0,"remaining":table_count("outbox")}
+    with DB_LOCK, db_connect() as conn:
+        rows=conn.execute(
+            "SELECT * FROM outbox WHERE next_retry_at<=? ORDER BY id LIMIT ?",
+            (now_ts(),max(1,limit)),
+        ).fetchall()
+    sent=0
+    for row in rows:
+        payload=bytes(row["payload"])
+        if row["kind"]=="document":
+            ok,err=_tg_doc(payload,str(row["filename"] or "backup.json"),str(row["caption"] or ""))
+        else:
+            ok,err=_tg_text(payload.decode(errors="replace"))
+        with DB_LOCK,db_connect() as conn:
+            if ok:
+                conn.execute("DELETE FROM outbox WHERE id=?",(row["id"],)); sent+=1
+            else:
+                attempts=int(row["attempts"] or 0)+1
+                delay=min(1800,15*(2**min(attempts,7)))
+                conn.execute("UPDATE outbox SET attempts=?,next_retry_at=? WHERE id=?",
+                             (attempts,now_ts()+delay,row["id"]))
+                set_runtime_error(f"Telegram outbox: {err}")
+            conn.commit()
+        if not ok:
+            break
+    return {"sent":sent,"remaining":table_count("outbox")}
 
 
-# --- Time stop / no-stall logic ---
-FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
-FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "11"))
-FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.25"))
-FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").lower() == "true"
+# ---------------------------------------------------------------------------
+# Public BingX REST market data
+# ---------------------------------------------------------------------------
 
-# --- Market shock context ---
-# We do not trade market phase/trend. BTC is used only as a shock filter.
-BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.020")) # avoid alt scalp during violent BTC shock
+class SlidingRateLimiter:
+    def __init__(self,max_calls: int=82,window_seconds: float=10.0)->None:
+        self.max_calls=max_calls; self.window=window_seconds
+        self.calls: Deque[float]=deque(); self.lock=threading.Lock()
+    def acquire(self)->None:
+        while True:
+            with self.lock:
+                now=time.monotonic()
+                while self.calls and now-self.calls[0]>=self.window:
+                    self.calls.popleft()
+                if len(self.calls)<self.max_calls:
+                    self.calls.append(now); return
+                wait=max(.01,self.window-(now-self.calls[0])+.01)
+            time.sleep(min(wait,1.0))
 
-# --- Side control / professional LONG repair ---
-# The 125-outcome audit found that evidence-qualified LONGs were the strongest
-# family, while both recent SHORT families stayed negative. LONG protection is
-# therefore based only on comparable evidence-qualified LIVE history.
-ALLOW_LONG = os.getenv("ALLOW_LONG", "true").lower() == "true"
-ALLOW_SHORT = os.getenv("ALLOW_SHORT", "true").lower() == "true"
-LONG_BLOCK_BTC_BEAR = os.getenv("LONG_BLOCK_BTC_BEAR", "false").lower() == "true"
-LONG_MIN_1M_VOLUME_RATIO = float(os.getenv("LONG_MIN_1M_VOLUME_RATIO", "0.75"))
-LONG_MIN_1M_RANGE_RATIO = float(os.getenv("LONG_MIN_1M_RANGE_RATIO", "0.80"))
-LONG_MIN_3M_CONFIRM = float(os.getenv("LONG_MIN_3M_CONFIRM", "0.0012"))     # 0.12% in 3m
-LONG_MIN_CLOSE_LOCATION = float(os.getenv("LONG_MIN_CLOSE_LOCATION", "0.72"))
-LONG_MAX_15M_CHASE = float(os.getenv("LONG_MAX_15M_CHASE", "0.040"))        # above this needs pullback/sweep
-LONG_MAX_30M_CHASE = float(os.getenv("LONG_MAX_30M_CHASE", "0.070"))
-LONG_MIN_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MIN_PULLBACK_AFTER_PUMP", "0.0055"))
-LONG_MAX_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MAX_PULLBACK_AFTER_PUMP", "0.038"))
-LONG_REQUIRE_SWEEP_OR_RECLAIM = os.getenv("LONG_REQUIRE_SWEEP_OR_RECLAIM", "true").lower() == "true"
-LONG_REQUIRE_HIGHER_LOW = os.getenv("LONG_REQUIRE_HIGHER_LOW", "true").lower() == "true"
-LONG_STATS_PROTECTION = os.getenv("LONG_STATS_PROTECTION", "true").lower() == "true"
-LONG_STATS_MIN_CLOSED = int(os.getenv("LONG_STATS_MIN_CLOSED", "4"))
-LONG_STATS_MIN_WR = float(os.getenv("LONG_STATS_MIN_WR", "40"))
-LONG_STATS_WINDOW = int(os.getenv("LONG_STATS_WINDOW", "20"))
-LONG_STATS_MIN_EXPECTANCY_R = float(os.getenv("LONG_STATS_MIN_EXPECTANCY_R", "0.00"))
+API_LIMITER=SlidingRateLimiter()
+KLINE_CACHE: Dict[str,Tuple[float,Optional[List[Dict[str,float]]]]]={}
+TICKER_CACHE: Tuple[float,List[Dict[str,Any]]]=(0.0,[])
 
-# --- V13.21 context-adaptive rules ---
-# Professional idea: BTC direction is not a simple long/short switch.
-# LONG is allowed in a bearish market only if the coin is showing clear relative strength
-# and live reclaim pressure. SHORT is prioritized during BTC dump, but not chased without
-# a bounce/reject structure.
-CONTEXT_ADAPTIVE_ENABLED = os.getenv("CONTEXT_ADAPTIVE_ENABLED", "true").lower() == "true"
-BTC_DUMP_SHORT_BIAS_ENABLED = os.getenv("BTC_DUMP_SHORT_BIAS_ENABLED", "true").lower() == "true"
-BTC_DUMP_1H = float(os.getenv("BTC_DUMP_1H", "-0.012"))
-BTC_DUMP_6H = float(os.getenv("BTC_DUMP_6H", "-0.025"))
-LONG_ALLOW_BEAR_RELATIVE_STRENGTH = os.getenv("LONG_ALLOW_BEAR_RELATIVE_STRENGTH", "true").lower() == "true"
-LONG_BEAR_MIN_ALT_15M = float(os.getenv("LONG_BEAR_MIN_ALT_15M", "0.0065"))
-LONG_BEAR_MIN_ALT_30M = float(os.getenv("LONG_BEAR_MIN_ALT_30M", "0.0100"))
-LONG_BEAR_MIN_1M3 = float(os.getenv("LONG_BEAR_MIN_1M3", "0.0020"))
-LONG_BEAR_MIN_REL_STRENGTH_1H = float(os.getenv("LONG_BEAR_MIN_REL_STRENGTH_1H", "0.010"))
-LONG_BEAR_MIN_VOL1 = float(os.getenv("LONG_BEAR_MIN_VOL1", "0.90"))
-LONG_BEAR_MIN_RANGE1 = float(os.getenv("LONG_BEAR_MIN_RANGE1", "0.95"))
-LONG_BEAR_MIN_CLOSE_LOCATION = float(os.getenv("LONG_BEAR_MIN_CLOSE_LOCATION", "0.76"))
-SHORT_DUMP_ALLOW_EXTENDED_30M = float(os.getenv("SHORT_DUMP_ALLOW_EXTENDED_30M", "0.145"))
-SHORT_DUMP_MIN_LIVE_1M3 = float(os.getenv("SHORT_DUMP_MIN_LIVE_1M3", "-0.0014"))
-SHORT_DUMP_MIN_BOUNCE = float(os.getenv("SHORT_DUMP_MIN_BOUNCE", "0.0025"))
+def api_get(path: str,params: Optional[Dict[str,Any]]=None)->Optional[Dict[str,Any]]:
+    err="unknown"
+    for attempt in range(API_RETRIES):
+        API_LIMITER.acquire()
+        try:
+            RUNTIME["api_calls"]+=1
+            r=requests.get(BINGX_BASE_URL+path,params=params or {},timeout=REQUEST_TIMEOUT_SECONDS)
+            if r.status_code in {408,425,429,500,502,503,504}:
+                err=f"HTTP {r.status_code} {path}"; time.sleep(.25*(attempt+1)); continue
+            r.raise_for_status()
+            payload=r.json()
+            if isinstance(payload,dict) and payload.get("code") in (None,0,"0"):
+                return payload
+            err=f"BingX {path}: {str(payload)[:180]}"
+        except Exception as exc:
+            err=f"{path}: {exc!r}"
+            time.sleep(.3*(attempt+1))
+    RUNTIME["api_errors"]+=1
+    set_runtime_error(err)
+    return None
 
-
-# --- Ultra-risk blocks ---
-ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.095"))
-ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.140"))
-
-SCALP_STRATEGIES = {"PRO_SCALPING_EDGE_LONG", "PRO_SCALPING_EDGE_SHORT"}
-
-QUALITY_BASES = {
-    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
-    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "MATIC", "TON", "LTC", "BCH", "ETC", "FIL", "ATOM",
-    "UNI", "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI",
-    "PORTAL", "HOME", "TAC", "VELVET", "BEAT", "BLESS"
-}
-
-# Do not include VELVET here; user gave a successful VELVET long example.
-ULTRA_RISK_KEYWORDS = {
-    "1000", "PEPE", "BONK", "WIF", "MEME", "DOGS", "CATI", "HMSTR", "GOBLIN", "MOG", "TURBO",
-    "BOME", "NEIRO", "PNUT", "MOODENG", "ACT", "GOAT", "FIGHT", "BLEND", "MAGMA"
-}
-
-FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
-    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
-    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "LTC", "BCH", "ETC", "FIL", "ATOM", "UNI",
-    "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI", "BEAT", "BLESS",
-    "KAITO", "XLM", "WLFI", "PUMP", "PORTAL", "HOME", "TAC", "VELVET"
-]]
-
-STATE: Dict[str, Any] = {}
-SEED_RESTORE_INFO: Dict[str, Any] = {"restored": 0, "source": "", "reason": "not_checked"}
-KLINE_CACHE: Dict[str, Tuple[float, Optional[List[Dict[str, float]]]]] = {}
-TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
-LIQUIDITY_SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
-STATE_IO_LOCK = threading.RLock()
-SCAN_RUN_LOCK = threading.Lock()
-TRACK_RUN_LOCK = threading.Lock()
-PENDING_RUN_LOCK = threading.Lock()
-TELEGRAM_SEND_LOCK = threading.Lock()
-TELEGRAM_OUTBOX_FLUSH_LOCK = threading.Lock()
-LONG_STATS_CACHE: Dict[str, Any] = {"ts": 0.0, "value": (True, "not evaluated")}
-
-# ============================================================
-# State / utilities
-# ============================================================
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-def normalize_symbol(symbol: str) -> str:
-    s = symbol.replace("/", "-").upper()
-    if s.endswith("USDT") and "-" not in s:
-        s = s.replace("USDT", "-USDT")
+def normalize_symbol(symbol: str)->str:
+    s=str(symbol or "").upper().replace("/","-").replace("_","-")
+    if "-" not in s and s.endswith("USDT"):
+        s=s[:-4]+"-USDT"
     return s
 
-
-def display_symbol(symbol: str) -> str:
-    return normalize_symbol(symbol).replace("-", "/")
-
-
-def base_asset(symbol: str) -> str:
-    return normalize_symbol(symbol).split("-")[0]
-
-
-def default_watch_audit() -> Dict[str, Any]:
-    return {
-        "version": "V17.2.2",
-        "liquidity_checked": 0,
-        "liquidity_passed": 0,
-        "liquidity_rejected": 0,
-        "started": 0,
-        "execution_passed": 0,
-        "confirmed": 0,
-        "rejected": {
-            "execution_book": 0,
-            "risk_rr": 0,
-            "symbol_repeat": 0,
-            "other": 0,
-        },
-        "by_side": {
-            "LONG": {"started": 0, "confirmed": 0, "rejected": 0},
-            "SHORT": {"started": 0, "confirmed": 0, "rejected": 0},
-        },
-        "by_lane": {
-            "DIRECT_MEASURED": {"started": 0, "confirmed": 0, "rejected": 0},
-        },
-        "recent": [],
-    }
-
-
-def default_telegram_delivery() -> Dict[str, Any]:
-    return {
-        "version": "V17.1.1",
-        "immediate_sent": 0,
-        "queued": 0,
-        "delivered_from_queue": 0,
-        "failed_attempts": 0,
-        "dropped_diagnostics": 0,
-        "last_success_at": 0,
-        "last_failure_at": 0,
-        "last_error": "",
-        "last_mode": "not_started",
-    }
-
-
-def default_state() -> Dict[str, Any]:
-    return {
-        "schema_version": 6,
-        "active_signals": [],
-        "pending_signals": [],
-        "shadow_signals": [],
-        "stats": {
-            "total": {"profit": 0, "sl": 0, "expired": 0},
-            "side": {},
-            "grade": {},
-            "strategy": {},
-            "symbol": {},
-            "type": {},
-        },
-        "pair_cooldown": {},
-        "strategy_cooldown": {},
-        "shadow_cooldown": {},
-        "symbol_outcomes": {},
-        "strategy_guard_status": {},
-        "live_send_timestamps": [],
-        "live_send_history": [],
-        "seed_restore": {},
-        "last_backup_closed_count": 0,
-        "last_source_audit_closed_count": 0,
-        "last_forward_report_count": 0,
-        "last_paper_checkpoint_count": 0,
-        "last_paper_cohort_report_count": 0,
-        "watch_audit_v17_2": default_watch_audit(),
-        "last_pending_monitor": {},
-        "telegram_outbox": [],
-        "telegram_delivery": default_telegram_delivery(),
-        "last_scan": {},
-        "last_diag_ts": 0,
-        "last_error": "",
-    }
-
-
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
-        return default_state()
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        base = default_state()
-        if isinstance(data, dict):
-            base.update(data)
-        # Deep defaults keep an older V13/V15 state compatible with V16.
-        base.setdefault("active_signals", [])
-        base.setdefault("pending_signals", [])
-        base.setdefault("shadow_signals", [])
-        base.setdefault("pair_cooldown", {})
-        base.setdefault("strategy_cooldown", {})
-        base.setdefault("shadow_cooldown", {})
-        base.setdefault("symbol_outcomes", {})
-        base.setdefault("strategy_guard_status", {})
-        base.setdefault("live_send_timestamps", [])
-        base.setdefault("live_send_history", [])
-        base.setdefault("seed_restore", {})
-        base.setdefault("last_backup_closed_count", 0)
-        base.setdefault("last_source_audit_closed_count", 0)
-        base.setdefault("last_forward_report_count", 0)
-        base.setdefault("last_paper_checkpoint_count", 0)
-        base.setdefault("last_paper_cohort_report_count", 0)
-        audit = base.setdefault("watch_audit_v17_2", default_watch_audit())
-        if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.2":
-            base["watch_audit_v17_2"] = default_watch_audit()
-        base.setdefault("last_pending_monitor", {})
-        outbox = base.setdefault("telegram_outbox", [])
-        if not isinstance(outbox, list):
-            base["telegram_outbox"] = []
-        delivery = base.setdefault(
-            "telegram_delivery", default_telegram_delivery()
-        )
-        if (
-            not isinstance(delivery, dict)
-            or str(delivery.get("version", "")) != "V17.1.1"
-        ):
-            previous_delivery = delivery if isinstance(delivery, dict) else {}
-            delivery = default_telegram_delivery()
-            for key in delivery:
-                if key in previous_delivery and key != "version":
-                    delivery[key] = previous_delivery[key]
-            base["telegram_delivery"] = delivery
-        stats = base.setdefault("stats", {})
-        for bucket, value in default_state()["stats"].items():
-            stats.setdefault(bucket, value.copy() if isinstance(value, dict) else value)
-        base["schema_version"] = 6
-        return base
-    except Exception:
-        return default_state()
-
-
-def save_state() -> None:
-    try:
-        path = Path(STATE_FILE)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".tmp")
-        with STATE_IO_LOCK:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(STATE, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_path, path)
-    except Exception as e:
-        # Do not recursively call save_state from its own error path.
-        STATE["last_error"] = f"state save error: {repr(e)}"
-
-
-def _adaptive_seed_candidates() -> List[Path]:
-    """Return the configured seed first and avoid ambiguous JSON auto-picks.
-
-    V17.0 searched every JSON in the repository and selected the largest one.
-    That made duplicate/old backup names capable of restoring the wrong cohort.
-    V17.1 loads only ADAPTIVE_SEED_PATH unless discovery is explicitly enabled.
-    """
-    candidates: List[Path] = []
-    configured = Path(ADAPTIVE_SEED_PATH)
-    if not configured.is_absolute():
-        configured = Path.cwd() / configured
-    candidates.append(configured)
-
-    if ADAPTIVE_SEED_DISCOVERY_ENABLED:
-        roots = [Path.cwd(), Path(__file__).resolve().parent]
-        for root in roots:
-            try:
-                candidates.extend(sorted(root.glob("*.json")))
-            except Exception:
-                continue
-
-    state_path = Path(STATE_FILE)
-    if not state_path.is_absolute():
-        state_path = Path.cwd() / state_path
-    state_path = state_path.resolve()
-
-    unique: List[Path] = []
-    seen = set()
-    for path in candidates:
-        try:
-            resolved = path.resolve()
-        except Exception:
-            continue
-        marker = str(resolved)
-        if marker in seen or resolved == state_path:
-            continue
-        seen.add(marker)
-        unique.append(resolved)
-    return unique
-
-
-def restore_adaptive_seed_if_empty() -> Dict[str, Any]:
-    """Restore a portable V16.2+ export only into an empty adaptive DB.
-
-    Active signals and cooldowns are intentionally not restored: stale market
-    positions must never come back after a deploy. Historical outcomes, stats
-    and the latest training milestone are preserved.
-    """
-    init_adaptive_db()
-    if adaptive_closed_count() > 0:
-        return {"restored": 0, "source": "", "reason": "database_not_empty"}
-
-    seed_path: Optional[Path] = None
-    payload: Optional[Dict[str, Any]] = None
-    best_count = 0
-    for candidate in _adaptive_seed_candidates():
-        if not candidate.is_file():
-            continue
-        try:
-            with candidate.open("r", encoding="utf-8") as handle:
-                possible = json.load(handle)
-            trades = possible.get("adaptive_trades") if isinstance(possible, dict) else None
-            if isinstance(trades, list) and len(trades) > best_count:
-                seed_path = candidate
-                payload = possible
-                best_count = len(trades)
-        except Exception:
-            continue
-
-    if seed_path is None or payload is None:
-        return {"restored": 0, "source": "", "reason": "seed_not_found"}
-
-    seed_trades = payload.get("adaptive_trades") or []
-    inserted = 0
-    with _LOCK, _connect() as conn:
-        if int(conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"] or 0) > 0:
-            return {"restored": 0, "source": "", "reason": "database_not_empty"}
-
-        for index, item in enumerate(seed_trades):
-            if not isinstance(item, dict):
-                continue
-            result = str(item.get("result", "expired"))
-            if result not in {"profit", "sl", "expired"}:
-                continue
-            features_payload = item.get("features")
-            if not isinstance(features_payload, dict):
-                try:
-                    features_payload = json.loads(item.get("features_json") or "{}")
-                except Exception:
-                    features_payload = {}
-            created_at = int(item.get("created_at", int(time.time())) or int(time.time()))
-            closed_at = int(item.get("closed_at", created_at) or created_at)
-            signal_id = str(item.get("signal_id") or f"seed:{index}:{created_at}")
-            evidence_accepted = item.get("evidence_guard_accepted")
-            shadow_accepted = item.get("shadow_accepted")
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO adaptive_trades(
-                    signal_id, created_at, closed_at, source, symbol, side, strategy, grade,
-                    result, label, pnl_r, exit_price, mfe_r, mae_r, duration_minutes,
-                    features_json, model_version, model_probability, shadow_accepted,
-                    evidence_guard_version, evidence_guard_accepted, evidence_guard_reason,
-                    decision_reason
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    signal_id,
-                    created_at,
-                    closed_at,
-                    str(item.get("source", "live")),
-                    str(item.get("symbol", "?")),
-                    str(item.get("side", "?")),
-                    str(item.get("strategy", "?")),
-                    str(item.get("grade", "?")),
-                    result,
-                    1 if result == "profit" else 0,
-                    float(item.get("pnl_r", 0.0) or 0.0),
-                    float(item["exit_price"]) if item.get("exit_price") is not None else None,
-                    float(item.get("mfe_r", 0.0) or 0.0),
-                    float(item.get("mae_r", 0.0) or 0.0),
-                    float(item.get("duration_minutes", 0.0) or 0.0),
-                    json.dumps(features_payload, ensure_ascii=False),
-                    int(item.get("model_version", 0) or 0),
-                    float(item["model_probability"])
-                    if item.get("model_probability") is not None
-                    else None,
-                    int(bool(shadow_accepted)) if shadow_accepted is not None else None,
-                    int(item.get("evidence_guard_version", 0) or 0),
-                    int(bool(evidence_accepted)) if evidence_accepted is not None else None,
-                    str(item.get("evidence_guard_reason"))
-                    if item.get("evidence_guard_reason") is not None
-                    else None,
-                    str(item.get("decision_reason"))
-                    if item.get("decision_reason") is not None
-                    else None,
-                ),
-            )
-            inserted += max(0, int(cursor.rowcount or 0))
-
-        for event in payload.get("adaptive_events") or []:
-            if not isinstance(event, dict):
-                continue
-            event_payload = event.get("payload")
-            if not isinstance(event_payload, dict):
-                event_payload = {}
-            conn.execute(
-                "INSERT INTO adaptive_events(created_at, event_type, message, payload_json) "
-                "VALUES(?,?,?,?)",
-                (
-                    int(event.get("created_at", int(time.time())) or int(time.time())),
-                    str(event.get("event_type", "seed_event")),
-                    str(event.get("message", "Imported from adaptive seed")),
-                    json.dumps(event_payload, ensure_ascii=False),
-                ),
-            )
-        conn.commit()
-
-    if inserted <= 0:
-        return {"restored": 0, "source": seed_path.name, "reason": "no_valid_rows"}
-
-    with _LOCK, _connect() as conn:
-        eligible_count = int(
-            conn.execute(
-                "SELECT COUNT(*) AS n FROM adaptive_trades "
-                "WHERE COALESCE(decision_reason, '')=?",
-                (PAPER_VALIDATION_REASON,),
-            ).fetchone()["n"]
-            or 0
-        )
-
-    raw_model = payload.get("adaptive_model") or {}
-    allowed_model = {field.name for field in fields(ModelState)}
-    try:
-        restored_model = ModelState(
-            **{key: value for key, value in raw_model.items() if key in allowed_model}
-        )
-    except Exception:
-        restored_model = ModelState()
-    seed_policy_valid = str(raw_model.get("data_policy", "")) == MODEL_DATA_POLICY
-    model_shape_valid = (
-        len(restored_model.weights) == len(FEATURE_NAMES) + 1
-        and len(restored_model.mean) == len(FEATURE_NAMES)
-        and len(restored_model.std) == len(FEATURE_NAMES)
-    )
-    if not model_shape_valid or not seed_policy_valid:
-        restored_model.active = False
-        restored_model.weights = [0.0] * (len(FEATURE_NAMES) + 1)
-        restored_model.mean = [0.0] * len(FEATURE_NAMES)
-        restored_model.std = [1.0] * len(FEATURE_NAMES)
-        restored_model.version = 0
-        restored_model.last_trained_closed_count = 0
-        restored_model.last_attempted_closed_count = 0
-        restored_model.candidate_pass_streak = 0
-        restored_model.candidate_selected_total = 0
-        restored_model.deployment_fraction = 0.0
-        restored_model.last_candidate_reason = (
-            "feature_schema_changed"
-            if not model_shape_valid
-            else "v17_2_clean_forward_dataset"
-        )
-    seed_marker = str(payload.get("deploy_marker", "") or "")
-    restored_model.trained_rows = eligible_count
-    if not seed_marker.startswith(("V16_8_", "V16_9_", "V17_")):
-        # Older versions mixed diagnostic SHADOW rows into model training.
-        # Preserve every outcome, but never restore that model as a champion.
-        restored_model.active = False
-        restored_model.last_trained_closed_count = 0
-        restored_model.last_attempted_closed_count = eligible_count
-        restored_model.last_candidate_reason = "model_dataset_policy_changed"
-        restored_model.candidate_pass_streak = 0
-        restored_model.candidate_selected_total = 0
-        restored_model.deployment_fraction = 0.0
-    else:
-        restored_model.last_attempted_closed_count = min(
-            eligible_count,
-            int(restored_model.last_attempted_closed_count or eligible_count),
-        )
-    restored_model.data_policy = MODEL_DATA_POLICY
-    restored_model.trained_rows = eligible_count
-    if restored_model.active and float(restored_model.deployment_fraction or 0) <= 0:
-        restored_model.deployment_fraction = min(1.0, max(0.05, ADAPTIVE_INITIAL_LIVE_FRACTION))
-    _save_model_state(restored_model)
-    _save_model_snapshot(
-        restored_model,
-        "baseline" if restored_model.version == 0 else "inactive",
-        "portable_seed_restored_v16_8",
-    )
-
-    latest_id, latest_count = _latest_trade_marker()
-    raw_guard = payload.get("evidence_guard") or {}
-    allowed_guard = {field.name for field in fields(EvidenceGuardState)}
-    try:
-        restored_guard = EvidenceGuardState(
-            **{key: value for key, value in raw_guard.items() if key in allowed_guard}
-        )
-    except Exception:
-        restored_guard = EvidenceGuardState(
-            activation_trade_id=latest_id,
-            activation_closed_count=latest_count,
-            created_at=int(time.time()),
-        )
-    # Preserve a proven rollback. Do not silently reactivate a rule that the
-    # previous 25-decision audit disabled.
-    if int(restored_guard.version) != EVIDENCE_GUARD_VERSION:
-        restored_guard = EvidenceGuardState(
-            activation_trade_id=latest_id,
-            activation_closed_count=latest_count,
-            created_at=int(time.time()),
-        )
-    _save_evidence_guard_state(restored_guard)
-
-    seed_state = payload.get("state") or {}
-    seed_stats = seed_state.get("stats") if isinstance(seed_state, dict) else None
-    if isinstance(seed_stats, dict):
-        STATE["stats"] = seed_stats
-    STATE["last_backup_closed_count"] = latest_count
-    STATE["last_source_audit_closed_count"] = latest_count
-    STATE["seed_restore"] = {
-        "restored": inserted,
-        "source": seed_path.name,
-        "at": now_ts(),
-    }
-    rebuild_symbol_outcomes_from_adaptive_db()
-    save_state()
-    _event(
-        "portable_seed_restored",
-        f"Restored {inserted} adaptive outcomes from portable JSON",
-        {"restored": inserted, "source": seed_path.name},
-    )
-    return {"restored": inserted, "source": seed_path.name, "reason": "restored"}
-
-
-def inc_stat(bucket: str, key: str, result: str) -> None:
-    stats = STATE.setdefault("stats", default_state()["stats"])
-    d = stats.setdefault(bucket, {})
-    item = d.setdefault(key, {"profit": 0, "sl": 0, "expired": 0})
-    item[result] = item.get(result, 0) + 1
-
-
-def apply_result(signal: Dict[str, Any], result: str) -> bool:
-    if result not in ("profit", "sl", "expired"):
-        return False
-    if signal.get("stats_recorded"):
-        return False
-    stats = STATE.setdefault("stats", default_state()["stats"])
-    stats.setdefault("total", {"profit": 0, "sl": 0, "expired": 0})[result] += 1
-    inc_stat("side", signal.get("side", "?"), result)
-    inc_stat("grade", signal.get("grade", "?"), result)
-    inc_stat("strategy", signal.get("strategy", "?"), result)
-    inc_stat("symbol", signal.get("symbol", "?"), result)
-    inc_stat("type", signal.get("trade_type", "?"), result)
-    signal["stats_recorded"] = result
-    signal["closed_at"] = now_ts()
-    save_state()
+def good_symbol(symbol: str)->bool:
+    s=normalize_symbol(symbol)
+    if not s.endswith("-USDT"): return False
+    base=s.split("-",1)[0]
+    if not base or base in {"USDT","USDC","FDUSD","TUSD","DAI"}: return False
+    if any(tag in base for tag in ("BULL","BEAR","UP","DOWN")): return False
     return True
 
+def _first_float(item: Dict[str,Any],names: Sequence[str])->float:
+    for n in names:
+        try:
+            v=float(item.get(n) or 0)
+            if math.isfinite(v) and v!=0: return v
+        except Exception: pass
+    return 0.0
 
-def wr_text(item: Dict[str, int]) -> str:
-    p = int(item.get("profit", 0))
-    sl = int(item.get("sl", 0))
-    exp = int(item.get("expired", 0))
-    resolved = p + sl
-    all_outcomes = resolved + exp
-    resolved_wr = p / resolved * 100 if resolved else 0.0
-    all_success = p / all_outcomes * 100 if all_outcomes else 0.0
+def fetch_tickers(force: bool=False)->List[Dict[str,Any]]:
+    global TICKER_CACHE
+    with CACHE_LOCK:
+        if not force and time.time()-TICKER_CACHE[0]<45 and TICKER_CACHE[1]:
+            return list(TICKER_CACHE[1])
+    payload=api_get("/openApi/swap/v2/quote/ticker")
+    data=payload.get("data") if isinstance(payload,dict) else None
+    if isinstance(data,dict): data=[data]
+    out=[]
+    if isinstance(data,list):
+        for item in data:
+            if not isinstance(item,dict): continue
+            symbol=normalize_symbol(str(item.get("symbol") or item.get("s") or ""))
+            if not good_symbol(symbol): continue
+            last=_first_float(item,("lastPrice","last","price","close"))
+            quote=_first_float(item,("quoteVolume","quoteVol","quoteVolume24h","quoteAssetVolume","turnover","amount"))
+            basevol=_first_float(item,("volume","vol","volume24h"))
+            if quote<=0 and last>0 and basevol>0: quote=last*basevol
+            if last<=0 or quote<=0: continue
+            out.append({"symbol":symbol,"last":last,"quote_volume_24h":quote})
+    out.sort(key=lambda x:x["quote_volume_24h"],reverse=True)
+    with CACHE_LOCK:
+        if out: TICKER_CACHE=(time.time(),list(out))
+    return out
+
+def liquid_universe()->List[Dict[str,Any]]:
+    rows=[x for x in fetch_tickers() if x["quote_volume_24h"]>=MIN_24H_QUOTE_VOLUME_USDT][:MAX_UNIVERSE]
+    total=max(1,len(rows)-1)
+    for i,row in enumerate(rows):
+        row["liquidity_rank"]=1.0-i/total
+    return rows
+
+def parse_klines(raw: Any)->Optional[List[Dict[str,float]]]:
+    if not raw: return None
+    out=[]
+    for item in raw:
+        try:
+            if isinstance(item,dict):
+                c={
+                    "time":int(item.get("time") or item.get("openTime") or item.get("T") or 0),
+                    "open":float(item.get("open")),
+                    "high":float(item.get("high")),
+                    "low":float(item.get("low")),
+                    "close":float(item.get("close")),
+                    "volume":float(item.get("volume") or item.get("vol") or 0),
+                }
+            elif isinstance(item,(list,tuple)) and len(item)>=6:
+                c={"time":int(item[0]),"open":float(item[1]),"high":float(item[2]),
+                   "low":float(item[3]),"close":float(item[4]),"volume":float(item[5])}
+            else: continue
+            if all(c[k]>0 for k in ("open","high","low","close")): out.append(c)
+        except Exception: continue
+    out.sort(key=lambda x:x["time"])
+    return out if len(out)>=40 else None
+
+def get_klines(symbol: str,limit: int=90,cache_seconds: int=35)->Optional[List[Dict[str,float]]]:
+    s=normalize_symbol(symbol); key=f"{s}:1m:{limit}"
+    with CACHE_LOCK:
+        cached=KLINE_CACHE.get(key)
+        if cached and time.time()-cached[0]<cache_seconds: return cached[1]
+    for ep in ("/openApi/swap/v3/quote/klines","/openApi/swap/v2/quote/klines"):
+        payload=api_get(ep,{"symbol":s,"interval":"1m","limit":limit})
+        candles=parse_klines(payload.get("data") if isinstance(payload,dict) else None)
+        if candles:
+            with CACHE_LOCK: KLINE_CACHE[key]=(time.time(),candles)
+            return candles
+    with CACHE_LOCK: KLINE_CACHE[key]=(time.time(),None)
+    return None
+
+def _book_level(level: Any)->Tuple[float,float]:
+    try:
+        if isinstance(level,dict):
+            return float(level.get("price") or level.get("p") or 0),float(level.get("quantity") or level.get("qty") or level.get("q") or 0)
+        if isinstance(level,(list,tuple)) and len(level)>=2:
+            return float(level[0]),float(level[1])
+    except Exception: pass
+    return 0.0,0.0
+
+def get_book(symbol: str,include_depth: bool=False)->Dict[str,Any]:
+    s=normalize_symbol(symbol)
+    payload=api_get("/openApi/swap/v2/quote/bookTicker",{"symbol":s})
+    data=payload.get("data") if isinstance(payload,dict) else None
+    if isinstance(data,list): data=data[0] if data else None
+    bid=ask=bq=aq=0.0
+    if isinstance(data,dict):
+        bid=_first_float(data,("bidPrice","bid","b")); ask=_first_float(data,("askPrice","ask","a"))
+        bq=_first_float(data,("bidQty","bidQuantity","B")); aq=_first_float(data,("askQty","askQuantity","A"))
+    bids=[]; asks=[]
+    if include_depth:
+        depth=api_get("/openApi/swap/v2/quote/depth",{"symbol":s,"limit":5})
+        dd=depth.get("data") if isinstance(depth,dict) else None
+        if isinstance(dd,dict):
+            bids=list(dd.get("bids") or [])[:5]; asks=list(dd.get("asks") or [])[:5]
+            if bids and asks:
+                bid,bq=_book_level(bids[0]); ask,aq=_book_level(asks[0])
+    if bid<=0 or ask<=bid:
+        return {"ok":False,"bid":0.0,"ask":0.0,"spread_bps":999.0,"depth_usdt":0.0}
+    mid=(bid+ask)/2
+    spread=(ask-bid)/max(mid,1e-12)*10000
+    if bids and asks:
+        bd=sum(p*q for p,q in map(_book_level,bids)); ad=sum(p*q for p,q in map(_book_level,asks))
+    else:
+        bd=bid*max(0,bq); ad=ask*max(0,aq)
+    return {"ok":True,"bid":bid,"ask":ask,"spread_bps":spread,"depth_usdt":min(bd,ad)}
+
+def get_books(symbols: Sequence[str])->Dict[str,Dict[str,Any]]:
+    wanted={normalize_symbol(s) for s in symbols if s}
+    if not wanted: return {}
+    payload=api_get("/openApi/swap/v2/quote/bookTicker")
+    raw=payload.get("data") if isinstance(payload,dict) else None
+    if isinstance(raw,dict): raw=[raw]
+    books={}
+    if isinstance(raw,list):
+        for item in raw:
+            if not isinstance(item,dict): continue
+            s=normalize_symbol(str(item.get("symbol") or item.get("s") or ""))
+            if s not in wanted: continue
+            bid=_first_float(item,("bidPrice","bid","b")); ask=_first_float(item,("askPrice","ask","a"))
+            if bid<=0 or ask<=bid: continue
+            bq=_first_float(item,("bidQty","bidQuantity","B")); aq=_first_float(item,("askQty","askQuantity","A"))
+            mid=(bid+ask)/2
+            books[s]={"ok":True,"bid":bid,"ask":ask,
+                      "spread_bps":(ask-bid)/max(mid,1e-12)*10000,
+                      "depth_usdt":min(bid*bq,ask*aq)}
+    missing=sorted(wanted.difference(books))
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(4,len(missing))) as pool:
+            fs={pool.submit(get_book,s,False):s for s in missing}
+            for f in as_completed(fs):
+                s=fs[f]
+                try: books[s]=f.result()
+                except Exception: books[s]={"ok":False}
+    return books
+
+
+# ---------------------------------------------------------------------------
+# Features / signal protocol
+# ---------------------------------------------------------------------------
+
+def _median(values: Iterable[float],default: float=0.0)->float:
+    clean=[]
+    for x in values:
+        try:
+            v=float(x)
+            if math.isfinite(v): clean.append(v)
+        except Exception: pass
+    return statistics.median(clean) if clean else default
+
+def ema(values: Sequence[float],period: int)->float:
+    if not values: return 0.0
+    a=2/(max(1,period)+1); v=float(values[0])
+    for x in values[1:]: v=a*float(x)+(1-a)*v
+    return v
+
+def vwap(candles: Sequence[Dict[str,float]],bars: int=20)->float:
+    part=list(candles[-bars:]); vol=sum(max(0,r["volume"]) for r in part)
+    if vol<=0: return part[-1]["close"] if part else 0
+    return sum(((r["high"]+r["low"]+r["close"])/3)*max(0,r["volume"]) for r in part)/vol
+
+def atr_percent(candles: Sequence[Dict[str,float]],bars: int=14)->float:
+    if len(candles)<bars+1:return 0
+    rs=[]
+    for i in range(len(candles)-bars,len(candles)):
+        r=candles[i]; pc=candles[i-1]["close"]
+        rs.append(max(r["high"]-r["low"],abs(r["high"]-pc),abs(r["low"]-pc)))
+    return statistics.fmean(rs)/max(candles[-1]["close"],1e-12)
+
+def directional_return(candles: Sequence[Dict[str,float]],bars: int)->float:
+    if len(candles)<=bars:return 0
+    return (candles[-1]["close"]-candles[-1-bars]["close"])/max(candles[-1-bars]["close"],1e-12)
+
+def close_location(c: Dict[str,float])->float:
+    return (c["close"]-c["low"])/max(c["high"]-c["low"],1e-12)
+
+def completed_volume_ratio(candles: Sequence[Dict[str,float]])->float:
+    if len(candles)<24:return 0
+    ref=_median((r["volume"] for r in candles[-22:-2]),0)
+    return candles[-2]["volume"]/ref if ref>0 else 0
+
+def completed_range_ratio(candles: Sequence[Dict[str,float]])->float:
+    if len(candles)<24:return 0
+    ref=_median((r["high"]-r["low"] for r in candles[-22:-2]),0)
+    return (candles[-2]["high"]-candles[-2]["low"])/ref if ref>0 else 0
+
+def continuity_features(candles: Sequence[Dict[str,float]])->Tuple[float,float]:
+    part=list(candles[-60:])
+    if not part:return 0,0
+    active=sum(1 for r in part if r["volume"]>0)/len(part)
+    unique=len({round(r["close"],10) for r in part})/len(part)
+    return active,unique
+
+def btc_context()->Dict[str,Any]:
+    c=get_klines("BTC-USDT",90,45)
+    if not c:return {"regime":"UNKNOWN","ret15":0.0,"ret60":0.0}
+    r15=directional_return(c,15); r60=directional_return(c,60)
+    if r15>=.003 and r60>=0: regime="BULL"
+    elif r15<=-.003 and r60<=0: regime="BEAR"
+    else: regime="RANGE"
+    return {"regime":regime,"ret15":r15,"ret60":r60}
+
+def build_broad_candidate(ticker: Dict[str,Any],candles: Sequence[Dict[str,float]],btc: Dict[str,Any])->Optional[Dict[str,Any]]:
+    if len(candles)<65:return None
+    r1=directional_return(candles,1)
+    r3=directional_return(candles,3)
+    r15=directional_return(candles,15)
+    if r3==0 or r15==0 or r3*r15<=0:return None
+    side="LONG" if r3>0 else "SHORT"
+    d1=abs(r1); d3=abs(r3); d15=abs(r15)
+    if not BROAD_MIN_DIRECTIONAL_3M<=d3<=BROAD_MAX_DIRECTIONAL_3M:return None
+    if not BROAD_MIN_DIRECTIONAL_15M<=d15<=BROAD_MAX_DIRECTIONAL_15M:return None
+    active,unique=continuity_features(candles)
+    if active<MIN_ACTIVE_CANDLE_FRACTION or unique<MIN_UNIQUE_CLOSE_FRACTION:return None
+
+    last=candles[-1]
+    completed=candles[-2]
+    span=max(completed["high"]-completed["low"],1e-12)
+    body=abs(completed["close"]-completed["open"])/span
+    loc=close_location(completed)
+    e9=ema([r["close"] for r in candles[-30:]],9)
+    vw=vwap(candles,20)
+    vol1=completed_volume_ratio(candles)
+    range1=completed_range_ratio(candles)
+    atr=atr_percent(candles)
+    stop=min(MAX_STOP_MOVE,max(MIN_STOP_MOVE,atr*ATR_STOP_MULTIPLIER))
+    current=last["close"]
+    vwap_distance=abs(current-vw)/max(vw,1e-12)
+    d3_share=d3/max(d15,1e-12)
+
+    completed_aligned=(side=="LONG" and completed["close"]>completed["open"]) or (side=="SHORT" and completed["close"]<completed["open"])
+    current_aligned=(side=="LONG" and r1>0) or (side=="SHORT" and r1<0)
+    location_aligned=(side=="LONG" and loc>=PAPER_LONG_MIN_CLOSE_LOCATION) or (side=="SHORT" and loc<=PAPER_SHORT_MAX_CLOSE_LOCATION)
+    avg_aligned=(side=="LONG" and current>e9 and current>vw) or (side=="SHORT" and current<e9 and current<vw)
+    btc_opposite=(side=="LONG" and btc.get("regime")=="BEAR") or (side=="SHORT" and btc.get("regime")=="BULL")
+
+    return {
+        "created_at":now_ts(),
+        "cluster_id":now_ts()//INDEPENDENT_CLUSTER_SECONDS,
+        "symbol":ticker["symbol"],"side":side,
+        "last_price":float(current),
+        "quote_volume_24h":float(ticker["quote_volume_24h"]),
+        "liquidity_rank":float(ticker.get("liquidity_rank",0)),
+        "stop_move":stop,
+        "features":{
+            "directional_1m":d1,"signed_1m":r1,
+            "directional_3m":d3,"signed_3m":r3,
+            "directional_15m":d15,"signed_15m":r15,
+            "directional_30m":abs(directional_return(candles,30)),
+            "d3_share_of_d15":d3_share,
+            "vol1":vol1,"range1":range1,
+            "body_fraction":body,"close_location":loc,
+            "ema9":e9,"vwap20":vw,"vwap_distance":vwap_distance,
+            "atr_pct":atr,"active_fraction":active,"unique_close_fraction":unique,
+            "completed_candle_aligned":completed_aligned,
+            "current_1m_aligned":current_aligned,
+            "aligned_location":location_aligned,
+            "aligned_average":avg_aligned,
+            "btc_regime":btc.get("regime","UNKNOWN"),
+            "btc_ret15":float(btc.get("ret15",0) or 0),
+            "btc_ret60":float(btc.get("ret60",0) or 0),
+            "btc_opposite":btc_opposite,
+        }
+    }
+
+def apply_execution_and_paper_gate(candidate: Dict[str,Any],book: Dict[str,Any])->Dict[str,Any]:
+    item=dict(candidate); f=dict(item["features"]); side=item["side"]
+    ok=bool(book.get("ok")); bid=float(book.get("bid",0) or 0); ask=float(book.get("ask",0) or 0)
+    fallback=float(item["last_price"])
+    entry=ask if side=="LONG" and ask>0 else bid if side=="SHORT" and bid>0 else fallback
+    item.update({
+        "entry_price":entry,"entry_bid":bid,"entry_ask":ask,
+        "spread_bps":float(book.get("spread_bps",999) or 999),
+        "depth_usdt":float(book.get("depth_usdt",0) or 0),
+    })
+    f.update({"book_ok":ok,"spread_bps":item["spread_bps"],"depth_usdt":item["depth_usdt"],"executable_entry":entry})
+    item["features"]=f
+
+    reasons=[]
+    d1=float(f["directional_1m"]); d3=float(f["directional_3m"]); d15=float(f["directional_15m"])
+    share=float(f["d3_share_of_d15"])
+    if not PAPER_MIN_DIRECTIONAL_1M<=d1<=PAPER_MAX_DIRECTIONAL_1M: reasons.append("fresh_1m")
+    if not PAPER_MIN_DIRECTIONAL_3M<=d3<=PAPER_MAX_DIRECTIONAL_3M: reasons.append("directional_3m")
+    if not PAPER_MIN_DIRECTIONAL_15M<=d15<=PAPER_MAX_DIRECTIONAL_15M: reasons.append("directional_15m")
+    if share<PAPER_MIN_ACCELERATION: reasons.append("weak_acceleration")
+    if share>PAPER_MAX_D3_SHARE_OF_D15: reasons.append("exhaustion")
+    if not PAPER_MIN_VOL1<=float(f["vol1"])<=PAPER_MAX_VOL1: reasons.append("vol1")
+    if not PAPER_MIN_RANGE1<=float(f["range1"])<=PAPER_MAX_RANGE1: reasons.append("range1")
+    if not f["completed_candle_aligned"]: reasons.append("completed_candle")
+    if not f["current_1m_aligned"]: reasons.append("current_1m_reversal")
+    if not f["aligned_location"]: reasons.append("close_location")
+    if not f["aligned_average"]: reasons.append("ema_vwap")
+    if float(f["body_fraction"])<PAPER_MIN_BODY_FRACTION: reasons.append("body")
+    if float(f["vwap_distance"])>PAPER_MAX_VWAP_DISTANCE: reasons.append("chase")
+    if f["btc_opposite"]: reasons.append("btc_opposite")
+    if float(item["quote_volume_24h"])<PAPER_MIN_24H_QUOTE_VOLUME_USDT: reasons.append("quote_volume")
+    if not ok: reasons.append("book")
+    if item["spread_bps"]>PAPER_MAX_SPREAD_BPS: reasons.append("spread")
+    if item["depth_usdt"]<PAPER_MIN_DEPTH_USDT: reasons.append("depth")
+    if TP3_MOVE/max(float(item["stop_move"]),1e-12)<PAPER_MIN_TP3_RR: reasons.append("tp3_rr")
+
+    # Ranking is fixed and interpretable, not adaptive.
+    score=(
+        min(1,d1/.005)*15 +
+        min(1,d3/.015)*20 +
+        min(1,d15/.03)*15 +
+        min(1,float(f["vol1"])/1.5)*12 +
+        min(1,float(f["range1"])/2.0)*10 +
+        (8 if f["current_1m_aligned"] else 0) +
+        (8 if f["aligned_average"] else 0) +
+        (6 if not f["btc_opposite"] else 0) +
+        min(1,float(item["liquidity_rank"]))*6
+    )
+    item["quality_score"]=round(score,3)
+    item["paper_reject_reason"]=",".join(reasons)
+    item["paper_gate_pass"]=not reasons
+    return item
+
+
+# ---------------------------------------------------------------------------
+# Metrics/readiness
+# ---------------------------------------------------------------------------
+
+def metrics(rows: Sequence[Dict[str,Any]])->Dict[str,Any]:
+    # DATA_GAP is not silently counted as expired. It is a data-quality failure.
+    valid=[r for r in rows if str(r.get("outcome",""))!="data_gap"]
+    outcomes=Counter(str(r.get("outcome","")) for r in rows)
+    pnl=[float(r.get("pnl_r",0) or 0) for r in valid]
+    wins=[x for x in pnl if x>0]; losses=[x for x in pnl if x<0]
+    eq=peak=dd=0.0
+    for x in pnl:
+        eq+=x; peak=max(peak,eq); dd=max(dd,peak-eq)
+    n=len(valid); expectancy=statistics.fmean(pnl) if pnl else 0
+    std=statistics.stdev(pnl) if len(pnl)>=2 else 0
+    lcb=expectancy-1.645*std/math.sqrt(n) if n else -999
+    pf=sum(wins)/abs(sum(losses)) if losses else (999 if wins else 0)
+    return {
+        "n":n,
+        "raw_n":len(rows),
+        "profit":outcomes["profit"],"sl":outcomes["sl"],"expired":outcomes["expired"],
+        "data_gap":outcomes["data_gap"],
+        "tp3_rate":outcomes["profit"]/n if n else 0,
+        "expectancy_r":expectancy,"expectancy_lcb90_r":lcb,
+        "profit_factor":pf,"max_drawdown_r":dd,
+        "unique_symbols":len({str(r.get("symbol","")) for r in valid}),
+        "unique_clusters":len({int(r.get("cluster_id",0) or 0) for r in valid}),
+        "max_sample_gap_seconds":max([int(r.get("max_sample_gap_seconds",0) or 0) for r in valid] or [0]),
+    }
+
+def wilson_interval(wins: int,total: int,z: float=1.96)->Tuple[float,float]:
+    if total<=0:return 0,1
+    p=wins/total; den=1+z*z/total
+    center=(p+z*z/(2*total))/den
+    half=z*math.sqrt(p*(1-p)/total+z*z/(4*total*total))/den
+    return max(0,center-half),min(1,center+half)
+
+def review_gate()->Dict[str,Any]:
+    rows=primary_rows("paper",True)
+    current=metrics(rows); recent=metrics(rows[-REVIEW_RECENT_WINDOW:])
+    lower,upper=wilson_interval(current["profit"],current["n"])
+    checks={
+        "protocol_hash_exact":all(str(r.get("protocol_hash",""))==PROTOCOL_HASH for r in rows),
+        "enough_independent_paper":current["n"]>=REVIEW_MIN_INDEPENDENT_PAPER,
+        "enough_unique_symbols":current["unique_symbols"]>=REVIEW_MIN_UNIQUE_SYMBOLS,
+        "enough_unique_clusters":current["unique_clusters"]>=REVIEW_MIN_UNIQUE_CLUSTERS,
+        "tp3_gt_sl_plus_expired":current["profit"]>(current["sl"]+current["expired"]),
+        "tp3_rate":current["tp3_rate"]>=REVIEW_MIN_TP3_RATE,
+        "tp3_wilson_lower_above_50":lower>0.50,
+        "expectancy":current["expectancy_r"]>=REVIEW_MIN_EXPECTANCY_R,
+        "expectancy_lcb_positive":current["expectancy_lcb90_r"]>0,
+        "profit_factor":current["profit_factor"]>=REVIEW_MIN_PROFIT_FACTOR,
+        "drawdown":current["max_drawdown_r"]<=REVIEW_MAX_DRAWDOWN_R,
+        "recent_complete":recent["n"]>=REVIEW_RECENT_WINDOW,
+        "recent_tp3_gt_rest":recent["profit"]>(recent["sl"]+recent["expired"]),
+        "recent_expectancy_positive":recent["expectancy_r"]>0,
+        "path_sampling_ok":current["max_sample_gap_seconds"]<=8,
+        "no_data_gaps_in_primary":current["data_gap"]==0,
+    }
+    passed=bool(checks) and all(checks.values())
+    return {
+        "research_pass":passed,
+        "micro_live_candidate":passed,
+        "real_money_enabled":False,
+        "checks":checks,"metrics":current,"recent":recent,
+        "wilson95":{"lower":lower,"upper":upper},
+        "note":"Passing only authorizes a separate reviewed micro-LIVE build. This program never places orders."
+    }
+
+def metric_line(m: Dict[str,Any])->str:
+    pf=float(m.get("profit_factor",0) or 0)
     return (
-        f"{p} профит / {sl} SL / {exp} time-stop · "
-        f"WR TP/SL {resolved_wr:.1f}% · успех всех {all_success:.1f}%"
+        f"{int(m.get('profit',0))} TP3+ / {int(m.get('sl',0))} SL / "
+        f"{int(m.get('expired',0))} expired / {int(m.get('data_gap',0))} data-gap · "
+        f"TP3 {float(m.get('tp3_rate',0))*100:.1f}% · "
+        f"{float(m.get('expectancy_r',0)):+.3f}R · PF {'∞' if pf>=900 else f'{pf:.2f}'} · "
+        f"DD {float(m.get('max_drawdown_r',0)):.2f}R"
     )
 
 
-def build_stats_text() -> str:
-    stats = STATE.setdefault("stats", default_state()["stats"])
-    lines = ["📊 Статистика", f"Итого: {wr_text(stats.get('total', {}))}"]
-    for title, key in [("Стороны", "side"), ("Классы", "grade"), ("Стратегии", "strategy"), ("Типы", "type")]:
-        data = stats.get(key, {})
-        if data:
-            lines.append(f"\n{title}:")
-            for k, v in sorted(data.items(), key=lambda kv: -(kv[1].get("profit", 0) + kv[1].get("sl", 0) + kv[1].get("expired", 0)))[:12]:
-                lines.append(f"{k}: {wr_text(v)}")
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
+
+def format_price(value: Any)->str:
+    try:n=float(value)
+    except Exception:return "?"
+    if n>=1000:return f"{n:.2f}"
+    if n>=1:return f"{n:.5f}"
+    if n>=.01:return f"{n:.7f}"
+    return f"{n:.10f}".rstrip("0")
+
+def price_target(entry: float,side: str,move: float)->float:
+    return entry*(1+move) if side=="LONG" else entry*(1-move)
+
+def stop_price(entry: float,side: str,move: float)->float:
+    return entry*(1-move) if side=="LONG" else entry*(1+move)
+
+def entry_message(e: Dict[str,Any])->str:
+    f=json.loads(e["features_json"]); entry=float(e["entry_price"]); side=e["side"]
+    paper=e["tier"]=="paper"
+    icon="📋" if paper else "🔎"
+    title="PAPER-КАНДИДАТ" if paper else "OBSERVER — НЕ ПРОШЁЛ PAPER"
+    reason="" if paper else f"\nПричина observer: {e['paper_reject_reason'] or 'broad_only'}"
+    return (
+        f"{icon} V18.1 {title}\n"
+        f"{side} {e['symbol']} · score {float(e['quality_score']):.1f}\n"
+        f"Независимый: {'ДА' if int(e['independent']) else 'НЕТ'} · protocol {PROTOCOL_HASH}"
+        f"{reason}\n\n"
+        f"Исполнимый вход: {format_price(entry)}\n"
+        f"TP1 {format_price(price_target(entry,side,TP1_MOVE))} · "
+        f"TP2 {format_price(price_target(entry,side,TP2_MOVE))}\n"
+        f"TP3 {format_price(price_target(entry,side,TP3_MOVE))} ← PROFIT начинается здесь\n"
+        f"TP4 {format_price(price_target(entry,side,TP4_MOVE))} · "
+        f"TP5 {format_price(price_target(entry,side,TP5_MOVE))}\n"
+        f"SL {format_price(stop_price(entry,side,float(e['stop_move'])))} "
+        f"({float(e['stop_move'])*100:.2f}%)\n\n"
+        f"1m {float(f['directional_1m'])*100:.2f}% · "
+        f"3m {float(f['directional_3m'])*100:.2f}% · "
+        f"15m {float(f['directional_15m'])*100:.2f}% · "
+        f"Vol1 x{float(f['vol1']):.2f} · Range1 x{float(f['range1']):.2f}\n"
+        f"Spread {float(e['spread_bps']):.1f} bps · depth ≈ {float(e['depth_usdt']):.0f} USDT\n"
+        "Все созданные кандидаты видимы. Основной результат — 6 минут."
+    )
+
+def result_message(e: Dict[str,Any])->str:
+    labels={"profit":"✅ TP3+","sl":"❌ STOP LOSS","expired":"⏱ EXPIRED 6M","data_gap":"⚠️ DATA GAP"}
+    return (
+        f"📊 V18.1 {e['tier'].upper()} РЕЗУЛЬТАТ: {labels.get(str(e['primary_outcome']),'?')}\n"
+        f"{e['side']} {e['symbol']}\n"
+        f"Итог после fee+slippage model: {float(e['primary_pnl_r'] or 0):+.3f}R\n"
+        f"MFE {float(e['max_favorable_move'])*100:.2f}% · MAE {float(e['max_adverse_move'])*100:.2f}%\n"
+        f"Path samples {int(e.get('path_samples',0) or 0)} · max gap {int(e.get('max_sample_gap_seconds',0) or 0)}s\n"
+        "TP1/TP2 не считаются положительным исходом."
+    )
+
+def final_message(e: Dict[str,Any])->str:
+    with DB_LOCK,db_connect() as conn:
+        rows=conn.execute("SELECT * FROM horizon_results WHERE episode_id=? ORDER BY horizon_seconds",(e["id"],)).fetchall()
+    bits=[]
+    for r in rows:
+        bits.append(f"• {int(r['horizon_seconds'])//60}м: {r['outcome']} · {float(r['pnl_r']):+.2f}R · late {int(r['lateness_seconds'])}s")
+    return (
+        f"🔬 V18.1 ПОЛНЫЙ ПУТЬ {e['tier'].upper()}\n{e['side']} {e['symbol']}\n"
+        +("\n".join(bits) if bits else "нет снимков")
+        +"\n6-минутный основной исход не переписывается."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scan and execution path
+# ---------------------------------------------------------------------------
+
+def run_scan()->Dict[str,Any]:
+    if not SCAN_LOCK.acquire(blocking=False):return {"skipped":"scan_locked"}
+    started=time.time()
+    try:
+        universe=liquid_universe(); btc=btc_context(); candidates=[]; errors=0
+        def analyze(ticker):
+            try:
+                c=get_klines(ticker["symbol"],90,35)
+                if not c:return None,None
+                broad=build_broad_candidate(ticker,c,btc)
+                if not broad:return None,None
+                book=get_book(ticker["symbol"],True)
+                return apply_execution_and_paper_gate(broad,book),None
+            except Exception as exc:return None,repr(exc)
+        if universe:
+            with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS,len(universe))) as pool:
+                fs={pool.submit(analyze,t):t for t in universe}
+                for f in as_completed(fs):
+                    c,err=f.result()
+                    if err:errors+=1
+                    if c:candidates.append(c)
+        candidates.sort(key=lambda x:float(x["quality_score"]),reverse=True)
+
+        paper=observer=correlated=skipped=0
+        rejects=Counter(); slots=max(0,MAX_OPEN_EPISODES-open_episode_count())
+        for c in candidates:
+            if slots<=0:break
+            symbol,side=c["symbol"],c["side"]
+            tier="paper" if c["paper_gate_pass"] else "observer"
+
+            if tier=="paper" and recent_episode_exists(symbol,side,"paper",PAPER_SYMBOL_COOLDOWN_SECONDS):
+                # The broad candidate is STILL visible: downgrade duplicate PAPER to observer.
+                tier="observer"
+                c["paper_reject_reason"]=(c["paper_reject_reason"]+",paper_cooldown").strip(",")
+            if tier=="observer" and recent_episode_exists(symbol,side,"observer",OBSERVER_SYMBOL_COOLDOWN_SECONDS):
+                skipped+=1; continue
+
+            c["tier"]=tier
+            c["independent"]=independent_slot_available(int(c["cluster_id"]),side) if tier=="paper" else False
+            for reason in str(c.get("paper_reject_reason","")).split(","):
+                if reason:rejects[reason]+=1
+            e=insert_episode(c)
+            if not e:continue
+            slots-=1
+            if tier=="paper":
+                paper+=1
+                if not int(e["independent"]):correlated+=1
+            else: observer+=1
+
+            # User requirement: every newly recorded candidate is visible.
+            if send_text(entry_message(e),critical=True):
+                update_episode(int(e["id"]),{"entry_notified":1})
+
+        result={
+            "at":now_ts(),"universe":len(universe),"btc":btc,
+            "broad_candidates":len(candidates),"observer_created":observer,
+            "paper_created":paper,"correlated_paper":correlated,
+            "cooldown_skipped":skipped,"open":open_episode_count(),
+            "errors":errors,"reject_reasons":dict(rejects.most_common(12)),
+            "top":[{"symbol":x["symbol"],"side":x["side"],"score":x["quality_score"],
+                    "paper":x["paper_gate_pass"],"reason":x["paper_reject_reason"]} for x in candidates[:10]],
+            "elapsed":time.time()-started,
+        }
+        RUNTIME["scan_count"]+=1;RUNTIME["last_scan"]=result;RUNTIME["last_scan_at"]=result["at"]
+        return result
+    finally:
+        SCAN_LOCK.release()
+
+def directional_move(e: Dict[str,Any],exit_price: float)->float:
+    entry=float(e["entry_price"])
+    return (exit_price-entry)/max(entry,1e-12) if e["side"]=="LONG" else (entry-exit_price)/max(entry,1e-12)
+
+def first_passage_outcome(e: Dict[str,Any],cutoff: int)->str:
+    tp3=e.get("tp3_hit_at"); sl=e.get("sl_hit_at")
+    t_ok=tp3 is not None and int(tp3)<=cutoff
+    s_ok=sl is not None and int(sl)<=cutoff
+    if t_ok and (not s_ok or int(tp3)<int(sl)):return "profit"
+    if s_ok and (not t_ok or int(sl)<int(tp3)):return "sl"
+    return "expired"
+
+def pnl_r(e: Dict[str,Any],outcome: str,move: float)->float:
+    risk=max(float(e["stop_move"]),1e-8)
+    if outcome=="profit":return (TP3_MOVE-ROUND_TRIP_COST_MOVE)/risk
+    if outcome=="sl":return -(risk+ROUND_TRIP_COST_MOVE)/risk
+    if outcome=="data_gap":return 0.0
+    return (move-ROUND_TRIP_COST_MOVE)/risk
+
+def track_open_episodes(current_time: Optional[int]=None)->Dict[str,int]:
+    if not TRACK_LOCK.acquire(blocking=False):return {"skipped":1}
+    try:
+        current=int(current_time or now_ts())
+        episodes=get_open_episodes()
+        books=get_books(sorted({e["symbol"] for e in episodes}))
+        pclosed=fclosed=gaps=0
+
+        for original in episodes:
+            e=dict(original); book=books.get(e["symbol"],{"ok":False})
+            if not book.get("ok"):
+                gaps+=1
+                update_episode(int(e["id"]),{"data_gap_count":int(e["data_gap_count"] or 0)+1})
+                continue
+
+            last_seen=int(e.get("last_seen_at") or e["created_at"])
+            sample_gap=max(0,current-last_seen)
+            exit_price=float(book["bid"] if e["side"]=="LONG" else book["ask"])
+            move=directional_move(e,exit_price)
+            mfe=max(float(e.get("max_favorable_move",0) or 0),move)
+            mae=max(float(e.get("max_adverse_move",0) or 0),-move)
+
+            updates={
+                "max_favorable_move":mfe,"max_adverse_move":mae,
+                "last_exit_price":exit_price,"last_seen_at":current,
+                "path_samples":int(e.get("path_samples",0) or 0)+1,
+                "max_sample_gap_seconds":max(int(e.get("max_sample_gap_seconds",0) or 0),sample_gap),
+            }
+            for i,target in enumerate(TARGET_MOVES,1):
+                key=f"tp{i}_hit_at"
+                if e.get(key) is None and move>=target:
+                    updates[key]=current;e[key]=current
+            if e.get("sl_hit_at") is None and move<=-float(e["stop_move"]):
+                updates["sl_hit_at"]=current;e["sl_hit_at"]=current
+            e.update(updates)
+
+            age=current-int(e["created_at"])
+            # Primary: first-passage TP3/SL or 6-minute executable mark.
+            if e.get("primary_outcome") is None:
+                early=first_passage_outcome(e,int(e["created_at"])+PRIMARY_HORIZON_SECONDS)
+                if early in {"profit","sl"} or age>=PRIMARY_HORIZON_SECONDS:
+                    # If path had a large sampling hole before primary close, do not
+                    # pretend the 6m outcome is trustworthy.
+                    if int(e.get("max_sample_gap_seconds",0) or 0)>8:
+                        out="data_gap"; pr=0.0
+                    else:
+                        out=early if early in {"profit","sl"} else "expired"
+                        pr=pnl_r(e,out,move)
+                    updates.update({"primary_outcome":out,"primary_pnl_r":pr,"primary_closed_at":current})
+                    e.update(updates);pclosed+=1
+
+            update_episode(int(e["id"]),updates)
+
+            # Immutable horizon snapshots. Late snapshots become DATA_GAP.
+            for horizon in HORIZONS_SECONDS:
+                if age<horizon or horizon_exists(int(e["id"]),horizon):continue
+                lateness=age-horizon
+                cutoff=int(e["created_at"])+horizon
+                if lateness>MAX_HORIZON_LATENESS_SECONDS:
+                    out="data_gap"
+                else:
+                    out=first_passage_outcome(e,cutoff)
+                result={
+                    "episode_id":int(e["id"]),"horizon_seconds":horizon,
+                    "observed_at":current,"exit_price":exit_price,
+                    "net_move":move-ROUND_TRIP_COST_MOVE,
+                    "mfe_move":mfe,"mae_move":mae,
+                    "tp1_hit":int(e.get("tp1_hit_at") is not None and int(e["tp1_hit_at"])<=cutoff),
+                    "tp2_hit":int(e.get("tp2_hit_at") is not None and int(e["tp2_hit_at"])<=cutoff),
+                    "tp3_hit":int(e.get("tp3_hit_at") is not None and int(e["tp3_hit_at"])<=cutoff),
+                    "sl_hit":int(e.get("sl_hit_at") is not None and int(e["sl_hit_at"])<=cutoff),
+                    "outcome":out,"pnl_r":pnl_r(e,out,move),
+                    "lateness_seconds":lateness,
+                }
+                insert_horizon(result)
+
+            refreshed=get_episode(int(e["id"])) or e
+            # User requirement: results of BOTH PAPER and OBSERVER are visible.
+            if refreshed.get("primary_outcome") and not int(refreshed.get("primary_notified",0)):
+                if send_text(result_message(refreshed),critical=True):
+                    update_episode(int(refreshed["id"]),{"primary_notified":1})
+
+            if age>=FINAL_HORIZON_SECONDS:
+                update_episode(int(e["id"]),{"status":"closed","finalized_at":current})
+                fclosed+=1
+                refreshed=get_episode(int(e["id"])) or e
+                if not int(refreshed.get("final_notified",0)):
+                    if send_text(final_message(refreshed),critical=True):
+                        update_episode(int(refreshed["id"]),{"final_notified":1})
+
+        RUNTIME["last_track_at"]=current
+        if pclosed:maybe_send_milestones()
+        return {"open":len(episodes),"primary_closed":pclosed,"final_closed":fclosed,"gaps":gaps}
+    finally:
+        TRACK_LOCK.release()
+
+
+# ---------------------------------------------------------------------------
+# Reports/backups
+# ---------------------------------------------------------------------------
+
+def build_research_report()->str:
+    allm=metrics(primary_rows()); obs=metrics(primary_rows("observer"))
+    pap=metrics(primary_rows("paper")); ind=metrics(primary_rows("paper",True))
+    lines=[
+        "🧪 V18.1 — EXECUTION-ACCURATE FORWARD ОТЧЁТ",
+        f"Protocol {PROTOCOL_HASH}",
+        "Все созданные кандидаты видимы; PAPER и OBSERVER считаются отдельно.",
+        "",
+        f"ВСЕ: {metric_line(allm)}",
+        f"OBSERVER: {metric_line(obs)}",
+        f"PAPER все: {metric_line(pap)}",
+        f"PAPER независимые: {metric_line(ind)}",
+        "",
+        "Горизонты PAPER независимых:"
+    ]
+    for h in (360,600,900,1800):
+        lines.append(f"• {h//60}м: {metric_line(metrics(horizon_rows(h,'paper',True)))}")
+    gate=review_gate(); failed=[k for k,v in gate["checks"].items() if not v]
+    lines += [
+        "",
+        f"TP3+ > SL+expired: {ind['profit']}>{ind['sl']+ind['expired']} = {ind['profit']>ind['sl']+ind['expired']}",
+        f"Готовность к отдельному micro-LIVE: {gate['research_pass']}",
+        "Не пройдены: "+(", ".join(failed) if failed else "нет"),
+        "V18.1 реальные деньги технически не использует."
+    ]
     return "\n".join(lines)
 
-# ============================================================
-# Telegram / API — V17.1.1 reliable ordered delivery
-# ============================================================
-
-def _telegram_delivery_state() -> Dict[str, Any]:
-    delivery = STATE.setdefault("telegram_delivery", default_telegram_delivery())
-    if (
-        not isinstance(delivery, dict)
-        or str(delivery.get("version", "")) != "V17.1.1"
-    ):
-        delivery = default_telegram_delivery()
-        STATE["telegram_delivery"] = delivery
-    for key, value in default_telegram_delivery().items():
-        delivery.setdefault(key, value)
-    return delivery
-
-
-def telegram_outbox_depth() -> int:
-    outbox = STATE.setdefault("telegram_outbox", [])
-    return len(outbox) if isinstance(outbox, list) else 0
-
-
-def _telegram_message_key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:24]
-
-
-def _telegram_replaceable_message(text: str) -> bool:
-    """Diagnostics are superseded by the next scan and must not block trades."""
-    return str(text or "").lstrip().startswith("🧪 Диагностика")
-
-
-def _telegram_clear_stale_main_error() -> None:
-    current_error = str(STATE.get("last_error", "") or "")
-    if current_error.startswith("Telegram "):
-        STATE["last_error"] = ""
-
-
-def _telegram_record_success(mode: str, attempts_used: int = 1) -> None:
-    with STATE_IO_LOCK:
-        delivery = _telegram_delivery_state()
-        delivery["failed_attempts"] = int(
-            delivery.get("failed_attempts", 0) or 0
-        ) + max(0, int(attempts_used or 1) - 1)
-        if mode == "outbox":
-            delivery["delivered_from_queue"] = int(
-                delivery.get("delivered_from_queue", 0) or 0
-            ) + 1
-        else:
-            delivery["immediate_sent"] = int(
-                delivery.get("immediate_sent", 0) or 0
-            ) + 1
-        delivery["last_success_at"] = now_ts()
-        delivery["last_error"] = ""
-        delivery["last_mode"] = mode
-        _telegram_clear_stale_main_error()
-        save_state()
-
-
-def _telegram_record_failure(error: str, attempts_used: int, mode: str) -> None:
-    with STATE_IO_LOCK:
-        delivery = _telegram_delivery_state()
-        delivery["failed_attempts"] = int(
-            delivery.get("failed_attempts", 0) or 0
-        ) + max(1, int(attempts_used or 1))
-        delivery["last_failure_at"] = now_ts()
-        delivery["last_error"] = str(error or "unknown Telegram failure")[:500]
-        delivery["last_mode"] = mode
-        STATE["last_error"] = f"Telegram {mode}: {delivery['last_error']}"
-        save_state()
-
-
-def _telegram_post_text(
-    text: str,
-    attempts_override: Optional[int] = None,
-    read_timeout_override: Optional[float] = None,
-) -> Tuple[bool, str, int]:
-    """Perform bounded immediate retries without mutating the outbox."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return (
-            False,
-            "env missing: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
-            1,
-        )
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    last_error = "unknown Telegram error"
-    attempts_used = 0
-    max_attempts = max(
-        1,
-        int(
-            TELEGRAM_SEND_ATTEMPTS
-            if attempts_override is None
-            else attempts_override
-        ),
-    )
-    read_timeout = max(
-        2.0,
-        float(
-            TELEGRAM_READ_TIMEOUT
-            if read_timeout_override is None
-            else read_timeout_override
-        ),
-    )
-    with TELEGRAM_SEND_LOCK:
-        for attempt in range(max_attempts):
-            attempts_used = attempt + 1
-            try:
-                response = requests.post(
-                    url,
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]},
-                    timeout=(TELEGRAM_CONNECT_TIMEOUT, read_timeout),
-                )
-                if response.ok:
-                    return True, "", attempts_used
-                last_error = (
-                    f"HTTP {response.status_code}: "
-                    f"{str(getattr(response, 'text', ''))[:250]}"
-                )
-                retryable = response.status_code in {
-                    408, 409, 425, 429, 500, 502, 503, 504
-                }
-                if not retryable:
-                    break
-            except Exception as exc:
-                last_error = repr(exc)
-            if attempt + 1 < max_attempts:
-                time.sleep(TELEGRAM_RETRY_BASE_SECONDS * (2 ** attempt))
-    return False, last_error, attempts_used
-
-
-def _queue_telegram_message(text: str, error: str = "") -> bool:
-    if not TELEGRAM_OUTBOX_ENABLED or _telegram_replaceable_message(text):
-        return False
-    message = str(text or "")[:3900]
-    message_id = _telegram_message_key(message)
-    with STATE_IO_LOCK:
-        outbox = STATE.setdefault("telegram_outbox", [])
-        if not isinstance(outbox, list):
-            outbox = []
-            STATE["telegram_outbox"] = outbox
-        for item in outbox:
-            if str(item.get("id", "")) == message_id:
-                item["last_error"] = str(error or item.get("last_error", ""))[:500]
-                item["next_retry_at"] = min(
-                    int(item.get("next_retry_at", now_ts()) or now_ts()),
-                    now_ts() + TELEGRAM_OUTBOX_FLUSH_SECONDS,
-                )
-                save_state()
-                return True
-        if len(outbox) >= TELEGRAM_OUTBOX_MAX:
-            delivery = _telegram_delivery_state()
-            delivery["last_error"] = (
-                f"outbox full ({len(outbox)}/{TELEGRAM_OUTBOX_MAX})"
-            )
-            STATE["last_error"] = f"Telegram outbox: {delivery['last_error']}"
-            save_state()
-            return False
-        outbox.append(
-            {
-                "id": message_id,
-                "text": message,
-                "created_at": now_ts(),
-                "attempts": 0,
-                "next_retry_at": now_ts() + TELEGRAM_OUTBOX_FLUSH_SECONDS,
-                "last_error": str(error or "")[:500],
-            }
-        )
-        delivery = _telegram_delivery_state()
-        delivery["queued"] = int(delivery.get("queued", 0) or 0) + 1
-        delivery["last_mode"] = "queued"
-        STATE["last_error"] = (
-            f"Telegram queued: critical message saved; outbox={len(outbox)}"
-        )
-        save_state()
-    return True
-
-
-def send_telegram(text: str) -> bool:
-    """Accept a Telegram message for immediate or guaranteed queued delivery.
-
-    True means delivered now OR durably accepted into the ordered outbox. This
-    prevents milestone reports from being duplicated while a temporary timeout
-    is recovering.
-    """
-    message = str(text or "")[:3900]
-    replaceable = _telegram_replaceable_message(message)
-
-    # Do not let a new result overtake an earlier queued entry. A diagnostic is
-    # discarded while the critical outbox is non-empty; the next scan will
-    # create a fresh one after entries/results have been delivered.
-    if TELEGRAM_OUTBOX_ENABLED and telegram_outbox_depth() > 0:
-        if replaceable:
-            with STATE_IO_LOCK:
-                delivery = _telegram_delivery_state()
-                delivery["dropped_diagnostics"] = int(
-                    delivery.get("dropped_diagnostics", 0) or 0
-                ) + 1
-                delivery["last_mode"] = "diagnostic_deferred_for_outbox"
-                save_state()
-            return False
-        return _queue_telegram_message(
-            message, "ordered behind an earlier undelivered notification"
-        )
-
-    ok, error, attempts_used = _telegram_post_text(
-        message,
-        attempts_override=1 if replaceable else None,
-        read_timeout_override=min(6.0, TELEGRAM_READ_TIMEOUT)
-        if replaceable
-        else None,
-    )
-    if ok:
-        _telegram_record_success("immediate", attempts_used)
-        return True
-
-    _telegram_record_failure(error, attempts_used, "immediate")
-    if replaceable:
-        with STATE_IO_LOCK:
-            delivery = _telegram_delivery_state()
-            delivery["dropped_diagnostics"] = int(
-                delivery.get("dropped_diagnostics", 0) or 0
-            ) + 1
-            save_state()
-        return False
-    return _queue_telegram_message(message, error)
-
-
-def _format_queued_message(item: Dict[str, Any]) -> str:
-    text = str(item.get("text", "") or "")
-    created_at = int(item.get("created_at", now_ts()) or now_ts())
-    delay = max(0, now_ts() - created_at)
-    if delay < 30:
-        return text[:3900]
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(created_at))
-    prefix = f"⏳ ПОВТОРНАЯ ДОСТАВКА · создано {stamp} · задержка {delay}с\n"
-    return (prefix + text)[:3900]
-
-
-def flush_telegram_outbox() -> Dict[str, Any]:
-    if not TELEGRAM_OUTBOX_ENABLED:
-        return {"attempted": False, "reason": "disabled", "remaining": 0}
-    if not TELEGRAM_OUTBOX_FLUSH_LOCK.acquire(blocking=False):
-        return {
-            "attempted": False,
-            "reason": "already_running",
-            "remaining": telegram_outbox_depth(),
-        }
-    delivered = 0
-    try:
-        for _ in range(TELEGRAM_OUTBOX_BATCH):
-            with STATE_IO_LOCK:
-                outbox = STATE.setdefault("telegram_outbox", [])
-                if not isinstance(outbox, list) or not outbox:
-                    break
-                item = dict(outbox[0])
-                if int(item.get("next_retry_at", 0) or 0) > now_ts():
-                    break
-
-            ok, error, attempts_used = _telegram_post_text(
-                _format_queued_message(item)
-            )
-            message_id = str(item.get("id", ""))
-            if ok:
-                with STATE_IO_LOCK:
-                    current_outbox = STATE.setdefault("telegram_outbox", [])
-                    if (
-                        isinstance(current_outbox, list)
-                        and current_outbox
-                        and str(current_outbox[0].get("id", "")) == message_id
-                    ):
-                        current_outbox.pop(0)
-                    _telegram_record_success("outbox", attempts_used)
-                delivered += 1
-                continue
-
-            with STATE_IO_LOCK:
-                current_outbox = STATE.setdefault("telegram_outbox", [])
-                if (
-                    isinstance(current_outbox, list)
-                    and current_outbox
-                    and str(current_outbox[0].get("id", "")) == message_id
-                ):
-                    attempts = int(current_outbox[0].get("attempts", 0) or 0) + 1
-                    current_outbox[0]["attempts"] = attempts
-                    current_outbox[0]["last_error"] = str(error or "")[:500]
-                    backoff = min(
-                        TELEGRAM_OUTBOX_MAX_BACKOFF,
-                        TELEGRAM_OUTBOX_FLUSH_SECONDS * (2 ** min(attempts, 5)),
-                    )
-                    current_outbox[0]["next_retry_at"] = now_ts() + backoff
-                _telegram_record_failure(error, attempts_used, "outbox")
-            break
-        return {
-            "attempted": True,
-            "delivered": delivered,
-            "remaining": telegram_outbox_depth(),
-        }
-    finally:
-        TELEGRAM_OUTBOX_FLUSH_LOCK.release()
-
-
-def telegram_delivery_summary() -> str:
-    delivery = _telegram_delivery_state()
-    last_success = int(delivery.get("last_success_at", 0) or 0)
-    success_age = (
-        f"{max(0, now_ts() - last_success)}с назад"
-        if last_success
-        else "ещё не было"
-    )
+def diagnostics_text()->str:
+    rt=runtime_snapshot();scan=rt.get("last_scan") or {}
     return (
-        "Telegram V17.1.1: "
-        f"outbox={telegram_outbox_depth()} · "
-        f"сразу={int(delivery.get('immediate_sent', 0) or 0)} · "
-        f"из очереди={int(delivery.get('delivered_from_queue', 0) or 0)} · "
-        f"ошибок попыток={int(delivery.get('failed_attempts', 0) or 0)} · "
-        f"последняя успешная={success_age}"
+        "🧪 V18.1 Execution Accurate Visible\n"
+        f"Protocol {PROTOCOL_HASH} · scans {rt.get('scan_count',0)}\n"
+        f"Universe {scan.get('universe',0)} · broad {scan.get('broad_candidates',0)} · "
+        f"PAPER new {scan.get('paper_created',0)} · OBSERVER new {scan.get('observer_created',0)} · "
+        f"open {scan.get('open',open_episode_count())} · {scan.get('elapsed',0):.0f}s\n"
+        f"OBSERVER: {metric_line(metrics(primary_rows('observer')))}\n"
+        f"PAPER: {metric_line(metrics(primary_rows('paper')))}\n"
+        f"PAPER independent: {metric_line(metrics(primary_rows('paper',True)))}\n"
+        f"Rejects: {scan.get('reject_reasons',{}) or 'нет'}\n"
+        f"API {rt.get('api_calls',0)}/{rt.get('api_errors',0)} · "
+        f"Telegram {rt.get('telegram_sent',0)}/{rt.get('telegram_errors',0)} · outbox {table_count('outbox')}\n"
+        f"Last error: {rt.get('last_error','')}"
     )
 
+def maybe_send_milestones()->Dict[str,Any]:
+    total=primary_count();paper=primary_count("paper")
+    lr=int(meta_get("last_report_primary",0) or 0)
+    lb=int(meta_get("last_backup_primary",0) or 0)
+    lp=int(meta_get("last_paper_checkpoint",0) or 0)
+    rs=bs=ps=False
+    if total>=lr+BACKUP_EVERY_PRIMARY:
+        rs=send_text(build_research_report(),True)
+        if rs:meta_set("last_report_primary",total)
+    if total>=lb+BACKUP_EVERY_PRIMARY:
+        data=export_bytes();fn=f"v18_1_backup_{total}_{now_ts()}.json"
+        bs=send_document(data,fn,f"V18.1 full backup · {total} outcomes · {PROTOCOL_HASH}",True)
+        if bs:meta_set("last_backup_primary",total)
+    if paper>=lp+PAPER_CHECKPOINT_EVERY:
+        data=export_bytes();fn=f"v18_1_paper_{paper}_{now_ts()}.json"
+        ps=send_document(data,fn,f"V18.1 PAPER checkpoint · {paper} closed PAPER",True)
+        if ps:meta_set("last_paper_checkpoint",paper)
+    return {"total":total,"paper":paper,"report_sent":rs,"backup_sent":bs,"checkpoint_sent":ps}
 
-def send_telegram_document(data: bytes, filename: str, caption: str = "") -> bool:
-    """Retry JSON documents immediately; milestone logic retries them later."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        _telegram_record_failure("env missing for document backup", 1, "document")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-    last_error = "unknown Telegram document error"
-    attempts_used = 0
-    with TELEGRAM_SEND_LOCK:
-        for attempt in range(TELEGRAM_SEND_ATTEMPTS):
-            attempts_used = attempt + 1
-            try:
-                files = {
-                    "document": (filename, io.BytesIO(data), "application/json"),
-                }
-                form = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:900]}
-                response = requests.post(
-                    url,
-                    data=form,
-                    files=files,
-                    timeout=(
-                        TELEGRAM_CONNECT_TIMEOUT,
-                        max(30.0, TELEGRAM_READ_TIMEOUT),
-                    ),
-                )
-                if response.ok:
-                    _telegram_record_success("document", attempts_used)
-                    return True
-                last_error = (
-                    f"HTTP {response.status_code}: "
-                    f"{str(getattr(response, 'text', ''))[:250]}"
-                )
-                retryable = response.status_code in {
-                    408, 409, 425, 429, 500, 502, 503, 504
-                }
-                if not retryable:
-                    break
-            except Exception as exc:
-                last_error = repr(exc)
-            if attempt + 1 < TELEGRAM_SEND_ATTEMPTS:
-                time.sleep(TELEGRAM_RETRY_BASE_SECONDS * (2 ** attempt))
-    _telegram_record_failure(last_error, attempts_used, "document")
-    return False
-
-
-def admin_authorized(key: str) -> bool:
-    return bool(ADMIN_KEY) and secrets.compare_digest(str(key or ""), ADMIN_KEY)
-
-
-def adaptive_closed_count() -> int:
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        return int(conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"])
-
-
-def adaptive_source_counts() -> Dict[str, int]:
-    init_adaptive_db()
-    counts = {"live": 0, "shadow": 0, "all": 0}
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT source, COUNT(*) AS n FROM adaptive_trades GROUP BY source"
-        ).fetchall()
-    for row in rows:
-        source = str(row["source"] or "live")
-        count = int(row["n"] or 0)
-        counts[source] = count
-        counts["all"] += count
-    return counts
-
-
-def adaptive_model_data_count() -> int:
-    """Rows allowed to influence V17.2: its own confirmed PAPER cohort only."""
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS n FROM adaptive_trades "
-            "WHERE COALESCE(decision_reason, '')=?",
-            (PAPER_VALIDATION_REASON,),
-        ).fetchone()
-    return int(row["n"] or 0)
-
-
-def paper_validation_metrics() -> Dict[str, Any]:
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT result, pnl_r, symbol FROM adaptive_trades "
-            "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
-            (PAPER_VALIDATION_REASON,),
-        ).fetchall()
-    metrics = _outcome_metrics(rows)
-    metrics["unique_symbols"] = len(
-        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
-    )
-    return metrics
-
-
-def paper_lane_metrics() -> Dict[str, Dict[str, Any]]:
-    """V17.2.2 has one frozen direct measured A+ cohort."""
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT result, pnl_r, symbol, strategy FROM adaptive_trades "
-            "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
-            (PAPER_VALIDATION_REASON,),
-        ).fetchall()
-    return {"DIRECT_MEASURED": _outcome_metrics(rows)}
-
-
-def control_validation_metrics() -> Dict[str, Any]:
-    """Paired immediate-entry reference; visible but never model-eligible."""
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT result, pnl_r, symbol FROM adaptive_trades "
-            "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
-            (PAPER_CONTROL_REASON,),
-        ).fetchall()
-    metrics = _outcome_metrics(rows)
-    metrics["unique_symbols"] = len(
-        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
-    )
-    return metrics
-
-
-def micro_live_circuit_breaker() -> Dict[str, Any]:
-    """Stop new real-money alerts after a small, explicit evidence failure.
-
-    This guard is deliberately independent of the adaptive model.  Once it
-    blocks, new candidates go back to visible PAPER until the deployment is
-    reviewed; changing the model cannot silently reset real-money losses.
-    """
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, result, pnl_r, symbol, side FROM adaptive_trades "
-            "WHERE COALESCE(decision_reason, '')=? "
-            "ORDER BY closed_at ASC, id ASC",
-            (REAL_MONEY_LIVE_REASON,),
-        ).fetchall()
-
-    window_size = max(1, MICRO_LIVE_GUARD_WINDOW)
-    recent_rows = rows[-window_size:]
-    recent = _outcome_metrics(recent_rows)
-    nonprofit_streak = 0
-    for row in reversed(rows):
-        if str(row["result"] or "") == "profit":
-            break
-        nonprofit_streak += 1
-
-    equity = peak = 0.0
-    max_drawdown = 0.0
-    for row in rows:
-        equity += float(row["pnl_r"] or 0.0)
-        peak = max(peak, equity)
-        max_drawdown = max(max_drawdown, peak - equity)
-
-    enough_for_window_test = len(recent_rows) >= max(
-        1, MICRO_LIVE_GUARD_MIN_OUTCOMES
-    )
-    checks = {
-        "nonprofit_streak_ok": nonprofit_streak
-        < max(1, MICRO_LIVE_MAX_NONPROFIT_STREAK),
-        "drawdown_ok": max_drawdown <= MICRO_LIVE_MAX_DRAWDOWN_R,
-        "rolling_tp3_majority": (
-            not enough_for_window_test
-            or float(recent.get("success_rate", 0.0) or 0.0) > 0.50
-        ),
-        "rolling_expectancy_positive": (
-            not enough_for_window_test
-            or float(recent.get("expectancy_r", 0.0) or 0.0) > 0.0
-        ),
-    }
-    allowed = all(checks.values())
-    return {
-        "allowed": allowed,
-        "checks": checks,
-        "closed_micro_live": len(rows),
-        "recent": recent,
-        "recent_window": window_size,
-        "nonprofit_streak": nonprofit_streak,
-        "max_drawdown_r": max_drawdown,
-    }
-
-
-def real_money_readiness() -> Dict[str, Any]:
-    """Evidence gate for limited LIVE alerts; it never places exchange orders."""
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            # `side` is required below for the independent LONG/SHORT
-            # readiness cohorts.  V17.2.2 omitted it from this projection,
-            # so the first eligible PAPER row raised
-            # IndexError('No item with that key') on every later scan.
-            "SELECT id, result, pnl_r, symbol, side FROM adaptive_trades "
-            "WHERE COALESCE(decision_reason, '')=? "
-            "ORDER BY closed_at ASC, id ASC",
-            (PAPER_VALIDATION_REASON,),
-        ).fetchall()
-
-    cumulative = _outcome_metrics(rows)
-    recent_window = max(1, REAL_MONEY_RECENT_WINDOW)
-    recent_rows = rows[-recent_window:]
-    recent = _outcome_metrics(recent_rows)
-    unique_symbols = len(
-        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
-    )
-    equity = peak = 0.0
-    max_drawdown = 0.0
-    for row in rows:
-        equity += float(row["pnl_r"] or 0.0)
-        peak = max(peak, equity)
-        max_drawdown = max(max_drawdown, peak - equity)
-
-    total = int(cumulative.get("n", 0) or 0)
-    success = float(cumulative.get("success_rate", 0.0) or 0.0)
-    expectancy = float(cumulative.get("expectancy_r", 0.0) or 0.0)
-    recent_success = float(recent.get("success_rate", 0.0) or 0.0)
-    recent_expectancy = float(recent.get("expectancy_r", 0.0) or 0.0)
-    micro_live_guard = micro_live_circuit_breaker()
-    by_side: Dict[str, Dict[str, Any]] = {}
-    for side in ("LONG", "SHORT"):
-        side_rows = [row for row in rows if str(row["side"] or "").upper() == side]
-        side_recent_window = max(1, REAL_MONEY_SIDE_RECENT_WINDOW)
-        side_recent_rows = side_rows[-side_recent_window:]
-        side_metrics = _outcome_metrics(side_rows)
-        side_recent = _outcome_metrics(side_recent_rows)
-        side_checks = {
-            "enough_side_forward": len(side_rows) >= max(1, REAL_MONEY_MIN_SIDE_FORWARD),
-            "side_tp3_majority": float(side_metrics.get("success_rate", 0.0) or 0.0)
-            > REAL_MONEY_MIN_SUCCESS_RATE,
-            "side_expectancy": float(side_metrics.get("expectancy_r", 0.0) or 0.0)
-            >= REAL_MONEY_MIN_SIDE_EXPECTANCY_R,
-            "side_recent_complete": len(side_recent_rows) >= side_recent_window,
-            "side_recent_tp3_majority": float(
-                side_recent.get("success_rate", 0.0) or 0.0
-            )
-            > REAL_MONEY_MIN_SUCCESS_RATE,
-            "side_recent_expectancy": float(
-                side_recent.get("expectancy_r", 0.0) or 0.0
-            )
-            > 0.0,
-        }
-        by_side[side] = {
-            "ready": all(side_checks.values()),
-            "checks": side_checks,
-            "cumulative": side_metrics,
-            "recent": side_recent,
-            "required": REAL_MONEY_MIN_SIDE_FORWARD,
-            "recent_window": side_recent_window,
-        }
-    checks = {
-        "enough_forward": total >= max(1, REAL_MONEY_MIN_FORWARD),
-        "enough_unique_symbols": unique_symbols >= max(1, REAL_MONEY_MIN_UNIQUE_SYMBOLS),
-        "tp3_majority": success > REAL_MONEY_MIN_SUCCESS_RATE,
-        "positive_expectancy": expectancy >= REAL_MONEY_MIN_EXPECTANCY_R,
-        "recent_block_complete": len(recent_rows) >= recent_window,
-        "recent_tp3_majority": recent_success > REAL_MONEY_MIN_SUCCESS_RATE,
-        "recent_positive_expectancy": recent_expectancy > 0.0,
-        "drawdown_guard": max_drawdown <= 5.0,
-        "micro_live_circuit": bool(micro_live_guard.get("allowed")),
-    }
-    ready = all(checks.values())
-    return {
-        "ready": ready,
-        "live_flag": REAL_MONEY_SIGNALS,
-        "live_enabled": bool(ready and REAL_MONEY_SIGNALS),
-        "checks": checks,
-        "cumulative": cumulative,
-        "recent": recent,
-        "unique_symbols": unique_symbols,
-        "max_drawdown_r": max_drawdown,
-        "required_forward": REAL_MONEY_MIN_FORWARD,
-        "required_unique_symbols": REAL_MONEY_MIN_UNIQUE_SYMBOLS,
-        "by_side": by_side,
-        "micro_live_circuit": micro_live_guard,
-    }
-
-
-def next_model_analysis_target() -> int:
-    state = get_model_state()
-    normal_target = max(
-        MIN_TRAIN_TRADES,
-        int(state.last_attempted_closed_count or 0) + max(1, RETRAIN_EVERY),
-    )
-    if not PRO_QUALITY_FORWARD_ENABLED:
-        return normal_target
-    paper_count = int(paper_validation_metrics().get("n", 0) or 0)
-    remaining = max(0, PAPER_LANE_REQUIRED_OUTCOMES - paper_count)
-    return max(normal_target, adaptive_model_data_count() + remaining)
-
-
-def paper_progress_target(paper_count: Optional[int] = None) -> int:
-    count = (
-        int(paper_validation_metrics().get("n", 0) or 0)
-        if paper_count is None
-        else int(paper_count)
-    )
-    if count < PAPER_PILOT_REQUIRED_OUTCOMES:
-        return max(1, PAPER_PILOT_REQUIRED_OUTCOMES)
-    if count < PAPER_REVIEW_REQUIRED_OUTCOMES:
-        return max(PAPER_PILOT_REQUIRED_OUTCOMES, PAPER_REVIEW_REQUIRED_OUTCOMES)
-    return max(PAPER_REVIEW_REQUIRED_OUTCOMES, PAPER_LANE_REQUIRED_OUTCOMES)
-
-
-def format_paper_cohort_report(window: int = 25) -> str:
-    """Fixed-gate forward report. It never changes strategy parameters."""
-    size = max(1, int(window))
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        all_rows = conn.execute(
-            "SELECT id, result, pnl_r, symbol, side FROM adaptive_trades "
-            "WHERE COALESCE(decision_reason, '')=? "
-            "ORDER BY closed_at ASC, id ASC",
-            (PAPER_VALIDATION_REASON,),
-        ).fetchall()
-    recent = all_rows[-size:]
-    cumulative = _outcome_metrics(all_rows)
-    block = _outcome_metrics(recent)
-    unique_block = len(
-        {normalize_symbol(str(row["symbol"] or "?")) for row in recent}
-    )
-    unique_total = len(
-        {normalize_symbol(str(row["symbol"] or "?")) for row in all_rows}
-    )
-    n_total = int(cumulative.get("n", 0) or 0)
-    first_id = int(recent[0]["id"]) if recent else 0
-    last_id = int(recent[-1]["id"]) if recent else 0
-    lanes = paper_lane_metrics()
-
-    if n_total == PAPER_PILOT_REQUIRED_OUTCOMES:
-        passed = bool(
-            int(cumulative.get("profit", 0) or 0)
-            > int(cumulative.get("sl", 0) or 0)
-            + int(cumulative.get("expired", 0) or 0)
-            and float(cumulative.get("expectancy_r", 0.0) or 0.0) > 0.0
-            and unique_total >= PAPER_MIN_UNIQUE_SYMBOLS_PILOT
-        )
-        stage = f"РАННИЙ ЧЕКПОИНТ {n_total}/{PAPER_PILOT_REQUIRED_OUTCOMES}"
-        decision = (
-            "РАННИЙ ЧЕКПОИНТ ПОЛОЖИТЕЛЬНЫЙ: продолжаем без изменения правил до 50 PAPER."
-            if passed
-            else "РАННИЙ ЧЕКПОИНТ СЛАБЫЙ: LIVE запрещён; параметры не меняются до ручного разбора."
-        )
-    elif n_total == PAPER_REVIEW_REQUIRED_OUTCOMES:
-        passed = bool(
-            int(cumulative.get("profit", 0) or 0)
-            > int(cumulative.get("sl", 0) or 0)
-            + int(cumulative.get("expired", 0) or 0)
-            and float(cumulative.get("expectancy_r", 0.0) or 0.0)
-            >= PAPER_PILOT_MIN_EXPECTANCY_R
-            and unique_total >= max(12, PAPER_MIN_UNIQUE_SYMBOLS_PILOT)
-        )
-        stage = f"ПОЛНАЯ FORWARD-ПРОВЕРКА {n_total}/{PAPER_REVIEW_REQUIRED_OUTCOMES}"
-        decision = (
-            "50 PAPER прошли первичную цель; окончательное решение принимает отдельный readiness gate."
-            if passed
-            else "50 PAPER не доказали преимущество; реальные деньги запрещены."
-        )
-    elif n_total >= PAPER_LANE_REQUIRED_OUTCOMES:
-        passed = bool(
-            int(cumulative.get("profit", 0) or 0)
-            > int(cumulative.get("sl", 0) or 0)
-            + int(cumulative.get("expired", 0) or 0)
-            and float(cumulative.get("expectancy_r", 0.0) or 0.0)
-            >= PAPER_PILOT_MIN_EXPECTANCY_R
-        )
-        stage = f"ПОЛНАЯ ПРОВЕРКА {n_total}/{PAPER_LANE_REQUIRED_OUTCOMES}"
-        decision = (
-            "PAPER ПРОШЁЛ: проверяем последние 25, разнообразие символов и drawdown перед micro-LIVE."
-            if passed
-            else "PAPER НЕ ПРОШЁЛ: реальные деньги запрещены; champion не меняется."
-        )
-    else:
-        passed = float(block.get("expectancy_r", 0.0) or 0.0) > 0
-        stage = f"ПРОМЕЖУТОЧНЫЙ БЛОК {n_total}/{PAPER_LANE_REQUIRED_OUTCOMES}"
-        decision = "Параметры остаются замороженными до полной forward-проверки."
-
+def startup_message()->str:
     return (
-        "🧾 V17.2.2 — ОТЧЁТ DIRECT MEASURED PAPER\n"
-        f"Этап: {stage}\n"
-        f"Последний блок: ID {first_id}–{last_id} · {_metrics_line(block)} · "
-        f"уникальных монет {unique_block}\n"
-        f"Накоплено V17.2.2 PAPER: {_metrics_line(cumulative)} · "
-        f"уникальных монет {unique_total}\n"
-        f"DIRECT MEASURED: {_metrics_line(lanes['DIRECT_MEASURED'])}\n"
-        f"{watch_audit_summary()}\n"
-        f"Решение: {decision}\n"
-        "Важно: отчёт ничего не меняет автоматически и не разрешает реальную торговлю."
-    )
-
-
-def closed_outcome_progress_message(
-    signal: Dict[str, Any], result: str, source: Optional[str] = None
-) -> str:
-    """Compact proof after every outcome successfully reaches SQLite."""
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT result, pnl_r, source FROM adaptive_trades ORDER BY id ASC"
-        ).fetchall()
-    metrics = _source_breakdown(rows)
-    control_metrics = control_validation_metrics()
-    paper_metrics = paper_validation_metrics()
-    readiness = real_money_readiness()
-    paper_count = int(paper_metrics.get("n", 0) or 0)
-    paper_target = paper_progress_target(paper_count)
-    total = int(metrics["all"]["n"])
-    last_backup = int(STATE.get("last_backup_closed_count", 0) or 0)
-    next_backup = max(last_backup + max(1, AUTO_BACKUP_EVERY_CLOSED), total)
-    if total - last_backup >= max(1, AUTO_BACKUP_EVERY_CLOSED):
-        backup_line = f"Backup уже должен быть отправлен: отметка {total}."
-    else:
-        backup_line = (
-            f"До следующего JSON: "
-            f"{max(0, last_backup + max(1, AUTO_BACKUP_EVERY_CLOSED) - total)} "
-            f"закрытых исходов (ориентир {next_backup})."
-        )
-    labels = {"profit": "TP3+", "sl": "SL", "expired": "expired"}
-    return (
-        "📊 СТАТИСТИКА ПОСЛЕ ЗАКРЫТИЯ\n"
-        f"Последний исход: {labels.get(result, result)} · "
-        f"{str(source or signal.get('signal_source', 'live')).upper()} · "
-        f"{display_symbol(signal.get('symbol', '?'))}\n"
-        f"ВСЕГО: {_metrics_line(metrics['all'])}\n"
-        f"LIVE: {_metrics_line(metrics['live'])}\n"
-        f"SHADOW/PAPER: {_metrics_line(metrics['shadow'])}\n"
-        f"CONTROL V17.2.2: {_metrics_line(control_metrics)}\n"
-        f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(paper_metrics)} · "
-        f"{paper_count}/{paper_target}\n"
-        f"Допустимых для модели V17.2.2 PAPER: {adaptive_model_data_count()}\n"
-        f"Готовность micro-LIVE: {readiness.get('ready', False)} · "
-        f"разрешающий флаг: {readiness.get('live_flag', False)}\n"
-        f"{watch_audit_summary()}\n"
-        f"{backup_line}"
-    )
-
-
-def maybe_send_auto_backup() -> Dict[str, Any]:
-    if not AUTO_TELEGRAM_BACKUP or AUTO_BACKUP_EVERY_CLOSED <= 0:
-        return {"attempted": False, "sent": False, "reason": "disabled"}
-    try:
-        closed_count = adaptive_closed_count()
-        last_count = int(STATE.get("last_backup_closed_count", 0) or 0)
-        paper_count = int(paper_validation_metrics().get("n", 0) or 0)
-        last_paper_checkpoint = int(
-            STATE.get("last_paper_checkpoint_count", 0) or 0
-        )
-        total_due = bool(
-            closed_count >= AUTO_BACKUP_EVERY_CLOSED
-            and closed_count - last_count >= AUTO_BACKUP_EVERY_CLOSED
-        )
-        paper_due = bool(
-            PAPER_CHECKPOINT_EVERY > 0
-            and paper_count > 0
-            and paper_count - last_paper_checkpoint >= PAPER_CHECKPOINT_EVERY
-        )
-        last_paper_report = int(
-            STATE.get("last_paper_cohort_report_count", 0) or 0
-        )
-        report_milestones = {
-            max(1, PAPER_PILOT_REQUIRED_OUTCOMES),
-            max(1, PAPER_REVIEW_REQUIRED_OUTCOMES),
-            max(1, PAPER_LANE_REQUIRED_OUTCOMES),
-        }
-        report_due = bool(
-            paper_count > last_paper_report
-            and (
-                paper_count in report_milestones
-                or (
-                    paper_count > PAPER_LANE_REQUIRED_OUTCOMES
-                    and paper_count % max(1, RETRAIN_EVERY) == 0
-                )
-            )
-        )
-        if not total_due and not paper_due and not report_due:
-            return {
-                "attempted": False,
-                "sent": False,
-                "closed_count": closed_count,
-                "last_backup": last_count,
-                "paper_count": paper_count,
-                "last_paper_checkpoint": last_paper_checkpoint,
-            }
-        last_audit_count = int(STATE.get("last_source_audit_closed_count", 0) or 0)
-        if total_due and closed_count - last_audit_count >= AUTO_BACKUP_EVERY_CLOSED:
-            if send_telegram(format_source_audit_message(AUTO_BACKUP_EVERY_CLOSED)):
-                STATE["last_source_audit_closed_count"] = closed_count
-                save_state()
-        if report_due and send_telegram(format_paper_cohort_report(RETRAIN_EVERY)):
-            STATE["last_paper_cohort_report_count"] = paper_count
-            STATE["last_forward_report_count"] = paper_count
-            save_state()
-
-        filename_prefix = "adaptive_backup" if total_due else "adaptive_checkpoint"
-        filename = (
-            f"{filename_prefix}_{closed_count}_paper{paper_count}_{int(time.time())}.json"
-        )
-        caption_reason = (
-            f"full {AUTO_BACKUP_EVERY_CLOSED}-outcome backup"
-            if total_due
-            else f"emergency PAPER checkpoint {paper_count}"
-        )
-        if send_telegram_document(
-            build_export_bytes(),
-            filename,
-            f"🧠 V17.2.2 {caption_reason} · total {closed_count} · direct PAPER {paper_count}",
-        ):
-            if total_due:
-                STATE["last_backup_closed_count"] = closed_count
-            if paper_due:
-                STATE["last_paper_checkpoint_count"] = paper_count
-            save_state()
-            return {
-                "attempted": True,
-                "sent": True,
-                "closed_count": closed_count,
-                "paper_count": paper_count,
-                "total_due": total_due,
-                "paper_due": paper_due,
-                "filename": filename,
-            }
-        return {
-            "attempted": True,
-            "sent": False,
-            "closed_count": closed_count,
-            "error": STATE.get("last_error", "Telegram document send failed"),
-        }
-    except Exception as e:
-        STATE["last_error"] = f"automatic backup error: {repr(e)}"
-        save_state()
-        return {
-            "attempted": True,
-            "sent": False,
-            "error": STATE["last_error"],
-        }
-
-
-def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    url = BINGX_BASE_URL + path
-    last_err = None
-    for attempt in range(API_RETRIES):
-        try:
-            time.sleep(API_THROTTLE_SECONDS)
-            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HTTP {r.status_code} {path}"
-                time.sleep(0.25 * (attempt + 1))
-                continue
-            return r.json()
-        except Exception as e:
-            last_err = f"get_json {path}: {repr(e)}"
-            time.sleep(0.35 * (attempt + 1))
-    STATE["last_error"] = last_err or "unknown API error"
-    save_state()
-    return None
-
-
-def _book_level(level: Any) -> Tuple[float, float]:
-    """Read one public order-book level across BingX response variants."""
-    try:
-        if isinstance(level, dict):
-            price = float(level.get("price") or level.get("p") or 0.0)
-            quantity = float(
-                level.get("quantity") or level.get("qty") or level.get("q") or 0.0
-            )
-            return price, quantity
-        if isinstance(level, (list, tuple)) and len(level) >= 2:
-            return float(level[0]), float(level[1])
-    except Exception:
-        pass
-    return 0.0, 0.0
-
-
-def execution_book_snapshot(symbol: str) -> Dict[str, Any]:
-    """Best bid/ask and shallow executable depth at the candidate moment.
-
-    The endpoint is called only after the candle setup passes, so it does not
-    overload the market-data allowance during the universe scan.  A failed or
-    malformed book is a rejection for real-grade PAPER; unknown execution cost
-    must never be interpreted as good liquidity.
-    """
-    normalized = normalize_symbol(symbol)
-    bid = ask = bid_qty = ask_qty = 0.0
-    response = get_json(
-        "/openApi/swap/v2/quote/bookTicker", {"symbol": normalized}
-    )
-    data: Any = response.get("data") if isinstance(response, dict) else None
-    if isinstance(data, list):
-        data = data[0] if data else None
-    if isinstance(data, dict):
-        try:
-            bid = float(data.get("bidPrice") or data.get("bid") or 0.0)
-            ask = float(data.get("askPrice") or data.get("ask") or 0.0)
-            bid_qty = float(
-                data.get("bidQty") or data.get("bidQuantity") or 0.0
-            )
-            ask_qty = float(
-                data.get("askQty") or data.get("askQuantity") or 0.0
-            )
-        except Exception:
-            bid = ask = bid_qty = ask_qty = 0.0
-
-    # Fallback also gives several levels for a less fragile depth estimate.
-    bids: List[Any] = []
-    asks: List[Any] = []
-    depth_response: Optional[Dict[str, Any]] = None
-    if bid <= 0 or ask <= bid or bid_qty <= 0 or ask_qty <= 0:
-        depth_response = get_json(
-            "/openApi/swap/v2/quote/depth",
-            {"symbol": normalized, "limit": 5},
-        )
-    depth_data: Any = (
-        depth_response.get("data") if isinstance(depth_response, dict) else None
-    )
-    if isinstance(depth_data, dict):
-        bids = list(depth_data.get("bids") or [])[:5]
-        asks = list(depth_data.get("asks") or [])[:5]
-        if bids and asks:
-            bid, bid_qty = _book_level(bids[0])
-            ask, ask_qty = _book_level(asks[0])
-
-    if bid <= 0 or ask <= bid:
-        return {
-            "ok": False,
-            "reason": "public BingX bid/ask unavailable",
-            "spread_bps": 999.0,
-            "depth_usdt": 0.0,
-        }
-
-    mid = (bid + ask) / 2.0
-    spread_bps = (ask - bid) / max(mid, 1e-12) * 10_000.0
-    if bids and asks:
-        bid_depth = sum(price * qty for price, qty in map(_book_level, bids))
-        ask_depth = sum(price * qty for price, qty in map(_book_level, asks))
-    else:
-        bid_depth = bid * max(0.0, bid_qty)
-        ask_depth = ask * max(0.0, ask_qty)
-    depth_usdt = min(bid_depth, ask_depth)
-    return {
-        "ok": True,
-        "reason": "book available",
-        "bid": bid,
-        "ask": ask,
-        "spread_bps": spread_bps,
-        "depth_usdt": depth_usdt,
-    }
-
-
-def parse_klines(raw: Any) -> Optional[List[Dict[str, float]]]:
-    if not raw:
-        return None
-    candles: List[Dict[str, float]] = []
-    for c in raw:
-        try:
-            if isinstance(c, dict):
-                candles.append({
-                    "time": int(c.get("time") or c.get("openTime") or c.get("T") or 0),
-                    "open": float(c.get("open")),
-                    "high": float(c.get("high")),
-                    "low": float(c.get("low")),
-                    "close": float(c.get("close")),
-                    "volume": float(c.get("volume") or c.get("vol") or 0),
-                })
-            elif isinstance(c, (list, tuple)) and len(c) >= 6:
-                candles.append({
-                    "time": int(c[0]),
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4]),
-                    "volume": float(c[5]),
-                })
-        except Exception:
-            continue
-    candles = [x for x in candles if x["open"] > 0 and x["high"] > 0 and x["low"] > 0 and x["close"] > 0]
-    candles.sort(key=lambda x: x["time"])
-    return candles if len(candles) >= 30 else None
-
-
-def get_klines(symbol: str, interval: str, limit: int = 180, cache_seconds: int = 20) -> Optional[List[Dict[str, float]]]:
-    symbol = normalize_symbol(symbol)
-    key = f"{symbol}:{interval}:{limit}"
-    cached = KLINE_CACHE.get(key)
-    if cached and time.time() - cached[0] < cache_seconds:
-        return cached[1]
-    for ep in ["/openApi/swap/v3/quote/klines", "/openApi/swap/v2/quote/klines"]:
-        data = get_json(ep, {"symbol": symbol, "interval": interval, "limit": limit})
-        if not data:
-            continue
-        candles = parse_klines(data.get("data"))
-        if candles:
-            KLINE_CACHE[key] = (time.time(), candles)
-            return candles
-    KLINE_CACHE[key] = (time.time(), None)
-    return None
-
-
-def is_good_contract_symbol(symbol: str) -> bool:
-    s = normalize_symbol(symbol)
-    if not s.endswith("-USDT"):
-        return False
-    b = base_asset(s)
-    if any(x in b for x in ["USD", "USDC", "BULL", "BEAR"]):
-        return False
-    return True
-
-
-def get_symbols() -> List[str]:
-    cached = TICKER_CACHE.get("symbols")
-    if cached and time.time() - cached[0] < 600:
-        return cached[1] or FALLBACK_SYMBOLS
-    data = get_json("/openApi/swap/v2/quote/contracts")
-    out: List[str] = []
-    if data and isinstance(data.get("data"), list):
-        for item in data.get("data", []):
-            s = item.get("symbol")
-            if s and is_good_contract_symbol(s):
-                out.append(normalize_symbol(s))
-    if not out:
-        out = FALLBACK_SYMBOLS[:]
-    # Ensure important user examples are always included if contracts exist/fallback is needed.
-    for s in FALLBACK_SYMBOLS:
-        if s not in out:
-            out.append(s)
-    random.shuffle(out)
-    quality = [s for s in out if base_asset(s) in QUALITY_BASES]
-    rest = [s for s in out if base_asset(s) not in QUALITY_BASES]
-    result = (quality + rest)[:MAX_CONTRACTS]
-    TICKER_CACHE["symbols"] = (time.time(), result)
-    return result
-
-# ============================================================
-# Indicators
-# ============================================================
-
-def closes(c: List[Dict[str, float]]) -> List[float]:
-    return [x["close"] for x in c]
-
-
-def ema(values: List[float], period: int) -> float:
-    if not values:
-        return 0.0
-    if len(values) < period:
-        return sum(values) / len(values)
-    k = 2 / (period + 1)
-    e = sum(values[:period]) / period
-    for v in values[period:]:
-        e = v * k + e * (1 - k)
-    return e
-
-
-def vwap(candles: List[Dict[str, float]], n: int = 48) -> float:
-    part = candles[-n:] if len(candles) >= n else candles
-    pv = sum(((x["high"] + x["low"] + x["close"]) / 3) * max(x["volume"], 0) for x in part)
-    vv = sum(max(x["volume"], 0) for x in part)
-    return pv / vv if vv > 0 else (part[-1]["close"] if part else 0.0)
-
-
-def atr(candles: List[Dict[str, float]], n: int = 14) -> float:
-    if len(candles) < 2:
-        return 0.0
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    part = trs[-n:] if len(trs) >= n else trs
-    return sum(part) / len(part) if part else 0.0
-
-
-def percent_change(candles: List[Dict[str, float]], bars: int) -> float:
-    if len(candles) <= bars:
-        return 0.0
-    a = candles[-bars]["close"]
-    b = candles[-1]["close"]
-    return (b - a) / a if a else 0.0
-
-
-def volume_ratio(candles: List[Dict[str, float]], n: int = 30) -> float:
-    if len(candles) < n + 2:
-        return 1.0
-    cur = candles[-1]["volume"]
-    avg = sum(x["volume"] for x in candles[-n - 1:-1]) / n
-    return cur / avg if avg > 0 else 1.0
-
-
-def candle_range(c: Dict[str, float]) -> float:
-    return max(c["high"] - c["low"], 0.0)
-
-
-def candle_range_ratio(candles: List[Dict[str, float]], n: int = 20) -> float:
-    if len(candles) < n + 2:
-        return 1.0
-    cur = candle_range(candles[-1])
-    avg = sum(candle_range(x) for x in candles[-n - 1:-1]) / n
-    return cur / avg if avg > 0 else 1.0
-
-
-def close_location(c: Dict[str, float]) -> float:
-    rng = max(c["high"] - c["low"], 1e-12)
-    return (c["close"] - c["low"]) / rng
-
-
-def prior_compression_ratio(c5: List[Dict[str, float]], n: int = 6) -> float:
-    """Lower values mean the market compressed before the impulse.
-    A good scalp often comes after short compression then range expansion.
-    """
-    if len(c5) < n + 8:
-        return 1.0
-    prior = c5[-n-1:-1]
-    older = c5[-n-8:-n-1]
-    prior_avg = sum(candle_range(x) for x in prior) / max(len(prior), 1)
-    older_avg = sum(candle_range(x) for x in older) / max(len(older), 1)
-    return prior_avg / older_avg if older_avg > 0 else 1.0
-
-
-def micro_structure_break(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
-    """Require immediate 1m continuation, not a slow/stuck drift.
-    LONG: latest close must break above recent 1m highs.
-    SHORT: latest close must break below recent 1m lows.
-    """
-    if len(c1) < 12:
-        return False, "not enough 1m structure"
-    last = c1[-1]
-    prev_window = c1[-9:-1]
-    if side == "LONG":
-        ref = max(x["high"] for x in prev_window)
-        distance = (last["close"] - ref) / max(ref, 1e-12)
-        ok = last["close"] > ref * (1 + EDGE_MIN_BREAKOUT_DISTANCE) and last["close"] > last["open"]
-        return ok, f"1m break LONG {distance*100:+.2f}%"
-    ref = min(x["low"] for x in prev_window)
-    distance = (ref - last["close"]) / max(ref, 1e-12)
-    ok = last["close"] < ref * (1 - EDGE_MIN_BREAKOUT_DISTANCE) and last["close"] < last["open"]
-    return ok, f"1m break SHORT {distance*100:+.2f}%"
-
-
-def micro_sweep_reclaim(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
-    """Liquidity-grab filter. We want a tiny stop-hunt / failed micro move, then reclaim/reject.
-    This is optional but enabled by default because it matches discretionary scalping better.
-    """
-    if not EDGE_REQUIRE_MICRO_SWEEP:
-        return True, "micro sweep disabled"
-    if len(c1) < 16:
-        return False, "not enough 1m for sweep"
-    last = c1[-1]
-    recent = c1[-13:-1]
-    if side == "LONG":
-        swept = min(x["low"] for x in c1[-6:-1]) <= min(x["low"] for x in recent) * 1.001
-        reclaimed = last["close"] > last["open"] and close_location(last) >= 0.62
-        return swept and reclaimed, "micro sweep/reclaim LONG" if swept and reclaimed else "no micro sweep/reclaim LONG"
-    swept = max(x["high"] for x in c1[-6:-1]) >= max(x["high"] for x in recent) * 0.999
-    rejected = last["close"] < last["open"] and close_location(last) <= 0.38
-    return swept and rejected, "micro sweep/reject SHORT" if swept and rejected else "no micro sweep/reject SHORT"
-
-
-def tp5_feasible(c5: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
-    """If recent velocity cannot realistically cover TP5, skip.
-    The examples reached all takes quickly; this blocks slow setups.
-    """
-    if len(c5) < 8:
-        return False, "not enough candles for TP5 feasibility"
-    recent_abs_15m = abs(percent_change(c5, 3))
-    needed = TP5_MOVE * EDGE_MIN_TP5_FEASIBILITY
-    return recent_abs_15m >= needed, f"TP5 feasibility recent15m {recent_abs_15m*100:.2f}% / need {needed*100:.2f}%"
-
-
-def upper_wick_ratio(c: Dict[str, float]) -> float:
-    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
-    rng = max(h - l, 1e-12)
-    return (h - max(o, cl)) / rng
-
-
-def lower_wick_ratio(c: Dict[str, float]) -> float:
-    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
-    rng = max(h - l, 1e-12)
-    return (min(o, cl) - l) / rng
-
-
-def trend_state(candles: List[Dict[str, float]]) -> str:
-    cs = closes(candles)
-    if len(cs) < 60:
-        return "UNKNOWN"
-    e21 = ema(cs, 21)
-    e55 = ema(cs, 55)
-    price = cs[-1]
-    ch = percent_change(candles, min(20, len(candles) - 1))
-    if price > e21 > e55 and ch > 0.003:
-        return "UP"
-    if price < e21 < e55 and ch < -0.003:
-        return "DOWN"
-    return "RANGE"
-
-
-def btc_context() -> Dict[str, Any]:
-    c15 = get_klines("BTC-USDT", "15m", 120, cache_seconds=45)
-    c1h = get_klines("BTC-USDT", "1h", 120, cache_seconds=120)
-    if not c15 or not c1h:
-        return {"ok": False, "direction": "UNKNOWN", "text": "BTC data unavailable", "ch1h": 0.0}
-    ch1h = percent_change(c15, 4)
-    ch6h = percent_change(c15, 24)
-    t1h = trend_state(c1h)
-    direction = "RANGE"
-    if ch1h < -0.004 or ch6h < -0.018 or t1h == "DOWN":
-        direction = "BEAR"
-    elif ch1h > 0.004 or ch6h > 0.018 or t1h == "UP":
-        direction = "BULL"
-    return {
-        "ok": True,
-        "direction": direction,
-        "ch1h": ch1h,
-        "ch6h": ch6h,
-        "t1h": t1h,
-        "text": f"BTC {direction}: 1h {ch1h*100:+.2f}%, 6h {ch6h*100:+.2f}%, 1H {t1h}",
-    }
-
-# ============================================================
-# Hot symbol selection
-# ============================================================
-
-def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> bool:
-    b = base_asset(symbol)
-    if any(k in b for k in ULTRA_RISK_KEYWORDS):
-        return True
-    for c in c5[-18:]:
-        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_5M_CANDLE:
-            return True
-    for c in c15[-10:]:
-        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_15M_CANDLE:
-            return True
-    return False
-
-
-def _median(values: Sequence[float]) -> float:
-    clean = sorted(float(value) for value in values if math.isfinite(float(value)))
-    if not clean:
-        return 0.0
-    middle = len(clean) // 2
-    if len(clean) % 2:
-        return clean[middle]
-    return (clean[middle - 1] + clean[middle]) / 2.0
-
-
-def candle_liquidity_snapshot(
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-) -> Dict[str, Any]:
-    """Price-agnostic liquidity/print-continuity proxy for V17.2.
-
-    BingX candle volume is used only as an approximate quote-turnover rank
-    inside the same scan.  Absolute turnover is deliberately not used as a
-    promise of executable size; the hard checks focus on continuous prints and
-    reject the volume/range anomalies seen in the user's diagnostics.
-    """
-    if len(c1) < 35 or len(c5) < 24:
-        return {
-            "ok": False,
-            "reason": "not enough candles for liquidity audit",
-            "liquidity_raw": 0.0,
-        }
-    recent = c1[-60:]
-    prices = [max(float(row.get("close", 0.0) or 0.0), 0.0) for row in recent]
-    volumes = [max(float(row.get("volume", 0.0) or 0.0), 0.0) for row in recent]
-    notionals = [price * volume for price, volume in zip(prices, volumes)]
-    quote_60m = sum(notionals)
-    median_1m = _median(notionals)
-    active_fraction = sum(1 for value in volumes if value > 0.0) / max(1, len(volumes))
-    unique_fraction = len({round(value, 12) for value in prices if value > 0.0}) / max(1, len(prices))
-    flat_fraction = sum(
-        1
-        for row in recent
-        if (float(row.get("high", 0.0) or 0.0) - float(row.get("low", 0.0) or 0.0))
-        / max(float(row.get("close", 0.0) or 0.0), 1e-12)
-        <= 1e-7
-    ) / max(1, len(recent))
-    price = max(prices[-1], 1e-12)
-    atr1_pct = atr(c1, 14) / price
-    vr1 = volume_ratio(c1, 20)
-    rr1 = candle_range_ratio(c1, 20)
-    ch3m = abs(percent_change(c1, 3))
-
-    failures: List[str] = []
-    if quote_60m <= 0 or median_1m <= 0:
-        failures.append("zero turnover proxy")
-    if active_fraction < V17_2_MIN_ACTIVE_CANDLE_FRACTION:
-        failures.append(f"active candles {active_fraction*100:.0f}%")
-    if unique_fraction < V17_2_MIN_UNIQUE_CLOSE_FRACTION:
-        failures.append(f"unique closes {unique_fraction*100:.0f}%")
-    if flat_fraction > 0.20:
-        failures.append(f"flat candles {flat_fraction*100:.0f}%")
-    if vr1 > V17_2_MAX_CURRENT_VOL_RATIO:
-        failures.append(f"Vol1 anomaly x{vr1:.1f}")
-    if rr1 > V17_2_MAX_CURRENT_RANGE_RATIO:
-        failures.append(f"Range1 anomaly x{rr1:.1f}")
-    if atr1_pct > V17_2_MAX_ATR1_PCT:
-        failures.append(f"ATR1 too high {atr1_pct*100:.2f}%")
-    if ch3m >= 0.035 and vr1 < 0.25:
-        failures.append(f"large move on weak current volume x{vr1:.2f}")
-
-    # Raw score is used only for cross-sectional ranking.  Continuity matters
-    # as much as volume, preventing one absurd print from winning the hot list.
-    liquidity_raw = (
-        math.log1p(max(0.0, quote_60m))
-        + 0.35 * math.log1p(max(0.0, median_1m))
-        + 3.0 * active_fraction
-        + 2.0 * unique_fraction
-        - 3.0 * flat_fraction
-    )
-    return {
-        "ok": not failures,
-        "reason": "; ".join(failures) if failures else "liquidity continuity passed",
-        "liquidity_raw": liquidity_raw,
-        "quote_60m": quote_60m,
-        "median_quote_1m": median_1m,
-        "active_fraction": active_fraction,
-        "unique_fraction": unique_fraction,
-        "flat_fraction": flat_fraction,
-        "atr1_pct": atr1_pct,
-        "vol1": vr1,
-        "range1": rr1,
-    }
-
-
-def hot_score(symbol: str) -> Tuple[float, str, Dict[str, Any]]:
-    """Live-first hot score.
-    V13.19 intentionally avoids using 15m candles here to keep scans fast.
-    Deep analysis still loads 15m/1h only for selected candidates.
-    """
-    # Use the same candle depth as deep analysis. The 5m snapshot can be reused
-    # there, while 1m is intentionally refreshed before an actual entry.
-    c1 = get_klines(symbol, "1m", 120, cache_seconds=8)
-    c5 = get_klines(symbol, "5m", 120, cache_seconds=18)
-    if not c1 or not c5:
-        return 0.0, "no candles", {"ok": False, "reason": "no candles", "liquidity_raw": 0.0}
-
-    liquidity = candle_liquidity_snapshot(symbol, c1, c5)
-
-    ch3m_signed = percent_change(c1, 3)
-    ch3m = abs(ch3m_signed)
-    ch15m_signed = percent_change(c5, 3)
-    ch30m_signed = percent_change(c5, 6)
-    ch15m = abs(ch15m_signed)
-    ch30m = abs(ch30m_signed)
-    vr1 = volume_ratio(c1, 20)
-    vr5 = volume_ratio(c5, 20)
-    rr1 = candle_range_ratio(c1, 20)
-    rr5 = candle_range_ratio(c5, 20)
-
-    # Real-time pressure matters more than old 30m movement.
-    live_score = ch3m * 14000 + min(rr1, 5.0) * 14 + min(vr1, 5.0) * 7
-    recent_score = ch15m * 700 + ch30m * 320 + min(rr5, 5.0) * 7 + min(vr5, 5.0) * 4
-
-    # Reversal bonus: coin was stretched one way, but 1m flow is now counter-moving.
-    reversal_bonus = 0.0
-    if REVERSAL_ENABLED:
-        if ch30m_signed > REVERSAL_MIN_30M_MOVE and ch3m_signed < -REVERSAL_MIN_LIVE_COUNTER_MOVE:
-            reversal_bonus = 35 + abs(ch3m_signed) * 7000
-        elif ch30m_signed < -REVERSAL_MIN_30M_MOVE and ch3m_signed > REVERSAL_MIN_LIVE_COUNTER_MOVE:
-            reversal_bonus = 35 + abs(ch3m_signed) * 7000
-
-    score = live_score + recent_score + reversal_bonus
-
-    # Penalize coins that moved earlier but are dead right now.
-    dead_now = ch3m < HOT_MIN_LIVE_MOVE_3M and rr1 < 0.35 and vr1 < 0.45
-    stale = ch30m >= 0.012 and ch3m < HOT_MIN_LIVE_MOVE_3M and rr1 < HOT_MIN_LIVE_RANGE_OR_VOLUME and vr1 < HOT_MIN_LIVE_RANGE_OR_VOLUME
-    if HOT_STALE_PENALTY_ENABLED and stale and reversal_bonus <= 0:
-        score *= 0.25
-    if dead_now and reversal_bonus <= 0:
-        score *= 0.12
-
-    # Huge volume without range/movement is absorption, not immediate scalp flow.
-    if vr1 > 20 and ch3m < 0.0005 and rr1 < 0.5:
-        score *= 0.20
-
-    if base_asset(symbol) in QUALITY_BASES:
-        score += 2
-
-    live_tag = "LIVE" if not dead_now and (ch3m >= HOT_MIN_LIVE_MOVE_3M or rr1 >= 0.8 or vr1 >= 0.8 or reversal_bonus > 0) else "STALE"
-    mode_tag = "REV" if reversal_bonus > 0 else "MOM"
-    note = (
-        f"{live_tag}/{mode_tag}: 1m3 {ch3m_signed*100:+.2f}%, "
-        f"15m {ch15m_signed*100:+.2f}%, 30m {ch30m_signed*100:+.2f}%, "
-        f"vol1 x{vr1:.2f}, vol5 x{vr5:.2f}, range1 x{rr1:.2f}, range5 x{rr5:.2f}"
-    )
-    if V17_2_LIQUIDITY_FIRST_ENABLED and not bool(liquidity.get("ok")):
-        score = 0.0
-        note += f" · LIQ REJECT: {liquidity.get('reason', 'unknown')}"
-    return score, note, liquidity
-
-def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
-    LIQUIDITY_SCAN_CACHE.clear()
-    scored: List[Tuple[float, str, str, Dict[str, Any]]] = []
-    notes: List[str] = []
-    # Rotate through the complete contract universe instead of repeatedly
-    # checking the same cached first 220 names for ten minutes.  Quality bases
-    # remain in the universe, while every listed contract gets a timely pass.
-    if symbols:
-        cursor = int(STATE.get("symbol_scan_cursor", 0) or 0) % len(symbols)
-        take = min(len(symbols), max(1, MAX_ANALYZE_SYMBOLS))
-        scan_symbols = [symbols[(cursor + offset) % len(symbols)] for offset in range(take)]
-        STATE["symbol_scan_cursor"] = (cursor + take) % len(symbols)
-    else:
-        scan_symbols = []
-
-    # V16.6.5: network-bound candle requests must not run one symbol at a time.
-    # The old sequential pass took more than three minutes, so a live impulse
-    # often disappeared before deep analysis reached that symbol.
-    if HOT_SCAN_WORKERS <= 1 or len(scan_symbols) <= 1:
-        results = []
-        for sym in scan_symbols:
-            try:
-                results.append((sym, hot_score(sym), None))
-            except Exception as e:
-                results.append((sym, None, e))
-    else:
-        results = []
-        with ThreadPoolExecutor(
-            max_workers=min(HOT_SCAN_WORKERS, len(scan_symbols)),
-            thread_name_prefix="hot-scan",
-        ) as pool:
-            future_map = {pool.submit(hot_score, sym): sym for sym in scan_symbols}
-            for future in as_completed(future_map):
-                sym = future_map[future]
-                try:
-                    results.append((sym, future.result(), None))
-                except Exception as e:
-                    results.append((sym, None, e))
-
-    for sym, result, error in results:
-        if error is not None:
-            STATE["last_error"] = f"hot_score {sym}: {repr(error)}"
-            continue
-        if result is None:
-            continue
-        sc, note, liquidity = result
-        if bool(liquidity.get("ok")):
-            scored.append((sc, sym, note, liquidity))
-
-    audit = _watch_audit_state()
-    audit["liquidity_checked"] = int(audit.get("liquidity_checked", 0) or 0) + len(results)
-    audit["liquidity_rejected"] = int(audit.get("liquidity_rejected", 0) or 0) + max(
-        0, len(results) - len(scored)
-    )
-    if not scored:
-        return [], notes
-
-    by_liquidity = sorted(
-        scored,
-        key=lambda row: float(row[3].get("liquidity_raw", 0.0) or 0.0),
-        reverse=True,
-    )
-    keep_count = max(
-        min(HOT_SYMBOLS_TO_ANALYZE, len(by_liquidity)),
-        min(
-            len(by_liquidity),
-            int(math.ceil(len(by_liquidity) * max(0.10, min(1.0, V17_2_LIQUIDITY_KEEP_FRACTION)))),
-        ),
-    )
-    liquid_pool = by_liquidity[:keep_count]
-    pool_size = max(1, len(by_liquidity) - 1)
-    liquidity_rank = {
-        sym: 1.0 - (index / pool_size)
-        for index, (_, sym, _, _) in enumerate(by_liquidity)
-    }
-    adjusted: List[Tuple[float, str, str, Dict[str, Any]]] = []
-    for hot, sym, note, liquidity in liquid_pool:
-        percentile = float(liquidity_rank.get(sym, 0.0))
-        liquidity["rank_percentile"] = percentile
-        LIQUIDITY_SCAN_CACHE[normalize_symbol(sym)] = dict(liquidity)
-        adjusted_score = float(hot) + 24.0 * percentile
-        adjusted.append((adjusted_score, sym, note, liquidity))
-    adjusted.sort(reverse=True, key=lambda row: row[0])
-    selected = [row[1] for row in adjusted[:HOT_SYMBOLS_TO_ANALYZE]]
-    audit["liquidity_passed"] = int(audit.get("liquidity_passed", 0) or 0) + len(selected)
-
-    for adjusted_score, sym, note, liquidity in adjusted[:12]:
-        notes.append(
-            f"{display_symbol(sym)} quality {adjusted_score:.1f} · "
-            f"liq p{float(liquidity.get('rank_percentile', 0.0))*100:.0f} · "
-            f"turn60≈{float(liquidity.get('quote_60m', 0.0) or 0.0):.0f}: {note}"
-        )
-
-    min_live_candidates = min(HOT_SYMBOLS_TO_ANALYZE, max(1, MIN_HOT_CANDIDATES))
-    if len(selected) < min_live_candidates:
-        # Use only markets that passed hard continuity/anomaly checks.  The bot
-        # may report a smaller pool; it must never fill it with rejected junk.
-        seen = set(selected)
-        for _, sym, _, _ in by_liquidity:
-            if sym not in seen:
-                selected.append(sym)
-                seen.add(sym)
-            if len(selected) >= min_live_candidates:
-                break
-    return selected[:HOT_SYMBOLS_TO_ANALYZE], notes
-
-# ============================================================
-# Setup logic
-# ============================================================
-
-def realtime_pressure_ok(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str, Dict[str, float]]:
-    """Live 1m pressure gate.
-    This is the key V13.18 fix: a signal is allowed only if the coin is moving right now.
-    Expired signals usually came from patterns where the flow had already stopped.
-    """
-    if len(c1) < 30:
-        return False, "not enough 1m pressure data", {}
-
-    last = c1[-1]
-    prev = c1[-2]
-    ch2m = (last["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12)
-    ch3m = percent_change(c1, 3)
-    rr1 = candle_range_ratio(c1, 20)
-    vr1 = volume_ratio(c1, 20)
-    loc = close_location(last)
-    body = abs(last["close"] - last["open"]) / max(last["high"] - last["low"], 1e-12)
-
-    same_two_long = last["close"] > last["open"] and prev["close"] >= prev["open"]
-    same_two_short = last["close"] < last["open"] and prev["close"] <= prev["open"]
-
-    metrics = {"ch2m": ch2m, "ch3m": ch3m, "range1": rr1, "vol1": vr1, "loc": loc, "body": body}
-
-    if rr1 < REALTIME_MIN_1M_RANGE_RATIO:
-        return False, f"1m range not live x{rr1:.2f}", metrics
-    if vr1 < REALTIME_MIN_1M_VOLUME_RATIO:
-        return False, f"1m volume not live x{vr1:.2f}", metrics
-    if body < 0.35:
-        return False, f"1m body weak {body:.2f}", metrics
-
-    if side == "LONG":
-        if ch2m < REALTIME_MIN_2M_MOVE:
-            return False, f"LONG 2m pressure weak {ch2m*100:.2f}%", metrics
-        if loc < REALTIME_CLOSE_LOCATION_LONG:
-            return False, f"LONG 1m close not near high {loc:.2f}", metrics
-        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_long:
-            return False, "LONG lacks two 1m bullish candles", metrics
-    else:
-        if ch2m > -REALTIME_MIN_2M_MOVE:
-            return False, f"SHORT 2m pressure weak {ch2m*100:.2f}%", metrics
-        if loc > REALTIME_CLOSE_LOCATION_SHORT:
-            return False, f"SHORT 1m close not near low {loc:.2f}", metrics
-        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_short:
-            return False, "SHORT lacks two 1m bearish candles", metrics
-
-    return True, f"live pressure ok: 2m {ch2m*100:+.2f}%, 3m {ch3m*100:+.2f}%, range1 x{rr1:.2f}, vol1 x{vr1:.2f}", metrics
-
-
-def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, vol: float) -> Tuple[bool, str, Dict[str, float]]:
-    """V13.19 fast context.
-    Allows two professional scalp types:
-    1) continuation: 15m/30m and 1m pressure agree;
-    2) blow-off reversal: 30m is stretched one way, but live 1m pressure flips hard the other way.
-    This fixes the prior issue where TIMI-like +16% 30m then -1% 1m dump was rejected as no_fast_short.
-    """
-    if len(c1) < 20 or len(c5) < 36 or len(c15) < 24:
-        return False, "not enough candles", {}
-
-    ch15m = percent_change(c5, 3)
-    ch30m = percent_change(c5, 6)
-    ch3m_1m = percent_change(c1, 3)
-    rr = candle_range_ratio(c5, 20)
-    compression = prior_compression_ratio(c5, 6)
-    last = c5[-1]
-    candle_move = (last["high"] - last["low"]) / max(last["open"], 1e-12)
-
-    metrics = {
-        "ch15m": ch15m,
-        "ch30m": ch30m,
-        "ch3m_1m": ch3m_1m,
-        "range_ratio": rr,
-        "compression": compression,
-        "candle_move": candle_move,
-        "vol": vol,
-        "setup_mode": "unknown",
-    }
-
-    if candle_move > FAST_MAX_SPREAD_PROXY:
-        return False, f"last 5m candle too wide/chase risk {candle_move*100:.2f}%", metrics
-
-    if compression > EDGE_MIN_PRIOR_COMPRESSION and rr < 1.75:
-        return False, f"no compression-to-expansion edge: compression x{compression:.2f}, range x{rr:.2f}", metrics
-
-    micro_ok, micro_reason = micro_structure_break(c1, side)
-    if not micro_ok:
-        return False, micro_reason, metrics
-
-    pressure_ok, pressure_reason, pressure_metrics = realtime_pressure_ok(c1, side)
-    metrics.update(pressure_metrics)
-    if not pressure_ok:
-        return False, pressure_reason, metrics
-
-    sweep_ok, sweep_reason = micro_sweep_reclaim(c1, side)
-    if not sweep_ok:
-        return False, sweep_reason, metrics
-
-    feasible_ok, feasible_reason = tp5_feasible(c5, side)
-    if not feasible_ok:
-        return False, feasible_reason, metrics
-
-    # continuation vs blow-off reversal classification
-    if side == "LONG":
-        continuation = ch15m >= FAST_MIN_15M_MOVE and ch30m >= FAST_MIN_30M_MOVE and ch3m_1m >= FAST_MIN_1M_CONFIRM
-        reversal = REVERSAL_ENABLED and ch30m <= -REVERSAL_MIN_30M_MOVE and ch3m_1m >= REVERSAL_MIN_LIVE_COUNTER_MOVE
-        if not (continuation or reversal):
-            return False, f"no LONG edge: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%", metrics
-        if ch30m > FAST_MAX_30M_MOVE:
-            return False, f"late LONG chase 30m {ch30m*100:.2f}%", metrics
-        if last["close"] <= last["open"] and not reversal:
-            return False, "last 5m not bullish for continuation", metrics
-        if close_location(last) < CLOSE_LOCATION_MIN_LONG and not reversal:
-            return False, f"LONG close location weak {close_location(last):.2f}", metrics
-        metrics["setup_mode"] = "REVERSAL_LONG" if reversal else "CONTINUATION_LONG"
-    else:
-        btc_dump_context = BTC_DUMP_SHORT_BIAS_ENABLED and ch15m <= -FAST_MIN_15M_MOVE * 0.70 and ch3m_1m <= -FAST_MIN_1M_CONFIRM
-        continuation = (ch15m <= -FAST_MIN_15M_MOVE and ch30m <= -FAST_MIN_30M_MOVE and ch3m_1m <= -FAST_MIN_1M_CONFIRM) or btc_dump_context
-        reversal = REVERSAL_ENABLED and ch30m >= REVERSAL_MIN_30M_MOVE and ch3m_1m <= -REVERSAL_MIN_LIVE_COUNTER_MOVE
-        if not (continuation or reversal):
-            return False, f"no SHORT edge: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%", metrics
-        if ch30m < -FAST_MAX_30M_MOVE:
-            # During market-wide dumps many examples realize quickly to the downside.
-            # Still avoid blind chasing: require a small bounce/reject structure before continuing.
-            recent_low = min(x["low"] for x in c5[-8:])
-            bounce = (max(x["high"] for x in c5[-5:]) - recent_low) / max(recent_low, 1e-12)
-            if not (BTC_DUMP_SHORT_BIAS_ENABLED and ch30m >= -SHORT_DUMP_ALLOW_EXTENDED_30M and ch3m_1m <= SHORT_DUMP_MIN_LIVE_1M3 and bounce >= SHORT_DUMP_MIN_BOUNCE):
-                return False, f"late SHORT chase 30m {ch30m*100:.2f}%", metrics
-            metrics["dump_bounce"] = bounce
-        if last["close"] >= last["open"] and not reversal:
-            return False, "last 5m not bearish for continuation", metrics
-        if close_location(last) > CLOSE_LOCATION_MAX_SHORT and not reversal:
-            return False, f"SHORT close location weak {close_location(last):.2f}", metrics
-        metrics["setup_mode"] = "REVERSAL_SHORT" if reversal else "CONTINUATION_SHORT"
-
-    # For fast scalps, live velocity/range can bypass weak 15m volume.
-    live_bypass = abs(ch3m_1m) >= LIVE_BYPASS_VOLUME_MOVE or metrics.get("range1", 1.0) >= LIVE_BYPASS_RANGE_RATIO
-
-    if rr < FAST_MIN_RANGE_RATIO and not live_bypass:
-        return False, f"range expansion weak x{rr:.2f}", metrics
-    if vol < FAST_MIN_VOLUME_RATIO and not live_bypass:
-        return False, f"volume weak x{vol:.2f}", metrics
-
-    return True, (
-        f"{metrics['setup_mode']} edge ok: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, "
-        f"1m3 {ch3m_1m*100:+.2f}%, range5 x{rr:.2f}, vol15 x{vol:.2f}, "
-        f"range1 x{metrics.get('range1', 1.0):.2f}, vol1 x{metrics.get('vol1', 1.0):.2f}; "
-        f"{micro_reason}; {pressure_reason}; {sweep_reason}; {feasible_reason}"
-    ), metrics
-
-
-def long_live_stats_ok() -> Tuple[bool, str]:
-    """Evaluate only comparable, evidence-qualified LIVE LONG outcomes.
-
-    Older versions used every historical LONG, including trades created before
-    the joint Vol1/Range1/directional gate existed. That legacy mixture could
-    keep blocking the improved LONG family even though the 125-row audit showed
-    positive expectancy for evidence-qualified LIVE LONGs.
-    """
-    if not LONG_STATS_PROTECTION:
-        return True, "long stats protection disabled"
-    current = time.time()
-    cached_at = float(LONG_STATS_CACHE.get("ts", 0.0) or 0.0)
-    if current - cached_at < 30.0:
-        value = LONG_STATS_CACHE.get("value", (True, "cached"))
-        return bool(value[0]), str(value[1])
-
-    try:
-        init_adaptive_db()
-        with _LOCK, _connect() as conn:
-            rows = conn.execute(
-                "SELECT result, pnl_r, features_json FROM adaptive_trades "
-                "WHERE source='live' AND side='LONG' ORDER BY id DESC LIMIT 200"
-            ).fetchall()
-
-        comparable: List[Any] = []
-        for row in rows:
-            features = json.loads(row["features_json"] or "{}")
-            directional_3m = float(features.get("edge_3m", 0.0) or 0.0) * 0.25
-            vol1 = float(features.get("vol1", 0.0) or 0.0) * 8.0
-            range1 = float(features.get("range1", 0.0) or 0.0) * 8.0
-            if (
-                directional_3m >= DATA_MIN_DIRECTIONAL_3M
-                and vol1 >= DATA_MIN_VOL1
-                and range1 >= DATA_MIN_RANGE1
-            ):
-                comparable.append(row)
-            if len(comparable) >= max(1, LONG_STATS_WINDOW):
-                break
-
-        closed = len(comparable)
-        if closed < max(1, LONG_STATS_MIN_CLOSED):
-            result = (True, f"not enough comparable LIVE LONG stats: {closed}")
-        else:
-            profits = sum(1 for row in comparable if str(row["result"]) == "profit")
-            wr = profits / max(closed, 1) * 100.0
-            expectancy = sum(float(row["pnl_r"] or 0.0) for row in comparable) / max(closed, 1)
-            accepted = bool(
-                wr >= LONG_STATS_MIN_WR
-                and expectancy >= LONG_STATS_MIN_EXPECTANCY_R
-            )
-            result = (
-                accepted,
-                f"evidence LIVE LONG: {profits}/{closed} TP3+ · "
-                f"success {wr:.1f}% · {expectancy:+.3f}R",
-            )
-    except Exception as exc:
-        result = (True, f"LONG evidence stats unavailable; safety gates remain: {repr(exc)}")
-
-    LONG_STATS_CACHE["ts"] = current
-    LONG_STATS_CACHE["value"] = result
-    return result
-
-
-def professional_long_reclaim_gate(
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-    c15: List[Dict[str, float]],
-    btc: Dict[str, Any],
-    metrics: Dict[str, float],
-    setup_mode: str,
-    e1: float,
-    e5: float,
-    vw5: float,
-) -> Tuple[bool, str]:
-    """Strict LONG-only repair.
-
-    Live results showed LONG was buying weak bounces / late pumps.
-    A valid LONG now needs a real reclaim pattern:
-    - BTC must not be BEAR by default;
-    - strong 1m pressure, close near high, volume/range alive;
-    - price must reclaim 1m EMA and be near/above 5m EMA/VWAP;
-    - no buying vertical 15m/30m extension unless there was a controlled pullback;
-    - prefer liquidity sweep / higher-low reclaim.
-    """
-    if len(c1) < 24 or len(c5) < 24 or len(c15) < 10:
-        return False, "LONG gate: not enough candles"
-
-    btc_dir = str(btc.get("direction", "UNKNOWN"))
-    btc_ch1h = float(btc.get("ch1h", 0.0))
-    btc_ch6h = float(btc.get("ch6h", 0.0))
-
-    last1 = c1[-1]
-    prev1 = c1[-2]
-    price = last1["close"]
-    ch3m = percent_change(c1, 3)
-    ch15m = metrics.get("ch15m", percent_change(c5, 3))
-    ch30m = metrics.get("ch30m", percent_change(c5, 6))
-    vol1 = metrics.get("vol1", volume_ratio(c1, 20))
-    range1 = metrics.get("range1", candle_range_ratio(c1, 20))
-    loc1 = close_location(last1)
-
-    # BTC bearish does not automatically forbid LONG. But a LONG against a bearish BTC
-    # must be a leader/relative-strength coin, not a weak bounce. This is how coins like
-    # VELVET can still be traded LONG while the general market is heavy.
-    bear_rs_long = False
-    if btc_dir == "BEAR":
-        rel_strength_1h = ch15m - btc_ch1h
-        bear_rs_long = (
-            LONG_ALLOW_BEAR_RELATIVE_STRENGTH
-            and ch15m >= LONG_BEAR_MIN_ALT_15M
-            and ch30m >= LONG_BEAR_MIN_ALT_30M
-            and ch3m >= LONG_BEAR_MIN_1M3
-            and rel_strength_1h >= LONG_BEAR_MIN_REL_STRENGTH_1H
-            and vol1 >= LONG_BEAR_MIN_VOL1
-            and range1 >= LONG_BEAR_MIN_RANGE1
-            and loc1 >= LONG_BEAR_MIN_CLOSE_LOCATION
-        )
-        if LONG_BLOCK_BTC_BEAR and not bear_rs_long:
-            return False, (
-                f"LONG gate: BTC BEAR and coin has no relative strength: "
-                f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, "
-                f"1m3 {ch3m*100:+.2f}%, rel1h {rel_strength_1h*100:+.2f}%"
-            )
-
-    if ch3m < LONG_MIN_3M_CONFIRM:
-        return False, f"LONG gate: weak 3m confirm {ch3m*100:.2f}%"
-    if btc_dir == "BEAR" and LONG_ALLOW_BEAR_RELATIVE_STRENGTH and not bear_rs_long:
-        return False, (
-            f"LONG gate: BTC BEAR, only relative-strength longs allowed; "
-            f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, 1m3 {ch3m*100:+.2f}%"
-        )
-    if vol1 < LONG_MIN_1M_VOLUME_RATIO:
-        return False, f"LONG gate: weak 1m volume x{vol1:.2f}"
-    if range1 < LONG_MIN_1M_RANGE_RATIO:
-        return False, f"LONG gate: weak 1m range x{range1:.2f}"
-    if loc1 < LONG_MIN_CLOSE_LOCATION:
-        return False, f"LONG gate: 1m close not strong {loc1:.2f}"
-    if last1["close"] <= last1["open"]:
-        return False, "LONG gate: last 1m not bullish"
-    if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
-        return False, "LONG gate: did not reclaim prior red candle"
-
-    # Must reclaim micro trend. For continuation LONG, also avoid being below 5m EMA/VWAP.
-    if price < e1 * (1 + RECLAIM_BUFFER):
-        return False, "LONG gate: no 1m EMA reclaim"
-    if setup_mode == "CONTINUATION_LONG" and (price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER)):
-        return False, "LONG gate: no 5m EMA/VWAP reclaim"
-
-    # Liquidity sweep / higher-low reclaim. This avoids buying a random bounce with no trap.
-    recent = c1[-16:-4]
-    last_zone = c1[-5:]
-    swept_low = min(x["low"] for x in last_zone[:-1]) <= min(x["low"] for x in recent) * 1.0015 if recent else False
-    reclaimed = last1["close"] > max(x["close"] for x in c1[-5:-1]) and loc1 >= LONG_MIN_CLOSE_LOCATION
-    higher_low = min(x["low"] for x in c1[-4:]) > min(x["low"] for x in c1[-10:-4]) * 0.998 if len(c1) >= 12 else False
-
-    if LONG_REQUIRE_SWEEP_OR_RECLAIM and not (swept_low or reclaimed):
-        return False, "LONG gate: no sweep/reclaim trigger"
-    if LONG_REQUIRE_HIGHER_LOW and not (higher_low or swept_low):
-        return False, "LONG gate: no higher-low/sweep structure"
-
-    # Anti-chase: after a big pump, only buy if there was a real controlled pullback first.
-    recent_high = max(x["high"] for x in c5[-18:])
-    recent_low = min(x["low"] for x in c5[-10:])
-    pullback = (recent_high - recent_low) / max(recent_high, 1e-12)
-    if ch15m > LONG_MAX_15M_CHASE or ch30m > LONG_MAX_30M_CHASE:
-        if not (LONG_MIN_PULLBACK_AFTER_PUMP <= pullback <= LONG_MAX_PULLBACK_AFTER_PUMP and (swept_low or reclaimed)):
-            return False, f"LONG gate: late pump chase blocked 15m {ch15m*100:.2f}%, 30m {ch30m*100:.2f}%, pullback {pullback*100:.2f}%"
-
-    # Avoid buying into a distribution wick.
-    last5 = c5[-1]
-    if upper_wick_ratio(last5) > 0.48 and close_location(last5) < 0.68:
-        return False, "LONG gate: 5m upper wick/distribution"
-
-    return True, (
-        f"LONG professional gate ok: BTC {btc_dir}, 3m {ch3m*100:+.2f}%, "
-        f"vol1 x{vol1:.2f}, range1 x{range1:.2f}, closeLoc {loc1:.2f}, "
-        f"bearRS {bear_rs_long}, sweep {swept_low}, reclaim {reclaimed}, higherLow {higher_low}"
-    )
-
-def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
-    """Scalping Edge setup: no trend prediction.
-    We only require a tradable micro-event: fresh imbalance + micro sweep/reclaim + immediate continuation.
-    BTC/1H are informational, not directional gates, except violent BTC shock.
-    """
-    if not FAST_BURST_ENABLED:
-        return None
-    if len(c1) < 30 or len(c5) < 48 or len(c15) < 40 or len(c1h) < 60:
-        return None
-
-    price = c1[-1]["close"]
-    e5 = ema(closes(c5), 21)
-    e1 = ema(closes(c1), 9)
-    vw5 = vwap(c5, 36)
-    vol = volume_ratio(c15, 24)
-    t1h = trend_state(c1h)
-
-    # Market phase is not traded as a prediction. BTC is a context filter:
-    # - during BTC shock down, avoid LONG unless the coin later passes relative-strength LONG gate;
-    # - allow SHORT during dump because that is exactly when many alts realize quickly.
-    btc_ch1h = float(btc.get("ch1h", 0.0))
-    if abs(btc_ch1h) >= BTC_SHOCK_15M_BLOCK and side == "LONG":
-        # Do not hard-block here; professional_long_reclaim_gate can still allow an exceptional RS long.
-        pass
-
-    fast_ok, fast_reason, metrics = fast_context_ok(c1, c5, c15, side, vol)
-    if not fast_ok:
-        return None
-    setup_mode = str(metrics.get("setup_mode", ""))
-    is_reversal = setup_mode.startswith("REVERSAL")
-
-    if side == "LONG":
-        long_gate_ok, long_gate_reason = professional_long_reclaim_gate(symbol, c1, c5, c15, btc, metrics, setup_mode, e1, e5, vw5)
-        if not long_gate_ok:
-            return None
-        metrics["long_gate_reason"] = long_gate_reason
-
-    last5 = c5[-1]
-    prev5 = c5[-2]
-
-    if side == "LONG":
-        recent_high = max(x["high"] for x in c5[-18:])
-        pullback_low = min(x["low"] for x in c5[-10:])
-        pullback = (recent_high - pullback_low) / max(recent_high, 1e-12)
-        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
-            return None
-        if is_reversal:
-            # Blow-off reversal LONG: do not wait for 5m EMA/VWAP reclaim; that is often too late.
-            # Require live 1m reclaim only; fast_context already confirmed pressure and micro break.
-            if price < e1:
-                return None
-        else:
-            if price < e1 or price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER):
-                return None
-            # Entry must be continuation, not a mid-range hesitation.
-            if last5["close"] <= prev5["high"] * 0.999 and last5["close"] <= prev5["close"]:
-                return None
-            if upper_wick_ratio(last5) > 0.42 and close_location(last5) < 0.72:
-                return None
-        level = min(pullback_low, min(x["low"] for x in c1[-12:]))
-        strategy = "PRO_SCALPING_EDGE_LONG"
-        trade_type = "SCALPING EDGE LONG"
-        reason = (
-            f"SCALPING EDGE LONG: не прогноз рынка, а короткая ситуация. "
-            f"Режим {setup_mode}: свежий дисбаланс вверх, микро-откат/перехват {pullback*100:.2f}%, "
-            f"live 1m pressure, sweep/reclaim и немедленное продолжение. {fast_reason}. "
-            f"{metrics.get('long_gate_reason', '')}."
-        )
-    else:
-        recent_low = min(x["low"] for x in c5[-18:])
-        bounce_high = max(x["high"] for x in c5[-10:])
-        pullback = (bounce_high - recent_low) / max(recent_low, 1e-12)
-        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
-            return None
-        if is_reversal:
-            # Blow-off reversal SHORT: do not wait for 5m EMA/VWAP loss; that is often too late.
-            # Require live 1m reject only; fast_context already confirmed pressure and micro break.
-            if price > e1:
-                return None
-        else:
-            if price > e1 or price > e5 * (1 - RECLAIM_BUFFER) or price > vw5 * (1 - RECLAIM_BUFFER):
-                return None
-            if last5["close"] >= prev5["low"] * 1.001 and last5["close"] >= prev5["close"]:
-                return None
-            if lower_wick_ratio(last5) > 0.42 and close_location(last5) > 0.28:
-                return None
-        level = max(bounce_high, max(x["high"] for x in c1[-12:]))
-        strategy = "PRO_SCALPING_EDGE_SHORT"
-        trade_type = "SCALPING EDGE SHORT"
-        reason = (
-            f"SCALPING EDGE SHORT: не прогноз рынка, а короткая ситуация. "
-            f"Режим {setup_mode}: свежий дисбаланс вниз, микро-отскок/перехват {pullback*100:.2f}%, "
-            f"live 1m pressure и немедленное продолжение. {fast_reason}."
-        )
-
-    strong = vol >= 1.55 and metrics.get("range_ratio", 1.0) >= 1.55 and abs(metrics.get("ch3m_1m", 0)) >= FAST_MIN_1M_CONFIRM * 1.4
-    score = 74
-    score += min(12, int(abs(metrics.get("ch15m", 0)) * 650))
-    score += min(10, int(abs(metrics.get("ch30m", 0)) * 430))
-    score += min(8, int((vol - 1.0) * 7))
-    score += min(8, int((metrics.get("range_ratio", 1.0) - 1.0) * 7))
-    score += min(8, int((metrics.get("vol1", 1.0) - 1.0) * 7))
-    score += min(8, int((metrics.get("range1", 1.0) - 1.0) * 7))
-    # Market phase does not add or subtract. Only actual speed/liquidity edge matters.
-    if strong:
-        score += 7
-    if base_asset(symbol) in QUALITY_BASES:
-        score += 1
-    score = max(0, min(100, score))
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "strategy": strategy,
-        "trade_type": trade_type,
-        "score": score,
-        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol >= 1.45 else "B",
-        "entry": price,
-        "level": level,
-        "reason": reason,
-        "pullback": pullback,
-        "volume_ratio": vol,
-        "range_ratio": metrics.get("range_ratio", 1.0),
-        "compression": metrics.get("compression", 1.0),
-        "ch15m": metrics.get("ch15m", 0.0),
-        "ch30m": metrics.get("ch30m", 0.0),
-        "ch3m_1m": metrics.get("ch3m_1m", 0.0),
-        "vol1": metrics.get("vol1", 1.0),
-        "range1": metrics.get("range1", 1.0),
-        "ch2m": metrics.get("ch2m", 0.0),
-        "setup_mode": setup_mode,
-        "t1h": t1h,
-        "btc_text": btc.get("text", ""),
-    }
-
-
-
-def instant_edge_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
-    """V13.24 fallback: instant momentum/reclaim scalp.
-
-    This is for situations visible in diagnostics such as SYRUP/FOLKS:
-    live 1m impulse is present, but the older fast_burst setup rejects the trade because it
-    waits for a perfect 5m pullback/reclaim. We still keep strict quality filters after this.
-    """
-    if not INSTANT_EDGE_ENABLED:
-        return None
-    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
-        return None
-
-    price = c1[-1]["close"]
-    last1 = c1[-1]
-    prev1 = c1[-2]
-    ch3m = percent_change(c1, 3)
-    ch15m = percent_change(c5, 3)
-    ch30m = percent_change(c5, 6)
-    vol1 = volume_ratio(c1, 20)
-    range1 = candle_range_ratio(c1, 20)
-    vol5 = volume_ratio(c5, 20)
-    range5 = candle_range_ratio(c5, 20)
-    loc = close_location(last1)
-    body = abs(last1["close"] - last1["open"]) / max(last1["high"] - last1["low"], 1e-12)
-    t1h = trend_state(c1h)
-
-    # Live impulse must be real, not a dead hot-list artifact.
-    if side == "LONG":
-        if ch3m < INSTANT_MIN_1M3_MOVE:
-            return None
-        if ch15m < INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and ch3m >= INSTANT_MIN_1M3_MOVE * 1.45):
-            return None
-        if ch30m > INSTANT_MAX_30M_CHASE and ch3m < INSTANT_MIN_1M3_MOVE * 1.35:
-            return None
-        if loc < INSTANT_CLOSE_LONG or last1["close"] <= last1["open"]:
-            return None
-        if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
-            return None
-        # Avoid buying after multiple vertical green candles without any micro reset.
-        had_reset = any(x["close"] < x["open"] for x in c1[-7:-1]) or min(x["low"] for x in c1[-5:]) <= min(x["low"] for x in c1[-14:-5]) * 1.002
-        if not had_reset and ch30m > 0.025:
-            return None
-        level = min(x["low"] for x in c1[-10:])
-        strategy = "PRO_INSTANT_EDGE_LONG"
-        trade_type = "INSTANT EDGE LONG"
-        setup_mode = "INSTANT_MOMENTUM_LONG"
-        direction_text = "вверх"
-    else:
-        if ch3m > -INSTANT_MIN_1M3_MOVE:
-            return None
-        if ch15m > -INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.45):
-            return None
-        if ch30m < -INSTANT_MAX_30M_CHASE and abs(ch3m) < INSTANT_MIN_1M3_MOVE * 1.35:
-            return None
-        if loc > INSTANT_CLOSE_SHORT or last1["close"] >= last1["open"]:
-            return None
-        if prev1["close"] > prev1["open"] and last1["close"] >= prev1["open"]:
-            return None
-        had_reset = any(x["close"] > x["open"] for x in c1[-7:-1]) or max(x["high"] for x in c1[-5:]) >= max(x["high"] for x in c1[-14:-5]) * 0.998
-        if not had_reset and ch30m < -0.025:
-            return None
-        level = max(x["high"] for x in c1[-10:])
-        strategy = "PRO_INSTANT_EDGE_SHORT"
-        trade_type = "INSTANT EDGE SHORT"
-        setup_mode = "INSTANT_MOMENTUM_SHORT"
-        direction_text = "вниз"
-
-    if body < INSTANT_MIN_BODY:
-        return None
-    if range1 < INSTANT_MIN_RANGE1:
-        return None
-    if vol1 < INSTANT_MIN_VOL1 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and range1 >= 1.15):
-        return None
-    if range5 < INSTANT_MIN_RANGE5:
-        return None
-    if vol5 < INSTANT_MIN_VOL5 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.60):
-        return None
-
-    # Keep a micro structure break; this prevents entering the middle of a random candle.
-    micro_ok, micro_reason = micro_structure_break(c1, side)
-    if not micro_ok:
-        return None
-
-    # BTC is context, not a hard phase filter. Against BTC pressure, demand stronger live impulse.
-    btc_dir = str(btc.get("direction", "UNKNOWN"))
-    if side == "LONG" and btc_dir == "BEAR" and not (ch3m >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m >= INSTANT_MIN_15M_MOVE * 1.2):
-        return None
-    if side == "SHORT" and btc_dir == "BULL" and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m <= -INSTANT_MIN_15M_MOVE * 1.2):
-        return None
-
-    score = 78
-    score += min(10, int(abs(ch3m) * 1000))
-    score += min(8, int(abs(ch15m) * 700))
-    score += min(6, int(max(0.0, vol1 - 0.8) * 6))
-    score += min(6, int(max(0.0, range1 - 1.0) * 6))
-    score += min(5, int(max(0.0, range5 - 1.0) * 4))
-    score = max(0, min(100, score))
-
-    reason = (
-        f"INSTANT EDGE {side}: профессиональный fallback для живого импульса. "
-        f"Цена движется {direction_text} сейчас: 1m3 {ch3m*100:+.2f}%, 15m {ch15m*100:+.2f}%, "
-        f"30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
-        f"Vol5 x{vol5:.2f}, Range5 x{range5:.2f}, closeLoc {loc:.2f}. "
-        f"{micro_reason}. Сделка всё равно проходит RR/SL/live-volume quality gate."
-    )
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "strategy": strategy,
-        "trade_type": trade_type,
-        "score": score,
-        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 1.20 else "B",
-        "entry": price,
-        "level": level,
-        "reason": reason,
-        "pullback": 0.0,
-        "volume_ratio": vol5,
-        "range_ratio": range5,
-        "compression": 1.0,
-        "ch15m": ch15m,
-        "ch30m": ch30m,
-        "ch3m_1m": ch3m,
-        "vol1": vol1,
-        "range1": range1,
-        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
-        "setup_mode": setup_mode,
-        "t1h": t1h,
-        "btc_text": btc.get("text", ""),
-    }
-
-def market_dump_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """V13.28 fallback: market-dump continuation SHORT.
-
-    This is for active market selloff sessions when BTC/ETH and many alts are falling.
-    The old setup logic often waits for a perfect AERO pullback/reject and returns no_fast,
-    while the tape is already giving a clean dump continuation. We still pass the final
-    RR/SL/live-volume and trader-pattern gates after this setup is constructed.
-    """
-    if not MARKET_DUMP_SHORT_ENABLED or not ALLOW_SHORT:
-        return None
-    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
-        return None
-
-    side = "SHORT"
-    price = c1[-1]["close"]
-    last1 = c1[-1]
-    prev1 = c1[-2]
-    ch3m = percent_change(c1, 3)
-    ch15m = percent_change(c5, 3)
-    ch30m = percent_change(c5, 6)
-    vol1 = volume_ratio(c1, 20)
-    vol5 = volume_ratio(c5, 20)
-    range1 = candle_range_ratio(c1, 20)
-    range5 = candle_range_ratio(c5, 20)
-    loc = close_location(last1)
-    recent_range = (max(x["high"] for x in c5[-6:]) - min(x["low"] for x in c5[-6:])) / max(price, 1e-12)
-    btc_1h = float(btc.get("ch1h", 0.0) or 0.0)
-    btc_6h = float(btc.get("ch6h", 0.0) or 0.0)
-
-    # Must be real downside pressure now.
-    if ch3m > -DUMP_MIN_1M3:
-        return None
-
-    # Either the alt itself is already selling on 15m, or BTC has a clear dump context.
-    market_dump_context = btc_1h <= -0.0025 or btc_6h <= -0.0100 or str(btc.get("direction", "")) == "BEAR"
-    alt_dump_context = ch15m <= -DUMP_MIN_15M or ch30m <= -DUMP_MIN_15M * 1.25
-    if not (market_dump_context or alt_dump_context):
-        return None
-
-    # Avoid very late shorts after an extreme 30m collapse unless the live tape is still exceptional.
-    if ch30m < -DUMP_MAX_LATE_30M and not (abs(ch3m) >= DUMP_MIN_1M3 * 2.0 and range1 >= 1.35):
-        return None
-
-    if vol1 < DUMP_MIN_VOL1:
-        return None
-    if vol5 < DUMP_MIN_VOL5 and not (abs(ch3m) >= DUMP_MIN_1M3 * 1.65):
-        return None
-    if range1 < DUMP_MIN_RANGE1:
-        return None
-    if range5 < DUMP_MIN_RANGE5:
-        return None
-    if recent_range < DUMP_MIN_RECENT_RANGE:
-        return None
-
-    # Do not short a weak doji. In a dump, close below mid/low half is enough; exact low-close is too strict.
-    if loc > DUMP_CLOSE_SHORT or last1["close"] >= last1["open"]:
-        return None
-
-    fresh_low_break = last1["close"] < min(x["low"] for x in c1[-7:-1])
-    failed_bounce = any(x["close"] > x["open"] for x in c1[-8:-1]) and last1["close"] < prev1["close"]
-    lower_high_reject = max(x["high"] for x in c1[-4:]) < max(x["high"] for x in c1[-14:-4]) and last1["close"] < prev1["close"]
-    if DUMP_REQUIRE_REJECT_OR_BREAK and not (fresh_low_break or failed_bounce or lower_high_reject):
-        return None
-
-    level = max(x["high"] for x in c1[-10:])
-    score = 80
-    score += min(10, int(abs(ch3m) * 1100))
-    score += min(8, int(abs(min(ch15m, 0.0)) * 700))
-    score += min(6, int(max(0.0, vol1 - 0.60) * 6))
-    score += min(7, int(max(0.0, range1 - 0.80) * 5))
-    score += min(6, int(max(0.0, range5 - 1.00) * 4))
-    if market_dump_context:
-        score += 3
-    if fresh_low_break:
-        score += 3
-    score = max(0, min(100, score))
-
-    reason = (
-        f"MARKET DUMP SHORT: активный рыночный слив, не прогноз, а dump-continuation. "
-        f"BTC context {btc.get('text', '')}; alt pressure 1m3 {ch3m*100:+.2f}%, "
-        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, "
-        f"Vol5 x{vol5:.2f}, Range1 x{range1:.2f}, Range5 x{range5:.2f}. "
-        f"Break/reject: freshLow {fresh_low_break}, failedBounce {failed_bounce}, lowerHighReject {lower_high_reject}. "
-        f"Дальше сделка обязана пройти RR/SL/live-volume/trader quality gates."
-    )
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "strategy": "PRO_MARKET_DUMP_SHORT",
-        "trade_type": "MARKET DUMP SHORT",
-        "score": score,
-        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 0.85 and range1 >= 1.15 else "B",
-        "entry": price,
-        "level": level,
-        "reason": reason,
-        "pullback": 0.0,
-        "volume_ratio": vol5,
-        "range_ratio": range5,
-        "compression": 1.0,
-        "ch15m": ch15m,
-        "ch30m": ch30m,
-        "ch3m_1m": ch3m,
-        "vol1": vol1,
-        "range1": range1,
-        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
-        "setup_mode": "MARKET_DUMP_SHORT",
-        "t1h": trend_state(c1h),
-        "btc_text": btc.get("text", ""),
-    }
-
-
-def evidence_imbalance_setup(
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-    c15: List[Dict[str, float]],
-    c1h: List[Dict[str, float]],
-    btc: Dict[str, Any],
-    side: str,
-) -> Optional[Dict[str, Any]]:
-    """V16.6.5 direct path for a proven live imbalance.
-
-    Older fast/instant templates can reject a coin before the evidence-backed
-    Vol1/Range1/directional rule is evaluated. This constructor does not lower
-    that rule. It only creates a candidate when all three requirements already
-    pass, the closing candle is directional and a fresh micro break exists.
-    The normal RR, trader-pattern, delayed confirmation and adaptive gates still
-    run afterwards.
-    """
-    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
-        return None
-
-    direction = 1.0 if side == "LONG" else -1.0
-    price = float(c1[-1]["close"])
-    last1 = c1[-1]
-    ch3m = percent_change(c1, 3)
-    directional_3m = direction * ch3m
-    vol1 = volume_ratio(c1, 20)
-    range1 = candle_range_ratio(c1, 20)
-
-    # Exact V16.6 evidence gate: this path is an alternative detector, not a
-    # relaxation of the quality threshold.
-    if directional_3m < DATA_MIN_DIRECTIONAL_3M:
-        return None
-    if vol1 < DATA_MIN_VOL1 or range1 < DATA_MIN_RANGE1:
-        return None
-
-    location = close_location(last1)
-    if side == "LONG":
-        if last1["close"] <= last1["open"] or location < max(TRADER_CLOSE_LONG, PRE_LIVE_CLOSE_LONG):
-            return None
-    else:
-        if last1["close"] >= last1["open"] or location > min(TRADER_CLOSE_SHORT, PRE_LIVE_CLOSE_SHORT):
-            return None
-
-    micro_ok, micro_reason = micro_structure_break(c1, side)
-    if not micro_ok:
-        return None
-
-    ch15m = percent_change(c5, 3)
-    ch30m = percent_change(c5, 6)
-    vol5 = volume_ratio(c5, 20)
-    range5 = candle_range_ratio(c5, 20)
-    level = (
-        min(x["low"] for x in c1[-10:])
-        if side == "LONG"
-        else max(x["high"] for x in c1[-10:])
-    )
-
-    score = 82
-    score += min(8, int(max(0.0, directional_3m - DATA_MIN_DIRECTIONAL_3M) * 1000))
-    score += min(5, int(max(0.0, vol1 - DATA_MIN_VOL1) * 5))
-    score += min(5, int(max(0.0, range1 - DATA_MIN_RANGE1) * 4))
-    score = max(0, min(100, score))
-    setup_mode = f"INSTANT_EVIDENCE_{side}"
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "strategy": f"PRO_EVIDENCE_IMBALANCE_{side}",
-        "trade_type": f"EVIDENCE IMBALANCE {side}",
-        "score": score,
-        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 1.20 and range1 >= 1.80 else "B",
-        "entry": price,
-        "level": level,
-        "reason": (
-            f"EVIDENCE IMBALANCE {side}: прямой путь для подтверждённого живого дисбаланса; "
-            f"1m3 {ch3m*100:+.2f}%, Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
-            f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}; {micro_reason}. "
-            "Старый fast-шаблон не используется, но все финальные проверки остаются обязательными."
-        ),
-        "pullback": 0.0,
-        "volume_ratio": vol5,
-        "range_ratio": range5,
-        "compression": 1.0,
-        "ch15m": ch15m,
-        "ch30m": ch30m,
-        "ch3m_1m": ch3m,
-        "vol1": vol1,
-        "range1": range1,
-        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
-        "setup_mode": setup_mode,
-        "t1h": trend_state(c1h),
-        "btc_text": btc.get("text", ""),
-    }
-
-
-def near_miss_shadow_setup(
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-    c15: List[Dict[str, float]],
-    c1h: List[Dict[str, float]],
-    btc: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """Build a measurement-only trade for an almost-qualifying imbalance.
-
-    This constructor is deliberately separate from every LIVE path. It gives
-    the adaptive layer labelled outcomes during quiet sessions without lowering
-    the evidence gate or sending an experimental signal to Telegram.
-    """
-    if not SHADOW_PROBE_ENABLED or not SHADOW_TRACKING_ENABLED:
-        return None
-    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
-        return None
-
-    ch3m = percent_change(c1, 3)
-    if abs(ch3m) < SHADOW_PROBE_MIN_DIRECTIONAL_3M:
-        return None
-    side = "LONG" if ch3m > 0 else "SHORT"
-    if (side == "LONG" and not ALLOW_LONG) or (side == "SHORT" and not ALLOW_SHORT):
-        return None
-
-    vol1 = volume_ratio(c1, 20)
-    range1 = candle_range_ratio(c1, 20)
-    if vol1 < SHADOW_PROBE_MIN_VOL1 or range1 < SHADOW_PROBE_MIN_RANGE1:
-        return None
-
-    directional_3m = abs(ch3m)
-    evidence_score = (
-        directional_3m / max(DATA_MIN_DIRECTIONAL_3M, 1e-9)
-        + vol1 / max(DATA_MIN_VOL1, 1e-9)
-        + range1 / max(DATA_MIN_RANGE1, 1e-9)
-    )
-    if evidence_score < SHADOW_PROBE_MIN_EVIDENCE_SCORE:
-        return None
-
-    price = float(c1[-1]["close"])
-    ch15m = percent_change(c5, 3)
-    ch30m = percent_change(c5, 6)
-    vol5 = volume_ratio(c5, 20)
-    range5 = candle_range_ratio(c5, 20)
-    level = (
-        min(x["low"] for x in c1[-10:])
-        if side == "LONG"
-        else max(x["high"] for x in c1[-10:])
-    )
-    score = max(0, min(87, 62 + int(min(evidence_score, 5.0) * 5)))
-    setup_mode = f"INSTANT_SHADOW_OBSERVATION_{side}"
-
-    live_failures: List[str] = []
-    if directional_3m < DATA_MIN_DIRECTIONAL_3M:
-        live_failures.append(
-            f"move {directional_3m*100:.2f}% < {DATA_MIN_DIRECTIONAL_3M*100:.2f}%"
-        )
-    if vol1 < DATA_MIN_VOL1:
-        live_failures.append(f"Vol1 x{vol1:.2f} < x{DATA_MIN_VOL1:.2f}")
-    if range1 < DATA_MIN_RANGE1:
-        live_failures.append(f"Range1 x{range1:.2f} < x{DATA_MIN_RANGE1:.2f}")
-    live_gap = "; ".join(live_failures) if live_failures else "numeric gate passed; structure rejected"
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "strategy": f"SHADOW_NEAR_MISS_{side}",
-        "trade_type": f"SHADOW NEAR-MISS {side}",
-        "score": score,
-        "grade": "B",
-        "entry": price,
-        "level": level,
-        "reason": (
-            f"SHADOW ONLY: near-miss observation, never a LIVE signal. "
-            f"Evidence score {evidence_score:.2f}; 1m3 {ch3m*100:+.2f}%, "
-            f"Vol1 x{vol1:.2f}, Range1 x{range1:.2f}; LIVE gap: {live_gap}."
-        ),
-        "pullback": 0.0,
-        "volume_ratio": vol5,
-        "range_ratio": range5,
-        "compression": 1.0,
-        "ch15m": ch15m,
-        "ch30m": ch30m,
-        "ch3m_1m": ch3m,
-        "vol1": vol1,
-        "range1": range1,
-        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
-        "setup_mode": setup_mode,
-        "t1h": trend_state(c1h),
-        "btc_text": btc.get("text", ""),
-        "shadow_probe_score": evidence_score,
-        "shadow_probe_live_gap": live_gap,
-        "shadow_probe_never_live": True,
-    }
-
-
-def v17_2_dual_paper_setup(
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-    c15: List[Dict[str, float]],
-    c1h: List[Dict[str, float]],
-    btc: Dict[str, Any],
-    side: str,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Build one liquidity-first WATCH candidate, never a LIVE trade.
-
-    Lane 1 follows a moderate ATR-normalized impulse and waits for a retest.
-    Lane 2 follows a genuine sweep/reversal and waits for a second reclaim.
-    A detected impulse is not counted as a trade; only the later confirmed
-    entry becomes model-eligible PAPER data.
-    """
-    if len(c1) < 60 or len(c5) < 48 or len(c15) < 24 or len(c1h) < 40:
-        return None, "not enough candles"
-    liquidity = candle_liquidity_snapshot(symbol, c1, c5)
-    cached_liquidity = LIQUIDITY_SCAN_CACHE.get(normalize_symbol(symbol), {})
-    if cached_liquidity:
-        # Keep fresh hard checks but retain the cross-sectional rank calculated
-        # by the immediately preceding universe pass.
-        liquidity["rank_percentile"] = float(
-            cached_liquidity.get("rank_percentile", 0.50) or 0.50
-        )
-    if not bool(liquidity.get("ok")):
-        return None, f"liquidity rejected: {liquidity.get('reason', 'unknown')}"
-
-    side = str(side).upper()
-    direction = 1.0 if side == "LONG" else -1.0
-    price = float(c1[-1]["close"])
-    last = c1[-1]
-    ch3 = percent_change(c1, 3)
-    ch15 = percent_change(c5, 3)
-    ch30 = percent_change(c5, 6)
-    directional_3m = direction * ch3
-    directional_15m = direction * ch15
-    opposite_stretch = -direction * ch15
-    atr1_pct = max(float(liquidity.get("atr1_pct", 0.0) or 0.0), 0.0005)
-    normalized_move = directional_3m / atr1_pct
-    vol1 = volume_ratio(c1, 20)
-    range1 = candle_range_ratio(c1, 20)
-    vol5 = volume_ratio(c5, 20)
-    range5 = candle_range_ratio(c5, 20)
-    location = close_location(last)
-    candle_span = max(float(last["high"]) - float(last["low"]), 1e-12)
-    body_fraction = abs(float(last["close"]) - float(last["open"])) / candle_span
-    ema9 = ema(closes(c1[-40:]), 9)
-    ema21 = ema(closes(c1[-50:]), 21)
-    vwap30 = vwap(c1, 30)
-
-    if not (
-        V17_2_MIN_VOL1 <= vol1 <= V17_2_MAX_VOL1
-        and range1 >= V17_2_MIN_RANGE1
-        and vol5 >= V17_2_MIN_VOL5
-        and range5 >= V17_2_MIN_RANGE5
-    ):
-        return None, (
-            f"flow rejected: Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
-            f"Vol5 x{vol5:.2f}, Range5 x{range5:.2f}"
-        )
-
-    directional_close = bool(
-        (side == "LONG" and last["close"] > last["open"] and location >= 0.58)
-        or (side == "SHORT" and last["close"] < last["open"] and location <= 0.42)
-    )
-    aligned = bool(
-        (side == "LONG" and price >= ema9 and price >= ema21 and price >= vwap30)
-        or (side == "SHORT" and price <= ema9 and price <= ema21 and price <= vwap30)
-    )
-    min_move = max(V17_2_MIN_ABS_MOVE, V17_2_MIN_ATR_MOVE * atr1_pct)
-    max_move = min(V17_2_MAX_ABS_MOVE, V17_2_MAX_ATR_MOVE * atr1_pct)
-    continuation = bool(
-        min_move <= directional_3m <= max_move
-        and V17_2_CONT_MIN_15M <= directional_15m <= V17_2_CONT_MAX_15M
-        and directional_close
-        and body_fraction >= 0.35
-        and aligned
-    )
-
-    older = c1[-22:-6]
-    recent = c1[-6:-1]
-    if side == "LONG":
-        swept = min(row["low"] for row in recent) <= min(row["low"] for row in older) * 1.001
-        reclaimed = bool(last["close"] > last["open"] and location >= 0.64 and price > ema9)
-    else:
-        swept = max(row["high"] for row in recent) >= max(row["high"] for row in older) * 0.999
-        reclaimed = bool(last["close"] < last["open"] and location <= 0.36 and price < ema9)
-    reversal = bool(
-        opposite_stretch >= V17_2_REVERSAL_MIN_STRETCH
-        and directional_3m >= max(V17_2_REVERSAL_MIN_COUNTER, 0.65 * atr1_pct)
-        and directional_3m <= V17_2_MAX_ABS_MOVE
-        and swept
-        and reclaimed
-        and body_fraction >= 0.30
-    )
-
-    if continuation:
-        lane = "CONTINUATION"
-        setup_mode = f"V17_2_CONTINUATION_{side}"
-        strategy = f"V17_2_WATCH_CONTINUATION_{side}"
-        trade_type = f"LIQUIDITY CONTINUATION WATCH {side}"
-        score = 79
-        score += min(6, int(max(0.0, normalized_move - V17_2_MIN_ATR_MOVE) * 3.0))
-        score += min(5, int(max(0.0, directional_15m - V17_2_CONT_MIN_15M) * 250))
-        pullback_fraction_min, pullback_fraction_max = 0.15, 0.60
-        pullback_abs_min, pullback_abs_max = 0.0012, 0.0160
-        recovery_required = 0.42
-        max_watch_seconds = 240
-        min_directional_15m = -0.0020
-        reason = (
-            f"V17.2 CONTINUATION: ликвидный умеренный импульс, нормированный к ATR; "
-            f"3m {directional_3m*100:.2f}% = {normalized_move:.2f} ATR1, "
-            f"15m {directional_15m*100:.2f}%. Входа сейчас нет: нужен откат и повторный reclaim."
-        )
-    elif reversal:
-        lane = "SWEEP_REVERSAL"
-        setup_mode = f"V17_2_SWEEP_REVERSAL_{side}"
-        strategy = f"V17_2_WATCH_SWEEP_REVERSAL_{side}"
-        trade_type = f"LIQUIDITY SWEEP REVERSAL WATCH {side}"
-        score = 81
-        score += min(6, int(max(0.0, opposite_stretch - V17_2_REVERSAL_MIN_STRETCH) * 220))
-        score += min(5, int(max(0.0, directional_3m - V17_2_REVERSAL_MIN_COUNTER) * 350))
-        pullback_fraction_min, pullback_fraction_max = 0.10, 0.55
-        pullback_abs_min, pullback_abs_max = 0.0010, 0.0140
-        recovery_required = 0.50
-        max_watch_seconds = 180
-        min_directional_15m = -0.0180
-        reason = (
-            f"V17.2 SWEEP/REVERSAL: после растяжения против входа "
-            f"{opposite_stretch*100:.2f}% произошёл sweep и reclaim; "
-            f"контрдвижение 3m {directional_3m*100:.2f}%. Нужен второй retest/reclaim, входа сейчас нет."
-        )
-    else:
-        return None, (
-            f"no dual setup: dir3 {directional_3m*100:.2f}%/{normalized_move:.2f}ATR, "
-            f"dir15 {directional_15m*100:.2f}%, opposite stretch {opposite_stretch*100:.2f}%"
-        )
-
-    rank = float(liquidity.get("rank_percentile", 0.50) or 0.50)
-    score += min(6, int(max(0.0, rank) * 6))
-    score += min(4, int(max(0.0, vol1 - V17_2_MIN_VOL1) * 2))
-    score += min(4, int(max(0.0, range1 - V17_2_MIN_RANGE1) * 2))
-    score = max(V17_2_A_MIN_SCORE, min(100, score))
-    grade = "A+" if score >= V17_2_A_PLUS_MIN_SCORE else "A"
-    level = (
-        min(row["low"] for row in c1[-12:])
-        if side == "LONG"
-        else max(row["high"] for row in c1[-12:])
-    )
-    return {
-        "symbol": symbol,
-        "side": side,
-        "strategy": strategy,
-        "trade_type": trade_type,
-        "score": score,
-        "grade": grade,
-        "entry": price,
-        "level": level,
-        "reason": reason,
-        "pullback": 0.0,
-        "volume_ratio": vol5,
-        "range_ratio": range5,
-        "compression": prior_compression_ratio(c5),
-        "ch15m": ch15,
-        "ch30m": ch30,
-        "ch3m_1m": ch3,
-        "vol1": vol1,
-        "range1": range1,
-        "ch2m": percent_change(c1, 2),
-        "setup_mode": setup_mode,
-        "t1h": trend_state(c1h),
-        "btc_text": btc.get("text", ""),
-        "paper_setup_lane": lane,
-        "paper_validation_only": True,
-        "paper_validation_immediate": False,
-        "paper_validation_lane": PAPER_VALIDATION_REASON,
-        "watch_impulse": max(directional_3m, min_move),
-        "watch_pullback_min_fraction": pullback_fraction_min,
-        "watch_pullback_max_fraction": pullback_fraction_max,
-        "watch_pullback_abs_min": pullback_abs_min,
-        "watch_pullback_abs_max": pullback_abs_max,
-        "watch_recovery_required": recovery_required,
-        "watch_min_seconds": 12 if lane == "SWEEP_REVERSAL" else 15,
-        "watch_max_seconds": max_watch_seconds,
-        "watch_min_directional_3m": 0.0005,
-        "watch_min_directional_15m": min_directional_15m,
-        "watch_max_directional_15m": 0.0500,
-        "watch_max_chase": 0.0045 if lane == "CONTINUATION" else 0.0035,
-        "watch_min_vol1": 0.45,
-        "watch_max_vol1": V17_2_MAX_VOL1,
-        "watch_min_range1": 0.60,
-        "watch_min_range5": 0.60,
-        "liquidity_quote_60m": float(liquidity.get("quote_60m", 0.0) or 0.0),
-        "liquidity_rank_percentile": rank,
-        "liquidity_active_fraction": float(liquidity.get("active_fraction", 0.0) or 0.0),
-        "liquidity_unique_fraction": float(liquidity.get("unique_fraction", 0.0) or 0.0),
-        "atr1_pct": atr1_pct,
-        "normalized_directional_move": normalized_move,
-        "paper_validation_origin": reason,
-    }, "ok"
-
-
-def direct_measured_setup(
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-    c15: List[Dict[str, float]],
-    c1h: List[Dict[str, float]],
-    btc: Dict[str, Any],
-    side: str,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Independent V17.2.2 entry detector.
-
-    This path deliberately does not call ``instant_edge_setup`` or any legacy
-    trader template.  It first applies the one frozen archive hypothesis, then
-    demands evidence that the current 1m candle is still closing in the same
-    direction around EMA9/VWAP.  Execution liquidity and TP3 risk are checked
-    separately after this function returns.
-    """
-    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 30:
-        return None, "candles"
-    side = str(side).upper()
-    if side not in DIRECT_MEASURED_STRATEGIES:
-        return None, "side"
-
-    direction = 1.0 if side == "LONG" else -1.0
-    price = float(c1[-1]["close"])
-    last = c1[-1]
-    ch3 = percent_change(c1, 3)
-    ch15 = percent_change(c5, 3)
-    ch30 = percent_change(c5, 6)
-    directional_3m = direction * ch3
-    directional_15m = direction * ch15
-    directional_30m = direction * ch30
-    vol1 = volume_ratio(c1, 20)
-    range1 = candle_range_ratio(c1, 20)
-    vol5 = volume_ratio(c5, 20)
-    range5 = candle_range_ratio(c5, 20)
-
-    fixed_band = bool(
-        MEASURED_MIN_DIRECTIONAL_3M
-        <= directional_3m
-        <= MEASURED_MAX_DIRECTIONAL_3M
-        and MEASURED_MIN_DIRECTIONAL_15M
-        <= directional_15m
-        <= MEASURED_MAX_DIRECTIONAL_15M
-        and directional_30m <= MEASURED_MAX_30M_CHASE
-        and MEASURED_MIN_VOL1 <= vol1 <= MEASURED_MAX_VOL1
-        and MEASURED_MIN_RANGE1 <= range1 <= MEASURED_MAX_RANGE1
-        and MEASURED_MIN_VOL5 <= vol5 <= MEASURED_MAX_VOL5
-        and range5 >= MEASURED_MIN_RANGE5
-    )
-    if not fixed_band:
-        return None, "fixed_band"
-
-    location = close_location(last)
-    body_fraction = abs(last["close"] - last["open"]) / max(
-        last["high"] - last["low"], 1e-12
-    )
-    directional_candle = bool(
-        (side == "LONG" and last["close"] > last["open"])
-        or (side == "SHORT" and last["close"] < last["open"])
-    )
-    close_quality = bool(
-        location >= MEASURED_LONG_MIN_CLOSE_LOCATION
-        if side == "LONG"
-        else location <= MEASURED_SHORT_MAX_CLOSE_LOCATION
-    )
-    recent_closes = [float(row["close"]) for row in c1[-4:]]
-    directional_steps = sum(
-        1
-        for previous, current in zip(recent_closes, recent_closes[1:])
-        if direction * (current - previous) > 0
-    )
-    continuing_now = bool(
-        directional_steps >= 2
-        and direction * (recent_closes[-1] - recent_closes[-2]) > 0
-    )
-    ema9 = ema(closes(c1), 9)
-    current_vwap = vwap(c1, 30)
-    aligned = bool(
-        (side == "LONG" and price >= ema9 and price >= current_vwap)
-        or (side == "SHORT" and price <= ema9 and price <= current_vwap)
-    )
-    if not (
-        directional_candle
-        and close_quality
-        and body_fraction >= MEASURED_MIN_BODY_FRACTION
-        and continuing_now
-        and aligned
-    ):
-        return None, "current_structure"
-
-    score = 90
-    score += min(4, int(max(0.0, directional_3m - MEASURED_MIN_DIRECTIONAL_3M) * 250))
-    score += min(3, int(max(0.0, directional_15m - MEASURED_MIN_DIRECTIONAL_15M) * 100))
-    score += min(2, directional_steps - 1)
-    score += 1 if body_fraction >= 0.45 else 0
-    score = min(100, max(90, score))
-    level = (
-        min(row["low"] for row in c1[-10:])
-        if side == "LONG"
-        else max(row["high"] for row in c1[-10:])
-    )
-    reason = (
-        f"V17.2.2 DIRECT MEASURED {side}: frozen band + live continuation; "
-        f"3m {directional_3m*100:.2f}%, 15m {directional_15m*100:.2f}%, "
-        f"Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, Vol5 x{vol5:.2f}, "
-        f"Range5 x{range5:.2f}, closeLoc {location:.2f}, body {body_fraction:.2f}."
-    )
-    return {
-        "symbol": normalize_symbol(symbol),
-        "side": side,
-        "strategy": DIRECT_MEASURED_STRATEGIES[side],
-        "trade_type": f"DIRECT MEASURED A+ {side}",
-        "score": score,
-        "grade": "A+",
-        "entry": price,
-        "level": level,
-        "reason": reason,
-        "pullback": 0.0,
-        "volume_ratio": vol5,
-        "range_ratio": range5,
-        "compression": prior_compression_ratio(c5),
-        "ch15m": ch15,
-        "ch30m": ch30,
-        "ch3m_1m": ch3,
-        "vol1": vol1,
-        "range1": range1,
-        "ch2m": percent_change(c1, 2),
-        "setup_mode": f"V17_2_2_DIRECT_MEASURED_{side}",
-        "t1h": trend_state(c1h),
-        "btc_text": btc.get("text", ""),
-        "paper_setup_lane": "DIRECT_MEASURED",
-        "paper_validation_only": True,
-        "paper_validation_immediate": True,
-        "paper_validation_lane": PAPER_VALIDATION_REASON,
-        "watch_impulse": directional_3m,
-        "paper_validation_origin": reason,
-    }, "direct_band_and_structure_passed"
-
-
-def direct_measured_risk_gate(
-    trade: Dict[str, Any],
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-) -> Tuple[bool, str]:
-    """V17.2.2 safety check aligned with the TP3 accounting rule."""
-    entry = float(trade.get("entry", 0.0) or 0.0)
-    sl = float(trade.get("sl", entry) or entry)
-    if entry <= 0:
-        return False, "invalid entry"
-    sl_move = abs(entry - sl) / entry
-    tp3_rr = TP3_MOVE / max(sl_move, 1e-12)
-    if not LOCAL_SCALP_MIN_SL_MOVE <= sl_move <= LOCAL_SCALP_MAX_SL_MOVE * 1.02:
-        return False, f"local SL {sl_move*100:.2f}% outside safety band"
-    if tp3_rr < 1.25:
-        return False, f"TP3 RR {tp3_rr:.2f} < 1.25"
-    if float(trade.get("ladder_rr", 0.0) or 0.0) < 1.20:
-        return False, f"ladder RR {float(trade.get('ladder_rr', 0.0) or 0.0):.2f} < 1.20"
-    recent_high = max(row["high"] for row in c5[-6:])
-    recent_low = min(row["low"] for row in c5[-6:])
-    recent_range = (recent_high - recent_low) / entry
-    atr_capacity = atr(c5, 14) / entry * 3.0
-    feasible_move = max(recent_range, atr_capacity)
-    if feasible_move < TP3_MOVE * 0.75:
-        return False, (
-            f"TP3 capacity {feasible_move*100:.2f}% < "
-            f"{TP3_MOVE*0.75*100:.2f}%"
-        )
-    return True, (
-        f"direct TP3 risk passed: SL {sl_move*100:.2f}%, TP3 RR {tp3_rr:.2f}, "
-        f"capacity {feasible_move*100:.2f}%, ladder RR "
-        f"{float(trade.get('ladder_rr', 0.0) or 0.0):.2f}"
-    )
-
-
-def v17_2_paper_risk_gate(
-    trade: Dict[str, Any],
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-) -> Tuple[bool, str]:
-    """Risk/feasibility gate aligned to TP3, the actual success definition."""
-    entry = float(trade.get("entry", 0.0) or 0.0)
-    sl = float(trade.get("sl", entry) or entry)
-    if entry <= 0:
-        return False, "bad entry"
-    sl_move = abs(entry - sl) / entry
-    if sl_move > LOCAL_SCALP_MAX_SL_MOVE * 1.10:
-        return False, f"local SL too wide {sl_move*100:.2f}%"
-    if float(trade.get("ladder_rr", 0.0) or 0.0) < MIN_LADDER_RR_HARD:
-        return False, f"ladder RR too low {float(trade.get('ladder_rr', 0.0) or 0.0):.2f}"
-    if float(trade.get("final_rr", 0.0) or 0.0) < MIN_FINAL_RR_HARD:
-        return False, f"final RR too low {float(trade.get('final_rr', 0.0) or 0.0):.2f}"
-    recent_high = max(row["high"] for row in c5[-6:])
-    recent_low = min(row["low"] for row in c5[-6:])
-    recent_range = (recent_high - recent_low) / entry
-    atr_move = atr(c5, 14) / entry
-    feasible_move = max(recent_range, atr_move * 3.0)
-    if feasible_move < TP3_MOVE * 0.75:
-        return False, (
-            f"TP3 feasibility weak: recent/ATR capacity {feasible_move*100:.2f}% "
-            f"< {TP3_MOVE*0.75*100:.2f}%"
-        )
-    return True, (
-        f"V17.2 risk passed: SL {sl_move*100:.2f}%, capacity {feasible_move*100:.2f}%, "
-        f"ladder RR {float(trade.get('ladder_rr', 0.0) or 0.0):.2f}"
-    )
-
-
-def measured_edge_entry_gate(
-    setup: Dict[str, Any],
-    symbol: str,
-    c1: List[Dict[str, float]],
-    c5: List[Dict[str, float]],
-) -> Tuple[bool, str]:
-    """Frozen V17.2.2 cohort and real execution-cost check.
-
-    The measured candle band comes from the complete archive; the order-book
-    check is new forward evidence and is intentionally unavailable to the old
-    rows.  A candidate must pass both.  No parameter in this function is
-    changed automatically while the 50-outcome cohort is being collected.
-    """
-    side = str(setup.get("side", "")).upper()
-    direction = 1.0 if side == "LONG" else -1.0
-    grade = str(setup.get("grade", "B")).upper()
-    strategy = str(setup.get("strategy", "")).upper()
-    directional_3m = direction * float(setup.get("ch3m_1m", 0.0) or 0.0)
-    directional_15m = direction * float(setup.get("ch15m", 0.0) or 0.0)
-    vol1 = float(setup.get("vol1", 0.0) or 0.0)
-    range1 = float(setup.get("range1", 0.0) or 0.0)
-    vol5 = float(setup.get("volume_ratio", 0.0) or 0.0)
-    range5 = float(setup.get("range_ratio", 0.0) or 0.0)
-
-    failures: List[str] = []
-    if grade != "A+":
-        failures.append("grade is not A+")
-    if strategy != DIRECT_MEASURED_STRATEGIES.get(side, ""):
-        failures.append("not PRO_DIRECT_MEASURED")
-    if not MEASURED_MIN_VOL1 <= vol1 <= MEASURED_MAX_VOL1:
-        failures.append(
-            f"Vol1 x{vol1:.2f} outside x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f}"
-        )
-    if not MEASURED_MIN_RANGE1 <= range1 <= MEASURED_MAX_RANGE1:
-        failures.append(
-            f"Range1 x{range1:.2f} outside x{MEASURED_MIN_RANGE1:.2f}–x{MEASURED_MAX_RANGE1:.2f}"
-        )
-    if not MEASURED_MIN_DIRECTIONAL_3M <= directional_3m <= MEASURED_MAX_DIRECTIONAL_3M:
-        failures.append(
-            f"directional 3m {directional_3m*100:.2f}% outside "
-            f"{MEASURED_MIN_DIRECTIONAL_3M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_3M*100:.2f}%"
-        )
-    if not MEASURED_MIN_DIRECTIONAL_15M <= directional_15m <= MEASURED_MAX_DIRECTIONAL_15M:
-        failures.append(
-            f"directional 15m {directional_15m*100:.2f}% outside "
-            f"{MEASURED_MIN_DIRECTIONAL_15M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_15M*100:.2f}%"
-        )
-    if not MEASURED_MIN_VOL5 <= vol5 <= MEASURED_MAX_VOL5:
-        failures.append(
-            f"Vol5 x{vol5:.2f} outside x{MEASURED_MIN_VOL5:.2f}–x{MEASURED_MAX_VOL5:.2f}"
-        )
-    if range5 < MEASURED_MIN_RANGE5:
-        failures.append(f"Range5 x{range5:.2f} < x{MEASURED_MIN_RANGE5:.2f}")
-    if failures:
-        return False, "; ".join(failures)
-
-    liquidity = candle_liquidity_snapshot(symbol, c1, c5)
-    cached = LIQUIDITY_SCAN_CACHE.get(normalize_symbol(symbol), {})
-    rank = float(cached.get("rank_percentile", 0.0) or 0.0)
-    quote_60m = float(liquidity.get("quote_60m", 0.0) or 0.0)
-    if not bool(liquidity.get("ok")):
-        return False, f"liquidity continuity rejected: {liquidity.get('reason', 'unknown')}"
-    if rank < MEASURED_MIN_LIQUIDITY_RANK:
-        return False, f"liquidity rank p{rank*100:.0f} below p{MEASURED_MIN_LIQUIDITY_RANK*100:.0f}"
-    if quote_60m < MEASURED_MIN_QUOTE_60M:
-        return False, (
-            f"60m quote-turnover proxy {quote_60m:.0f} < {MEASURED_MIN_QUOTE_60M:.0f}"
-        )
-
-    book = execution_book_snapshot(symbol)
-    spread_bps = float(book.get("spread_bps", 999.0) or 999.0)
-    depth_usdt = float(book.get("depth_usdt", 0.0) or 0.0)
-    if not bool(book.get("ok")):
-        return False, str(book.get("reason", "order book unavailable"))
-    if spread_bps > MEASURED_MAX_BOOK_SPREAD_BPS:
-        return False, (
-            f"spread {spread_bps:.1f} bps > {MEASURED_MAX_BOOK_SPREAD_BPS:.1f} bps"
-        )
-    if depth_usdt < MEASURED_MIN_BOOK_DEPTH_USDT:
-        return False, (
-            f"visible depth {depth_usdt:.0f} USDT < {MEASURED_MIN_BOOK_DEPTH_USDT:.0f}"
-        )
-
-    mark_entry = float(setup.get("entry", 0.0) or 0.0)
-    executable_entry = float(
-        book.get("ask" if side == "LONG" else "bid", mark_entry) or mark_entry
-    )
-    if executable_entry <= 0:
-        return False, "invalid executable bid/ask"
-    setup["execution_mark_entry"] = mark_entry
-    setup["entry"] = executable_entry
-    setup["book_spread_bps"] = spread_bps
-    setup["book_depth_usdt"] = depth_usdt
-    setup["liquidity_quote_60m"] = quote_60m
-    setup["liquidity_rank_percentile"] = rank
-    setup["liquidity_active_fraction"] = float(
-        liquidity.get("active_fraction", 0.0) or 0.0
-    )
-    setup["liquidity_unique_fraction"] = float(
-        liquidity.get("unique_fraction", 0.0) or 0.0
-    )
-    setup["atr1_pct"] = float(liquidity.get("atr1_pct", 0.0) or 0.0)
-    setup["normalized_directional_move"] = directional_3m / max(
-        float(setup["atr1_pct"] or 0.0), 1e-6
-    )
-    setup["paper_setup_lane"] = "DIRECT_MEASURED"
-    setup["watch_impulse"] = directional_3m
-    return True, (
-        f"direct measured cohort passed: Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
-        f"3m {directional_3m*100:.2f}%, 15m {directional_15m*100:.2f}%, "
-        f"spread {spread_bps:.1f} bps, depth {depth_usdt:.0f} USDT, liq p{rank*100:.0f}"
-    )
-
-
-def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
-    side = setup["side"]
-    entry = setup["entry"]
-    level = setup["level"]
-    a = atr(c5, 14)
-    instant = str(setup.get("setup_mode", "")).startswith("INSTANT")
-    buffer = max(entry * (0.0016 if instant else 0.0022), a * (0.55 if instant else SL_ATR_MULT))
-
-    if side == "LONG":
-        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
-        recent_low = min(x["low"] for x in recent_source)
-        sl = min(level, recent_low) - buffer
-        sl = min(sl, entry * (1 - MIN_SL_MOVE))
-        tp1 = entry * (1 + TP1_MOVE)
-        tp2 = entry * (1 + TP2_MOVE)
-        tp3 = entry * (1 + TP3_MOVE)
-        tp4 = entry * (1 + TP4_MOVE)
-        tp5 = entry * (1 + TP5_MOVE)
-    else:
-        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
-        recent_high = max(x["high"] for x in recent_source)
-        sl = max(level, recent_high) + buffer
-        sl = max(sl, entry * (1 + MIN_SL_MOVE))
-        tp1 = entry * (1 - TP1_MOVE)
-        tp2 = entry * (1 - TP2_MOVE)
-        tp3 = entry * (1 - TP3_MOVE)
-        tp4 = entry * (1 - TP4_MOVE)
-        tp5 = entry * (1 - TP5_MOVE)
-
-    risk = abs(entry - sl)
-    risk_move = risk / max(entry, 1e-12)
-
-    # V13.29 professional scalp rule:
-    # The public trader examples use a far invalidation/averaging zone, but the signal itself
-    # must be managed by a local scalp stop. If the structural stop is too far, compress it
-    # to a local stop for fast execution instead of discarding every live dump candidate.
-    setup_mode = str(setup.get("setup_mode", ""))
-    if LOCAL_SCALP_STOP_ENABLED and risk_move > LOCAL_SCALP_MAX_SL_MOVE and setup_mode in LOCAL_STOP_MODES:
-        local_move = max(LOCAL_SCALP_MIN_SL_MOVE, min(LOCAL_SCALP_MAX_SL_MOVE, max(TP1_MOVE * 1.20, abs(float(setup.get("ch3m_1m", 0.0) or 0.0)) * 1.10)))
-        if side == "LONG":
-            sl = entry * (1 - local_move)
-        else:
-            sl = entry * (1 + local_move)
-        setup["local_stop_used"] = True
-        setup["original_sl_move"] = risk_move
-        risk = abs(entry - sl)
-        risk_move = risk / max(entry, 1e-12)
-
-    if risk_move > MAX_SL_MOVE:
-        return None
-
-    rewards = [abs(tp1 - entry), abs(tp2 - entry), abs(tp3 - entry), abs(tp4 - entry), abs(tp5 - entry)]
-    rr = rewards[0] / risk if risk > 0 else 0.0
-    ladder_rr = (sum(rewards) / len(rewards)) / risk if risk > 0 else 0.0
-    final_rr = rewards[-1] / risk if risk > 0 else 0.0
-    roi_tp1 = rewards[0] / entry * LEVERAGE * 100
-    roi_sl = risk / entry * LEVERAGE * 100
-
-    return {
-        **setup,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "tp4": tp4,
-        "tp5": tp5,
-        "rr": rr,
-        "ladder_rr": ladder_rr,
-        "final_rr": final_rr,
-        "roi_tp1": roi_tp1,
-        "roi_sl": roi_sl,
-        "risk_mult": A_RISK_MULT if setup["grade"] == "A+" else FAST_RISK_MULT,
-        "local_stop_used": bool(setup.get("local_stop_used", False)),
-        "original_sl_move": float(setup.get("original_sl_move", 0.0) or 0.0),
-        "created_at": now_ts(),
-        "status": "active",
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "tp3_hit": False,
-        "tp4_hit": False,
-        "tp5_hit": False,
-    }
-
-
-
-def professional_quality_gate(trade: Dict[str, Any], symbol: str) -> Tuple[bool, str, str]:
-    """Final professional quality filter.
-
-    This is intentionally hard. A fast scalp is not allowed when:
-    - stop risk is much larger than the reward ladder;
-    - TP5 does not at least compensate risk;
-    - live 1m volume is weak without a strong price/range exception;
-    - heavy/slow coins have wide SL and weak RR.
-    """
-    side = trade.get("side", "?")
-    base = base_asset(symbol)
-    rr = float(trade.get("rr", 0.0) or 0.0)
-    ladder_rr = float(trade.get("ladder_rr", 0.0) or 0.0)
-    final_rr = float(trade.get("final_rr", 0.0) or 0.0)
-    roi_sl = float(trade.get("roi_sl", 999.0) or 999.0)
-    vol1 = float(trade.get("vol1", 1.0) or 1.0)
-    range1 = float(trade.get("range1", 1.0) or 1.0)
-    ch3m = abs(float(trade.get("ch3m_1m", 0.0) or 0.0))
-
-    # Hard stop check is price-based first, because ROI depends on chosen leverage.
-    # At x20 a normal 1.1% local scalp stop looks like 22% ROI, which should not be blocked
-    # if final RR and ladder RR are healthy.
-    sl_price_move = roi_sl / max(LEVERAGE * 100.0, 1e-12)
-    if sl_price_move > LOCAL_SCALP_MAX_SL_MOVE * 1.10:
-        return False, "sl_price_too_high_block", f"{display_symbol(symbol)} {side}: SL price risk too high {sl_price_move*100:.2f}%"
-
-    if roi_sl > MAX_SCALP_SL_ROI:
-        return False, "sl_roi_too_high_block", f"{display_symbol(symbol)} {side}: SL risk too high {roi_sl:.1f}% ROI"
-
-    if rr < MIN_TP1_RR:
-        return False, "tp1_rr_hard_block", f"{display_symbol(symbol)} {side}: TP1 RR too weak {rr:.2f}"
-
-    if ladder_rr < MIN_LADDER_RR_HARD:
-        return False, "ladder_rr_hard_block", f"{display_symbol(symbol)} {side}: ladder RR too weak {ladder_rr:.2f}"
-
-    if final_rr < MIN_FINAL_RR_HARD:
-        return False, "final_rr_hard_block", f"{display_symbol(symbol)} {side}: final RR too weak {final_rr:.2f}"
-
-    if vol1 < MIN_LIVE_VOL_NORMAL:
-        strong_price_exception = (
-            vol1 >= MIN_LIVE_VOL_STRONG_PRICE
-            and ch3m >= STRONG_1M3_MOVE
-            and range1 >= STRONG_RANGE1
-        )
-        if not strong_price_exception:
-            return (
-                False,
-                "weak_live_volume_block",
-                f"{display_symbol(symbol)} {side}: weak live volume x{vol1:.2f}, 1m3 {ch3m*100:.2f}%, range1 x{range1:.2f}"
-            )
-
-    if base in HEAVY_BASES:
-        if roi_sl > HEAVY_MAX_SL_ROI:
-            return False, "heavy_coin_sl_block", f"{display_symbol(symbol)} {side}: heavy coin SL too wide {roi_sl:.1f}% ROI"
-        if final_rr < HEAVY_MIN_FINAL_RR:
-            return False, "heavy_coin_rr_block", f"{display_symbol(symbol)} {side}: heavy coin final RR too weak {final_rr:.2f}"
-        if vol1 < HEAVY_MIN_LIVE_VOL:
-            return False, "heavy_coin_volume_block", f"{display_symbol(symbol)} {side}: heavy coin live volume weak x{vol1:.2f}"
-
-    return True, "ok", "quality ok"
-
-
-
-def aero_style_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
-    """V13.27 AERO/PORTAL-style gate.
-
-    Looks for the specific trader structure:
-    - SHORT: recent upper pullback/stop-hunt -> loss of momentum -> 1m breakdown.
-    - LONG: recent lower sweep -> reclaim -> 1m breakout.
-
-    This does not replace RR/SL filters. It is a structure-quality exception so the bot
-    can catch examples-style trades without accepting random weak B signals.
-    """
-    if not AERO_STYLE_GATE_ENABLED:
-        return False, "aero_disabled", "aero-style disabled"
-    if len(c1) < 35 or len(c5) < 20:
-        return False, "aero_no_candles", f"{display_symbol(symbol)}: not enough candles for AERO-style gate"
-
-    side = str(trade.get("side", ""))
-    if side == "SHORT" and not AERO_SHORT_ENABLED:
-        return False, "aero_short_disabled", f"{display_symbol(symbol)} SHORT: AERO short disabled"
-    if side == "LONG" and not AERO_LONG_ENABLED:
-        return False, "aero_long_disabled", f"{display_symbol(symbol)} LONG: AERO long disabled"
-
-    entry = float(trade.get("entry", 0.0) or 0.0)
-    if entry <= 0:
-        return False, "aero_bad_entry", f"{display_symbol(symbol)} {side}: bad entry"
-
-    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
-    vol1 = float(trade.get("vol1", 1.0) or 1.0)
-    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
-    range1 = float(trade.get("range1", 1.0) or 1.0)
-    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
-    loc = close_location(c1[-1])
-    e1 = ema([x["close"] for x in c1[-25:]], 9)
-    e5 = ema([x["close"] for x in c5[-30:]], 9)
-    recent_1m = c1[-18:]
-    recent_5m = c5[-8:]
-    recent_high = max(x["high"] for x in recent_1m + recent_5m[-3:])
-    recent_low = min(x["low"] for x in recent_1m + recent_5m[-3:])
-    recent_range = (recent_high - recent_low) / max(entry, 1e-12)
-
-    if recent_range < AERO_MIN_RECENT_RANGE:
-        return False, "aero_recent_range_block", f"{display_symbol(symbol)} {side}: recent range too small {recent_range*100:.2f}%"
-    if vol1 < AERO_MIN_VOL1:
-        return False, "aero_vol1_block", f"{display_symbol(symbol)} {side}: vol1 too weak x{vol1:.2f}"
-    if vol5 < AERO_MIN_VOL5:
-        return False, "aero_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
-    if range1 < AERO_MIN_RANGE1:
-        return False, "aero_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
-    if range5 < AERO_MIN_RANGE5:
-        return False, "aero_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
-
-    if side == "SHORT":
-        pullback = (recent_high - entry) / max(entry, 1e-12)
-        if pullback < AERO_MIN_PULLBACK:
-            return False, "aero_pullback_block", f"{display_symbol(symbol)} SHORT: no upper pullback/reject; pullback {pullback*100:.2f}%"
-        if pullback > AERO_MAX_PULLBACK:
-            return False, "aero_spike_block", f"{display_symbol(symbol)} SHORT: spike too extreme {pullback*100:.2f}%"
-        if ch3m > -AERO_MIN_1M3:
-            return False, "aero_pressure_block", f"{display_symbol(symbol)} SHORT: no live breakdown 1m3 {ch3m*100:+.2f}%"
-        if loc > AERO_CLOSE_SHORT or c1[-1]["close"] >= c1[-1]["open"]:
-            return False, "aero_reject_close_block", f"{display_symbol(symbol)} SHORT: last 1m not rejected near low"
-        if c1[-1]["close"] >= min(x["low"] for x in c1[-7:-1]):
-            return False, "aero_breakdown_block", f"{display_symbol(symbol)} SHORT: no fresh local breakdown"
-        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] < e1 or c1[-1]["close"] < e5):
-            return False, "aero_ema_reject_block", f"{display_symbol(symbol)} SHORT: no EMA/VWAP-style rejection"
-        return True, "aero_style_short_ok", (
-            f"AERO-style SHORT ok: upper pullback/reject {pullback*100:.2f}%, "
-            f"live breakdown 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
-            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
-        )
-
-    if side == "LONG":
-        sweep = (entry - recent_low) / max(entry, 1e-12)
-        if sweep < AERO_MIN_PULLBACK:
-            return False, "aero_sweep_block", f"{display_symbol(symbol)} LONG: no lower sweep/reclaim; sweep {sweep*100:.2f}%"
-        if sweep > AERO_MAX_PULLBACK:
-            return False, "aero_spike_block", f"{display_symbol(symbol)} LONG: spike too extreme {sweep*100:.2f}%"
-        if ch3m < AERO_MIN_1M3:
-            return False, "aero_pressure_block", f"{display_symbol(symbol)} LONG: no live reclaim 1m3 {ch3m*100:+.2f}%"
-        if loc < AERO_CLOSE_LONG or c1[-1]["close"] <= c1[-1]["open"]:
-            return False, "aero_reclaim_close_block", f"{display_symbol(symbol)} LONG: last 1m not reclaimed near high"
-        if c1[-1]["close"] <= max(x["high"] for x in c1[-7:-1]):
-            return False, "aero_breakout_block", f"{display_symbol(symbol)} LONG: no fresh local breakout"
-        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] > e1 or c1[-1]["close"] > e5):
-            return False, "aero_ema_reclaim_block", f"{display_symbol(symbol)} LONG: no EMA/VWAP-style reclaim"
-        return True, "aero_style_long_ok", (
-            f"AERO-style LONG ok: lower sweep/reclaim {sweep*100:.2f}%, "
-            f"live reclaim 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
-            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
-        )
-
-    return False, "aero_side_block", f"{display_symbol(symbol)}: unknown side {side}"
-
-def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
-    """Example-style final gate.
-
-    The goal is to block signals that are technically valid but not trader-quality:
-    - weak B-class entries with no live volume;
-    - tiny or stale continuation;
-    - counter-direction entries without true reversal strength;
-    - target ladders that require more movement than the recent market has shown;
-    - heavy coins unless the setup is genuinely A+.
-    """
-    if not TRADER_PATTERN_GATE_ENABLED:
-        return True, "ok", "trader pattern gate disabled"
-
-    side = str(trade.get("side", ""))
-    base = base_asset(symbol)
-    score = int(trade.get("score", 0) or 0)
-    grade = str(trade.get("grade", "B"))
-    setup_mode = str(trade.get("setup_mode", ""))
-    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
-    ch15m = float(trade.get("ch15m", 0.0) or 0.0)
-    ch30m = float(trade.get("ch30m", 0.0) or 0.0)
-    vol1 = float(trade.get("vol1", 1.0) or 1.0)
-    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
-    range1 = float(trade.get("range1", 1.0) or 1.0)
-    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
-    entry = float(trade.get("entry", 0.0) or 0.0)
-    tp5 = float(trade.get("tp5", 0.0) or 0.0)
-
-    aero_ok, aero_block, aero_reason = aero_style_gate(trade, symbol, c1, c5, c15, btc)
-
-    if grade != "A+" and not TRADER_ALLOW_B_SCORE:
-        return False, "trader_grade_block", f"{display_symbol(symbol)} {side}: B-class skipped by env; set TRADER_ALLOW_B_SCORE=true to allow B+"
-
-    if score < TRADER_MIN_SCORE:
-        if not (aero_ok and AERO_ALLOW_B_SCORE and score >= max(72, TRADER_MIN_SCORE - 10)):
-            return False, "trader_score_block", f"{display_symbol(symbol)} {side}: trader score too low {score} < {TRADER_MIN_SCORE}"
-
-    # Balanced B+ mode: B setups are allowed, but only if the current tape is alive.
-    # This keeps the bot from going silent while still blocking random weak B entries.
-    if grade != "A+":
-        if abs(ch3m) < TRADER_MIN_ABS_1M3 * 1.20 and vol1 < TRADER_MIN_VOL1 * 1.20 and range1 < TRADER_MIN_RANGE1 * 1.15:
-            if not aero_ok:
-                return False, "trader_bplus_quality_block", (
-                    f"{display_symbol(symbol)} {side}: B+ not strong enough; 1m3 {ch3m*100:+.2f}%, "
-                    f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
-                )
-
-    if base in HEAVY_BASES and TRADER_HEAVY_ONLY_A_PLUS and grade != "A+":
-        return False, "trader_heavy_grade_block", f"{display_symbol(symbol)} {side}: heavy coin requires A+"
-
-    # Directional pressure must exist now. Examples are not slow predictions.
-    if side == "LONG":
-        if ch3m < TRADER_MIN_ABS_1M3:
-            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} LONG: weak live pressure 1m3 {ch3m*100:+.2f}%"
-        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] <= c5[-2]["close"]:
-            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} LONG: last 5m not confirming up"
-        if close_location(c1[-1]) < TRADER_CLOSE_LONG:
-            return False, "trader_close_location_block", f"{display_symbol(symbol)} LONG: 1m close not near high"
-        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] <= max(x["high"] for x in c1[-6:-1]):
-            return False, "trader_micro_break_block", f"{display_symbol(symbol)} LONG: no fresh 1m high break"
-        aligned = ch15m >= TRADER_MIN_ABS_15M and ch30m >= -TRADER_MAX_COUNTER_30M
-        reversal_exception = setup_mode.startswith("REVERSAL") and ch3m >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
-    else:
-        if ch3m > -TRADER_MIN_ABS_1M3:
-            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} SHORT: weak live pressure 1m3 {ch3m*100:+.2f}%"
-        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] >= c5[-2]["close"]:
-            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} SHORT: last 5m not confirming down"
-        if close_location(c1[-1]) > TRADER_CLOSE_SHORT:
-            return False, "trader_close_location_block", f"{display_symbol(symbol)} SHORT: 1m close not near low"
-        dump_exception = setup_mode.startswith("MARKET_DUMP") and ch3m <= -TRADER_MIN_ABS_1M3 * 1.10 and range1 >= max(0.45, TRADER_MIN_RANGE1 * 0.60)
-        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] >= min(x["low"] for x in c1[-6:-1]) and not dump_exception:
-            return False, "trader_micro_break_block", f"{display_symbol(symbol)} SHORT: no fresh 1m low break"
-        aligned = ch15m <= -TRADER_MIN_ABS_15M and ch30m <= TRADER_MAX_COUNTER_30M
-        reversal_exception = setup_mode.startswith("REVERSAL") and abs(ch3m) >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
-
-    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok or setup_mode.startswith("MARKET_DUMP")):
-        return False, "trader_structure_block", (
-            f"{display_symbol(symbol)} {side}: weak structure; 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, mode {setup_mode}"
-        )
-
-    if vol1 < TRADER_MIN_VOL1 and not aero_ok:
-        return False, "trader_vol1_block", f"{display_symbol(symbol)} {side}: live vol1 too weak x{vol1:.2f}"
-    if vol5 < TRADER_MIN_VOL5 and not aero_ok:
-        return False, "trader_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
-    if range1 < TRADER_MIN_RANGE1 and not aero_ok:
-        return False, "trader_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
-    if range5 < TRADER_MIN_RANGE5 and not aero_ok:
-        return False, "trader_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
-
-    # TP5 should be plausible from current market expansion, not a fantasy target.
-    if entry > 0 and tp5 > 0:
-        need = abs(entry - tp5) / entry
-        recent_move = max(abs(ch15m), abs(ch30m), abs(percent_change(c5, 6)))
-        if recent_move < need * TRADER_MIN_TP5_FEASIBILITY:
-            return False, "trader_tp5_feasibility_block", (
-                f"{display_symbol(symbol)} {side}: TP5 move {need*100:.2f}% not feasible vs recent {recent_move*100:.2f}%"
-            )
-
-    style_note = aero_reason if aero_ok else "standard trader-pattern ok"
-    return True, "ok", (
-        f"{style_note}; score {score}, grade {grade}, 1m3 {ch3m*100:+.2f}%, "
-        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, vol1 x{vol1:.2f}, range1 x{range1:.2f}"
-    )
-
-def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
-    t = now_ts()
-    if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
-        return False, "pair cooldown"
-    if t < STATE.setdefault("strategy_cooldown", {}).get(strategy, 0):
-        return False, "strategy cooldown"
-    return True, "ok"
-
-
-def _prune_live_send_history(current_ts: Optional[int] = None) -> List[Dict[str, Any]]:
-    current = int(current_ts or now_ts())
-    cutoff = current - 24 * 60 * 60
-    raw_history = STATE.setdefault("live_send_history", [])
-    if not raw_history:
-        raw_history = [
-            {"ts": value, "side": "UNKNOWN", "model_version": 0}
-            for value in STATE.setdefault("live_send_timestamps", [])
-        ]
-    cleaned: List[Dict[str, Any]] = []
-    for value in raw_history:
-        try:
-            if isinstance(value, dict):
-                timestamp = int(value.get("ts", 0) or 0)
-                side = str(value.get("side", "UNKNOWN")).upper()
-                model_version = int(value.get("model_version", 0) or 0)
-            else:
-                timestamp = int(value)
-                side = "UNKNOWN"
-                model_version = 0
-        except Exception:
-            continue
-        if timestamp > cutoff:
-            cleaned.append(
-                {"ts": timestamp, "side": side, "model_version": model_version}
-            )
-    cleaned.sort(key=lambda item: int(item["ts"]))
-    STATE["live_send_history"] = cleaned
-    STATE["live_send_timestamps"] = [int(item["ts"]) for item in cleaned]
-    return cleaned
-
-
-def live_signal_budget_24h(current_ts: Optional[int] = None) -> Dict[str, Any]:
-    current = int(current_ts or now_ts())
-    history = _prune_live_send_history(current)
-    side_counts = {"LONG": 0, "SHORT": 0}
-    adaptive_count = 0
-    for item in history:
-        side = str(item.get("side", "UNKNOWN")).upper()
-        if side in side_counts:
-            side_counts[side] += 1
-        if int(item.get("model_version", 0) or 0) > 0:
-            adaptive_count += 1
-    total = len(history)
-    last_ts = int(history[-1]["ts"]) if history else 0
-    spacing_left = max(0, MIN_LIVE_SIGNAL_SPACING_SECONDS - (current - last_ts))
-    return {
-        "total": total,
-        "remaining": 10**9 if MAX_LIVE_SIGNALS_24H <= 0 else max(0, MAX_LIVE_SIGNALS_24H - total),
-        "long": side_counts["LONG"],
-        "short": side_counts["SHORT"],
-        "adaptive": adaptive_count,
-        "spacing_left": spacing_left,
-        "last_ts": last_ts,
-    }
-
-
-def data_entry_quality_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
-    """Joint entry rule validated on chronological slices of the saved 100 outcomes."""
-    if not DATA_ENTRY_GATE_ENABLED:
-        return True, "data entry gate disabled"
-    side = str(trade.get("side", "")).upper()
-    direction = 1.0 if side == "LONG" else -1.0
-    vol1 = float(trade.get("vol1", 0.0) or 0.0)
-    range1 = float(trade.get("range1", 0.0) or 0.0)
-    directional_3m = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
-    failures: List[str] = []
-    if vol1 < DATA_MIN_VOL1:
-        failures.append(f"Vol1 x{vol1:.2f} < x{DATA_MIN_VOL1:.2f}")
-    if range1 < DATA_MIN_RANGE1:
-        failures.append(f"Range1 x{range1:.2f} < x{DATA_MIN_RANGE1:.2f}")
-    if directional_3m < DATA_MIN_DIRECTIONAL_3M:
-        failures.append(
-            f"directional 3m {directional_3m*100:.2f}% < {DATA_MIN_DIRECTIONAL_3M*100:.2f}%"
-        )
-    accepted = not failures
-    reason = (
-        f"data gate passed: Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
-        f"directional 3m {directional_3m*100:.2f}%"
-        if accepted
-        else "data gate blocked: " + "; ".join(failures)
-    )
-    trade["data_entry_gate_accepted"] = accepted
-    trade["data_entry_gate_reason"] = reason
-    return accepted, reason
-
-
-def paper_pullback_challenger_eligible(trade: Dict[str, Any]) -> bool:
-    """Select the fixed V17.1 moderate-impulse cohort for WATCH, never LIVE."""
-    side = str(trade.get("side", "")).upper()
-    direction = 1.0 if side == "LONG" else -1.0
-    directional_3m = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
-    directional_15m = direction * float(trade.get("ch15m", 0.0) or 0.0)
-    vol1 = float(trade.get("vol1", 0.0) or 0.0)
-    range1 = float(trade.get("range1", 0.0) or 0.0)
-    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 0.0)) or 0.0)
-    common = bool(
-        PAPER_VALIDATION_ENABLED
-        and PAPER_PULLBACK_CHALLENGER_ENABLED
-        and side in PAPER_INSTANT_STRATEGIES
-        and str(trade.get("strategy", "")).upper() == PAPER_INSTANT_STRATEGIES[side]
-        and str(trade.get("grade", "")).upper() == "A+"
-        and PAPER_EDGE_MIN <= directional_3m <= PAPER_EDGE_MAX
-        and directional_15m <= PAPER_MAX_DIRECTIONAL_15M
-        and DATA_MIN_VOL1 <= vol1 <= PAPER_MAX_VOL1
-        and range1 >= DATA_MIN_RANGE1
-    )
-    if not common:
-        return False
-    if side == "LONG":
-        return bool(
-            directional_15m >= PAPER_LONG_MIN_DIRECTIONAL_15M
-            and PAPER_LONG_MIN_VOL5 <= vol5 <= PAPER_LONG_MAX_VOL5
-        )
-    return bool(
-        directional_3m >= PAPER_SHORT_MIN_DIRECTIONAL_3M
-        and directional_15m >= PAPER_SHORT_MIN_DIRECTIONAL_15M
-    )
-
-
-def paper_symbol_independence_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
-    """Prevent one coin/impulse from masquerading as independent evidence."""
-    symbol = normalize_symbol(str(trade.get("symbol", "?")))
-    for item in STATE.setdefault("pending_signals", []):
-        if (
-            normalize_symbol(str(item.get("symbol", "?"))) == symbol
-            and bool(item.get("paper_validation_only"))
-        ):
-            return False, "same symbol already awaiting PAPER confirmation"
-    for item in STATE.setdefault("shadow_signals", []):
-        if (
-            normalize_symbol(str(item.get("symbol", "?"))) == symbol
-            and str(item.get("shadow_reason", "")) in {
-                PAPER_VALIDATION_REASON,
-                PAPER_CONTROL_REASON,
-            }
-        ):
-            return False, "same symbol already has an active confirmation/PAPER observation"
-
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        row = conn.execute(
-            "SELECT MAX(closed_at) AS last_closed FROM adaptive_trades "
-            "WHERE symbol=? AND COALESCE(decision_reason, '') IN (?, ?)",
-            (symbol, PAPER_VALIDATION_REASON, PAPER_CONTROL_REASON),
-        ).fetchone()
-    last_closed = int(row["last_closed"] or 0)
-    elapsed = max(0, now_ts() - last_closed) if last_closed else 10**9
-    if elapsed < max(0, PAPER_SYMBOL_COOLDOWN_SECONDS):
-        hours_left = (PAPER_SYMBOL_COOLDOWN_SECONDS - elapsed) / 3600.0
-        return False, f"independence cooldown: same symbol, retry in {hours_left:.1f}h"
-    return True, "independent symbol window passed"
-
-
-def strategy_circuit_breaker(trade: Dict[str, Any]) -> Tuple[bool, str]:
-    """Pause a weak strategy in LIVE while continuously rechecking it in SHADOW."""
-    strategy = str(trade.get("strategy", "?"))
-    if not STRATEGY_CIRCUIT_BREAKER_ENABLED:
-        return True, "strategy circuit breaker disabled"
-    init_adaptive_db()
-    window = max(1, STRATEGY_GUARD_WINDOW)
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT result, pnl_r FROM adaptive_trades WHERE strategy=? "
-            "ORDER BY id DESC LIMIT ?",
-            (strategy, window),
-        ).fetchall()
-    ordered = list(reversed(rows))
-    metrics = _outcome_metrics(ordered)
-    recovery_rows = ordered[-max(1, STRATEGY_RECOVERY_WINDOW):]
-    recovery = _outcome_metrics(recovery_rows)
-    enough = int(metrics["n"]) >= max(1, STRATEGY_GUARD_MIN_ROWS)
-    weak = (
-        enough
-        and float(metrics["expectancy_r"]) <= STRATEGY_GUARD_MAX_EXPECTANCY_R
-        and float(metrics["success_rate"]) <= STRATEGY_GUARD_MAX_SUCCESS_RATE
-    )
-    recovered = (
-        int(recovery["n"]) >= max(1, STRATEGY_RECOVERY_WINDOW)
-        and int(recovery["profit"]) >= max(1, STRATEGY_RECOVERY_MIN_PROFITS)
-        and float(recovery["expectancy_r"]) >= STRATEGY_RECOVERY_MIN_EXPECTANCY_R
-    )
-    forced_requalification = bool(
-        MARKET_DUMP_SHORT_REQUALIFY
-        and strategy == "PRO_MARKET_DUMP_SHORT"
-    )
-    accepted = bool(recovered if forced_requalification else (not weak or recovered))
-    reason = (
-        f"strategy guard passed: last {int(metrics['n'])}, {_metrics_line(metrics)}"
-        if accepted
-        else (
-            f"strategy LIVE paused until recovery: last {int(metrics['n'])}, "
-            f"{_metrics_line(metrics)}"
-            if forced_requalification
-            else f"strategy LIVE paused: last {int(metrics['n'])}, {_metrics_line(metrics)}"
-        )
-    )
-    trade["strategy_guard_accepted"] = accepted
-    trade["strategy_guard_reason"] = reason
-
-    statuses = STATE.setdefault("strategy_guard_status", {})
-    previous = statuses.get(strategy)
-    if previous is None or bool(previous.get("accepted", True)) != accepted:
-        statuses[strategy] = {
-            "accepted": accepted,
-            "reason": reason,
-            "updated_at": now_ts(),
-        }
-        save_state()
-        if not accepted:
-            send_telegram(
-                f"⏸ Стратегия временно переведена в SHADOW\n{strategy}\n{reason}\n"
-                "Новые исходы продолжают отслеживаться; восстановление автоматическое."
-            )
-        elif previous is not None:
-            send_telegram(
-                f"▶️ Стратегия восстановлена в LIVE\n{strategy}\n{reason}"
-            )
-    return accepted, reason
-
-
-def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
-    """Rebuild only the lightweight per-symbol streak state from saved rows."""
-    if not SYMBOL_QUARANTINE_ENABLED:
-        STATE["symbol_outcomes"] = {}
-        return {}
-    init_adaptive_db()
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT symbol, result, source, closed_at, decision_reason FROM adaptive_trades "
-            "ORDER BY closed_at ASC, id ASC"
-        ).fetchall()
-
-    outcomes: Dict[str, Any] = {}
-    for row in rows:
-        # Exploratory near-miss probes train the model, but must never punish or
-        # quarantine a symbol that was not actually eligible for LIVE.
-        decision_reason = str(row["decision_reason"] or "")
-        if decision_reason in {
-            "near_miss_probe",
-            PAPER_VALIDATION_REASON,
-            PAPER_CONTROL_REASON,
-            LEGACY_V17_2_1_PAPER_VALIDATION_REASON,
-            LEGACY_V17_2_1_CONTROL_REASON,
-            LEGACY_V17_1_PAPER_VALIDATION_REASON,
-            LEGACY_V17_1_CONTROL_REASON,
-            LEGACY_V17_PAPER_VALIDATION_REASON,
-            LEGACY_V17_CONTROL_REASON,
-            LEGACY_PAPER_VALIDATION_REASON,
-        } or decision_reason.startswith(("v16_9_", "v16_9_1_")):
-            continue
-        symbol = normalize_symbol(str(row["symbol"] or "?"))
-        item = outcomes.setdefault(
-            symbol,
-            {
-                "fail_streak": 0,
-                "quarantine_until": 0,
-                "observations": 0,
-                "last_result": "",
-                "last_source": "",
-                "updated_at": 0,
-            },
-        )
-        result = str(row["result"] or "expired")
-        closed_at = int(row["closed_at"] or 0)
-        item["observations"] = int(item.get("observations", 0) or 0) + 1
-        if result == "profit":
-            item["fail_streak"] = 0
-            item["quarantine_until"] = 0
-        else:
-            item["fail_streak"] = int(item.get("fail_streak", 0) or 0) + 1
-            if item["fail_streak"] >= max(1, SYMBOL_FAIL_LIMIT):
-                item["quarantine_until"] = closed_at + max(1, SYMBOL_QUARANTINE_SECONDS)
-        item["last_result"] = result
-        item["last_source"] = str(row["source"] or "live")
-        item["updated_at"] = closed_at
-    STATE["symbol_outcomes"] = outcomes
-    return outcomes
-
-
-def symbol_quarantine_gate(trade: Dict[str, Any]) -> Tuple[bool, str]:
-    symbol = normalize_symbol(str(trade.get("symbol", "?")))
-    item = STATE.setdefault("symbol_outcomes", {}).get(symbol) or {}
-    fail_streak = int(item.get("fail_streak", 0) or 0)
-    quarantine_until = int(item.get("quarantine_until", 0) or 0)
-    trade["symbol_fail_streak"] = fail_streak
-    trade["symbol_quarantine_until"] = quarantine_until
-
-    if not SYMBOL_QUARANTINE_ENABLED:
-        return True, "symbol quarantine disabled"
-    if now_ts() < quarantine_until:
-        hours_left = max(0.0, (quarantine_until - now_ts()) / 3600.0)
-        return False, (
-            f"symbol quarantine: {display_symbol(symbol)} has {fail_streak} consecutive "
-            f"non-profit outcomes; retry in {hours_left:.1f}h"
-        )
-    return True, f"symbol streak {fail_streak}/{max(1, SYMBOL_FAIL_LIMIT)}"
-
-
-def update_symbol_outcome_guard(
-    signal: Dict[str, Any], result: str, source: Optional[str] = None
-) -> Dict[str, Any]:
-    if not SYMBOL_QUARANTINE_ENABLED:
-        return {}
-    symbol = normalize_symbol(str(signal.get("symbol", "?")))
-    outcomes = STATE.setdefault("symbol_outcomes", {})
-    item = outcomes.setdefault(
-        symbol,
-        {
-            "fail_streak": 0,
-            "quarantine_until": 0,
-            "observations": 0,
-            "last_result": "",
-            "last_source": "",
-            "updated_at": 0,
-        },
-    )
-    item["observations"] = int(item.get("observations", 0) or 0) + 1
-    if result == "profit":
-        item["fail_streak"] = 0
-        item["quarantine_until"] = 0
-    else:
-        item["fail_streak"] = int(item.get("fail_streak", 0) or 0) + 1
-        if item["fail_streak"] >= max(1, SYMBOL_FAIL_LIMIT):
-            item["quarantine_until"] = now_ts() + max(1, SYMBOL_QUARANTINE_SECONDS)
-    item["last_result"] = result
-    item["last_source"] = str(source or signal.get("signal_source", "live"))
-    item["updated_at"] = now_ts()
-    save_state()
-    return dict(item)
-
-
-def analyze_symbol(
-    symbol: str,
-    btc: Dict[str, Any],
-    blocks: Dict[str, int],
-    near_miss: List[str],
-    allow_shadow_probe: bool = False,
-    shadow_probe_sink: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    symbol = normalize_symbol(symbol)
-    # Refresh the execution tape; reuse the slower 5m context collected by the
-    # hot scan. This removes one duplicate request per symbol without entering
-    # on stale 1m pressure.
-    c1 = get_klines(symbol, "1m", 120, cache_seconds=4)
-    c5 = get_klines(symbol, "5m", 120, cache_seconds=60)
-    c15 = get_klines(symbol, "15m", 120, cache_seconds=30)
-    c1h = get_klines(symbol, "1h", 120, cache_seconds=90)
-
-    if not c1 or not c5 or not c15 or not c1h:
-        blocks["no_candles"] = blocks.get("no_candles", 0) + 1
-        return None
-
-    if ultra_risk_symbol(symbol, c5, c15):
-        blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
-        return None
-
-    # V17.2.2 evaluates the frozen measured hypothesis directly.  It does not
-    # depend on instant_edge_setup or on the older trader-pattern templates,
-    # which were the reason V17.2.1 reported tens of thousands of checks but no
-    # started PAPER candidates.  New matches remain visible PAPER until the
-    # independent readiness gate is satisfied.
-    if PRO_QUALITY_FORWARD_ENABLED:
-        forward_candidates: List[Dict[str, Any]] = []
-        for side in ("LONG", "SHORT"):
-            if side == "LONG" and not ALLOW_LONG:
-                blocks["long_disabled"] = blocks.get("long_disabled", 0) + 1
-                continue
-            if side == "SHORT" and not ALLOW_SHORT:
-                blocks["short_disabled"] = blocks.get("short_disabled", 0) + 1
-                continue
-            setup, detector_reason = direct_measured_setup(
-                symbol, c1, c5, c15, c1h, btc, side
-            )
-            if not setup:
-                key = f"v17_2_2_{detector_reason}_{side.lower()}"
-                blocks[key] = blocks.get(key, 0) + 1
-                continue
-
-            audit_item = dict(setup)
-            audit_item["pending_started_at"] = now_ts()
-            record_watch_audit(audit_item, "started", detector_reason)
-
-            entry_ok, entry_reason = measured_edge_entry_gate(
-                setup, symbol, c1, c5
-            )
-            if not entry_ok:
-                blocks["v17_2_2_execution_block"] = blocks.get(
-                    "v17_2_2_execution_block", 0
-                ) + 1
-                record_watch_audit(
-                    audit_item, "rejected:execution_book", entry_reason
-                )
-                if len(near_miss) < 8:
-                    near_miss.append(
-                        f"{display_symbol(symbol)} {side}: {entry_reason}"
-                    )
-                continue
-            record_watch_audit(setup, "execution_passed", entry_reason)
-
-            trade = calculate_fast_trade(setup, c1, c5)
-            if not trade:
-                blocks["v17_2_2_sl_structure_block"] = blocks.get(
-                    "v17_2_2_sl_structure_block", 0
-                ) + 1
-                record_watch_audit(
-                    setup, "rejected:risk_rr", "trade construction failed"
-                )
-                continue
-
-            risk_ok, risk_reason = direct_measured_risk_gate(
-                trade, symbol, c1, c5
-            )
-            if not risk_ok:
-                blocks["v17_2_2_tp3_risk_block"] = blocks.get(
-                    "v17_2_2_tp3_risk_block", 0
-                ) + 1
-                record_watch_audit(trade, "rejected:risk_rr", risk_reason)
-                if len(near_miss) < 8:
-                    near_miss.append(
-                        f"{display_symbol(symbol)} {side}: {risk_reason}"
-                    )
-                continue
-
-            independent, independence_reason = paper_symbol_independence_gate(trade)
-            if not independent:
-                blocks["v17_2_2_correlated_repeat"] = blocks.get(
-                    "v17_2_2_correlated_repeat", 0
-                ) + 1
-                record_watch_audit(
-                    trade, "rejected:symbol_repeat", independence_reason
-                )
-                continue
-
-            trade["strategy"] = DIRECT_MEASURED_STRATEGIES[side]
-            trade["trade_type"] = f"DIRECT MEASURED A+ {side}"
-            trade["setup_mode"] = f"V17_2_2_DIRECT_MEASURED_{side}"
-            trade["paper_setup_lane"] = "DIRECT_MEASURED"
-            trade["paper_validation_lane"] = PAPER_VALIDATION_REASON
-            trade["paper_validation_immediate"] = True
-            trade["v17_2_risk_reason"] = risk_reason
-            trade["paper_validation_origin"] = (
-                f"V17.2.2 independent direct measured cohort · "
-                f"{detector_reason} · {entry_reason} · {risk_reason} · "
-                f"{independence_reason}"
-            )
-            # A promoted model may only influence a stable canary fraction of
-            # LIVE alerts.  It never removes a candidate from the visible PAPER
-            # baseline, which avoids selection bias in the next audit.
-            try:
-                adaptive_ok, adaptive_reason, adaptive_probability = adaptive_gate(
-                    trade
-                )
-                trade["adaptive_selection_reason"] = adaptive_reason
-                if adaptive_probability is not None:
-                    trade["adaptive_probability"] = adaptive_probability
-            except Exception as exc:
-                adaptive_ok = False
-                adaptive_reason = f"adaptive safety fallback to PAPER: {repr(exc)}"
-                trade["adaptive_selection_reason"] = adaptive_reason
-                STATE["last_error"] = adaptive_reason
-
-            readiness = real_money_readiness()
-            side_readiness = (
-                readiness.get("by_side", {}).get(side, {})
-                if isinstance(readiness.get("by_side", {}), dict)
-                else {}
-            )
-            side_ready = bool(side_readiness.get("ready"))
-            live_enabled = bool(
-                readiness.get("live_enabled") and side_ready and adaptive_ok
-            )
-            trade["paper_validation_only"] = not live_enabled
-            if live_enabled:
-                symbol_ok, symbol_reason = symbol_quarantine_gate(trade)
-                if not symbol_ok:
-                    blocks["micro_live_symbol_quarantine"] = blocks.get(
-                        "micro_live_symbol_quarantine", 0
-                    ) + 1
-                    live_enabled = False
-                    trade["paper_validation_only"] = True
-                    trade["adaptive_reason"] = (
-                        f"PAPER downgrade: {symbol_reason}"
-                    )
-                else:
-                    cooldown_allowed, cooldown_reason = cooldown_ok(
-                        symbol, trade["strategy"]
-                    )
-                    if not cooldown_allowed:
-                        blocks["micro_live_cooldown"] = blocks.get(
-                            "micro_live_cooldown", 0
-                        ) + 1
-                        live_enabled = False
-                        trade["paper_validation_only"] = True
-                        trade["adaptive_reason"] = (
-                            f"PAPER downgrade: {cooldown_reason}"
-                        )
-                    else:
-                        trade["symbol_quarantine_reason"] = symbol_reason
-                        trade["adaptive_reason"] = REAL_MONEY_LIVE_REASON
-                        trade["risk_mult"] = min(
-                            float(
-                                trade.get("risk_mult", MICRO_LIVE_RISK_MULT)
-                                or MICRO_LIVE_RISK_MULT
-                            ),
-                            MICRO_LIVE_RISK_MULT,
-                        )
-            else:
-                trade["adaptive_reason"] = (
-                    f"PAPER lock: {int(readiness.get('cumulative', {}).get('n', 0) or 0)}/"
-                    f"{REAL_MONEY_MIN_FORWARD} new outcomes; live flag={REAL_MONEY_SIGNALS}; "
-                    f"side {side} ready={side_ready}; model={adaptive_reason}"
-                )
-            forward_candidates.append(trade)
-            record_watch_audit(trade, "confirmed", risk_reason)
-            blocks["v17_2_2_direct_candidate"] = blocks.get(
-                "v17_2_2_direct_candidate", 0
-            ) + 1
-            if len(near_miss) < 8:
-                near_miss.append(
-                    f"{display_symbol(symbol)} {side}: DIRECT MEASURED A+ "
-                    f"{'micro-LIVE' if live_enabled else 'PAPER'} · "
-                    f"3m {float(trade.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}% · "
-                    f"spread {float(trade.get('book_spread_bps', 0.0) or 0.0):.1f} bps"
-                )
-        if not forward_candidates:
-            return None
-        forward_candidates.sort(
-            key=lambda row: (
-                str(row.get("grade", "A")) == "A+",
-                int(row.get("score", 0) or 0),
-                float(row.get("ladder_rr", 0.0) or 0.0),
-            ),
-            reverse=True,
-        )
-        return forward_candidates[0]
-
-    candidates: List[Dict[str, Any]] = []
-    shadow_observed = False
-    for side in ("LONG", "SHORT"):
-        if side == "LONG" and not ALLOW_LONG:
-            blocks["long_disabled"] = blocks.get("long_disabled", 0) + 1
-            continue
-        if side == "SHORT" and not ALLOW_SHORT:
-            blocks["short_disabled"] = blocks.get("short_disabled", 0) + 1
-            continue
-        setup = fast_burst_setup(symbol, c1, c5, c15, c1h, btc, side)
-        if not setup:
-            setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
-            if setup:
-                blocks[f"instant_edge_{side.lower()}"] = blocks.get(f"instant_edge_{side.lower()}", 0) + 1
-        if not setup and side == "SHORT":
-            setup = market_dump_short_setup(symbol, c1, c5, c15, c1h, btc)
-            if setup:
-                blocks["market_dump_short"] = blocks.get("market_dump_short", 0) + 1
-        if not setup:
-            setup = evidence_imbalance_setup(symbol, c1, c5, c15, c1h, btc, side)
-            if setup:
-                key = f"evidence_imbalance_{side.lower()}"
-                blocks[key] = blocks.get(key, 0) + 1
-        if not setup:
-            blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
-            continue
-
-        if side == "LONG":
-            long_stats_ok, long_stats_reason = long_live_stats_ok()
-            if not long_stats_ok and setup.get("grade") != "A+":
-                blocks["long_stats_protection_block"] = blocks.get("long_stats_protection_block", 0) + 1
-                if len(near_miss) < 8:
-                    near_miss.append(f"{display_symbol(symbol)} LONG: {long_stats_reason}; B-class long skipped")
-                continue
-
-        co, reason = cooldown_ok(symbol, setup["strategy"])
-        if not co:
-            blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
-            continue
-
-        trade = calculate_fast_trade(setup, c1, c5)
-        if not trade:
-            blocks["sl_too_far_block"] = blocks.get("sl_too_far_block", 0) + 1
-            if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side}: SL too far")
-            continue
-
-        if trade["score"] < B_MIN_SCORE:
-            blocks["score_block"] = blocks.get("score_block", 0) + 1
-            if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side}: score {trade['score']}, vol x{trade['volume_ratio']:.2f}, range x{trade['range_ratio']:.2f}")
-            continue
-
-        # V13.23 balanced professional quality gate.
-        # Still blocks XMR-style bad scalps: huge SL, weak RR, weak live volume.
-        # But thresholds are not over-tight, so the bot can remain alive during the day.
-        q_ok, q_block, q_reason = professional_quality_gate(trade, symbol)
-        if not q_ok:
-            blocks[q_block] = blocks.get(q_block, 0) + 1
-            if len(near_miss) < 8:
-                near_miss.append(q_reason)
-            continue
-
-        t_ok, t_block, t_reason = trader_pattern_gate(trade, symbol, c1, c5, c15, btc)
-        if not t_ok:
-            blocks[t_block] = blocks.get(t_block, 0) + 1
-            if len(near_miss) < 8:
-                near_miss.append(t_reason)
-            continue
-        trade["trader_pattern_reason"] = t_reason
-
-        # V17.1 fixed forward experiment. B and MARKET_DUMP are diagnostic rejects,
-        # not pseudo-trades. An eligible A+ INSTANT setup is first registered
-        # as a CONTROL observation, then must form a bounded pullback/reclaim
-        # before a separate PAPER entry exists.  Nothing in this block is LIVE.
-        if PRO_QUALITY_FORWARD_ENABLED:
-            grade = str(trade.get("grade", "B")).upper()
-            if grade != "A+":
-                blocks["v17_b_excluded_by_400_audit"] = blocks.get(
-                    "v17_b_excluded_by_400_audit", 0
-                ) + 1
-                continue
-
-            if str(trade.get("strategy", "")).upper() == "PRO_MARKET_DUMP_SHORT":
-                blocks["v17_market_dump_excluded_by_400_audit"] = blocks.get(
-                    "v17_market_dump_excluded_by_400_audit", 0
-                ) + 1
-                continue
-
-            direction = 1.0 if side == "LONG" else -1.0
-            directional_3m = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
-            if paper_pullback_challenger_eligible(trade):
-                independent, independence_reason = paper_symbol_independence_gate(trade)
-                if independent:
-                    trade["paper_validation_only"] = True
-                    trade["paper_validation_immediate"] = False
-                    trade["paper_validation_lane"] = PAPER_VALIDATION_REASON
-                    trade["watch_impulse"] = directional_3m
-                    trade["paper_validation_origin"] = (
-                        f"registered V17.1 moderate A+ INSTANT {side}: directional 3m "
-                        f"{directional_3m*100:+.2f}% · 15m/Vol1 ceilings passed · "
-                        "WATCH for dynamic pullback/reclaim · "
-                        f"{independence_reason}"
-                    )
-                    candidates.append(trade)
-                    blocks["v17_1_moderate_watch_candidate"] = blocks.get(
-                        "v17_1_moderate_watch_candidate", 0
-                    ) + 1
-                    if len(near_miss) < 8:
-                        near_miss.append(
-                            f"{display_symbol(symbol)} {side}: A+ WATCH awaiting pullback/reclaim · "
-                            f"3m {directional_3m*100:+.2f}%"
-                        )
-                    continue
-                blocks["v17_1_correlated_repeat"] = blocks.get(
-                    "v17_1_correlated_repeat", 0
-                ) + 1
-                trade["paper_validation_origin"] = independence_reason
-                continue
-
-            blocks["v17_1_moderate_gate_reject"] = blocks.get(
-                "v17_1_moderate_gate_reject", 0
-            ) + 1
-            trade["paper_validation_origin"] = (
-                "A+ did not pass the fixed V17.1 moderate impulse/volume gate"
-            )
-            continue
-
-        # V16.6: the joint Vol1/Range1/directional-move condition was the only
-        # compact entry filter with positive expectancy in both chronological
-        # development and holdout slices of the saved 100 outcomes. Rejected
-        # setups remain visible in SHADOW, so the rule can be challenged later.
-        data_ok, data_reason = data_entry_quality_gate(trade)
-        if not data_ok:
-            blocks["data_entry_gate_block"] = blocks.get("data_entry_gate_block", 0) + 1
-            shadow_observed = add_shadow_signal(trade, "data_entry_gate_block") or shadow_observed
-            if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side}: {data_reason}")
-            continue
-
-        strategy_ok, strategy_reason = strategy_circuit_breaker(trade)
-        if not strategy_ok:
-            blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
-            shadow_observed = add_shadow_signal(trade, "strategy_circuit_breaker") or shadow_observed
-            if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side}: {strategy_reason}")
-            continue
-
-        # V16.6: evaluate the transparent evidence rule first. A blocked trade
-        # is still followed in shadow, so the bot can measure missed winners and
-        # automatically roll the rule back. The symbol gate is evaluated on the
-        # same candidate and contributes its failure streak to adaptive features.
-        symbol_ok, symbol_reason = symbol_quarantine_gate(trade)
-        trade["symbol_quarantine_reason"] = symbol_reason
-        try:
-            evidence_ok, evidence_reason = evidence_guard(trade)
-            if not evidence_ok:
-                blocks["evidence_guard_block"] = blocks.get("evidence_guard_block", 0) + 1
-                shadow_observed = add_shadow_signal(trade, "evidence_guard_block") or shadow_observed
-                if len(near_miss) < 8:
-                    near_miss.append(f"{display_symbol(symbol)} {side}: {evidence_reason}")
-                continue
-        except Exception as e:
-            trade["evidence_guard_reason"] = f"evidence guard error bypass: {repr(e)}"
-            STATE["last_error"] = trade["evidence_guard_reason"]
-
-        if not symbol_ok:
-            blocks["symbol_quarantine_block"] = blocks.get("symbol_quarantine_block", 0) + 1
-            shadow_observed = add_shadow_signal(trade, "symbol_quarantine_block") or shadow_observed
-            if len(near_miss) < 8:
-                near_miss.append(f"{display_symbol(symbol)} {side}: {symbol_reason}")
-            continue
-
-        # Adaptive model starts in shadow mode. During warm-up it never blocks signals.
-        try:
-            adaptive_ok, adaptive_reason, adaptive_probability = adaptive_gate(trade)
-            trade["adaptive_reason"] = adaptive_reason
-            if adaptive_probability is not None:
-                trade["adaptive_probability"] = adaptive_probability
-            if not adaptive_ok:
-                blocks["adaptive_model_block"] = blocks.get("adaptive_model_block", 0) + 1
-                shadow_observed = add_shadow_signal(trade, "adaptive_model_block") or shadow_observed
-                if len(near_miss) < 8:
-                    near_miss.append(f"{display_symbol(symbol)} {side}: {adaptive_reason}")
-                continue
-        except Exception as e:
-            # Learning failure must never stop the market scanner.
-            trade["adaptive_reason"] = f"adaptive error bypass: {repr(e)}"
-            STATE["last_error"] = trade["adaptive_reason"]
-
-        candidates.append(trade)
-
-    # Optional measurement path: a strict no-setup scan can produce neither
-    # LIVE nor SHADOW rows. Observe only a bounded top-ranked near miss. This
-    # branch cannot return a candidate and therefore can never send a signal.
-    if not candidates and not shadow_observed and allow_shadow_probe:
-        probe_setup = near_miss_shadow_setup(symbol, c1, c5, c15, c1h, btc)
-        if probe_setup:
-            probe_trade = calculate_fast_trade(probe_setup, c1, c5)
-            if probe_trade:
-                data_entry_quality_gate(probe_trade)
-                if shadow_probe_sink is not None:
-                    with STATE_IO_LOCK:
-                        shadow_probe_sink.append(probe_trade)
-                elif add_shadow_signal(probe_trade, "near_miss_probe"):
-                    blocks["near_miss_shadow_added"] = blocks.get("near_miss_shadow_added", 0) + 1
-                    if len(near_miss) < 8:
-                        near_miss.append(
-                            f"{display_symbol(symbol)} {probe_trade['side']}: "
-                            f"saved to SHADOW only · {probe_trade['shadow_probe_live_gap']}"
-                        )
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
-    return candidates[0]
-
-# ============================================================
-# Formatting / scanning / tracking
-# ============================================================
-
-def format_price(x: Optional[float]) -> str:
-    if x is None:
-        return "-"
-    if x >= 100:
-        return f"{x:.2f}"
-    if x >= 1:
-        return f"{x:.5f}".rstrip("0").rstrip(".")
-    return f"{x:.8f}".rstrip("0").rstrip(".")
-
-
-def build_signal_message(s: Dict[str, Any]) -> str:
-    arrow = "🟢" if s["side"] == "LONG" else "🔴"
-    live_header = (
-        "🛡 ОГРАНИЧЕННЫЙ MICRO-LIVE СИГНАЛ — forward gate пройден\n"
-        if str(s.get("strategy", "")).startswith("PRO_DIRECT_MEASURED_")
-        else ""
-    )
-    return (
-        f"{live_header}{arrow} {s['side']} {display_symbol(s['symbol'])}\n"
-        f"Класс: {s['grade']} · Score {s['score']} · {s['trade_type']}\n"
-        f"Стратегия: {s['strategy']}\n\n"
-        f"Вход: {format_price(s['entry'])}\n"
-        f"TP1: {format_price(s['tp1'])} · ≈ {s['roi_tp1']:.1f}% ROI x{LEVERAGE}\n"
-        f"TP2: {format_price(s['tp2'])}\n"
-        f"TP3: {format_price(s['tp3'])}\n"
-        f"TP4: {format_price(s['tp4'])}\n"
-        f"TP5: {format_price(s['tp5'])}\n"
-        f"Учёт результата: TP1/TP2 промежуточные; profit только после TP3.\n"
-        f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
-        f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
-        f"Риск: multiplier x{s['risk_mult']:.2f}; для первого micro-LIVE рисковать не более 0.10% счёта\n"
-        f"Evidence guard: {s.get('evidence_guard_reason', 'not evaluated')}\n"
-        f"Symbol guard: {s.get('symbol_quarantine_reason', 'no history')}\n"
-        f"Adaptive: {s.get('adaptive_reason', 'warm-up')}\n\n"
-        f"📌 Логика:\n{s['reason']}\n"
-        f"15m: {s['ch15m']*100:+.2f}% · 30m: {s['ch30m']*100:+.2f}% · 1m3: {s['ch3m_1m']*100:+.2f}%\n"
-        f"Volume15 x{s['volume_ratio']:.2f} · Range5 x{s['range_ratio']:.2f} · Vol1 x{s.get('vol1', 1.0):.2f} · Range1 x{s.get('range1', 1.0):.2f}\n"
-        f"BTC: {s['btc_text']}\n\n"
-        f"⏱ Scalping rule: если за {FAST_MAX_MINUTES_TO_TP1} минут нет движения к TP1 — сигнал expired. Фаза рынка не важна; важна быстрая реализация."
-    )
-
-
-def build_paper_signal_message(s: Dict[str, Any]) -> str:
-    return (
-        "📋 PAPER-ВХОД V17.2.2 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
-        f"{s['side']} {display_symbol(s['symbol'])} · {s['grade']} · Score {s['score']}\n"
-        f"Линия: {s.get('paper_setup_lane', 'DIRECT_MEASURED')}\n"
-        f"Стратегия: {s['strategy']}\n"
-        "Статус: независимый A+ detector прошёл фиксированный диапазон, текущую структуру и проверку исполнения; только PAPER.\n\n"
-        f"Вход наблюдения: {format_price(s['entry'])}\n"
-        f"TP1: {format_price(s['tp1'])}\n"
-        f"TP2: {format_price(s['tp2'])}\n"
-        f"TP3: {format_price(s['tp3'])} · только здесь считается profit\n"
-        f"TP4: {format_price(s['tp4'])}\n"
-        f"TP5: {format_price(s['tp5'])}\n"
-        f"SL: {format_price(s['sl'])}\n\n"
-        f"Исполняемый вход: {'ASK' if s.get('side') == 'LONG' else 'BID'} · "
-        f"spread {float(s.get('book_spread_bps', 0.0) or 0.0):.1f} bps · "
-        f"видимая глубина ≈ {float(s.get('book_depth_usdt', 0.0) or 0.0):.0f} USDT\n"
-        f"Vol1 x{float(s.get('vol1', 0.0) or 0.0):.2f} · "
-        f"Range1 x{float(s.get('range1', 0.0) or 0.0):.2f} · "
-        f"3m {float(s.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}%\n"
-        f"Почему PAPER: {s.get('paper_validation_origin', 'forward challenger')}\n"
-        f"Следующий отчёт: {paper_progress_target(int(paper_validation_metrics().get('n', 0) or 0))} закрытых V17.2.2 PAPER."
-    )
-
-
-def build_paper_result_message(
-    signal: Dict[str, Any], result: str, closing_price: float
-) -> str:
-    labels = {
-        "profit": "✅ TP3+",
-        "sl": "❌ STOP LOSS",
-        "expired": "⏱ EXPIRED",
-    }
-    if bool(signal.get("protected_exit")):
-        labels["expired"] = "🛡 ЗАЩИТНЫЙ ВЫХОД ПОСЛЕ TP1"
-    pnl_r = _estimate_pnl_r(signal, result)
-    age_minutes = max(
-        0.0, (now_ts() - int(signal.get("created_at", now_ts()) or now_ts())) / 60.0
-    )
-    paper_metrics = paper_validation_metrics()
-    return (
-        f"📋 PAPER РЕЗУЛЬТАТ: {labels.get(result, result.upper())}\n"
-        f"{signal.get('side', '?')} {display_symbol(signal.get('symbol', '?'))}\n"
-        f"Стратегия: {signal.get('strategy', '?')}\n"
-        f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
-        f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
-        "Это результат подтверждённого виртуального входа, не реальная сделка.\n"
-        f"Direct Measured PAPER V17.2.2: {_metrics_line(paper_metrics)} · "
-        f"собрано {int(paper_metrics.get('n', 0))}/"
-        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
-        f"уникальных монет {int(paper_metrics.get('unique_symbols', 0))}."
-    )
-
-
-def build_control_signal_message(s: Dict[str, Any]) -> str:
-    return (
-        "🔬 SETUP WATCH V17.2 — ЭТО ЕЩЁ НЕ ВХОД\n"
-        f"{s.get('side', '?')} {display_symbol(s.get('symbol', '?'))} · "
-        f"{s.get('grade', '?')} · Score {s.get('score', '?')}\n"
-        f"Линия: {s.get('paper_setup_lane', 'CONTINUATION')}\n"
-        f"Исходный импульс: {s.get('strategy', '?')}\n"
-        f"Контрольная цена: {format_price(s.get('entry'))}\n"
-        f"3m: {float(s.get('watch_impulse', s.get('ch3m_1m', 0.0)) or 0.0)*100:+.2f}% · "
-        f"15m: {float(s.get('ch15m', 0.0) or 0.0)*100:+.2f}% · "
-        f"Vol1 x{float(s.get('vol1', 0.0) or 0.0):.2f} · "
-        f"Range1 x{float(s.get('range1', 0.0) or 0.0):.2f}\n"
-        f"Допустимый откат: "
-        f"{float(s.get('pending_min_pullback', 0.0) or 0.0)*100:.2f}%–"
-        f"{float(s.get('pending_max_pullback', 0.0) or 0.0)*100:.2f}%\n"
-        f"TP3 reference: {format_price(s.get('tp3'))} · SL reference: {format_price(s.get('sl'))}\n"
-        "Бот ждёт retest/reclaim. Если подтверждения не будет, PAPER-вход не создаётся. "
-        "Контрольная цена видима для аудита, но этот исход не обучает модель."
-    )
-
-
-def build_control_result_message(
-    signal: Dict[str, Any], result: str, closing_price: float
-) -> str:
-    labels = {"profit": "✅ TP3+", "sl": "❌ SL", "expired": "⏱ EXPIRED"}
-    return (
-        f"🔬 WATCH-КОНТРОЛЬ РЕЗУЛЬТАТ: {labels.get(result, result.upper())}\n"
-        f"{signal.get('side', '?')} {display_symbol(signal.get('symbol', '?'))}\n"
-        f"Контрольный импульс: {signal.get('strategy', '?')}\n"
-        f"Цена наблюдения: {format_price(signal.get('entry'))} · "
-        f"выход: {format_price(closing_price)}\n"
-        f"Итог: {_estimate_pnl_r(signal, result):+.3f}R.\n"
-        "Это парный контроль старого немедленного входа; он видим, но не обучает модель."
-    )
-
-
-def build_shadow_signal_message(s: Dict[str, Any]) -> str:
-    if str(s.get("shadow_reason", "")) == PAPER_CONTROL_REASON:
-        return build_control_signal_message(s)
-    return (
-        "👁 SHADOW-ВХОД — ВИДИМОЕ НАБЛЮДЕНИЕ, НЕ LIVE\n"
-        f"{s.get('side', '?')} {display_symbol(s.get('symbol', '?'))} · "
-        f"{s.get('grade', '?')} · Score {s.get('score', '?')}\n"
-        f"Стратегия: {s.get('strategy', '?')}\n"
-        f"Причина SHADOW: {s.get('shadow_reason', 'diagnostic observation')}\n\n"
-        f"Вход наблюдения: {format_price(s.get('entry'))}\n"
-        f"TP1: {format_price(s.get('tp1'))}\n"
-        f"TP2: {format_price(s.get('tp2'))}\n"
-        f"TP3: {format_price(s.get('tp3'))} · только TP3+ считается profit\n"
-        f"TP4: {format_price(s.get('tp4'))}\n"
-        f"TP5: {format_price(s.get('tp5'))}\n"
-        f"SL: {format_price(s.get('sl'))}\n"
-        "Бот сообщит TP3+, SL или expired отдельным уведомлением."
-    )
-
-
-def build_shadow_result_message(
-    signal: Dict[str, Any], result: str, closing_price: float
-) -> str:
-    if str(signal.get("shadow_reason", "")) == PAPER_CONTROL_REASON:
-        return build_control_result_message(signal, result, closing_price)
-    labels = {
-        "profit": "✅ TP3+",
-        "sl": "❌ STOP LOSS",
-        "expired": "⏱ EXPIRED",
-    }
-    pnl_r = _estimate_pnl_r(signal, result)
-    age_minutes = max(
-        0.0, (now_ts() - int(signal.get("created_at", now_ts()) or now_ts())) / 60.0
-    )
-    return (
-        f"👁 SHADOW РЕЗУЛЬТАТ: {labels.get(result, result.upper())}\n"
-        f"{signal.get('side', '?')} {display_symbol(signal.get('symbol', '?'))}\n"
-        f"Стратегия: {signal.get('strategy', '?')}\n"
-        f"Причина SHADOW: {signal.get('shadow_reason', 'diagnostic observation')}\n"
-        f"Вход: {format_price(signal.get('entry'))} · "
-        f"выход: {format_price(closing_price)}\n"
-        f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
-        "Это прозрачный виртуальный результат, не реальная сделка."
-    )
-
-
-def build_diagnostic(scan: Dict[str, Any]) -> str:
-    blocks = scan.get("blocks", {})
-    block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:12]]
-    hot = scan.get("hot_notes", [])[:8]
-    near = scan.get("near_miss", [])[:8]
-    control_metrics = control_validation_metrics()
-    paper_metrics = paper_validation_metrics()
-    readiness = real_money_readiness()
-    return (
-        f"🧪 Диагностика V17.2.3 Direct Measured + Readiness Hotfix\n"
-        f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
-        f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
-        f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
-        f"PAPER отправлено: {scan.get('paper_sent', 0)} · "
-        f"shadow новых: {scan.get('shadow_added', 0)} "
-        f"(near-miss {scan.get('near_miss_added', 0)}) · "
-        f"shadow активных: {scan.get('shadow_active', 0)} "
-        f"(near-miss {scan.get('near_miss_active', 0)}) · "
-        f"PAPER активных: {scan.get('paper_active', 0)} · "
-        f"время: {scan.get('elapsed', 0):.0f}с\n"
-        f"BTC: {scan.get('btc', 'unknown')}\n"
-        f"LIVE история: {wr_text(STATE.get('stats', {}).get('total', {}))}\n"
-        f"CONTROL V17.2.2: {_metrics_line(control_metrics)}\n"
-        f"DIRECT MEASURED PAPER V17.2.2: {_metrics_line(paper_metrics)} · "
-        f"{int(paper_metrics.get('n', 0))}/"
-        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))}\n"
-        f"Micro-LIVE readiness: ready={readiness.get('ready', False)} · "
-        f"env flag={readiness.get('live_flag', False)} · "
-        f"enabled={readiness.get('live_enabled', False)}\n"
-        f"{watch_audit_summary()}\n\n"
-        f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
-        f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
-        ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
-        f"\n\n{telegram_delivery_summary()}" +
-        f"\n\nLast error: {STATE.get('last_error', '')}"
-    )
-
-
-def ensure_signal_runtime_fields(signal: Dict[str, Any], source: str) -> None:
-    created_at = int(signal.get("created_at", now_ts()) or now_ts())
-    signal["created_at"] = created_at
-    signal.setdefault(
-        "signal_id",
-        f"{source}:{signal.get('symbol','?')}:{signal.get('side','?')}:"
-        f"{signal.get('strategy','?')}:{created_at}:{time.time_ns() % 1_000_000_000}",
-    )
-    signal["signal_source"] = source
-    signal.setdefault("mfe_r", 0.0)
-    signal.setdefault("mae_r", 0.0)
-    signal.setdefault("stats_recorded", None)
-
-
-def update_excursion(signal: Dict[str, Any], price: float) -> None:
-    entry = float(signal.get("entry", 0.0) or 0.0)
-    sl = float(signal.get("sl", entry) or entry)
-    risk = abs(entry - sl)
-    if entry <= 0 or risk <= 0:
-        return
-    direction = 1.0 if signal.get("side") == "LONG" else -1.0
-    move_r = direction * (price - entry) / risk
-    signal["mfe_r"] = max(float(signal.get("mfe_r", 0.0) or 0.0), move_r)
-    signal["mae_r"] = min(float(signal.get("mae_r", 0.0) or 0.0), move_r)
-    signal["last_observed_price"] = price
-    signal["last_observed_at"] = now_ts()
-
-
-def shadow_key(signal: Dict[str, Any]) -> str:
-    base = (
-        f"{signal.get('symbol','?')}:{signal.get('side','?')}:"
-        f"{signal.get('strategy','?')}"
-    )
-    lane = str(
-        signal.get("shadow_reason")
-        or signal.get("paper_validation_lane")
-        or ""
-    )
-    if lane in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON}:
-        return f"{base}:{lane}"
-    return base
-
-
-def remove_matching_shadow(signal: Dict[str, Any]) -> None:
-    key = shadow_key(signal)
-    STATE["shadow_signals"] = [
-        item for item in STATE.setdefault("shadow_signals", [])
-        if shadow_key(item) != key
-    ]
-
-
-def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
-    if not SHADOW_TRACKING_ENABLED:
-        return False
-    with STATE_IO_LOCK:
-        shadows = STATE.setdefault("shadow_signals", [])
-        protected_lane = reason in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON}
-        ordinary_limit = max(0, SHADOW_MAX_ACTIVE - max(0, SHADOW_PAPER_RESERVED_SLOTS))
-        if protected_lane and len(shadows) >= SHADOW_MAX_ACTIVE:
-            return False
-        if not protected_lane and len(shadows) >= ordinary_limit:
-            return False
-        if reason == "near_miss_probe":
-            active_probes = sum(
-                1 for item in shadows
-                if str(item.get("shadow_reason", "")) == "near_miss_probe"
-            )
-            if active_probes >= max(0, SHADOW_PROBE_MAX_ACTIVE):
-                return False
-        shadow = dict(signal)
-        shadow["shadow_reason"] = reason
-        key = shadow_key(shadow)
-        cooldowns = STATE.setdefault("shadow_cooldown", {})
-        if now_ts() < int(cooldowns.get(key, 0) or 0):
-            return False
-        if any(shadow_key(item) == key for item in shadows):
-            return False
-
-        ensure_signal_runtime_fields(shadow, "shadow")
-        shadow["stats_recorded"] = None
-        shadows.append(shadow)
-        cooldown_seconds = (
-            SHADOW_PROBE_COOLDOWN_SECONDS
-            if reason == "near_miss_probe"
-            else SHADOW_COOLDOWN_SECONDS
-        )
-        cooldowns[key] = now_ts() + max(0, cooldown_seconds)
-        save_state()
-    return True
-
-
-def set_confirmed_paper_signal(signal: Dict[str, Any]) -> bool:
-    """Add the confirmed reclaim PAPER entry beside its paired CONTROL."""
-    if not SHADOW_TRACKING_ENABLED or not PAPER_VALIDATION_ENABLED:
-        return False
-    with STATE_IO_LOCK:
-        shadows = STATE.setdefault("shadow_signals", [])
-        key = shadow_key(signal)
-        paper = dict(signal)
-        paper.pop("signal_id", None)
-        paper["created_at"] = now_ts()
-        ensure_signal_runtime_fields(paper, "shadow")
-        paper["shadow_reason"] = PAPER_VALIDATION_REASON
-        paper["paper_validation_visible"] = True
-        paper["stats_recorded"] = None
-        paper["learning_recorded"] = None
-
-        if any(shadow_key(item) == key for item in shadows):
-            return False
-        if len(shadows) >= SHADOW_MAX_ACTIVE:
-            return False
-        shadows.append(paper)
-        STATE.setdefault("shadow_cooldown", {})[key] = now_ts() + max(
-            0, SHADOW_COOLDOWN_SECONDS
-        )
-        save_state()
-    return True
-
-
-def pending_key(signal: Dict[str, Any]) -> str:
-    return shadow_key(signal)
-
-
-def _watch_audit_state() -> Dict[str, Any]:
-    audit = STATE.setdefault("watch_audit_v17_2", default_watch_audit())
-    if not isinstance(audit, dict) or str(audit.get("version", "")) != "V17.2.2":
-        audit = default_watch_audit()
-        STATE["watch_audit_v17_2"] = audit
-    audit.setdefault("rejected", default_watch_audit()["rejected"].copy())
-    audit.setdefault("by_side", default_watch_audit()["by_side"].copy())
-    audit.setdefault("by_lane", default_watch_audit()["by_lane"].copy())
-    audit.setdefault("recent", [])
-    return audit
-
-
-def record_watch_audit(
-    item: Dict[str, Any], event: str, detail: str = ""
-) -> None:
-    with STATE_IO_LOCK:
-        _record_watch_audit_locked(item, event, detail)
-
-
-def _record_watch_audit_locked(
-    item: Dict[str, Any], event: str, detail: str = ""
-) -> None:
-    """Persist the V17.2.2 direct-entry funnel for every JSON backup."""
-    audit = _watch_audit_state()
-    side = str(item.get("side", "UNKNOWN")).upper()
-    lane = str(item.get("paper_setup_lane", "DIRECT_MEASURED")).upper()
-    side_state = audit.setdefault("by_side", {}).setdefault(
-        side, {"started": 0, "confirmed": 0, "rejected": 0}
-    )
-    lane_state = audit.setdefault("by_lane", {}).setdefault(
-        lane, {"started": 0, "confirmed": 0, "rejected": 0}
-    )
-    rejected = audit.setdefault("rejected", {})
-    if event == "started":
-        audit["started"] = int(audit.get("started", 0) or 0) + 1
-        side_state["started"] = int(side_state.get("started", 0) or 0) + 1
-        lane_state["started"] = int(lane_state.get("started", 0) or 0) + 1
-    elif event == "execution_passed":
-        audit["execution_passed"] = int(audit.get("execution_passed", 0) or 0) + 1
-    elif event == "confirmed":
-        audit["confirmed"] = int(audit.get("confirmed", 0) or 0) + 1
-        side_state["confirmed"] = int(side_state.get("confirmed", 0) or 0) + 1
-        lane_state["confirmed"] = int(lane_state.get("confirmed", 0) or 0) + 1
-    elif event.startswith("rejected:"):
-        reason = event.split(":", 1)[1] or "other"
-        rejected[reason] = int(rejected.get(reason, 0) or 0) + 1
-        side_state["rejected"] = int(side_state.get("rejected", 0) or 0) + 1
-        lane_state["rejected"] = int(lane_state.get("rejected", 0) or 0) + 1
-
-    recent = audit.setdefault("recent", [])
-    recent.append(
-        {
-            "ts": now_ts(),
-            "symbol": normalize_symbol(str(item.get("symbol", "?"))),
-            "side": side,
-            "lane": lane,
-            "event": event,
-            "detail": str(detail or "")[:280],
-            "age_seconds": max(
-                0,
-                now_ts() - int(item.get("pending_started_at", now_ts()) or now_ts()),
-            ),
-            "pullback": float(item.get("pending_retest_depth", 0.0) or 0.0),
-            "recovery": float(item.get("reclaim_recovery", 0.0) or 0.0),
-        }
-    )
-    if len(recent) > 80:
-        del recent[:-80]
-
-
-def watch_audit_summary() -> str:
-    audit = _watch_audit_state()
-    rejected = audit.get("rejected", {})
-    rejected_total = sum(int(value or 0) for value in rejected.values())
-    reasons = ", ".join(
-        f"{key}={int(value or 0)}"
-        for key, value in sorted(
-            rejected.items(), key=lambda item: -int(item[1] or 0)
-        )
-        if int(value or 0) > 0
-    ) or "нет"
-    lane_bits = []
-    for lane, values in sorted(audit.get("by_lane", {}).items()):
-        lane_bits.append(
-            f"{lane} {int(values.get('confirmed', 0) or 0)}/"
-            f"{int(values.get('started', 0) or 0)}"
-        )
-    lane_text = ", ".join(lane_bits) or "нет"
-    return (
-        f"FUNNEL V17.2.2: liquidity={int(audit.get('liquidity_passed', 0) or 0)}/"
-        f"{int(audit.get('liquidity_checked', 0) or 0)} · "
-        f"detected={int(audit.get('started', 0) or 0)} · "
-        f"execution={int(audit.get('execution_passed', 0) or 0)} · "
-        f"PAPER={int(audit.get('confirmed', 0) or 0)} · "
-        f"rejected={rejected_total} ({reasons}) · lanes: {lane_text}"
-    )
-
-
-def _add_pending_signal_impl(signal: Dict[str, Any]) -> bool:
-    if not PRE_LIVE_CONFIRMATION_ENABLED:
-        return False
-    pending = STATE.setdefault("pending_signals", [])
-    if len(pending) >= max(1, min(PRE_LIVE_MAX_ACTIVE, V17_2_MAX_PENDING_WATCH)):
-        return False
-    key = pending_key(signal)
-    if any(pending_key(item) == key for item in pending):
-        return False
-    item = dict(signal)
-    item["pending_started_at"] = now_ts()
-    item["pending_reference_entry"] = float(signal.get("entry", 0.0) or 0.0)
-    item["pending_status"] = "waiting_confirmation"
-    item["pending_stage"] = "seeking_pullback"
-    item["pending_retest_seen"] = False
-    item["pending_reclaim_seen"] = False
-    item["pending_retest_depth"] = 0.0
-    reference = float(item.get("pending_reference_entry", 0.0) or 0.0)
-    item["pending_extreme_price"] = reference
-    item["pending_retest_price"] = reference
-    item["pending_last_price"] = reference
-    item["pending_last_candle_time"] = 0.0
-    impulse = max(0.0025, abs(float(item.get("watch_impulse", 0.0) or 0.0)))
-    min_fraction = float(
-        item.get("watch_pullback_min_fraction", PAPER_RECLAIM_MIN_IMPULSE_FRACTION)
-        or PAPER_RECLAIM_MIN_IMPULSE_FRACTION
-    )
-    max_fraction = float(
-        item.get("watch_pullback_max_fraction", PAPER_RECLAIM_MAX_IMPULSE_FRACTION)
-        or PAPER_RECLAIM_MAX_IMPULSE_FRACTION
-    )
-    abs_min = float(
-        item.get("watch_pullback_abs_min", PAPER_RECLAIM_MIN_PULLBACK)
-        or PAPER_RECLAIM_MIN_PULLBACK
-    )
-    abs_max = float(
-        item.get("watch_pullback_abs_max", PAPER_RECLAIM_MAX_PULLBACK)
-        or PAPER_RECLAIM_MAX_PULLBACK
-    )
-    item["pending_min_pullback"] = max(
-        abs_min,
-        min(abs_max, impulse * min_fraction),
-    )
-    item["pending_max_pullback"] = max(
-        float(item["pending_min_pullback"]) + 0.0005,
-        min(abs_max, impulse * max_fraction),
-    )
-    pending.append(item)
-    # The immediate impulse is a paired visible CONTROL.  It remains separate
-    # from a later reclaim entry and is never eligible for model promotion.
-    if not add_shadow_signal(item, PAPER_CONTROL_REASON):
-        pending.pop()
-        return False
-    record_watch_audit(item, "started", str(item.get("paper_validation_origin", "")))
-    save_state()
-    return True
-
-
-def add_pending_signal(signal: Dict[str, Any]) -> bool:
-    with PENDING_RUN_LOCK:
-        return _add_pending_signal_impl(signal)
-
-
-def send_watch_status(item: Dict[str, Any], status: str, detail: str) -> None:
-    if not VISIBLE_SHADOW_NOTIFICATIONS:
-        return
-    send_telegram(
-        "🔬 A/A+ WATCH V17.2 — RETEST/RECLAIM\n"
-        f"{item.get('side', '?')} {display_symbol(item.get('symbol', '?'))}\n"
-        f"Линия: {item.get('paper_setup_lane', 'CONTINUATION')}\n"
-        f"Статус: {status}\n{detail}\n"
-        "Это наблюдение перед PAPER-входом; реальной сделки нет."
-    )
-
-
-def _candle_time_seconds(candle: Dict[str, Any]) -> float:
-    raw = float(candle.get("time", 0.0) or 0.0)
-    return raw / 1000.0 if raw > 10_000_000_000 else raw
-
-
-def _process_pending_signals_impl(
-    blocks: Dict[str, int], near_miss: List[str]
-) -> List[Dict[str, Any]]:
-    if not PRE_LIVE_CONFIRMATION_ENABLED:
-        return []
-    pending = STATE.setdefault("pending_signals", [])
-    if not pending:
-        return []
-
-    confirmed: List[Dict[str, Any]] = []
-    remaining: List[Dict[str, Any]] = []
-    current_ts = now_ts()
-    for item in pending:
-        started = int(item.get("pending_started_at", current_ts) or current_ts)
-        age = max(0, current_ts - started)
-        is_paper = bool(item.get("paper_validation_only"))
-        min_seconds = (
-            int(item.get("watch_min_seconds", PAPER_RECLAIM_MIN_SECONDS) or PAPER_RECLAIM_MIN_SECONDS)
-            if is_paper
-            else PRE_LIVE_MIN_SECONDS
-        )
-        max_seconds = (
-            int(item.get("watch_max_seconds", PAPER_RECLAIM_MAX_SECONDS) or PAPER_RECLAIM_MAX_SECONDS)
-            if is_paper
-            else PRE_LIVE_MAX_SECONDS
-        )
-        if age > max(min_seconds, max_seconds):
-            key = "paper_reclaim_watch_expired" if is_paper else "pre_live_confirmation_expired"
-            blocks[key] = blocks.get(key, 0) + 1
-            if is_paper:
-                if not bool(item.get("pending_retest_seen")):
-                    reason = "no_pullback"
-                    detail = f"За {max_seconds}с не появился допустимый откат."
-                elif not bool(item.get("pending_reclaim_seen")):
-                    reason = "no_reclaim"
-                    detail = (
-                        f"Откат был, но за {max_seconds}с цена не вернула EMA9/"
-                        f"{float(item.get('watch_recovery_required', PAPER_RECLAIM_MIN_RECOVERY) or PAPER_RECLAIM_MIN_RECOVERY)*100:.0f}% отката."
-                    )
-                else:
-                    reason = "quality_gate"
-                    detail = "Reclaim был, но подтверждение свечи/потока не сложилось в допустимом окне."
-                record_watch_audit(item, f"rejected:{reason}", detail)
-                send_watch_status(item, "ОТКЛОНЁН", detail)
-            continue
-
-        symbol = str(item.get("symbol", ""))
-        side = str(item.get("side", "")).upper()
-        reference = float(item.get("pending_reference_entry", item.get("entry", 0.0)) or 0.0)
-        c1 = get_klines(symbol, "1m", 80, cache_seconds=4)
-        c5 = get_klines(symbol, "5m", 80, cache_seconds=8)
-        if not c1 or not c5 or reference <= 0:
-            remaining.append(item)
-            continue
-
-        price = float(c1[-1]["close"])
-        direction = 1.0 if side == "LONG" else -1.0
-        directional_move = direction * (price - reference) / reference
-        last = c1[-1]
-        previous = c1[-2]
-        location = close_location(last)
-        vol1 = volume_ratio(c1, 20)
-        range1 = candle_range_ratio(c1, 20)
-        vol5_now = volume_ratio(c5, 20)
-        range5_now = candle_range_ratio(c5, 20)
-        directional_3m = direction * percent_change(c1, 3)
-        directional_15m = direction * percent_change(c1, 15)
-        ema9 = ema(closes(c1[-30:]), 9)
-
-        if is_paper:
-            # V17.1 is a real state machine. Tick samples arrive from the
-            # dedicated 10-second monitor. Completed 1m candles that opened
-            # after WATCH started provide high/low evidence that a 60-second
-            # universe scan used to miss.
-            previous_extreme = float(item.get("pending_extreme_price", reference) or reference)
-            extreme = previous_extreme
-            retest_price = float(item.get("pending_retest_price", extreme) or extreme)
-            retest_seen = bool(item.get("pending_retest_seen"))
-            last_candle_time = float(item.get("pending_last_candle_time", 0.0) or 0.0)
-
-            # Use only completed candles. If a new extreme formed inside a
-            # candle, its close is chronologically after that extreme and is a
-            # safe first retest point. This avoids guessing high/low ordering.
-            completed_after_watch = []
-            for candle in c1[:-1]:
-                candle_time = _candle_time_seconds(candle)
-                if candle_time < started or candle_time <= last_candle_time:
-                    continue
-                completed_after_watch.append(candle)
-            for candle in completed_after_watch:
-                candle_high = float(candle.get("high", candle.get("close", price)) or price)
-                candle_low = float(candle.get("low", candle.get("close", price)) or price)
-                candle_close = float(candle.get("close", price) or price)
-                if side == "LONG":
-                    if not retest_seen and candle_high >= extreme:
-                        extreme = candle_high
-                        retest_price = min(candle_high, candle_close)
-                    else:
-                        retest_price = min(retest_price, candle_low)
-                else:
-                    if not retest_seen and candle_low <= extreme:
-                        extreme = candle_low
-                        retest_price = max(candle_low, candle_close)
-                    else:
-                        retest_price = max(retest_price, candle_high)
-                last_candle_time = max(
-                    last_candle_time, _candle_time_seconds(candle)
-                )
-
-            # Add the current 10-second price sample. Before the pullback is
-            # latched the directional extreme can advance; afterwards the
-            # anchor stays fixed and only the deepest retest is updated.
-            if side == "LONG":
-                if not retest_seen and price >= extreme:
-                    extreme = price
-                    retest_price = price
-                else:
-                    retest_price = min(retest_price, price)
-                retest_depth = max(
-                    0.0, (extreme - retest_price) / max(extreme, 1e-12)
-                )
-            else:
-                if not retest_seen and price <= extreme:
-                    extreme = price
-                    retest_price = price
-                else:
-                    retest_price = max(retest_price, price)
-                retest_depth = max(
-                    0.0, (retest_price - extreme) / max(extreme, 1e-12)
-                )
-
-            item["pending_extreme_price"] = extreme
-            item["pending_retest_price"] = retest_price
-            item["pending_last_price"] = price
-            item["pending_last_candle_time"] = last_candle_time
-            deepest = max(float(item.get("pending_retest_depth", 0.0) or 0.0), retest_depth)
-            item["pending_retest_depth"] = deepest
-            min_pullback = float(
-                item.get("pending_min_pullback", PAPER_RECLAIM_MIN_PULLBACK)
-                or PAPER_RECLAIM_MIN_PULLBACK
-            )
-            max_pullback = float(
-                item.get("pending_max_pullback", PAPER_RECLAIM_MAX_PULLBACK)
-                or PAPER_RECLAIM_MAX_PULLBACK
-            )
-            if min_pullback <= deepest <= max_pullback and not retest_seen:
-                item["pending_retest_seen"] = True
-                item["pending_retest_seen_at"] = current_ts
-                item["pending_stage"] = "seeking_reclaim"
-                retest_seen = True
-                record_watch_audit(
-                    item,
-                    "pullback_seen",
-                    f"pullback {deepest*100:.2f}% within "
-                    f"{min_pullback*100:.2f}%–{max_pullback*100:.2f}%",
-                )
-
-            if deepest > max_pullback:
-                blocks["paper_reclaim_too_deep"] = blocks.get("paper_reclaim_too_deep", 0) + 1
-                detail = (
-                    f"Откат {deepest*100:.2f}% глубже разрешённых "
-                    f"{max_pullback*100:.2f}% для этого импульса."
-                )
-                record_watch_audit(item, "rejected:pullback_too_deep", detail)
-                send_watch_status(
-                    item,
-                    "ОТКЛОНЁН",
-                    detail,
-                )
-                continue
-            if not bool(item.get("pending_retest_seen")):
-                remaining.append(item)
-                continue
-            if age < max(0, min_seconds):
-                remaining.append(item)
-                continue
-
-            if side == "LONG":
-                candle_ok = (
-                    last["close"] > last["open"]
-                    and last["close"] > previous["close"]
-                    and location >= PRE_LIVE_CLOSE_LONG
-                    and price > ema9
-                )
-            else:
-                candle_ok = (
-                    last["close"] < last["open"]
-                    and last["close"] < previous["close"]
-                    and location <= PRE_LIVE_CLOSE_SHORT
-                    and price < ema9
-                )
-            reclaim_span = max(abs(extreme - retest_price), reference * 1e-8)
-            recovery = (
-                (price - retest_price) / reclaim_span
-                if side == "LONG"
-                else (retest_price - price) / reclaim_span
-            )
-            recovery = max(0.0, min(1.0, recovery))
-            item["reclaim_recovery"] = recovery
-            directional_floor = float(
-                item.get("watch_min_directional_15m", -0.0020) or -0.0020
-            )
-            directional_ceiling = float(
-                item.get("watch_max_directional_15m", 0.0500) or 0.0500
-            )
-            min_directional_3m = float(
-                item.get("watch_min_directional_3m", PAPER_RECLAIM_MIN_3M)
-                or PAPER_RECLAIM_MIN_3M
-            )
-            max_chase = float(
-                item.get("watch_max_chase", PAPER_RECLAIM_MAX_CHASE)
-                or PAPER_RECLAIM_MAX_CHASE
-            )
-            directional_ok = bool(
-                directional_3m >= min_directional_3m
-                and directional_15m >= directional_floor
-                and directional_15m <= directional_ceiling
-                and PAPER_RECLAIM_ENTRY_FLOOR
-                <= directional_move
-                <= max_chase
-            )
-            reclaim_core = bool(
-                recovery >= float(
-                    item.get("watch_recovery_required", PAPER_RECLAIM_MIN_RECOVERY)
-                    or PAPER_RECLAIM_MIN_RECOVERY
-                )
-                and ((side == "LONG" and price > ema9) or (side == "SHORT" and price < ema9))
-            )
-            flow_ok = bool(
-                vol1 >= float(item.get("watch_min_vol1", PAPER_RECLAIM_MIN_VOL1) or PAPER_RECLAIM_MIN_VOL1)
-                and vol1 <= float(item.get("watch_max_vol1", PAPER_MAX_VOL1) or PAPER_MAX_VOL1)
-                and range1 >= float(item.get("watch_min_range1", PAPER_RECLAIM_MIN_RANGE1) or PAPER_RECLAIM_MIN_RANGE1)
-                and range5_now >= float(item.get("watch_min_range5", 0.60) or 0.60)
-            )
-            if reclaim_core:
-                if not bool(item.get("pending_reclaim_seen")):
-                    record_watch_audit(
-                        item,
-                        "reclaim_seen",
-                        f"recovery {recovery*100:.0f}% and EMA9 reclaimed",
-                    )
-                item["pending_reclaim_seen"] = True
-                item["pending_reclaim_seen_at"] = current_ts
-                item["pending_stage"] = "quality_confirmation"
-            if candle_ok:
-                item["pending_candle_ok_at"] = current_ts
-            if flow_ok:
-                item["pending_flow_ok_at"] = current_ts
-
-            def latch_recent(key: str) -> bool:
-                timestamp = int(item.get(key, 0) or 0)
-                return bool(
-                    timestamp > 0
-                    and current_ts - timestamp <= max(1, PAPER_CONFIRM_LATCH_SECONDS)
-                )
-
-            confirmed_now = bool(
-                directional_ok
-                and latch_recent("pending_reclaim_seen_at")
-                and latch_recent("pending_candle_ok_at")
-                and latch_recent("pending_flow_ok_at")
-            )
-        else:
-            if directional_move <= -max(0.0, PRE_LIVE_MAX_ADVERSE_MOVE):
-                blocks["pre_live_adverse_reject"] = blocks.get("pre_live_adverse_reject", 0) + 1
-                continue
-            if directional_move >= max(PRE_LIVE_MIN_DIRECTIONAL_MOVE, PRE_LIVE_MAX_CHASE_MOVE):
-                blocks["pre_live_chase_reject"] = blocks.get("pre_live_chase_reject", 0) + 1
-                continue
-            if age < max(0, min_seconds):
-                remaining.append(item)
-                continue
-            if side == "LONG":
-                candle_ok = (
-                    last["close"] > last["open"]
-                    and last["close"] > previous["close"]
-                    and location >= PRE_LIVE_CLOSE_LONG
-                    and price > ema9
-                )
-            else:
-                candle_ok = (
-                    last["close"] < last["open"]
-                    and last["close"] < previous["close"]
-                    and location <= PRE_LIVE_CLOSE_SHORT
-                    and price < ema9
-                )
-            confirmed_now = bool(
-                directional_move >= PRE_LIVE_MIN_DIRECTIONAL_MOVE
-                and directional_3m >= DATA_MIN_DIRECTIONAL_3M * 0.75
-                and vol1 >= PRE_LIVE_MIN_VOL1
-                and range1 >= PRE_LIVE_MIN_RANGE1
-                and candle_ok
-            )
-
-        if not confirmed_now:
-            remaining.append(item)
-            continue
-
-        setup = dict(item)
-        setup["entry"] = price
-        setup["ch3m_1m"] = direction * directional_3m
-        setup["ch2m"] = percent_change(c1, 2)
-        setup["vol1"] = vol1
-        setup["range1"] = range1
-        setup["volume_ratio"] = vol5_now
-        setup["range_ratio"] = range5_now
-        setup["ch15m"] = direction * directional_15m
-        setup["ch30m"] = percent_change(c1, 30)
-        setup["pending_confirmation_seconds"] = age
-        setup["pending_confirmation_move"] = directional_move
-        setup["pre_live_confirmed"] = True
-        if is_paper:
-            lane = str(item.get("paper_setup_lane", "CONTINUATION")).upper()
-            if lane == "SWEEP_REVERSAL":
-                setup["strategy"] = PAPER_REVERSAL_STRATEGIES[side]
-                setup["trade_type"] = f"LIQUIDITY SWEEP REVERSAL {side}"
-                setup["setup_mode"] = f"V17_2_CONFIRMED_REVERSAL_{side}"
-            else:
-                setup["strategy"] = PAPER_RECLAIM_STRATEGIES[side]
-                setup["trade_type"] = f"LIQUIDITY CONTINUATION RECLAIM {side}"
-                setup["setup_mode"] = f"V17_2_CONFIRMED_CONTINUATION_{side}"
-            setup["paper_validation_lane"] = PAPER_VALIDATION_REASON
-            setup["paper_validation_origin"] = (
-                f"V17.2 {lane} confirmed {side}: liquidity-first WATCH → pullback "
-                f"{float(item.get('pending_retest_depth', 0.0) or 0.0)*100:.2f}% → "
-                f"EMA9/price reclaim after {age}s; move vs WATCH {directional_move*100:+.2f}%"
-            )
-        refreshed = calculate_fast_trade(setup, c1, c5)
-        if not refreshed:
-            blocks["pre_live_reprice_sl_block"] = blocks.get("pre_live_reprice_sl_block", 0) + 1
-            if is_paper:
-                detail = "После нового входа защитный SL/RR не прошёл проверку."
-                record_watch_audit(item, "rejected:reprice_or_rr", detail)
-                send_watch_status(item, "ОТКЛОНЁН", detail)
-            continue
-        quality_ok, quality_block, quality_reason = professional_quality_gate(refreshed, symbol)
-        if not quality_ok:
-            blocks[quality_block] = blocks.get(quality_block, 0) + 1
-            if len(near_miss) < 8:
-                near_miss.append(quality_reason)
-            if is_paper:
-                record_watch_audit(
-                    item, "rejected:quality_gate", quality_reason
-                )
-                send_watch_status(item, "ОТКЛОНЁН", quality_reason)
-            continue
-        v17_risk_ok, v17_risk_reason = v17_2_paper_risk_gate(
-            refreshed, symbol, c1, c5
-        )
-        if not v17_risk_ok:
-            blocks["v17_2_confirmed_tp3_risk_block"] = blocks.get(
-                "v17_2_confirmed_tp3_risk_block", 0
-            ) + 1
-            if is_paper:
-                record_watch_audit(
-                    item, "rejected:quality_gate", v17_risk_reason
-                )
-                send_watch_status(item, "ОТКЛОНЁН", v17_risk_reason)
-            continue
-        refreshed["v17_2_risk_reason"] = v17_risk_reason
-        if refreshed.get("paper_validation_only"):
-            refreshed["strategy_guard_reason"] = (
-                "PULLBACK PAPER bypasses LIVE strategy gate; never eligible for LIVE"
-            )
-        else:
-            strategy_ok, _ = strategy_circuit_breaker(refreshed)
-            if not strategy_ok:
-                blocks["strategy_circuit_breaker_block"] = blocks.get("strategy_circuit_breaker_block", 0) + 1
-                if is_paper:
-                    record_watch_audit(
-                        item,
-                        "rejected:other",
-                        "strategy circuit breaker rejected refreshed setup",
-                    )
-                continue
-        if is_paper:
-            record_watch_audit(
-                item,
-                "confirmed",
-                f"entry confirmed after {age}s; pullback "
-                f"{float(item.get('pending_retest_depth', 0.0) or 0.0)*100:.2f}%",
-            )
-        confirmed.append(refreshed)
-
-    STATE["pending_signals"] = remaining
-    save_state()
-    return confirmed
-
-
-def process_pending_signals(
-    blocks: Dict[str, int], near_miss: List[str]
-) -> List[Dict[str, Any]]:
-    if not PENDING_RUN_LOCK.acquire(blocking=False):
-        return []
-    try:
-        return _process_pending_signals_impl(blocks, near_miss)
-    finally:
-        PENDING_RUN_LOCK.release()
-
-
-def add_active_signal(s: Dict[str, Any]) -> None:
-    remove_matching_shadow(s)
-    ensure_signal_runtime_fields(s, "live")
-    STATE.setdefault("active_signals", []).append(s)
-    STATE.setdefault("pair_cooldown", {})[s["symbol"]] = now_ts() + PAIR_COOLDOWN_SECONDS
-    STATE.setdefault("strategy_cooldown", {})[s["strategy"]] = now_ts() + STRATEGY_COOLDOWN_SECONDS
-    history = _prune_live_send_history()
-    history.append(
-        {
-            "ts": now_ts(),
-            "side": str(s.get("side", "UNKNOWN")).upper(),
-            "model_version": int(s.get("adaptive_model_version", 0) or 0),
-        }
-    )
-    STATE["live_send_history"] = history
-    STATE["live_send_timestamps"] = [int(item["ts"]) for item in history]
-    save_state()
-
-
-def _run_scan_impl(manual: bool = False) -> Dict[str, Any]:
-    start = time.time()
-    blocks: Dict[str, int] = {}
-    near_miss: List[str] = []
-    shadow_before_ids = {
-        str(item.get("signal_id", ""))
-        for item in STATE.setdefault("shadow_signals", [])
-        if item.get("signal_id")
-    }
-    btc = btc_context()
-    symbols = get_symbols()
-    selected, hot_notes = select_hot_symbols(symbols)
-
-    scan = {
-        "checked": 0,
-        "universe": len(symbols),
-        "candidates": 0,
-        "sent": 0,
-        "shadow_added": 0,
-        "near_miss_added": 0,
-        "paper_sent": 0,
-        "shadow_active": len(STATE.setdefault("shadow_signals", [])),
-        "near_miss_active": sum(
-            1 for item in STATE.setdefault("shadow_signals", [])
-            if str(item.get("shadow_reason", "")) == "near_miss_probe"
-        ),
-        "paper_active": sum(
-            1 for item in STATE.setdefault("shadow_signals", [])
-            if str(item.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
-        ),
-        "blocks": blocks,
-        "near_miss": near_miss,
-        "hot_notes": hot_notes,
-        "btc": btc.get("text", "BTC unknown"),
-        "elapsed": 0,
-    }
-
-    if not btc.get("ok"):
-        blocks["btc_data_problem"] = 1
-        STATE["last_scan"] = scan
-        save_state()
-        return scan
-
-    # Before scanning, refresh old active signals so expired/TP/SL positions do not block the market scan.
-    try:
-        track_active_signals()
-    except Exception as e:
-        STATE["last_error"] = f"pre-scan track_active_signals: {repr(e)}"
-        save_state()
-
-    confirmed_candidates = process_pending_signals(blocks, near_miss)
-
-    found: List[Dict[str, Any]] = []
-    probe_candidates: List[Dict[str, Any]] = []
-
-    def analyze_one(sym: str) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, int], List[str], Optional[Exception]]:
-        local_blocks: Dict[str, int] = {}
-        local_near: List[str] = []
-        try:
-            return (
-                sym,
-                analyze_symbol(
-                    sym,
-                    btc,
-                    local_blocks,
-                    local_near,
-                    allow_shadow_probe=SHADOW_PROBE_ENABLED,
-                    shadow_probe_sink=probe_candidates,
-                ),
-                local_blocks,
-                local_near,
-                None,
-            )
-        except Exception as exc:
-            return sym, None, local_blocks, local_near, exc
-
-    if DEEP_SCAN_WORKERS <= 1 or len(selected) <= 1:
-        analysis_results = [analyze_one(sym) for sym in selected]
-    else:
-        analysis_results = []
-        with ThreadPoolExecutor(
-            max_workers=min(DEEP_SCAN_WORKERS, len(selected)),
-            thread_name_prefix="deep-scan",
-        ) as pool:
-            future_map = {pool.submit(analyze_one, sym): sym for sym in selected}
-            for future in as_completed(future_map):
-                analysis_results.append(future.result())
-
-    for sym, candidate, local_blocks, local_near, error in analysis_results:
-        if error is not None:
-            blocks["analyze_exception"] = blocks.get("analyze_exception", 0) + 1
-            STATE["last_error"] = f"analyze {sym}: {repr(error)}"
-            continue
-        scan["checked"] += 1
-        for key, value in local_blocks.items():
-            blocks[key] = blocks.get(key, 0) + int(value)
-        for item in local_near:
-            if len(near_miss) < 8:
-                near_miss.append(item)
-        if candidate:
-            found.append(candidate)
-
-    # Rank all measurement-only candidates after the parallel scan. This keeps
-    # the three strongest near misses, rather than whichever worker finishes
-    # first or whichever symbol happened to rank first in the hot list.
-    probe_candidates.sort(
-        key=lambda item: (
-            float(item.get("shadow_probe_score", 0.0) or 0.0),
-            abs(float(item.get("ch3m_1m", 0.0) or 0.0)),
-            float(item.get("vol1", 0.0) or 0.0),
-        ),
-        reverse=True,
-    )
-    for probe_trade in probe_candidates[:max(0, SHADOW_PROBE_PER_SCAN)]:
-        if add_shadow_signal(probe_trade, "near_miss_probe"):
-            blocks["near_miss_shadow_added"] = blocks.get("near_miss_shadow_added", 0) + 1
-            if len(near_miss) < 8:
-                near_miss.append(
-                    f"{display_symbol(probe_trade['symbol'])} {probe_trade['side']}: "
-                    f"saved to SHADOW only · {probe_trade['shadow_probe_live_gap']}"
-                )
-
-    found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
-    scan["candidates"] = len(found)
-    pending_added = 0
-    if PRE_LIVE_CONFIRMATION_ENABLED:
-        # V17 has no immediate registered PAPER entry. Every challenger
-        # must complete the pullback/reclaim state machine above.
-        immediate_paper = [
-            candidate for candidate in found
-            if bool(candidate.get("paper_validation_immediate"))
-        ]
-        confirmation_queue = [
-            candidate for candidate in found
-            if not bool(candidate.get("paper_validation_immediate"))
-        ]
-        for candidate in confirmation_queue:
-            if pending_added >= max(1, V17_2_MAX_NEW_WATCH_PER_SCAN):
-                break
-            if add_pending_signal(candidate):
-                pending_added += 1
-        ready_candidates = list(confirmed_candidates) + immediate_paper
-    else:
-        ready_candidates = found
-    ready_candidates.sort(
-        key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]),
-        reverse=True,
-    )
-    paper_ready = [
-        item for item in ready_candidates
-        if bool(item.get("paper_validation_only"))
-    ]
-    ready_candidates = [
-        item for item in ready_candidates
-        if not bool(item.get("paper_validation_only"))
-    ]
-    paper_sent = 0
-    for paper_candidate in paper_ready:
-        if set_confirmed_paper_signal(paper_candidate):
-            send_telegram(build_paper_signal_message(paper_candidate))
-            paper_sent += 1
-    scan["paper_sent"] = paper_sent
-    scan["pending_added"] = pending_added
-    scan["pending_active"] = len(STATE.get("pending_signals", []))
-    scan["confirmed"] = len(confirmed_candidates)
-
-    sent = 0
-    open_risk_count = sum(
-        1 for signal in STATE.get("active_signals", [])
-        if not signal.get(PROFIT_TARGET_KEY + "_hit") and not signal.get("stats_recorded")
-    )
-    free_slots = max(0, MAX_ACTIVE_SIGNALS - open_risk_count)
-    budget = live_signal_budget_24h()
-    selected_live: List[Dict[str, Any]] = []
-    shadow_queue: List[Tuple[Dict[str, Any], str]] = []
-    local_total = int(budget["total"])
-    local_side = {"LONG": int(budget["long"]), "SHORT": int(budget["short"])}
-    local_adaptive = int(budget["adaptive"])
-    spacing_open = int(budget["spacing_left"]) <= 0
-    scan_limit = min(MAX_SIGNALS_PER_SCAN, free_slots)
-
-    for candidate in ready_candidates:
-        side = str(candidate.get("side", "UNKNOWN")).upper()
-        model_version = int(candidate.get("adaptive_model_version", 0) or 0)
-        reason = ""
-        if len(selected_live) >= scan_limit:
-            reason = "active_slots_or_scan_limit"
-        elif MAX_LIVE_SIGNALS_24H > 0 and local_total >= MAX_LIVE_SIGNALS_24H:
-            reason = "daily_live_cap"
-        elif side in local_side and MAX_LIVE_SIGNALS_PER_SIDE_24H > 0 and local_side[side] >= MAX_LIVE_SIGNALS_PER_SIDE_24H:
-            reason = f"{side.lower()}_daily_reserve"
-        elif model_version > 0 and MAX_ADAPTIVE_CANARY_LIVE_24H > 0 and local_adaptive >= MAX_ADAPTIVE_CANARY_LIVE_24H:
-            reason = "adaptive_canary_daily_cap"
-        elif not spacing_open:
-            reason = "live_spacing"
-
-        if reason:
-            shadow_queue.append((candidate, reason))
-            continue
-
-        selected_live.append(candidate)
-        local_total += 1
-        if side in local_side:
-            local_side[side] += 1
-        if model_version > 0:
-            local_adaptive += 1
-        # With forced spacing disabled, more than one independently confirmed
-        # setup may be sent in the same scan (still bounded by active slots).
-        if MIN_LIVE_SIGNAL_SPACING_SECONDS > 0:
-            spacing_open = False
-
-    if not selected_live and ready_candidates:
-        if free_slots <= 0:
-            block_key = "active_slots_full_send_block"
-            detail = f"found {len(ready_candidates)} confirmed candidate(s), but active slots are full"
-        elif int(budget["remaining"]) <= 0:
-            block_key = "daily_live_cap_block"
-            detail = f"24h live cap reached: {budget['total']}/{MAX_LIVE_SIGNALS_24H}"
-        elif int(budget["spacing_left"]) > 0:
-            block_key = "live_spacing_block"
-            detail = f"next live slot in {math.ceil(int(budget['spacing_left'])/60)} min"
-        else:
-            block_key = "balanced_side_cap_block"
-            detail = (
-                f"balanced cap: LONG {budget['long']}/{MAX_LIVE_SIGNALS_PER_SIDE_24H}, "
-                f"SHORT {budget['short']}/{MAX_LIVE_SIGNALS_PER_SIDE_24H}"
-            )
-        blocks[block_key] = blocks.get(block_key, 0) + 1
-        if len(near_miss) < 8:
-            near_miss.append(detail + "; candidates stay in shadow")
-
-    for s in selected_live:
-        add_active_signal(s)
-        send_telegram(build_signal_message(s))
-        sent += 1
-
-    shadow_added = 0
-    near_miss_added = 0
-    if SHADOW_TRACKING_ENABLED:
-        for candidate, shadow_reason in shadow_queue[:max(0, SHADOW_PER_SCAN)]:
-            add_shadow_signal(candidate, shadow_reason)
-
-        # Include shadows created directly by data/model guards and pending
-        # confirmation, not only overflow candidates from the send queue.
-        new_shadows = [
-            item
-            for item in STATE.setdefault("shadow_signals", [])
-            if item.get("signal_id") and str(item.get("signal_id")) not in shadow_before_ids
-        ]
-        shadow_added = len(new_shadows)
-        near_miss_added = sum(
-            1 for item in new_shadows
-            if str(item.get("shadow_reason", "")) == "near_miss_probe"
-        )
-        if VISIBLE_SHADOW_NOTIFICATIONS:
-            for item in new_shadows:
-                # Registered PAPER entries have their own stronger warning and
-                # were already sent above.  Every other tracked shadow becomes
-                # visible here instead of existing only inside diagnostics.
-                if str(item.get("shadow_reason", "")) == PAPER_VALIDATION_REASON:
-                    continue
-                send_telegram(build_shadow_signal_message(item))
-
-    scan["sent"] = sent
-    scan["shadow_added"] = shadow_added
-    scan["near_miss_added"] = near_miss_added
-    scan["shadow_active"] = len(STATE.setdefault("shadow_signals", []))
-    scan["near_miss_active"] = sum(
-        1 for item in STATE.setdefault("shadow_signals", [])
-        if str(item.get("shadow_reason", "")) == "near_miss_probe"
-    )
-    scan["paper_active"] = sum(
-        1 for item in STATE.setdefault("shadow_signals", [])
-        if str(item.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
-    )
-    scan["elapsed"] = time.time() - start
-    STATE["last_scan"] = scan
-    save_state()
-
-    if manual or (sent == 0 and now_ts() - STATE.get("last_diag_ts", 0) >= DIAG_SECONDS):
-        send_telegram(build_diagnostic(scan))
-        STATE["last_diag_ts"] = now_ts()
-        save_state()
-
-    # A temporary Telegram document failure must not postpone the backup until
-    # another trade closes.  Every scan retries an overdue milestone until the
-    # file is acknowledged and last_backup_closed_count advances.
-    maybe_send_auto_backup()
-
-    return scan
-
-
-def run_scan(manual: bool = False) -> Dict[str, Any]:
-    with SCAN_RUN_LOCK:
-        return _run_scan_impl(manual=manual)
-
-
-def current_price(symbol: str) -> Optional[float]:
-    c = get_klines(symbol, "1m", 80, cache_seconds=4)
-    return c[-1]["close"] if c else None
-
-
-def target_hit(side: str, price: float, target: float) -> bool:
-    return price >= target if side == "LONG" else price <= target
-
-
-def sl_hit(side: str, price: float, sl: float) -> bool:
-    return price <= sl if side == "LONG" else price >= sl
-
-
-def directional_progress_ratio(s: Dict[str, Any], p: float) -> Tuple[bool, float]:
-    entry = s["entry"]
-    tp1 = s["tp1"]
-    full = abs(tp1 - entry)
-    if full <= 0:
-        return False, 0.0
-    if s["side"] == "LONG":
-        directional = p > entry
-        progress = max(0.0, p - entry) / full
-    else:
-        directional = p < entry
-        progress = max(0.0, entry - p) / full
-    return directional, progress
-
-
-def safe_record_learning_result(
-    signal: Dict[str, Any], result: str, source: Optional[str] = None
-) -> None:
-    """Persist one outcome and evaluate a challenger without interrupting scans."""
-    if signal.get("learning_recorded"):
-        return
-    try:
-        report = record_closed_trade(signal, result, source=source)
-        if report.get("inserted"):
-            signal["learning_recorded"] = result
-            shadow_reason = str(signal.get("shadow_reason", ""))
-            if shadow_reason not in {
-                "near_miss_probe",
-                PAPER_VALIDATION_REASON,
-                PAPER_CONTROL_REASON,
-                LEGACY_V17_2_1_PAPER_VALIDATION_REASON,
-                LEGACY_V17_2_1_CONTROL_REASON,
-                LEGACY_V17_1_PAPER_VALIDATION_REASON,
-                LEGACY_V17_1_CONTROL_REASON,
-                LEGACY_V17_PAPER_VALIDATION_REASON,
-                LEGACY_V17_CONTROL_REASON,
-                LEGACY_PAPER_VALIDATION_REASON,
-            } and not shadow_reason.startswith(("v16_9_", "v16_9_1_")):
-                update_symbol_outcome_guard(signal, result, source=source)
-            backup_report = maybe_send_auto_backup()
-            send_telegram(closed_outcome_progress_message(signal, result, source=source))
-            if backup_report.get("attempted") and not backup_report.get("sent"):
-                send_telegram(
-                    "⚠️ JSON-backup пока не отправлен; бот повторит попытку на следующем "
-                    f"скане. Ошибка: {backup_report.get('error', STATE.get('last_error', 'unknown'))}"
-                )
-        evidence_audit = report.get("evidence_guard_audit")
-        if isinstance(evidence_audit, dict):
-            send_telegram(format_evidence_guard_audit_message(evidence_audit))
-        live_audit = report.get("live_audit")
-        if isinstance(live_audit, dict):
-            send_telegram(format_live_audit_message(live_audit))
-
-        training_report = report.get("training_report")
-        if not isinstance(training_report, dict):
-            training_report = report
-        if training_report.get("attempted"):
-            send_telegram(format_training_attempt_message(training_report))
-    except Exception as e:
-        STATE["last_error"] = f"adaptive record error: {repr(e)}"
-        save_state()
-
-
-def track_shadow_signals() -> bool:
-    shadows = STATE.setdefault("shadow_signals", [])
-    if not shadows:
-        return False
-
-    remaining: List[Dict[str, Any]] = []
-    changed = False
-    for signal in shadows:
-        ensure_signal_runtime_fields(signal, "shadow")
-        price = current_price(signal["symbol"])
-        if price is None:
-            remaining.append(signal)
-            continue
-
-        update_excursion(signal, price)
-        side = signal["side"]
-        age_minutes = (now_ts() - int(signal.get("created_at", now_ts()))) / 60.0
-
-        protected_stop = signal.get("protected_sl")
-        effective_sl = float(protected_stop if protected_stop is not None else signal["sl"])
-        if sl_hit(side, price, effective_sl):
-            protected_exit = protected_stop is not None
-            close_result = "expired" if protected_exit else "sl"
-            signal["protected_exit"] = protected_exit
-            signal["_closing_price"] = effective_sl
-            safe_record_learning_result(signal, close_result, source="shadow")
-            if (
-                PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
-            ):
-                send_telegram(
-                    build_paper_result_message(signal, close_result, effective_sl)
-                )
-            elif VISIBLE_SHADOW_NOTIFICATIONS:
-                send_telegram(
-                    build_shadow_result_message(signal, close_result, effective_sl)
-                )
-            changed = True
-            continue
-
-        for key in ["tp1", "tp2"]:
-            if target_hit(side, price, signal[key]):
-                signal[f"{key}_hit"] = True
-
-        if (
-            PAPER_BREAKEVEN_AFTER_TP1
-            and signal.get("tp1_hit")
-            and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
-            and signal.get("protected_sl") is None
-        ):
-            entry = float(signal.get("entry", price) or price)
-            fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
-            candidate_stop = (
-                entry * (1.0 + fee_buffer)
-                if side == "LONG"
-                else entry * (1.0 - fee_buffer)
-            )
-            signal["protected_sl"] = (
-                max(float(signal["sl"]), candidate_stop)
-                if side == "LONG"
-                else min(float(signal["sl"]), candidate_stop)
-            )
-            signal["tp1_protected"] = True
-            changed = True
-
-        # Once TP2 traded, a V17.1 PAPER position may not turn into a full loss.
-        # Lock approximately TP1 (after a fee/slippage buffer) while TP3 remains
-        # the only positive classification used by the quality target.
-        if (
-            signal.get("tp2_hit")
-            and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
-            and not signal.get("tp2_protected")
-        ):
-            fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
-            tp1 = float(signal.get("tp1", signal.get("entry", price)) or price)
-            candidate_stop = (
-                tp1 * (1.0 - fee_buffer)
-                if side == "LONG"
-                else tp1 * (1.0 + fee_buffer)
-            )
-            current_stop = float(signal.get("protected_sl", signal["sl"]) or signal["sl"])
-            signal["protected_sl"] = (
-                max(current_stop, candidate_stop)
-                if side == "LONG"
-                else min(current_stop, candidate_stop)
-            )
-            signal["tp2_protected"] = True
-            changed = True
-
-        if target_hit(side, price, signal[PROFIT_TARGET_KEY]):
-            signal[PROFIT_TARGET_KEY + "_hit"] = True
-            signal["_closing_price"] = signal[PROFIT_TARGET_KEY]
-            safe_record_learning_result(signal, "profit", source="shadow")
-            if (
-                PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
-            ):
-                send_telegram(
-                    build_paper_result_message(
-                        signal, "profit", float(signal[PROFIT_TARGET_KEY])
-                    )
-                )
-            elif VISIBLE_SHADOW_NOTIFICATIONS:
-                send_telegram(
-                    build_shadow_result_message(
-                        signal, "profit", float(signal[PROFIT_TARGET_KEY])
-                    )
-                )
-            changed = True
-            continue
-
-        directional, progress = directional_progress_ratio(signal, price)
-        fast_stop = (
-            FAST_CANCEL_IF_NO_PROGRESS
-            and age_minutes >= FAST_MAX_MINUTES_TO_TP1
-            and ((not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP)
-        )
-        if signal.get("tp1_hit"):
-            fast_stop = False
-        if fast_stop or age_minutes >= FAST_HARD_EXPIRE_MINUTES:
-            signal["_closing_price"] = price
-            safe_record_learning_result(signal, "expired", source="shadow")
-            if (
-                PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
-            ):
-                send_telegram(
-                    build_paper_result_message(signal, "expired", float(price))
-                )
-            elif VISIBLE_SHADOW_NOTIFICATIONS:
-                send_telegram(
-                    build_shadow_result_message(signal, "expired", float(price))
-                )
-            changed = True
-            continue
-
-        remaining.append(signal)
-
-    if changed:
-        STATE["shadow_signals"] = remaining
-    return changed
-
-
-def _track_active_signals_impl() -> None:
-    active = STATE.setdefault("active_signals", [])
-    remaining: List[Dict[str, Any]] = []
-    changed = False
-
-    for signal in active:
-        ensure_signal_runtime_fields(signal, "live")
-        price = current_price(signal["symbol"])
-        if price is None:
-            remaining.append(signal)
-            continue
-
-        update_excursion(signal, price)
-        side = signal["side"]
-        age_minutes = (now_ts() - int(signal.get("created_at", now_ts()))) / 60.0
-
-        # Migrate an already-running signal only if TP3 was actually reached.
-        if signal.get("tp3_hit") and not signal.get("stats_recorded"):
-            signal["_closing_price"] = signal.get("tp3", price)
-            if apply_result(signal, "profit"):
-                safe_record_learning_result(signal, "profit", source="live")
-            changed = True
-
-        # TP1 and TP2 remain intermediate labels: only TP3 is a positive
-        # outcome.  Capital protection is separate from labelling, however.
-        # After TP1 the stop moves to an execution-cost-adjusted breakeven; after
-        # TP2 it locks roughly TP1.  A protected exit is recorded conservatively
-        # as ``expired`` with its actual PnL, never as a TP3 profit.
-        if not signal.get("tp3_hit"):
-            protected_stop = signal.get("protected_sl")
-            effective_sl = float(
-                protected_stop if protected_stop is not None else signal["sl"]
-            )
-            if sl_hit(side, price, effective_sl):
-                protected_exit = protected_stop is not None
-                result = "expired" if protected_exit else "sl"
-                signal["protected_exit"] = protected_exit
-                signal["_closing_price"] = effective_sl
-                result_r = _estimate_pnl_r(signal, result)
-                if apply_result(signal, result):
-                    safe_record_learning_result(signal, result, source="live")
-                if protected_exit:
-                    title = "🛡 ЗАЩИТНЫЙ ВЫХОД ПОСЛЕ TP1/TP2"
-                    detail = (
-                        f"Защитный stop: {format_price(effective_sl)}\n"
-                        f"Фактический итог: {result_r:+.2f}R; для TP3-статистики = expired."
-                    )
-                else:
-                    title = "❌ STOP LOSS"
-                    detail = (
-                        f"SL: {format_price(effective_sl)}\n"
-                        f"Фактический итог: {result_r:+.2f}R."
-                    )
-                send_telegram(
-                    f"{title}\n"
-                    f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
-                    f"Стратегия: {signal['strategy']}\n"
-                    f"Вход: {format_price(signal['entry'])}\n"
-                    f"{detail}\n"
-                    f"Текущая цена: {format_price(price)}\n\n"
-                    f"{build_stats_text()}"
-                )
-                changed = True
-                continue
-
-            for key in ["tp1", "tp2"]:
-                if (
-                    not signal.get(f"{key}_hit")
-                    and target_hit(side, price, signal[key])
-                ):
-                    signal[f"{key}_hit"] = True
-                    changed = True
-                    send_telegram(
-                        f"🎯 {key.upper()} HIT — промежуточная цель\n"
-                        f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
-                        f"Стратегия: {signal['strategy']}\n"
-                        f"{key.upper()}: {format_price(signal[key])}\n"
-                        f"Текущая цена: {format_price(price)}\n"
-                        f"Сделка станет положительной только при TP3."
-                    )
-
-            if signal.get("tp1_hit") and signal.get("protected_sl") is None:
-                entry = float(signal.get("entry", price) or price)
-                fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
-                candidate_stop = (
-                    entry * (1.0 + fee_buffer)
-                    if side == "LONG"
-                    else entry * (1.0 - fee_buffer)
-                )
-                signal["protected_sl"] = (
-                    max(float(signal["sl"]), candidate_stop)
-                    if side == "LONG"
-                    else min(float(signal["sl"]), candidate_stop)
-                )
-                signal["tp1_protected"] = True
-                changed = True
-
-            if signal.get("tp2_hit") and not signal.get("tp2_protected"):
-                fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
-                tp1 = float(signal.get("tp1", signal.get("entry", price)) or price)
-                candidate_stop = (
-                    tp1 * (1.0 - fee_buffer)
-                    if side == "LONG"
-                    else tp1 * (1.0 + fee_buffer)
-                )
-                current_stop = float(
-                    signal.get("protected_sl", signal["sl"]) or signal["sl"]
-                )
-                signal["protected_sl"] = (
-                    max(current_stop, candidate_stop)
-                    if side == "LONG"
-                    else min(current_stop, candidate_stop)
-                )
-                signal["tp2_protected"] = True
-                changed = True
-
-            if target_hit(side, price, signal["tp3"]):
-                signal["tp3_hit"] = True
-                signal["profit_locked_at"] = now_ts()
-                signal["_closing_price"] = signal["tp3"]
-                if apply_result(signal, "profit"):
-                    safe_record_learning_result(signal, "profit", source="live")
-                send_telegram(
-                    f"✅ TP3 — сделка засчитана в profit\n"
-                    f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
-                    f"Стратегия: {signal['strategy']}\n"
-                    f"TP3: {format_price(signal['tp3'])}\n"
-                    f"Текущая цена: {format_price(price)}\n\n"
-                    f"{build_stats_text()}"
-                )
-                changed = True
-
-            if not signal.get("tp3_hit"):
-                directional, progress = directional_progress_ratio(signal, price)
-                fast_stop = (
-                    FAST_CANCEL_IF_NO_PROGRESS
-                    and age_minutes >= FAST_MAX_MINUTES_TO_TP1
-                    and not signal.get("tp1_hit")
-                    and ((not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP)
-                )
-                if fast_stop or age_minutes >= FAST_HARD_EXPIRE_MINUTES:
-                    signal["_closing_price"] = price
-                    result_r = _estimate_pnl_r(signal, "expired")
-                    if apply_result(signal, "expired"):
-                        safe_record_learning_result(signal, "expired", source="live")
-                    label = "FAST TIME-STOP" if fast_stop else "HARD TIME-STOP"
-                    stop_reason = (
-                        f"TP1 не получил достаточного движения за {age_minutes:.1f} мин.\n"
-                        if fast_stop
-                        else f"TP3 не достигнут за {age_minutes:.1f} мин.\n"
-                    )
-                    send_telegram(
-                        f"⏱ {label}\n"
-                        f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
-                        f"Стратегия: {signal['strategy']}\n"
-                        f"{stop_reason}"
-                        f"Вход: {format_price(signal['entry'])}\n"
-                        f"Цена выхода: {format_price(price)}\n"
-                        f"Прогресс к TP1: {progress*100:.1f}% · итог {result_r:+.2f}R\n\n"
-                        f"{build_stats_text()}"
-                    )
-                    changed = True
-                    continue
-
-        # After TP3, TP4/TP5 are informational and cannot double-count profit.
-        for key in ["tp4"]:
-            if (
-                signal.get("tp3_hit")
-                and signal.get(key)
-                and not signal.get(f"{key}_hit")
-                and target_hit(side, price, signal[key])
-            ):
-                signal[f"{key}_hit"] = True
-                changed = True
-                send_telegram(
-                    f"🎯 {key.upper()} HIT\n"
-                    f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
-                    f"Стратегия: {signal['strategy']}\n"
-                    f"{key.upper()}: {format_price(signal[key])}\n"
-                    f"Текущая цена: {format_price(price)}"
-                )
-
-        if signal.get("tp3_hit") and target_hit(side, price, signal["tp5"]):
-            signal["tp5_hit"] = True
-            send_telegram(
-                f"✅ FULL LADDER TAKE PROFIT\n"
-                f"{signal['grade']} · {side} {display_symbol(signal['symbol'])}\n"
-                f"Стратегия: {signal['strategy']}\n"
-                f"TP5 достигнут: {format_price(price)}\n"
-                f"Время в сделке: {age_minutes:.1f} мин\n\n"
-                f"{build_stats_text()}"
-            )
-            changed = True
-            continue
-
-        if signal.get("tp3_hit") and age_minutes >= LADDER_FOLLOWUP_MINUTES:
-            changed = True
-            continue
-
-        remaining.append(signal)
-
-    if track_shadow_signals():
-        changed = True
-    if changed:
-        STATE["active_signals"] = remaining
-        save_state()
-
-
-def track_active_signals() -> None:
-    if not TRACK_RUN_LOCK.acquire(blocking=False):
-        return
-    try:
-        _track_active_signals_impl()
-    finally:
-        TRACK_RUN_LOCK.release()
-
-# ============================================================
-# Background tasks / HTTP endpoints
-# ============================================================
+        f"✅ {APP_NAME} активирован.\n"
+        f"Deploy marker: {DEPLOY_MARKER}\nProtocol: {PROTOCOL_HASH}\n\n"
+        "Режим: RESEARCH + PAPER/OBSERVER ONLY. Ордеров BingX в коде нет.\n"
+        "ВСЕ созданные broad-кандидаты и их 6m результаты видимы в Telegram.\n"
+        "PAPER усилен против expired: свежий 1m impulse + 3m acceleration + closed-candle continuation + "
+        "EMA/VWAP + anti-chase + BTC opposite filter + execution liquidity.\n"
+        f"Tracking executable BBO: каждые ~{TRACK_INTERVAL_SECONDS}s.\n"
+        f"Costs in readiness: fee {ROUND_TRIP_FEE_MOVE*100:.2f}% + assumed slippage "
+        f"{ASSUMED_SLIPPAGE_MOVE*100:.2f}% = {ROUND_TRIP_COST_MOVE*100:.2f}% round trip.\n"
+        f"PAPER liquidity: turnover ≥ {PAPER_MIN_24H_QUOTE_VOLUME_USDT/1e6:.0f}M, "
+        f"spread ≤ {PAPER_MAX_SPREAD_BPS:.0f}bps, depth ≥ {PAPER_MIN_DEPTH_USDT:.0f} USDT.\n"
+        f"TP: 0.65/1.20/1.85/2.60/3.50%; only TP3+ = profit. SL {MIN_STOP_MOVE*100:.2f}%–{MAX_STOP_MOVE*100:.2f}%.\n"
+        f"Micro-LIVE review only after ≥{REVIEW_MIN_INDEPENDENT_PAPER} independent PAPER, "
+        f"TP3+ > SL+expired, TP3 ≥ {REVIEW_MIN_TP3_RATE*100:.0f}%, expectancy ≥ {REVIEW_MIN_EXPECTANCY_R:.2f}R, "
+        f"PF ≥ {REVIEW_MIN_PROFIT_FACTOR:.2f}.\n"
+        f"Storage {DB_PATH}. Seed: {runtime_snapshot().get('seed_restore',{})}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
 
 async def scan_loop():
     await asyncio.sleep(3)
-    guard_state = get_evidence_guard_state()
-    model_state = get_model_state()
-    source_counts = adaptive_source_counts()
-    model_data_count = adaptive_model_data_count()
-    paper_metrics = paper_validation_metrics()
-    control_metrics = control_validation_metrics()
-    readiness = real_money_readiness()
-    restored_count = int(SEED_RESTORE_INFO.get("restored", 0) or 0)
-    restored_text = (
-        f"restored {restored_count} outcomes from {SEED_RESTORE_INFO.get('source', 'JSON')}"
-        if restored_count
-        else str(SEED_RESTORE_INFO.get("reason", "not needed"))
-    )
-    state_storage = str(Path(STATE_FILE))
-    db_storage = str(Path(DB_PATH))
-    storage_warning = (
-        "persistent /var/data paths configured"
-        if state_storage.startswith("/var/data/") and db_storage.startswith("/var/data/")
-        else "WARNING: configure Render Disk /var/data and absolute storage paths"
-    )
-    send_telegram(
-        f"✅ {APP_NAME} активирован.\n"
-        f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: MEASURED A+ EDGE FORWARD + GUARDED MICRO-LIVE.\n"
-        f"Логика: свежий A+ INSTANT импульс → измеренный диапазон объёма/амплитуды → "
-        f"проверка публичного bid/ask и глубины → своевременный PAPER-вход → 5 TP.\n"
-        f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
-        f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
-        f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
-        f"Risk multiplier: PAPER A+ x{A_RISK_MULT:.2f}; первый micro-LIVE x{MICRO_LIVE_RISK_MULT:.2f} и не более 0.10% счёта на риск.\n"
-        f"Opportunity engine: analyze up to {MAX_ANALYZE_SYMBOLS} contracts · "
-        f"deep-check up to {HOT_SYMBOLS_TO_ANALYZE} liquidity-qualified names · "
-        f"parallel workers {HOT_SCAN_WORKERS}/{DEEP_SCAN_WORKERS}.\n"
-        f"Universe rotation: every scan advances through the full contract list; no fixed first-220 blind spot.\n"
-        f"Liquidity gate: top {V17_2_LIQUIDITY_KEEP_FRACTION*100:.0f}% by relative turnover/continuity · "
-        f"active candles ≥ {V17_2_MIN_ACTIVE_CANDLE_FRACTION*100:.0f}% · "
-        f"anomalies Vol1 > x{V17_2_MAX_CURRENT_VOL_RATIO:.0f} or Range1 > x{V17_2_MAX_CURRENT_RANGE_RATIO:.0f} rejected.\n"
-        f"Direct measured entry: independent of legacy instant/no_fast templates · Vol1 x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f} · "
-        f"Range1 x{MEASURED_MIN_RANGE1:.2f}–x{MEASURED_MAX_RANGE1:.2f} · directional 3m "
-        f"{MEASURED_MIN_DIRECTIONAL_3M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_3M*100:.2f}% · "
-        f"15m {MEASURED_MIN_DIRECTIONAL_15M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_15M*100:.2f}%.\n"
-        f"Execution gate: spread ≤ {MEASURED_MAX_BOOK_SPREAD_BPS:.1f} bps · visible depth ≥ "
-        f"{MEASURED_MIN_BOOK_DEPTH_USDT:.0f} USDT/side · 60m turnover proxy ≥ {MEASURED_MIN_QUOTE_60M:.0f}.\n"
-        f"Anti-chase: no delayed 90%–100% reclaim entry; the failed V17.2 retest path is excluded.\n"
-        f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
-        f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
-        f"every entry/result visible in Telegram; no forced daily PAPER quota.\n"
-        f"Reports: first quality checkpoint at {PAPER_PILOT_REQUIRED_OUTCOMES} · full review at "
-        f"{PAPER_REVIEW_REQUIRED_OUTCOMES} · model remains frozen until at least "
-        f"{PAPER_LANE_REQUIRED_OUTCOMES} unchanged PAPER outcomes.\n"
-        f"Data separation: old {source_counts['all']} outcomes and every pre-V17.2.2 row are audit-only; "
-        f"only new direct-measured PAPER can train.\n"
-        f"Real-money readiness: ready={readiness.get('ready', False)} · env flag REAL_MONEY_SIGNALS="
-        f"{readiness.get('live_flag', False)} · enabled={readiness.get('live_enabled', False)}. "
-        f"Both evidence and manual flag are mandatory. This code never places exchange orders.\n"
-        f"Side guard: LONG and SHORT are admitted separately after ≥ "
-        f"{REAL_MONEY_MIN_SIDE_FORWARD} fresh outcomes/side, TP3+ majority, positive expectancy "
-        f"and a positive newest {REAL_MONEY_SIDE_RECENT_WINDOW}-outcome side block.\n"
-        f"Micro-LIVE safety when enabled: ≤ {MAX_LIVE_SIGNALS_24H}/24h · ≤ "
-        f"{MAX_LIVE_SIGNALS_PER_SIDE_24H}/side · spacing ≥ {MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min · "
-        f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
-        f"Micro-LIVE kill switch: after {MICRO_LIVE_MAX_NONPROFIT_STREAK} consecutive "
-        f"non-profit outcomes, drawdown > {MICRO_LIVE_MAX_DRAWDOWN_R:.1f}R, or a weak "
-        f"rolling {MICRO_LIVE_GUARD_WINDOW}-outcome block, new LIVE alerts stop and return to PAPER.\n"
-        f"Reliable Telegram V17.1.1: immediate retries={TELEGRAM_SEND_ATTEMPTS} · "
-        f"ordered outbox={TELEGRAM_OUTBOX_ENABLED} · flush every "
-        f"{TELEGRAM_OUTBOX_FLUSH_SECONDS}s · diagnostics are replaceable and never block trades.\n"
-        f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
-        f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
-        f"Adaptive model: active={model_state.active} · version={model_state.version} · "
-        f"LIVE routing remains locked until readiness passes.\n"
-        f"Shadow candidates: {SHADOW_TRACKING_ENABLED} · full JSON every "
-        f"{AUTO_BACKUP_EVERY_CLOSED} total outcomes · PAPER checkpoint every "
-        f"{PAPER_CHECKPOINT_EVERY} confirmed entries.\n"
-        f"Seed JSON: {restored_text}.\n"
-        f"Restored sources: LIVE={source_counts['live']} · SHADOW={source_counts['shadow']} · "
-        f"ALL={source_counts['all']}.\n"
-        f"Eligible V17.2.2 model data={model_data_count} · minimum before analysis "
-        f"{PAPER_LANE_REQUIRED_OUTCOMES}.\n"
-        f"CONTROL collected: {int(control_metrics.get('n', 0))} · "
-        f"{_metrics_line(control_metrics)}.\n"
-        f"Direct Measured PAPER V17.2.2 collected: {int(paper_metrics.get('n', 0))}/"
-        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
-        f"{_metrics_line(paper_metrics)} · unique symbols="
-        f"{int(paper_metrics.get('unique_symbols', 0))}.\n"
-        f"{watch_audit_summary()}.\n"
-        f"Next JSON backup at {((source_counts['all'] // max(1, AUTO_BACKUP_EVERY_CLOSED)) + 1) * max(1, AUTO_BACKUP_EVERY_CLOSED)} total outcomes.\n"
-        f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH} · {storage_warning}."
-    )
-    try:
-        scan = await asyncio.to_thread(run_scan, True)
-        send_telegram(build_diagnostic(scan))
-    except Exception as e:
-        STATE["last_error"] = f"first scan exception: {repr(e)}"
-        save_state()
-        send_telegram(f"⚠️ Ошибка первого скана: {repr(e)}")
-
     while True:
-        try:
-            if AUTO_SCAN_ENABLED:
-                await asyncio.to_thread(run_scan, False)
-        except Exception as e:
-            STATE["last_error"] = f"scan_loop: {repr(e)}"
-            save_state()
-            send_telegram(f"⚠️ Ошибка auto-scan: {repr(e)}")
-        await asyncio.sleep(AUTO_SCAN_SECONDS)
-
+        try: await asyncio.to_thread(run_scan)
+        except Exception as exc:
+            set_runtime_error(f"scan_loop:{exc!r}")
+            send_text(f"⚠️ V18.1 scan error: {exc!r}",True)
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 async def track_loop():
-    await asyncio.sleep(8)
+    await asyncio.sleep(5)
     while True:
         try:
-            if AUTO_TRACK_ENABLED:
-                await asyncio.to_thread(track_active_signals)
-        except Exception as e:
-            STATE["last_error"] = f"track_loop: {repr(e)}"
-            save_state()
-        await asyncio.sleep(AUTO_TRACK_SECONDS)
+            await asyncio.to_thread(track_open_episodes)
+            await asyncio.to_thread(flush_outbox)
+        except Exception as exc:set_runtime_error(f"track_loop:{exc!r}")
+        await asyncio.sleep(TRACK_INTERVAL_SECONDS)
 
-
-def monitor_pending_and_dispatch() -> Dict[str, Any]:
-    """Check WATCH candidates without waiting for the full 80-symbol scan."""
-    blocks: Dict[str, int] = {}
-    near_miss: List[str] = []
-    confirmed = process_pending_signals(blocks, near_miss)
-    paper_sent = 0
-    non_paper_confirmed = 0
-    for candidate in confirmed:
-        if bool(candidate.get("paper_validation_only")):
-            if set_confirmed_paper_signal(candidate):
-                send_telegram(build_paper_signal_message(candidate))
-                paper_sent += 1
-        else:
-            # PRO_QUALITY_FORWARD_ENABLED means this branch should stay empty.
-            # Preserve diagnostics rather than silently turning it into LIVE.
-            non_paper_confirmed += 1
-    status = {
-        "ts": now_ts(),
-        "pending_active": len(STATE.get("pending_signals", [])),
-        "confirmed": len(confirmed),
-        "paper_sent": paper_sent,
-        "non_paper_confirmed": non_paper_confirmed,
-        "blocks": blocks,
-        "near_miss": near_miss[:8],
-    }
-    STATE["last_pending_monitor"] = status
-    save_state()
-    return status
-
-
-async def pending_monitor_loop():
-    await asyncio.sleep(max(3, PAPER_PENDING_MONITOR_SECONDS))
+async def diagnostic_loop():
+    await asyncio.sleep(20)
     while True:
         try:
-            if PRE_LIVE_CONFIRMATION_ENABLED:
-                await asyncio.to_thread(monitor_pending_and_dispatch)
-        except Exception as e:
-            STATE["last_error"] = f"pending_monitor_loop: {repr(e)}"
-            save_state()
-        await asyncio.sleep(max(3, PAPER_PENDING_MONITOR_SECONDS))
+            send_text(diagnostics_text(),False)
+            RUNTIME["last_diagnostic_at"]=now_ts()
+        except Exception as exc:set_runtime_error(f"diagnostic_loop:{exc!r}")
+        await asyncio.sleep(DIAGNOSTIC_INTERVAL_SECONDS)
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db();restore_seed_if_empty();send_text(startup_message(),True)
+    tasks=[asyncio.create_task(scan_loop()),asyncio.create_task(track_loop()),asyncio.create_task(diagnostic_loop())]
+    try:yield
+    finally:
+        for t in tasks:t.cancel()
+        await asyncio.gather(*tasks,return_exceptions=True)
 
-async def telegram_outbox_loop():
-    await asyncio.sleep(2)
-    while True:
-        try:
-            await asyncio.to_thread(flush_telegram_outbox)
-        except Exception as exc:
-            STATE["last_error"] = f"telegram_outbox_loop: {repr(exc)}"
-            save_state()
-        await asyncio.sleep(TELEGRAM_OUTBOX_FLUSH_SECONDS)
+app=FastAPI(title=APP_NAME,lifespan=lifespan)
 
-
-@app.on_event("startup")
-async def startup_event():
-    global STATE, SEED_RESTORE_INFO
-    STATE = load_state()
-    try:
-        init_adaptive_db()
-        SEED_RESTORE_INFO = restore_adaptive_seed_if_empty()
-        if adaptive_closed_count() > 0:
-            rebuild_symbol_outcomes_from_adaptive_db()
-            save_state()
-    except Exception as e:
-        STATE["last_error"] = f"adaptive DB init error: {repr(e)}"
-        save_state()
-    asyncio.create_task(telegram_outbox_loop())
-    asyncio.create_task(scan_loop())
-    asyncio.create_task(track_loop())
-    asyncio.create_task(pending_monitor_loop())
-
+def authorized(key: str)->bool:
+    return bool(ADMIN_KEY) and secrets.compare_digest(str(key),ADMIN_KEY)
 
 @app.get("/")
-def root():
-    return HTMLResponse(
-        f"<h3>{APP_NAME}</h3>"
-        f"<p>{DEPLOY_MARKER}</p>"
-        f"<p>Use /health /version /scan /auto-status /readiness /stats /adaptive-report "
-        f"/source-audit /watch-audit /adaptive-retrain /adaptive-events "
-        f"/export-data /telegram-backup /telegram-status /test-telegram</p>"
-    )
-
+def root()->HTMLResponse:
+    return HTMLResponse(f"<h3>{APP_NAME}</h3><p>{DEPLOY_MARKER}</p><p>Protocol {PROTOCOL_HASH}. Research/PAPER only.</p>")
 
 @app.get("/health")
-def health():
-    readiness = real_money_readiness()
-    return {
-        "ok": True,
-        "app": APP_NAME,
-        "deploy": DEPLOY_MARKER,
-        "active": len(STATE.get("active_signals", [])),
-        "real_money_ready": bool(readiness.get("ready")),
-        "real_money_enabled": bool(readiness.get("live_enabled")),
-        "last_error": STATE.get("last_error", ""),
-    }
+def health()->Dict[str,Any]:
+    return {"ok":True,"app":APP_NAME,"deploy_marker":DEPLOY_MARKER,"protocol_hash":PROTOCOL_HASH,
+            "episodes":table_count("episodes"),"primary_closed":primary_count(),
+            "open":open_episode_count(),"last_error":runtime_snapshot().get("last_error","")}
 
+@app.get("/status")
+def status()->JSONResponse:
+    return JSONResponse({"runtime":runtime_snapshot(),
+                         "observer":metrics(primary_rows("observer")),
+                         "paper":metrics(primary_rows("paper")),
+                         "paper_independent":metrics(primary_rows("paper",True)),
+                         "review_gate":review_gate()})
 
-@app.get("/version")
-def version():
-    return {"app": APP_NAME, "deploy_marker": DEPLOY_MARKER}
+@app.get("/diagnostic")
+def diagnostic()->HTMLResponse:
+    return HTMLResponse("<pre>"+diagnostics_text()+"</pre>")
 
+@app.post("/scan")
+def manual_scan(key: str=Query(""))->JSONResponse:
+    if not authorized(key):return JSONResponse({"ok":False,"error":"unauthorized"},status_code=403)
+    return JSONResponse(run_scan())
 
-@app.get("/auto-status")
-def auto_status():
-    readiness = real_money_readiness()
-    return JSONResponse({
-        "app": APP_NAME,
-        "deploy": DEPLOY_MARKER,
-        "active_signals": STATE.get("active_signals", []),
-        "pending_signals": STATE.get("pending_signals", []),
-        "last_pending_monitor": STATE.get("last_pending_monitor", {}),
-        "watch_audit_v17_2": STATE.get("watch_audit_v17_2", {}),
-        "telegram_outbox_depth": telegram_outbox_depth(),
-        "telegram_delivery": STATE.get("telegram_delivery", {}),
-        "paper_metrics_v17_2_2": paper_validation_metrics(),
-        "real_money_readiness": readiness,
-        "last_scan": STATE.get("last_scan", {}),
-        "last_error": STATE.get("last_error", ""),
-        "stats": STATE.get("stats", {}),
-    })
+@app.get("/export")
+def export(key: str=Query(""))->Response:
+    if not authorized(key):return JSONResponse({"ok":False,"error":"unauthorized"},status_code=403)
+    return Response(export_bytes(),media_type="application/json",
+                    headers={"Content-Disposition":f"attachment; filename=v18_1_research_{primary_count()}.json"})
 
+@app.post("/telegram-backup")
+def telegram_backup(key: str=Query(""))->JSONResponse:
+    if not authorized(key):return JSONResponse({"ok":False,"error":"unauthorized"},status_code=403)
+    count=primary_count();fn=f"v18_1_manual_{count}_{now_ts()}.json"
+    sent=send_document(export_bytes(),fn,"Manual V18.1 research backup")
+    return JSONResponse({"ok":sent,"filename":fn,"primary_count":count})
 
-@app.get("/readiness")
-def readiness_endpoint():
-    """Human-auditable two-key gate; this endpoint never enables trading."""
-    return JSONResponse({
-        "app": APP_NAME,
-        "deploy": DEPLOY_MARKER,
-        "warning": (
-            "Signal-only service: no exchange orders are placed. REAL_MONEY_SIGNALS "
-            "remains ineffective until every evidence check passes."
-        ),
-        "readiness": real_money_readiness(),
-    })
-
-
-@app.get("/telegram-status")
-def telegram_status_endpoint():
-    queued = STATE.get("telegram_outbox", [])
-    oldest = queued[0] if isinstance(queued, list) and queued else None
-    return JSONResponse({
-        "ok": True,
-        "app": APP_NAME,
-        "deploy": DEPLOY_MARKER,
-        "summary": telegram_delivery_summary(),
-        "outbox_depth": telegram_outbox_depth(),
-        "delivery": STATE.get("telegram_delivery", {}),
-        "oldest_queued": (
-            {
-                "id": oldest.get("id"),
-                "created_at": oldest.get("created_at"),
-                "attempts": oldest.get("attempts"),
-                "next_retry_at": oldest.get("next_retry_at"),
-                "last_error": oldest.get("last_error"),
-            }
-            if isinstance(oldest, dict)
-            else None
-        ),
-    })
-
-
-@app.get("/scan")
-def manual_scan(send: bool = Query(True)):
-    scan = run_scan(manual=True)
-    if send:
-        send_telegram(build_diagnostic(scan))
-    return JSONResponse(scan)
-
-
-@app.get("/stats")
-def stats():
-    return HTMLResponse("<pre>" + build_stats_text() + "</pre>")
-
-
-@app.get("/adaptive-report")
-def adaptive_report_endpoint():
-    try:
-        return HTMLResponse("<pre>" + adaptive_report() + "</pre>")
-    except Exception as e:
-        return HTMLResponse("<pre>Adaptive report error: " + repr(e) + "</pre>", status_code=500)
-
-
-@app.get("/source-audit")
-def source_audit_endpoint(window: int = Query(25, ge=1, le=100)):
-    try:
-        return HTMLResponse("<pre>" + format_source_audit_message(window) + "</pre>")
-    except Exception as e:
-        return HTMLResponse("<pre>Source audit error: " + repr(e) + "</pre>", status_code=500)
-
-
-@app.get("/watch-audit")
-def watch_audit_endpoint():
-    try:
-        return JSONResponse(
-            {
-                "summary": watch_audit_summary(),
-                "audit": STATE.get("watch_audit_v17_2", default_watch_audit()),
-                "last_pending_monitor": STATE.get("last_pending_monitor", {}),
-            }
-        )
-    except Exception as e:
-        return JSONResponse({"error": repr(e)}, status_code=500)
-
-
-@app.get("/adaptive-retrain")
-def adaptive_retrain_endpoint(key: str = Query("")):
-    if not admin_authorized(key):
-        return JSONResponse(
-            {"ok": False, "error": "Set ADMIN_KEY and provide ?key=..."},
-            status_code=403,
-        )
-    try:
-        return JSONResponse(maybe_retrain(force=True))
-    except Exception as e:
-        return JSONResponse({"trained": False, "error": repr(e)}, status_code=500)
-
-
-@app.get("/adaptive-events")
-def adaptive_events_endpoint(limit: int = Query(20, ge=1, le=100)):
-    try:
-        return JSONResponse(recent_adaptive_events(limit))
-    except Exception as e:
-        return JSONResponse({"error": repr(e)}, status_code=500)
-
-
-@app.get("/export-data")
-def export_data_endpoint(key: str = Query("")):
-    if not admin_authorized(key):
-        return JSONResponse(
-            {"ok": False, "error": "Set ADMIN_KEY and provide ?key=..."},
-            status_code=403,
-        )
-    try:
-        closed_count = adaptive_closed_count()
-        filename = f"adaptive_backup_{closed_count}_{int(time.time())}.json"
-        return Response(
-            content=build_export_bytes(),
-            media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": repr(e)}, status_code=500)
-
-
-@app.get("/telegram-backup")
-def telegram_backup_endpoint(key: str = Query("")):
-    if not admin_authorized(key):
-        return JSONResponse(
-            {"ok": False, "error": "Set ADMIN_KEY and provide ?key=..."},
-            status_code=403,
-        )
-    try:
-        closed_count = adaptive_closed_count()
-        filename = f"adaptive_backup_{closed_count}_{int(time.time())}.json"
-        sent = send_telegram_document(
-            build_export_bytes(),
-            filename,
-            f"🧠 Manual adaptive backup · {closed_count} learning outcomes (LIVE + SHADOW)",
-        )
-        if sent:
-            STATE["last_backup_closed_count"] = closed_count
-            save_state()
-        return {"ok": sent, "closed_count": closed_count, "filename": filename}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": repr(e)}, status_code=500)
-
-
-@app.get("/test-telegram")
-def test_telegram():
-    accepted = send_telegram(
-        f"✅ Test Telegram OK\n{APP_NAME}\n{DEPLOY_MARKER}"
-    )
-    return {
-        "accepted": accepted,
-        "outbox_depth": telegram_outbox_depth(),
-        "delivery": STATE.get("telegram_delivery", {}),
-        "last_error": STATE.get("last_error", ""),
-    }
-
-
-if __name__ == "__main__":
+if __name__=="__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app,host="0.0.0.0",port=PORT,log_level="info")
