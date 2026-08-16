@@ -1,2773 +1,3101 @@
-from __future__ import annotations
-
-"""
-V18.4 Visible Trades + Bounded Adaptive PAPER Research Recorder
-BingX USDT-M perpetual markets.
-
-RESEARCH / PAPER ONLY:
-- no authenticated exchange endpoints
-- cannot place, modify, or cancel orders
-- every executable PAPER entry, primary result and full path is visible in Telegram
-- PAPER trades have a stable visible number; there are no hidden SHADOW trades
-- the unchanged V18.1 liquid-momentum lane is the CHAMPION
-- a fixed trend/pullback/reclaim lane is the CHALLENGER
-- OBSERVER is diagnostic only and never trains or enables a model
-- only TP3+ is a profitable outcome
-- primary legacy result remains 6 minutes
-- path is sampled from executable BBO every ~2 seconds
-- missed horizons are marked DATA_GAP instead of inventing historical prices
-- TP3/SL hits in the same sample are DATA_GAP, never an invented winner
-- real-money readiness uses cost-adjusted payoff, regime/day diversity,
-  cluster-robust confidence and three non-overlapping 50-trade blocks
-
-Every 25 closed visible PAPER outcomes trigger an audit, a prospective bounded
-policy update and a JSON file sent to Telegram.  A weak block can only move its
-lane one step up a pre-registered selectivity ladder (higher score floor and a
-longer cooldown).  The bot never loosens rules automatically and never rewrites
-its Python source.  Promotion statistics use only independent outcomes produced
-by the current policy revision.  No audit can change targets, place an exchange
-order, or enable real money.  A lane can be recommended for a separately
-reviewed micro-LIVE build only after a much larger independent forward sample
-under one unchanged policy revision passes all pre-registered checks.
-"""
-
-import asyncio
-import hashlib
-import io
-import json
-import math
 import os
-import secrets
-import sqlite3
-import statistics
-import threading
 import time
-from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+import json
+import random
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 
 
-# ---------------------------------------------------------------------------
-# Immutable V18.4 base protocol
-# ---------------------------------------------------------------------------
 
-APP_NAME = "Professional Futures Research Bot V18.4 VISIBLE BOUNDED ADAPTIVE"
-DEPLOY_MARKER = "V18_4_VISIBLE_BOUNDED_ADAPTIVE_2026_08_16"
-EXPORT_SCHEMA = "v18_4_visible_adaptive_export_v1"
-COHORT_ID = "V18_4_VISIBLE_BOUNDED_ADAPTIVE_V1"
+# ============================================================
+# SAFE ADAPTIVE LEARNING LAYER
+# ============================================================
 
-STRATEGY_MOMENTUM = "LIQUID_MOMENTUM_CHAMPION"
-STRATEGY_PULLBACK = "TREND_PULLBACK_RECLAIM_CHALLENGER"
-STRATEGIES: Tuple[str, ...] = (STRATEGY_MOMENTUM, STRATEGY_PULLBACK)
+"""
+adaptive_learning.py
 
-TARGET_MOVES: Tuple[float, ...] = (0.0065, 0.0120, 0.0185, 0.0260, 0.0350)
-TP1_MOVE, TP2_MOVE, TP3_MOVE, TP4_MOVE, TP5_MOVE = TARGET_MOVES
+Safe adaptive layer for a futures signal bot.
 
-HORIZONS_SECONDS: Tuple[int, ...] = (60, 180, 360, 600, 900, 1800)
-PRIMARY_HORIZON_SECONDS = 360
-FINAL_HORIZON_SECONDS = 1800
-MAX_HORIZON_LATENESS_SECONDS = 8
+What it does:
+- Stores every closed signal and its feature snapshot in SQLite.
+- Retrains after MIN_TRAIN_TRADES closed trades and then every RETRAIN_EVERY trades.
+- Uses a simple logistic model implemented with the Python standard library.
+- Validates on the newest 30% of trades (walk-forward style).
+- Activates a new model only if it beats a constant base-rate model.
+- Learns a probability threshold that maximizes an expectancy-style objective.
+- Never changes leverage, stop-loss safety limits, API permissions, or source code.
 
-# Broad recorder: deliberately permissive for diagnostics. Only executable
-# PAPER episodes are visible in Telegram; OBSERVER cannot train or promote.
-BROAD_MIN_DIRECTIONAL_3M = 0.0035
-BROAD_MAX_DIRECTIONAL_3M = 0.0500
-BROAD_MIN_DIRECTIONAL_15M = 0.0050
-BROAD_MAX_DIRECTIONAL_15M = 0.0800
+This module does NOT guarantee profit and must be used in paper/shadow mode first.
+"""
 
-# Stronger PAPER continuation gate. Designed to attack the old failure mode:
-# weak/late impulses that quickly become expired or reverse into SL.
-PAPER_MIN_DIRECTIONAL_1M = 0.0012
-PAPER_MAX_DIRECTIONAL_1M = 0.0090
-PAPER_MIN_DIRECTIONAL_3M = 0.0065
-PAPER_MAX_DIRECTIONAL_3M = 0.0280
-PAPER_MIN_DIRECTIONAL_15M = 0.0090
-PAPER_MAX_DIRECTIONAL_15M = 0.0500
-PAPER_MIN_ACCELERATION = 0.22        # d3 must be >= 22% of d15
-PAPER_MAX_D3_SHARE_OF_D15 = 0.78    # avoids one-bar exhaustion
-PAPER_MIN_VOL1 = 0.95
-PAPER_MAX_VOL1 = 2.80
-PAPER_MIN_RANGE1 = 1.15
-PAPER_MAX_RANGE1 = 4.00
-PAPER_MIN_BODY_FRACTION = 0.38
-PAPER_LONG_MIN_CLOSE_LOCATION = 0.65
-PAPER_SHORT_MAX_CLOSE_LOCATION = 0.35
-PAPER_MAX_VWAP_DISTANCE = 0.0180
-PAPER_MAX_SPREAD_BPS = 10.0
-PAPER_MIN_DEPTH_USDT = 5_000.0
-PAPER_MIN_24H_QUOTE_VOLUME_USDT = 10_000_000.0
-# This is the actual net winner / actual net loser ratio after two taker fees
-# and the fixed slippage allowance below.  The previous build checked gross
-# TP3/stop and could accept a trade whose real payoff was materially weaker.
-PAPER_MIN_NET_PAYOFF_RATIO = 1.45
-
-# Pre-registered CHALLENGER.  This is a mechanical interpretation of the
-# public trend -> controlled pullback -> reclaim idea, not a claim that these
-# are any named trader's proprietary parameters.
-PULLBACK_MIN_ADX14 = 20.0
-PULLBACK_MAX_ADX14 = 60.0
-PULLBACK_MIN_DIRECTIONAL_15M = 0.0060
-PULLBACK_MAX_DIRECTIONAL_15M = 0.0500
-PULLBACK_MIN_DIRECTIONAL_30M = 0.0080
-PULLBACK_MAX_DIRECTIONAL_30M = 0.0800
-PULLBACK_MIN_RETRACE = 0.12
-PULLBACK_MAX_RETRACE = 0.50
-PULLBACK_EMA20_TOLERANCE_ATR = 0.35
-PULLBACK_MIN_TRIGGER_BODY = 0.30
-PULLBACK_LONG_MIN_CLOSE_LOCATION = 0.62
-PULLBACK_SHORT_MAX_CLOSE_LOCATION = 0.38
-PULLBACK_MIN_VOL1 = 0.70
-PULLBACK_MAX_VOL1 = 3.50
-PULLBACK_MIN_RANGE1 = 0.80
-PULLBACK_MAX_RANGE1 = 4.00
-PULLBACK_MAX_ENTRY_CHASE_ATR = 0.30
-
-MIN_24H_QUOTE_VOLUME_USDT = 3_000_000.0
-MIN_ACTIVE_CANDLE_FRACTION = 0.82
-MIN_UNIQUE_CLOSE_FRACTION = 0.35
-MAX_UNIVERSE = 100
-SCAN_WORKERS = 8
-MAX_OPEN_EPISODES = 180
-
-# We still avoid sending the identical symbol/side/strategy every scan.
-OBSERVER_SYMBOL_COOLDOWN_SECONDS = 30 * 60
-PAPER_SYMBOL_COOLDOWN_SECONDS = 3 * 60 * 60
-INDEPENDENT_CLUSTER_SECONDS = 15 * 60
-
-MIN_STOP_MOVE = 0.0080
-MAX_STOP_MOVE = 0.0127
-ATR_STOP_MULTIPLIER = 2.00
-
-# Conservative execution costs for readiness accounting.
-TAKER_FEE_PER_SIDE = 0.0005
-ROUND_TRIP_FEE_MOVE = TAKER_FEE_PER_SIDE * 2.0
-ASSUMED_ENTRY_SLIPPAGE_BPS = 4.0
-ASSUMED_EXIT_SLIPPAGE_BPS = 4.0
-ASSUMED_SLIPPAGE_MOVE = (
-    ASSUMED_ENTRY_SLIPPAGE_BPS + ASSUMED_EXIT_SLIPPAGE_BPS
-) / 10_000.0
-ROUND_TRIP_COST_MOVE = ROUND_TRIP_FEE_MOVE + ASSUMED_SLIPPAGE_MOVE
-
-# Research gate. Passing NEVER enables money in this program.
-REVIEW_MIN_INDEPENDENT_PAPER = 150
-REVIEW_MIN_UNIQUE_SYMBOLS = 30
-REVIEW_MIN_UNIQUE_CLUSTERS = 75
-REVIEW_MIN_ACTIVE_DAYS = 10
-REVIEW_MIN_MARKET_REGIMES = 2
-REVIEW_MIN_PER_SIDE = 30
-REVIEW_MIN_TP3_RATE = 0.52
-REVIEW_MIN_EXPECTANCY_R = 0.15
-REVIEW_MIN_PROFIT_FACTOR = 1.30
-REVIEW_MAX_DRAWDOWN_R = 8.0
-REVIEW_MAX_DATA_GAP_RATE = 0.02
-REVIEW_RECENT_WINDOW = 50
-REVIEW_STABILITY_BLOCKS = 3
-AUDIT_BLOCK_SIZE = 25
-MIN_LANE_COMPARISON_SAMPLE = 100
-MIN_LCB_ADVANTAGE_R = 0.05
-
-# Pre-registered, one-way adaptive ladder.  A completed 25-trade block may
-# tighten a lane by at most one level.  Automatic loosening is intentionally
-# impossible: a new policy revision must prove itself prospectively.
-ADAPTIVE_POLICY_SCHEMA = "v18_4_bounded_selectivity_v1"
-ADAPTIVE_MIN_INDEPENDENT_PER_LANE_BLOCK = 8
-ADAPTIVE_MAX_DATA_GAP_RATE = 0.05
-ADAPTIVE_LEVELS: Tuple[Dict[str, float], ...] = (
-    {"min_quality_score": 0.0, "cooldown_multiplier": 1.0},
-    {"min_quality_score": 60.0, "cooldown_multiplier": 1.5},
-    {"min_quality_score": 65.0, "cooldown_multiplier": 2.0},
-    {"min_quality_score": 70.0, "cooldown_multiplier": 3.0},
-    {"min_quality_score": 75.0, "cooldown_multiplier": 4.0},
-)
-
-PROTOCOL_MANIFEST = {
-    "cohort_id": COHORT_ID,
-    "targets": TARGET_MOVES,
-    "horizons": HORIZONS_SECONDS,
-    "primary_horizon": PRIMARY_HORIZON_SECONDS,
-    "max_horizon_lateness": MAX_HORIZON_LATENESS_SECONDS,
-    "broad_3m": [BROAD_MIN_DIRECTIONAL_3M, BROAD_MAX_DIRECTIONAL_3M],
-    "broad_15m": [BROAD_MIN_DIRECTIONAL_15M, BROAD_MAX_DIRECTIONAL_15M],
-    "paper_1m": [PAPER_MIN_DIRECTIONAL_1M, PAPER_MAX_DIRECTIONAL_1M],
-    "paper_3m": [PAPER_MIN_DIRECTIONAL_3M, PAPER_MAX_DIRECTIONAL_3M],
-    "paper_15m": [PAPER_MIN_DIRECTIONAL_15M, PAPER_MAX_DIRECTIONAL_15M],
-    "paper_acceleration": [PAPER_MIN_ACCELERATION, PAPER_MAX_D3_SHARE_OF_D15],
-    "paper_vol1": [PAPER_MIN_VOL1, PAPER_MAX_VOL1],
-    "paper_range1": [PAPER_MIN_RANGE1, PAPER_MAX_RANGE1],
-    "paper_body": PAPER_MIN_BODY_FRACTION,
-    "paper_vwap_distance": PAPER_MAX_VWAP_DISTANCE,
-    "spread_bps": PAPER_MAX_SPREAD_BPS,
-    "depth_usdt": PAPER_MIN_DEPTH_USDT,
-    "paper_min_24h_quote_volume": PAPER_MIN_24H_QUOTE_VOLUME_USDT,
-    "paper_min_net_payoff_ratio": PAPER_MIN_NET_PAYOFF_RATIO,
-    "strategies": STRATEGIES,
-    "pullback": {
-        "adx14": [PULLBACK_MIN_ADX14, PULLBACK_MAX_ADX14],
-        "directional_15m": [PULLBACK_MIN_DIRECTIONAL_15M, PULLBACK_MAX_DIRECTIONAL_15M],
-        "directional_30m": [PULLBACK_MIN_DIRECTIONAL_30M, PULLBACK_MAX_DIRECTIONAL_30M],
-        "retrace": [PULLBACK_MIN_RETRACE, PULLBACK_MAX_RETRACE],
-        "ema20_tolerance_atr": PULLBACK_EMA20_TOLERANCE_ATR,
-        "trigger_body": PULLBACK_MIN_TRIGGER_BODY,
-        "vol1": [PULLBACK_MIN_VOL1, PULLBACK_MAX_VOL1],
-        "range1": [PULLBACK_MIN_RANGE1, PULLBACK_MAX_RANGE1],
-        "entry_chase_atr": PULLBACK_MAX_ENTRY_CHASE_ATR,
-    },
-    "fees_round_trip": ROUND_TRIP_FEE_MOVE,
-    "assumed_slippage_round_trip": ASSUMED_SLIPPAGE_MOVE,
-    "cost_round_trip": ROUND_TRIP_COST_MOVE,
-    "stop_bounds": [MIN_STOP_MOVE, MAX_STOP_MOVE],
-    "review": {
-        "independent_paper": REVIEW_MIN_INDEPENDENT_PAPER,
-        "unique_symbols": REVIEW_MIN_UNIQUE_SYMBOLS,
-        "unique_clusters": REVIEW_MIN_UNIQUE_CLUSTERS,
-        "active_days": REVIEW_MIN_ACTIVE_DAYS,
-        "market_regimes": REVIEW_MIN_MARKET_REGIMES,
-        "per_side": REVIEW_MIN_PER_SIDE,
-        "data_gap_rate_max": REVIEW_MAX_DATA_GAP_RATE,
-        "stability_blocks": REVIEW_STABILITY_BLOCKS,
-        "stability_block_size": REVIEW_RECENT_WINDOW,
-    },
-    "bounded_adaptation": {
-        "schema": ADAPTIVE_POLICY_SCHEMA,
-        "audit_block_size": AUDIT_BLOCK_SIZE,
-        "min_independent_per_lane_block": ADAPTIVE_MIN_INDEPENDENT_PER_LANE_BLOCK,
-        "max_data_gap_rate": ADAPTIVE_MAX_DATA_GAP_RATE,
-        "levels": ADAPTIVE_LEVELS,
-        "automatic_loosening": False,
-        "source_rewriting": False,
-    },
-}
-PROTOCOL_HASH = hashlib.sha256(
-    json.dumps(PROTOCOL_MANIFEST, sort_keys=True, separators=(",", ":")).encode()
-).hexdigest()[:16]
+import json
+import math
+import os
+import random
+import sqlite3
+import threading
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-# ---------------------------------------------------------------------------
-# Environment/runtime
-# ---------------------------------------------------------------------------
+DB_PATH = os.getenv("ADAPTIVE_DB_PATH", "adaptive_bot.sqlite3")
+MIN_TRAIN_TRADES = int(os.getenv("ADAPTIVE_MIN_TRAIN_TRADES", "50"))
+RETRAIN_EVERY = int(os.getenv("ADAPTIVE_RETRAIN_EVERY", "25"))
+MAX_TRAIN_ROWS = int(os.getenv("ADAPTIVE_MAX_TRAIN_ROWS", "1500"))
+VALIDATION_FRACTION = float(os.getenv("ADAPTIVE_VALIDATION_FRACTION", "0.30"))
+MIN_VALIDATION_ROWS = int(os.getenv("ADAPTIVE_MIN_VALIDATION_ROWS", "15"))
+MIN_POSITIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_POSITIVE_ROWS", "8"))
+MIN_NEGATIVE_ROWS = int(os.getenv("ADAPTIVE_MIN_NEGATIVE_ROWS", "8"))
+MIN_MODEL_IMPROVEMENT = float(os.getenv("ADAPTIVE_MIN_MODEL_IMPROVEMENT", "0.015"))
+MIN_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MIN_SIGNAL_PROBABILITY", "0.60"))
+MAX_SIGNAL_PROBABILITY = float(os.getenv("ADAPTIVE_MAX_SIGNAL_PROBABILITY", "0.82"))
+MIN_VALIDATION_COVERAGE = float(os.getenv("ADAPTIVE_MIN_VALIDATION_COVERAGE", "0.15"))
+MODEL_ENABLED = os.getenv("ADAPTIVE_MODEL_ENABLED", "true").lower() == "true"
+SHADOW_ONLY = os.getenv("ADAPTIVE_SHADOW_ONLY", "true").lower() == "true"
 
-def _env_int(name: str, default: int, minimum: int = 0) -> int:
-    try:
-        return max(minimum, int(os.getenv(name, str(default))))
-    except Exception:
-        return max(minimum, default)
-
-def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    try:
-        return max(minimum, float(os.getenv(name, str(default))))
-    except Exception:
-        return max(minimum, default)
-
-BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").rstrip("/")
-DB_PATH = os.getenv("RESEARCH_DB_PATH", "research_v18_4.sqlite3")
-SEED_PATH = os.getenv("RESEARCH_SEED_PATH", "adaptive_seed.json")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
-PORT = _env_int("PORT", 10000, 1)
-
-SCAN_INTERVAL_SECONDS = _env_int("SCAN_INTERVAL_SECONDS", 60, 30)
-# Critical change: execution path from 15s -> 2s.
-TRACK_INTERVAL_SECONDS = _env_int("TRACK_INTERVAL_SECONDS", 2, 1)
-DIAGNOSTIC_INTERVAL_SECONDS = _env_int("DIAGNOSTIC_INTERVAL_SECONDS", 1800, 300)
-REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 10.0, 3.0)
-API_RETRIES = _env_int("API_RETRIES", 3, 1)
-BACKUP_EVERY_PRIMARY = _env_int("BACKUP_EVERY_PRIMARY", 5, 5)
-TELEGRAM_RETRIES = _env_int("TELEGRAM_RETRIES", 3, 1)
-
-DB_LOCK = threading.RLock()
-RUNTIME_LOCK = threading.RLock()
-SCAN_LOCK = threading.Lock()
-TRACK_LOCK = threading.Lock()
-CACHE_LOCK = threading.RLock()
-NOTIFY_LOCK = threading.RLock()
-
-RUNTIME: Dict[str, Any] = {
-    "started_at": int(time.time()),
-    "scan_count": 0,
-    "last_scan": {},
-    "last_scan_at": 0,
-    "last_track_at": 0,
-    "last_diagnostic_at": 0,
-    "last_error": "",
-    "api_calls": 0,
-    "api_errors": 0,
-    "telegram_sent": 0,
-    "telegram_errors": 0,
-    "seed_restore": {},
+# Never let learning touch these safety-critical settings.
+LOCKED_SAFETY_KEYS = {
+    "LEVERAGE",
+    "MAX_SL_MOVE",
+    "LOCAL_SCALP_MAX_SL_MOVE",
+    "MAX_ACTIVE_SIGNALS",
+    "MAX_SIGNALS_PER_SCAN",
 }
 
-def now_ts() -> int:
-    return int(time.time())
-
-def set_runtime_error(message: str) -> None:
-    with RUNTIME_LOCK:
-        RUNTIME["last_error"] = str(message)[:800]
-
-def runtime_snapshot() -> Dict[str, Any]:
-    with RUNTIME_LOCK:
-        return json.loads(json.dumps(RUNTIME, ensure_ascii=False, default=str))
-
-
-# ---------------------------------------------------------------------------
-# SQLite
-# ---------------------------------------------------------------------------
-
-EPISODE_COLUMNS: Tuple[str, ...] = (
-    "id", "episode_key", "cohort_id", "protocol_hash", "created_at",
-    "cluster_id", "symbol", "side", "strategy", "tier", "visible_paper", "independent",
-    "policy_revision", "policy_hash",
-    "quality_score", "paper_reject_reason", "entry_price", "entry_bid",
-    "entry_ask", "spread_bps", "depth_usdt", "quote_volume_24h",
-    "liquidity_rank", "stop_move", "tp1_move", "tp2_move", "tp3_move",
-    "tp4_move", "tp5_move", "features_json", "status", "primary_outcome",
-    "primary_pnl_r", "primary_closed_at", "primary_notified", "entry_notified",
-    "tp1_hit_at", "tp2_hit_at", "tp3_hit_at", "tp4_hit_at", "tp5_hit_at",
-    "sl_hit_at", "max_favorable_move", "max_adverse_move", "last_exit_price",
-    "last_seen_at", "data_gap_count", "path_samples", "max_sample_gap_seconds",
-    "finalized_at", "final_notified",
+FEATURE_NAMES: Tuple[str, ...] = (
+    "score",
+    "is_long",
+    "is_a_plus",
+    "ch3m_abs",
+    "ch15m_abs",
+    "ch30m_abs",
+    "vol1",
+    "vol5",
+    "range1",
+    "range5",
+    "rr_tp1",
+    "ladder_rr",
+    "final_rr",
+    "sl_price_move",
+    "btc_bull",
+    "btc_bear",
+    "is_reversal",
+    "is_dump",
+    "is_instant",
+    "is_aero",
 )
 
-HORIZON_COLUMNS: Tuple[str, ...] = (
-    "episode_id", "horizon_seconds", "observed_at", "exit_price",
-    "net_move", "mfe_move", "mae_move", "tp1_hit", "tp2_hit", "tp3_hit",
-    "sl_hit", "outcome", "pnl_r", "lateness_seconds",
-)
 
-def db_connect() -> sqlite3.Connection:
+@dataclass
+class ModelState:
+    version: int = 0
+    active: bool = False
+    threshold: float = MIN_SIGNAL_PROBABILITY
+    trained_rows: int = 0
+    validation_rows: int = 0
+    base_logloss: float = 999.0
+    model_logloss: float = 999.0
+    validation_win_rate: float = 0.0
+    validation_coverage: float = 0.0
+    validation_selected_wr: float = 0.0
+    validation_selected_count: int = 0
+    weights: List[float] = None
+    mean: List[float] = None
+    std: List[float] = None
+    last_trained_closed_count: int = 0
+    created_at: int = 0
+
+    def __post_init__(self) -> None:
+        if self.weights is None:
+            self.weights = [0.0] * (len(FEATURE_NAMES) + 1)
+        if self.mean is None:
+            self.mean = [0.0] * len(FEATURE_NAMES)
+        if self.std is None:
+            self.std = [1.0] * len(FEATURE_NAMES)
+
+
+_LOCK = threading.RLock()
+
+
+def _connect() -> sqlite3.Connection:
     path = Path(DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
-def init_db() -> None:
-    with DB_LOCK, db_connect() as conn:
+
+def init_adaptive_db() -> None:
+    with _LOCK, _connect() as conn:
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS episodes (
+            CREATE TABLE IF NOT EXISTS adaptive_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                episode_key TEXT NOT NULL UNIQUE,
-                cohort_id TEXT NOT NULL,
-                protocol_hash TEXT NOT NULL,
+                signal_id TEXT UNIQUE,
                 created_at INTEGER NOT NULL,
-                cluster_id INTEGER NOT NULL,
+                closed_at INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
                 strategy TEXT NOT NULL,
-                tier TEXT NOT NULL,
-                visible_paper INTEGER NOT NULL DEFAULT 0,
-                independent INTEGER NOT NULL DEFAULT 0,
-                policy_revision INTEGER NOT NULL DEFAULT 0,
-                policy_hash TEXT NOT NULL DEFAULT '',
-                quality_score REAL NOT NULL DEFAULT 0,
-                paper_reject_reason TEXT NOT NULL DEFAULT '',
-                entry_price REAL NOT NULL,
-                entry_bid REAL NOT NULL DEFAULT 0,
-                entry_ask REAL NOT NULL DEFAULT 0,
-                spread_bps REAL NOT NULL DEFAULT 999,
-                depth_usdt REAL NOT NULL DEFAULT 0,
-                quote_volume_24h REAL NOT NULL DEFAULT 0,
-                liquidity_rank REAL NOT NULL DEFAULT 0,
-                stop_move REAL NOT NULL,
-                tp1_move REAL NOT NULL,
-                tp2_move REAL NOT NULL,
-                tp3_move REAL NOT NULL,
-                tp4_move REAL NOT NULL,
-                tp5_move REAL NOT NULL,
+                grade TEXT NOT NULL,
+                result TEXT NOT NULL,
+                label INTEGER NOT NULL,
+                pnl_r REAL NOT NULL DEFAULT 0,
                 features_json TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',
-                primary_outcome TEXT,
-                primary_pnl_r REAL,
-                primary_closed_at INTEGER,
-                primary_notified INTEGER NOT NULL DEFAULT 0,
-                entry_notified INTEGER NOT NULL DEFAULT 0,
-                tp1_hit_at INTEGER,
-                tp2_hit_at INTEGER,
-                tp3_hit_at INTEGER,
-                tp4_hit_at INTEGER,
-                tp5_hit_at INTEGER,
-                sl_hit_at INTEGER,
-                max_favorable_move REAL NOT NULL DEFAULT 0,
-                max_adverse_move REAL NOT NULL DEFAULT 0,
-                last_exit_price REAL,
-                last_seen_at INTEGER,
-                data_gap_count INTEGER NOT NULL DEFAULT 0,
-                path_samples INTEGER NOT NULL DEFAULT 0,
-                max_sample_gap_seconds INTEGER NOT NULL DEFAULT 0,
-                finalized_at INTEGER,
-                final_notified INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_episodes_open
-            ON episodes(status, created_at);
-            CREATE INDEX IF NOT EXISTS idx_episodes_cohort_tier
-            ON episodes(cohort_id, tier, primary_closed_at);
-            CREATE TABLE IF NOT EXISTS horizon_results (
-                episode_id INTEGER NOT NULL,
-                horizon_seconds INTEGER NOT NULL,
-                observed_at INTEGER NOT NULL,
-                exit_price REAL NOT NULL,
-                net_move REAL NOT NULL,
-                mfe_move REAL NOT NULL,
-                mae_move REAL NOT NULL,
-                tp1_hit INTEGER NOT NULL,
-                tp2_hit INTEGER NOT NULL,
-                tp3_hit INTEGER NOT NULL,
-                sl_hit INTEGER NOT NULL,
-                outcome TEXT NOT NULL,
-                pnl_r REAL NOT NULL,
-                lateness_seconds INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (episode_id, horizon_seconds),
-                FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+                model_version INTEGER NOT NULL DEFAULT 0,
+                model_probability REAL,
+                shadow_accepted INTEGER
             );
 
-            CREATE TABLE IF NOT EXISTS outbox (
+            CREATE INDEX IF NOT EXISTS idx_adaptive_trades_closed
+            ON adaptive_trades(closed_at);
+
+            CREATE TABLE IF NOT EXISTS adaptive_model_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS adaptive_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                payload BLOB NOT NULL,
-                filename TEXT,
-                caption TEXT,
                 created_at INTEGER NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                next_retry_at INTEGER NOT NULL DEFAULT 0
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                payload_json TEXT
             );
             """
         )
-        existing = {str(r["name"]) for r in conn.execute("PRAGMA table_info(episodes)")}
-        if "strategy" not in existing:
+        row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
+        if row is None:
+            state = ModelState(created_at=int(time.time()))
             conn.execute(
-                "ALTER TABLE episodes ADD COLUMN strategy TEXT NOT NULL "
-                f"DEFAULT '{STRATEGY_MOMENTUM}'"
+                "INSERT INTO adaptive_model_state(id, state_json) VALUES(1, ?)",
+                (json.dumps(asdict(state), ensure_ascii=False),),
             )
-        if "policy_revision" not in existing:
-            conn.execute(
-                "ALTER TABLE episodes ADD COLUMN policy_revision INTEGER NOT NULL DEFAULT 0"
-            )
-        if "policy_hash" not in existing:
-            conn.execute(
-                "ALTER TABLE episodes ADD COLUMN policy_hash TEXT NOT NULL DEFAULT ''"
-            )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_episodes_symbol_strategy "
-            "ON episodes(cohort_id,symbol,side,strategy,tier,created_at)"
-        )
         conn.commit()
 
-def meta_get(key: str, default: Any = None) -> Any:
-    init_db()
-    with DB_LOCK, db_connect() as conn:
-        row = conn.execute("SELECT value_json FROM meta WHERE key=?", (key,)).fetchone()
-    if not row:
-        return default
+
+def _clip(value: Any, low: float, high: float, default: float = 0.0) -> float:
     try:
-        return json.loads(row["value_json"])
+        x = float(value)
+        if not math.isfinite(x):
+            return default
+        return min(high, max(low, x))
     except Exception:
         return default
 
-def meta_set(key: str, value: Any) -> None:
-    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    with DB_LOCK, db_connect() as conn:
-        conn.execute(
-            "INSERT INTO meta(key,value_json) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
-            (key, payload),
-        )
-        conn.commit()
 
-def _nonnegative_int(value: Any, default: int = 0) -> int:
-    try:
-        return max(0, int(value))
-    except Exception:
-        return max(0, int(default))
+def build_feature_dict(trade: Dict[str, Any]) -> Dict[str, float]:
+    side = str(trade.get("side", "")).upper()
+    grade = str(trade.get("grade", "")).upper()
+    mode = str(trade.get("setup_mode", "")).upper()
+    strategy = str(trade.get("strategy", "")).upper()
+    btc_text = str(trade.get("btc_text", "")).upper()
 
-def _adaptive_level(level: Any) -> int:
-    try:
-        value = int(level)
-    except Exception:
-        value = 0
-    return min(max(value, 0), len(ADAPTIVE_LEVELS) - 1)
+    entry = _clip(trade.get("entry"), 1e-12, 1e18, 1.0)
+    sl = _clip(trade.get("sl"), 0.0, 1e18, entry)
+    sl_move = abs(entry - sl) / max(entry, 1e-12)
 
-def _lane_policy_hash(strategy: str, lane: Dict[str, Any]) -> str:
-    payload = {
-        "schema": ADAPTIVE_POLICY_SCHEMA,
-        "strategy": strategy,
-        "revision": int(lane.get("revision", 0) or 0),
-        "level": _adaptive_level(lane.get("level", 0)),
-        "min_quality_score": float(lane.get("min_quality_score", 0.0) or 0.0),
-        "cooldown_multiplier": float(lane.get("cooldown_multiplier", 1.0) or 1.0),
-        "status": "ACTIVE",
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:16]
-
-def default_adaptive_policy() -> Dict[str, Any]:
-    lanes: Dict[str, Any] = {}
-    for strategy in STRATEGIES:
-        level = ADAPTIVE_LEVELS[0]
-        lane = {
-            "revision": 0,
-            "level": 0,
-            "min_quality_score": float(level["min_quality_score"]),
-            "cooldown_multiplier": float(level["cooldown_multiplier"]),
-            "status": "ACTIVE",
-            "last_action": "BASELINE",
-            "last_reason": "pre_registered_base_rules",
-            "applied_after_paper_count": 0,
-            "changed_at": 0,
-        }
-        lane["policy_hash"] = _lane_policy_hash(strategy, lane)
-        lanes[strategy] = lane
     return {
-        "schema": ADAPTIVE_POLICY_SCHEMA,
-        "global_revision": 0,
-        "last_completed_block_end": 0,
-        "updated_at": 0,
-        "automatic_loosening": False,
-        "source_rewriting": False,
-        "lanes": lanes,
+        "score": _clip(trade.get("score"), 0, 100) / 100.0,
+        "is_long": 1.0 if side == "LONG" else 0.0,
+        "is_a_plus": 1.0 if grade == "A+" else 0.0,
+        "ch3m_abs": _clip(abs(_clip(trade.get("ch3m_1m"), -1, 1)), 0, 0.25) / 0.25,
+        "ch15m_abs": _clip(abs(_clip(trade.get("ch15m"), -1, 1)), 0, 0.40) / 0.40,
+        "ch30m_abs": _clip(abs(_clip(trade.get("ch30m"), -1, 1)), 0, 0.60) / 0.60,
+        "vol1": _clip(trade.get("vol1"), 0, 8) / 8.0,
+        "vol5": _clip(trade.get("volume_ratio", trade.get("vol5", 1.0)), 0, 8) / 8.0,
+        "range1": _clip(trade.get("range1"), 0, 8) / 8.0,
+        "range5": _clip(trade.get("range_ratio", trade.get("range5", 1.0)), 0, 8) / 8.0,
+        "rr_tp1": _clip(trade.get("rr"), 0, 5) / 5.0,
+        "ladder_rr": _clip(trade.get("ladder_rr"), 0, 6) / 6.0,
+        "final_rr": _clip(trade.get("final_rr"), 0, 8) / 8.0,
+        "sl_price_move": _clip(sl_move, 0, 0.08) / 0.08,
+        "btc_bull": 1.0 if "BTC BULL" in btc_text else 0.0,
+        "btc_bear": 1.0 if "BTC BEAR" in btc_text else 0.0,
+        "is_reversal": 1.0 if "REVERSAL" in mode else 0.0,
+        "is_dump": 1.0 if "DUMP" in mode or "DUMP" in strategy else 0.0,
+        "is_instant": 1.0 if "INSTANT" in mode or "INSTANT" in strategy else 0.0,
+        "is_aero": 1.0 if "AERO" in mode or "AERO" in strategy else 0.0,
     }
 
-def normalize_adaptive_policy(raw: Any) -> Dict[str, Any]:
-    base = default_adaptive_policy()
-    if not isinstance(raw, dict) or raw.get("schema") != ADAPTIVE_POLICY_SCHEMA:
-        return base
-    base["global_revision"] = _nonnegative_int(raw.get("global_revision", 0))
-    base["last_completed_block_end"] = _nonnegative_int(
-        raw.get("last_completed_block_end", 0)
-    )
-    base["updated_at"] = _nonnegative_int(raw.get("updated_at", 0))
-    raw_lanes = raw.get("lanes") if isinstance(raw.get("lanes"), dict) else {}
-    for strategy in STRATEGIES:
-        current = raw_lanes.get(strategy)
-        if not isinstance(current, dict):
-            continue
-        level_index = _adaptive_level(current.get("level", 0))
-        level = ADAPTIVE_LEVELS[level_index]
-        lane = base["lanes"][strategy]
-        lane.update({
-            "revision": _nonnegative_int(current.get("revision", 0)),
-            "level": level_index,
-            # Exact ladder values prevent an exported file from silently
-            # loosening or inventing a filter on restart.
-            "min_quality_score": float(level["min_quality_score"]),
-            "cooldown_multiplier": float(level["cooldown_multiplier"]),
-            "status": "ACTIVE",
-            "last_action": str(current.get("last_action", "BASELINE"))[:80],
-            "last_reason": str(current.get("last_reason", ""))[:500],
-            "applied_after_paper_count": _nonnegative_int(
-                current.get("applied_after_paper_count", 0)
-            ),
-            "changed_at": _nonnegative_int(current.get("changed_at", 0)),
-        })
-        lane["policy_hash"] = _lane_policy_hash(strategy, lane)
-    return base
 
-def adaptive_policy_state() -> Dict[str, Any]:
-    return normalize_adaptive_policy(meta_get("adaptive_policy", None))
+def _vector_from_dict(features: Dict[str, float]) -> List[float]:
+    return [float(features.get(name, 0.0)) for name in FEATURE_NAMES]
 
-def adaptive_lane_policy(
-    strategy: str,
-    policy: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    snapshot = normalize_adaptive_policy(policy) if policy is not None else adaptive_policy_state()
-    return dict(snapshot["lanes"].get(strategy, snapshot["lanes"][STRATEGY_MOMENTUM]))
 
-def adaptive_policy_summary(policy: Optional[Dict[str, Any]] = None) -> str:
-    snapshot = normalize_adaptive_policy(policy) if policy is not None else adaptive_policy_state()
-    parts = []
-    for strategy in STRATEGIES:
-        lane = snapshot["lanes"][strategy]
-        short = "MOMENTUM" if strategy == STRATEGY_MOMENTUM else "PULLBACK"
-        parts.append(
-            f"{short}: rev{int(lane['revision'])}/L{int(lane['level'])}, "
-            f"score≥{float(lane['min_quality_score']):.1f}, "
-            f"cooldown×{float(lane['cooldown_multiplier']):.1f}"
-        )
-    return " | ".join(parts)
+def get_model_state() -> ModelState:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT state_json FROM adaptive_model_state WHERE id = 1").fetchone()
+        if row is None:
+            return ModelState()
+        raw = json.loads(row["state_json"])
+        return ModelState(**raw)
 
-def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return {key: row[key] for key in row.keys()}
 
-def table_count(table: str) -> int:
-    if table not in {"episodes", "horizon_results", "outbox"}:
-        raise ValueError("unsupported table")
-    with DB_LOCK, db_connect() as conn:
-        return int(conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
-
-def primary_count(
-    tier: Optional[str] = None,
-    independent_only: bool = False,
-    strategy: Optional[str] = None,
-) -> int:
-    q = "SELECT COUNT(*) AS n FROM episodes WHERE cohort_id=? AND primary_outcome IS NOT NULL"
-    p: List[Any] = [COHORT_ID]
-    if tier:
-        q += " AND tier=?"
-        p.append(tier)
-    if independent_only:
-        q += " AND independent=1"
-    if strategy:
-        q += " AND strategy=?"
-        p.append(strategy)
-    with DB_LOCK, db_connect() as conn:
-        return int(conn.execute(q, p).fetchone()["n"])
-
-def recent_episode_exists(symbol: str, side: str, strategy: str, tier: str, seconds: int) -> bool:
-    cutoff = now_ts() - max(0, seconds)
-    with DB_LOCK, db_connect() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM episodes WHERE cohort_id=? AND symbol=? AND side=? "
-            "AND strategy=? AND tier=? AND created_at>=? LIMIT 1",
-            (COHORT_ID, symbol, side, strategy, tier, cutoff),
-        ).fetchone()
-    return row is not None
-
-def independent_slot_available(cluster_id: int, side: str, strategy: str) -> bool:
-    with DB_LOCK, db_connect() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM episodes WHERE cohort_id=? AND cluster_id=? "
-            "AND side=? AND strategy=? AND tier='paper' AND independent=1 LIMIT 1",
-            (COHORT_ID, cluster_id, side, strategy),
-        ).fetchone()
-    return row is None
-
-def open_episode_count() -> int:
-    with DB_LOCK, db_connect() as conn:
-        return int(conn.execute(
-            "SELECT COUNT(*) AS n FROM episodes WHERE cohort_id=? AND status='open'",
-            (COHORT_ID,),
-        ).fetchone()["n"])
-
-def insert_episode(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    created = int(candidate["created_at"])
-    key = hashlib.sha256(
-        f"{COHORT_ID}:{candidate['symbol']}:{candidate['side']}:{candidate['strategy']}:{candidate['tier']}:{created}:{candidate['entry_price']:.12g}".encode()
-    ).hexdigest()
-    values = {
-        "episode_key": key,
-        "cohort_id": COHORT_ID,
-        "protocol_hash": PROTOCOL_HASH,
-        "created_at": created,
-        "cluster_id": int(candidate["cluster_id"]),
-        "symbol": candidate["symbol"],
-        "side": candidate["side"],
-        "strategy": candidate["strategy"],
-        "tier": candidate["tier"],
-        "visible_paper": int(candidate["tier"] == "paper"),
-        "independent": int(bool(candidate.get("independent"))),
-        "policy_revision": int(candidate.get("policy_revision", 0) or 0),
-        "policy_hash": str(candidate.get("policy_hash", ""))[:64],
-        "quality_score": float(candidate.get("quality_score", 0.0)),
-        "paper_reject_reason": str(candidate.get("paper_reject_reason", ""))[:500],
-        "entry_price": float(candidate["entry_price"]),
-        "entry_bid": float(candidate.get("entry_bid", 0.0)),
-        "entry_ask": float(candidate.get("entry_ask", 0.0)),
-        "spread_bps": float(candidate.get("spread_bps", 999.0)),
-        "depth_usdt": float(candidate.get("depth_usdt", 0.0)),
-        "quote_volume_24h": float(candidate.get("quote_volume_24h", 0.0)),
-        "liquidity_rank": float(candidate.get("liquidity_rank", 0.0)),
-        "stop_move": float(candidate["stop_move"]),
-        "tp1_move": TP1_MOVE, "tp2_move": TP2_MOVE, "tp3_move": TP3_MOVE,
-        "tp4_move": TP4_MOVE, "tp5_move": TP5_MOVE,
-        "features_json": json.dumps(candidate["features"], ensure_ascii=False),
-        "status": "open",
-        "last_seen_at": created,
-    }
-    cols = tuple(values)
-    try:
-        with DB_LOCK, db_connect() as conn:
-            cur = conn.execute(
-                f"INSERT INTO episodes({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
-                tuple(values[c] for c in cols),
-            )
-            eid = int(cur.lastrowid)
-            conn.commit()
-            row = conn.execute("SELECT * FROM episodes WHERE id=?", (eid,)).fetchone()
-        return row_to_dict(row) if row else None
-    except sqlite3.IntegrityError:
-        return None
-
-def get_open_episodes() -> List[Dict[str, Any]]:
-    with DB_LOCK, db_connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM episodes WHERE cohort_id=? AND status='open' ORDER BY created_at,id",
-            (COHORT_ID,),
-        ).fetchall()
-    return [row_to_dict(x) for x in rows]
-
-def get_episode(eid: int) -> Optional[Dict[str, Any]]:
-    with DB_LOCK, db_connect() as conn:
-        row = conn.execute("SELECT * FROM episodes WHERE id=?", (eid,)).fetchone()
-    return row_to_dict(row) if row else None
-
-def update_episode(eid: int, updates: Dict[str, Any]) -> None:
-    allowed = {
-        "tp1_hit_at","tp2_hit_at","tp3_hit_at","tp4_hit_at","tp5_hit_at",
-        "sl_hit_at","max_favorable_move","max_adverse_move","last_exit_price",
-        "last_seen_at","data_gap_count","path_samples","max_sample_gap_seconds",
-        "status","primary_outcome","primary_pnl_r","primary_closed_at",
-        "primary_notified","entry_notified","finalized_at","final_notified",
-    }
-    clean = {k:v for k,v in updates.items() if k in allowed}
-    if not clean:
-        return
-    with DB_LOCK, db_connect() as conn:
+def _save_model_state(state: ModelState) -> None:
+    with _LOCK, _connect() as conn:
         conn.execute(
-            f"UPDATE episodes SET {','.join(f'{k}=?' for k in clean)} WHERE id=?",
-            (*clean.values(), eid),
+            "INSERT INTO adaptive_model_state(id, state_json) VALUES(1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json",
+            (json.dumps(asdict(state), ensure_ascii=False),),
         )
         conn.commit()
 
-def horizon_exists(eid: int, horizon: int) -> bool:
-    with DB_LOCK, db_connect() as conn:
-        return conn.execute(
-            "SELECT 1 FROM horizon_results WHERE episode_id=? AND horizon_seconds=?",
-            (eid, horizon),
-        ).fetchone() is not None
 
-def insert_horizon(result: Dict[str, Any]) -> bool:
-    cols = HORIZON_COLUMNS
-    try:
-        with DB_LOCK, db_connect() as conn:
-            conn.execute(
-                f"INSERT INTO horizon_results({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
-                tuple(result[c] for c in cols),
-            )
-            conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-def primary_rows(
-    tier: Optional[str]=None,
-    independent_only: bool=False,
-    strategy: Optional[str]=None,
-) -> List[Dict[str,Any]]:
-    q = (
-        "SELECT id AS episode_id,symbol,side,strategy,tier,independent,cluster_id,created_at,"
-        "primary_outcome AS outcome,primary_pnl_r AS pnl_r,primary_closed_at,data_gap_count,"
-        "path_samples,max_sample_gap_seconds,protocol_hash,policy_revision,policy_hash,"
-        "quality_score,features_json "
-        "FROM episodes WHERE cohort_id=? AND primary_outcome IS NOT NULL"
-    )
-    p: List[Any] = [COHORT_ID]
-    if tier:
-        q += " AND tier=?"
-        p.append(tier)
-    if independent_only:
-        q += " AND independent=1"
-    if strategy:
-        q += " AND strategy=?"
-        p.append(strategy)
-    q += " ORDER BY created_at,id"
-    with DB_LOCK, db_connect() as conn:
-        return [row_to_dict(r) for r in conn.execute(q,p).fetchall()]
-
-def horizon_rows(
-    horizon: int,
-    tier: Optional[str]=None,
-    independent_only: bool=False,
-    strategy: Optional[str]=None,
-) -> List[Dict[str,Any]]:
-    q = (
-        "SELECT h.*,e.symbol,e.side,e.strategy,e.tier,e.independent,e.cluster_id,e.created_at,"
-        "e.protocol_hash,e.policy_revision,e.policy_hash,e.quality_score,"
-        "e.data_gap_count,e.path_samples,e.max_sample_gap_seconds "
-        "FROM horizon_results h JOIN episodes e ON e.id=h.episode_id "
-        "WHERE e.cohort_id=? AND h.horizon_seconds=?"
-    )
-    p: List[Any] = [COHORT_ID,horizon]
-    if tier:
-        q += " AND e.tier=?"
-        p.append(tier)
-    if independent_only:
-        q += " AND e.independent=1"
-    if strategy:
-        q += " AND e.strategy=?"
-        p.append(strategy)
-    q += " ORDER BY e.created_at,e.id"
-    with DB_LOCK, db_connect() as conn:
-        return [row_to_dict(r) for r in conn.execute(q,p).fetchall()]
-
-def paper_trade_number(episode_id: int) -> int:
-    """Stable visible sequence number for every real PAPER observation."""
-    with DB_LOCK, db_connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS n FROM episodes "
-            "WHERE cohort_id=? AND tier='paper' AND id<=?",
-            (COHORT_ID, int(episode_id)),
-        ).fetchone()
-    return int(row["n"] if row else 0)
-
-def _utc_text(timestamp: Any) -> str:
-    try:
-        value = int(timestamp or 0)
-    except Exception:
-        value = 0
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value)) if value else ""
-
-def paper_trade_ledger() -> List[Dict[str, Any]]:
-    """Human-readable ledger: open and closed PAPER trades, never OBSERVER."""
-    with DB_LOCK, db_connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM episodes WHERE cohort_id=? AND tier='paper' ORDER BY id",
-            (COHORT_ID,),
-        ).fetchall()
-    ledger: List[Dict[str, Any]] = []
-    for number, raw in enumerate(rows, 1):
-        row = row_to_dict(raw)
-        entry = float(row.get("entry_price", 0.0) or 0.0)
-        side = str(row.get("side", ""))
-        try:
-            features = json.loads(row.get("features_json") or "{}")
-        except Exception:
-            features = {}
-        ledger.append({
-            "trade_no": number,
-            "episode_id": int(row["id"]),
-            "visible_in_telegram": True,
-            "hidden_shadow_trade": False,
-            "created_at": int(row.get("created_at", 0) or 0),
-            "created_at_utc": _utc_text(row.get("created_at")),
-            "symbol": row.get("symbol"),
-            "side": side,
-            "strategy": row.get("strategy"),
-            "independent": bool(row.get("independent")),
-            "policy_revision": int(row.get("policy_revision", 0) or 0),
-            "policy_hash": str(row.get("policy_hash", "")),
-            "quality_score": float(row.get("quality_score", 0.0) or 0.0),
-            "entry_price": entry,
-            "tp1_price": price_target(entry, side, TP1_MOVE),
-            "tp2_price": price_target(entry, side, TP2_MOVE),
-            "tp3_price": price_target(entry, side, TP3_MOVE),
-            "tp4_price": price_target(entry, side, TP4_MOVE),
-            "tp5_price": price_target(entry, side, TP5_MOVE),
-            "sl_price": stop_price(entry, side, float(row.get("stop_move", 0.0) or 0.0)),
-            "spread_bps": float(row.get("spread_bps", 0.0) or 0.0),
-            "depth_usdt": float(row.get("depth_usdt", 0.0) or 0.0),
-            "status": row.get("status"),
-            "primary_outcome": row.get("primary_outcome"),
-            "primary_pnl_r": row.get("primary_pnl_r"),
-            "primary_closed_at": row.get("primary_closed_at"),
-            "primary_closed_at_utc": _utc_text(row.get("primary_closed_at")),
-            "mfe_move": float(row.get("max_favorable_move", 0.0) or 0.0),
-            "mae_move": float(row.get("max_adverse_move", 0.0) or 0.0),
-            "entry_message_sent_or_queued": bool(row.get("entry_notified")),
-            "result_message_sent_or_queued": bool(row.get("primary_notified")),
-            "final_message_sent_or_queued": bool(row.get("final_notified")),
-            "adaptive_level_at_entry": int(features.get("adaptive_level", 0) or 0),
-        })
-    return ledger
-
-
-# ---------------------------------------------------------------------------
-# Seed/export
-# ---------------------------------------------------------------------------
-
-def restore_seed_if_empty() -> Dict[str,Any]:
-    init_db()
-    if table_count("episodes") > 0:
-        report = {"restored":0,"reason":"database_not_empty"}
-        RUNTIME["seed_restore"] = report
-        return report
-    path = Path(SEED_PATH)
-    if not path.exists():
-        report = {"restored":0,"reason":"seed_not_found","path":str(path)}
-        RUNTIME["seed_restore"] = report
-        return report
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        report = {"restored":0,"reason":f"seed_invalid:{exc!r}"}
-        RUNTIME["seed_restore"] = report
-        return report
-
-    # V18.4 restores only the exact same schema/cohort. Old data is audit-only.
-    if payload.get("export_schema") == EXPORT_SCHEMA and payload.get("cohort_id") == COHORT_ID:
-        episodes = payload.get("episodes") or []
-        horizons = payload.get("horizon_results") or []
-        ie = ih = 0
-        with DB_LOCK, db_connect() as conn:
-            for row in episodes:
-                clean = {c:row.get(c) for c in EPISODE_COLUMNS if c in row}
-                cols = tuple(clean)
-                if not cols:
-                    continue
-                conn.execute(
-                    f"INSERT OR IGNORE INTO episodes({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
-                    tuple(clean[c] for c in cols),
-                )
-                ie += int(conn.execute("SELECT changes() n").fetchone()["n"])
-            for row in horizons:
-                clean = {c:row.get(c) for c in HORIZON_COLUMNS if c in row}
-                cols = tuple(clean)
-                if not cols:
-                    continue
-                conn.execute(
-                    f"INSERT OR IGNORE INTO horizon_results({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
-                    tuple(clean[c] for c in cols),
-                )
-                ih += int(conn.execute("SELECT changes() n").fetchone()["n"])
-            conn.commit()
-        state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
-        if isinstance(state.get("adaptive_policy"), dict):
-            meta_set("adaptive_policy", normalize_adaptive_policy(state["adaptive_policy"]))
-        if isinstance(state.get("adaptive_history"), list):
-            meta_set("adaptive_history", state["adaptive_history"][-200:])
-        restored_paper = primary_count("paper")
-        for key in ("last_audit_paper", "last_backup_paper"):
-            try:
-                value = max(0, min(int(state.get(key, 0) or 0), restored_paper))
-            except Exception:
-                value = 0
-            meta_set(key, value)
-        if isinstance(state.get("last_adaptive_review"), dict):
-            meta_set("last_adaptive_review", state["last_adaptive_review"])
-        if str(state.get("research_leader", "")) in (*STRATEGIES, "INSUFFICIENT_DATA"):
-            meta_set("research_leader", state["research_leader"])
-        report = {"restored":ie,"horizons":ih,"reason":"v18_4_backup_restored"}
-    else:
-        # Preserve a compact, verifiable audit note but never train/mix old
-        # V17/V18.2 results into this new forward protocol.
-        old_rows=list(payload.get("episodes") or payload.get("adaptive_trades") or [])
-        old_count=len(old_rows)
-        old_outcomes=Counter(
-            str(row.get("primary_outcome") or row.get("result") or "unknown")
-            for row in old_rows
+def _event(event_type: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            "INSERT INTO adaptive_events(created_at, event_type, message, payload_json) VALUES(?,?,?,?)",
+            (
+                int(time.time()),
+                event_type,
+                message,
+                json.dumps(payload or {}, ensure_ascii=False),
+            ),
         )
-        old_pnl=[
-            float(row.get("primary_pnl_r") if row.get("primary_pnl_r") is not None else row.get("pnl_r") or 0.0)
-            for row in old_rows
-        ]
-        last25=old_rows[-25:]
-        last25_outcomes=Counter(
-            str(row.get("primary_outcome") or row.get("result") or "unknown")
-            for row in last25
+        conn.commit()
+
+
+def predict_probability(trade: Dict[str, Any]) -> Tuple[Optional[float], ModelState]:
+    state = get_model_state()
+    if not MODEL_ENABLED or not state.active or state.trained_rows < MIN_TRAIN_TRADES:
+        return None, state
+
+    x = _vector_from_dict(build_feature_dict(trade))
+    z = state.weights[0]
+    for i, value in enumerate(x):
+        normalized = (value - state.mean[i]) / max(state.std[i], 1e-8)
+        z += state.weights[i + 1] * normalized
+    z = max(-35.0, min(35.0, z))
+    return 1.0 / (1.0 + math.exp(-z)), state
+
+
+def adaptive_gate(trade: Dict[str, Any]) -> Tuple[bool, str, Optional[float]]:
+    probability, state = predict_probability(trade)
+    if probability is None:
+        return True, f"adaptive warm-up: {state.trained_rows}/{MIN_TRAIN_TRADES}", None
+
+    accepted = probability >= state.threshold
+
+    if SHADOW_ONLY:
+        trade["adaptive_shadow_probability"] = probability
+        trade["adaptive_shadow_accepted"] = accepted
+        trade["adaptive_model_version"] = state.version
+        return True, (
+            f"adaptive shadow v{state.version}: p={probability:.3f}, "
+            f"threshold={state.threshold:.3f}, would_accept={accepted}"
+        ), probability
+
+    return accepted, (
+        f"adaptive v{state.version}: p={probability:.3f}, "
+        f"threshold={state.threshold:.3f}, accepted={accepted}"
+    ), probability
+
+
+def _estimate_pnl_r(signal: Dict[str, Any], result: str) -> float:
+    if result == "sl":
+        return -1.0
+    if result == "expired":
+        return -0.10
+
+    hit_count = sum(bool(signal.get(f"tp{i}_hit")) for i in range(1, 6))
+    if hit_count >= 5:
+        return max(0.5, float(signal.get("ladder_rr", 1.0) or 1.0))
+    if hit_count >= 3:
+        return 0.70
+    if hit_count >= 1:
+        return 0.25
+    return 0.10
+
+
+def record_closed_trade(signal: Dict[str, Any], result: str) -> Dict[str, Any]:
+    """
+    Call this exactly once when a signal closes.
+
+    result:
+      profit -> label 1
+      sl      -> label 0
+      expired -> label 0 (conservative)
+    """
+    if result not in {"profit", "sl", "expired"}:
+        raise ValueError(f"Unsupported result: {result}")
+
+    init_adaptive_db()
+
+    created_at = int(signal.get("created_at", int(time.time())))
+    closed_at = int(time.time())
+    signal_id = str(
+        signal.get("signal_id")
+        or f"{signal.get('symbol','?')}:{signal.get('side','?')}:{created_at}:{signal.get('strategy','?')}"
+    )
+    features = build_feature_dict(signal)
+    probability = signal.get("adaptive_shadow_probability")
+    model_version = int(signal.get("adaptive_model_version", 0) or 0)
+    shadow_accepted = signal.get("adaptive_shadow_accepted")
+    label = 1 if result == "profit" else 0
+    pnl_r = _estimate_pnl_r(signal, result)
+
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO adaptive_trades(
+                signal_id, created_at, closed_at, symbol, side, strategy, grade,
+                result, label, pnl_r, features_json, model_version,
+                model_probability, shadow_accepted
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                signal_id,
+                created_at,
+                closed_at,
+                str(signal.get("symbol", "?")),
+                str(signal.get("side", "?")),
+                str(signal.get("strategy", "?")),
+                str(signal.get("grade", "?")),
+                result,
+                label,
+                pnl_r,
+                json.dumps(features, ensure_ascii=False),
+                model_version,
+                float(probability) if probability is not None else None,
+                int(bool(shadow_accepted)) if shadow_accepted is not None else None,
+            ),
         )
-        legacy={
-            "count":old_count,
-            "profit":int(old_outcomes.get("profit",0)),
-            "sl":int(old_outcomes.get("sl",0)),
-            "expired":int(old_outcomes.get("expired",0)),
-            "expectancy_r":statistics.fmean(old_pnl) if old_pnl else 0.0,
-            "last25":{
-                "n":len(last25),
-                "profit":int(last25_outcomes.get("profit",0)),
-                "sl":int(last25_outcomes.get("sl",0)),
-                "expired":int(last25_outcomes.get("expired",0)),
-            },
-            "policy":"audit_only_never_training",
-        }
-        meta_set("legacy_audit",legacy)
-        report = {"restored":0,"legacy_audit_count":old_count,"reason":"old_schema_audit_only"}
-    RUNTIME["seed_restore"] = report
+        conn.commit()
+
+    report = maybe_retrain()
     return report
 
-def export_payload(
-    state_overrides: Optional[Dict[str, Any]] = None,
-    audit_context: Optional[Dict[str, Any]] = None,
-) -> Dict[str,Any]:
-    overrides = state_overrides if isinstance(state_overrides, dict) else {}
-    with DB_LOCK, db_connect() as conn:
-        episodes = [row_to_dict(r) for r in conn.execute("SELECT * FROM episodes ORDER BY id").fetchall()]
-        horizons = [row_to_dict(r) for r in conn.execute(
-            "SELECT * FROM horizon_results ORDER BY episode_id,horizon_seconds"
-        ).fetchall()]
-    return {
-        "export_schema":EXPORT_SCHEMA,
-        "exported_at":now_ts(),
-        "app":APP_NAME,
-        "deploy_marker":DEPLOY_MARKER,
-        "protocol":PROTOCOL_MANIFEST,
-        "protocol_hash":PROTOCOL_HASH,
-        "cohort_id":COHORT_ID,
-        "legacy_audit":meta_get("legacy_audit",{}),
-        "episodes":episodes,
-        "horizon_results":horizons,
-        "paper_trade_ledger":paper_trade_ledger(),
-        "state":{
-            "adaptive_policy":adaptive_policy_state(),
-            "adaptive_history":meta_get("adaptive_history",[]),
-            "last_audit_paper":int(overrides.get(
-                "last_audit_paper",meta_get("last_audit_paper",0)
-            ) or 0),
-            "last_backup_paper":int(overrides.get(
-                "last_backup_paper",meta_get("last_backup_paper",0)
-            ) or 0),
-            "research_leader":meta_get("research_leader","INSUFFICIENT_DATA"),
-            "last_adaptive_review":meta_get("last_adaptive_review",{}),
-        },
-        "runtime":runtime_snapshot(),
-        "adaptive_review": champion_challenger_review(),
-        "milestone_audit":audit_context or {},
-        "warning":"RESEARCH/PAPER only. Rename newest same-schema V18.4 Telegram file to adaptive_seed.json before redeploy without persistent disk.",
-    }
 
-def export_bytes(
-    state_overrides: Optional[Dict[str, Any]] = None,
-    audit_context: Optional[Dict[str, Any]] = None,
-) -> bytes:
-    return json.dumps(
-        export_payload(state_overrides, audit_context),
-        ensure_ascii=False,
-        indent=2,
-        allow_nan=False,
-    ).encode()
+def _sigmoid(z: float) -> float:
+    z = max(-35.0, min(35.0, z))
+    return 1.0 / (1.0 + math.exp(-z))
 
 
-# ---------------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------------
+def _logloss(labels: Sequence[int], probabilities: Sequence[float]) -> float:
+    if not labels:
+        return 999.0
+    total = 0.0
+    for y, p in zip(labels, probabilities):
+        p = min(1.0 - 1e-7, max(1e-7, p))
+        total += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+    return total / len(labels)
 
-def telegram_configured() -> bool:
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
-def _tg_text(text: str) -> Tuple[bool,str]:
-    if not telegram_configured():
-        return False,"Telegram credentials not configured"
-    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    err="unknown"
-    for attempt in range(TELEGRAM_RETRIES):
-        try:
-            r=requests.post(url,data={
-                "chat_id":TELEGRAM_CHAT_ID,
-                "text":text,
-                "disable_web_page_preview":"true",
-            },timeout=REQUEST_TIMEOUT_SECONDS)
-            if r.ok:
-                RUNTIME["telegram_sent"] += 1
-                return True,""
-            err=f"HTTP {r.status_code}: {r.text[:180]}"
-        except Exception as exc:
-            err=repr(exc)
-        time.sleep(.35*(2**attempt))
-    RUNTIME["telegram_errors"] += 1
-    return False,err
-
-def _tg_doc(data: bytes,filename: str,caption: str) -> Tuple[bool,str]:
-    if not telegram_configured():
-        return False,"Telegram credentials not configured"
-    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-    err="unknown"
-    for attempt in range(TELEGRAM_RETRIES):
-        try:
-            r=requests.post(
-                url,
-                data={"chat_id":TELEGRAM_CHAT_ID,"caption":caption[:1024]},
-                files={"document":(filename,io.BytesIO(data),"application/json")},
-                timeout=max(20.0,REQUEST_TIMEOUT_SECONDS*2),
-            )
-            if r.ok:
-                RUNTIME["telegram_sent"] += 1
-                return True,""
-            err=f"HTTP {r.status_code}: {r.text[:180]}"
-        except Exception as exc:
-            err=repr(exc)
-        time.sleep(.5*(2**attempt))
-    RUNTIME["telegram_errors"] += 1
-    return False,err
-
-def enqueue_outbox(kind: str,payload: bytes,filename: str="",caption: str="") -> bool:
-    with DB_LOCK, db_connect() as conn:
-        conn.execute(
-            "INSERT INTO outbox(kind,payload,filename,caption,created_at,next_retry_at) VALUES(?,?,?,?,?,?)",
-            (kind,sqlite3.Binary(payload),filename,caption,now_ts(),now_ts()+15),
-        )
-        conn.commit()
-    return True
-
-def send_text(text: str,critical: bool=True) -> bool:
-    ok,err=_tg_text(text)
-    if not ok:
-        set_runtime_error(f"Telegram text: {err}")
-        if critical and telegram_configured():
-            return enqueue_outbox("text",text.encode())
-    return ok
-
-def send_document(data: bytes,filename: str,caption: str,critical: bool=True) -> bool:
-    ok,err=_tg_doc(data,filename,caption)
-    if not ok:
-        set_runtime_error(f"Telegram document: {err}")
-        if critical and telegram_configured():
-            return enqueue_outbox("document",data,filename,caption)
-    return ok
-
-def flush_outbox(limit: int=5) -> Dict[str,int]:
-    if not telegram_configured():
-        return {"sent":0,"remaining":table_count("outbox")}
-    with DB_LOCK, db_connect() as conn:
-        rows=conn.execute(
-            "SELECT * FROM outbox WHERE next_retry_at<=? ORDER BY id LIMIT ?",
-            (now_ts(),max(1,limit)),
-        ).fetchall()
-    sent=0
+def _mean_std(rows: Sequence[Sequence[float]]) -> Tuple[List[float], List[float]]:
+    n_features = len(FEATURE_NAMES)
+    means = [0.0] * n_features
     for row in rows:
-        payload=bytes(row["payload"])
-        if row["kind"]=="document":
-            ok,err=_tg_doc(payload,str(row["filename"] or "backup.json"),str(row["caption"] or ""))
-        else:
-            ok,err=_tg_text(payload.decode(errors="replace"))
-        with DB_LOCK,db_connect() as conn:
-            if ok:
-                conn.execute("DELETE FROM outbox WHERE id=?",(row["id"],)); sent+=1
-            else:
-                attempts=int(row["attempts"] or 0)+1
-                delay=min(1800,15*(2**min(attempts,7)))
-                conn.execute("UPDATE outbox SET attempts=?,next_retry_at=? WHERE id=?",
-                             (attempts,now_ts()+delay,row["id"]))
-                set_runtime_error(f"Telegram outbox: {err}")
-            conn.commit()
-        if not ok:
-            break
-    return {"sent":sent,"remaining":table_count("outbox")}
+        for j, value in enumerate(row):
+            means[j] += value
+    count = max(len(rows), 1)
+    means = [x / count for x in means]
+
+    stds = [0.0] * n_features
+    for row in rows:
+        for j, value in enumerate(row):
+            stds[j] += (value - means[j]) ** 2
+    stds = [math.sqrt(x / count) if x > 1e-10 else 1.0 for x in stds]
+    return means, stds
 
 
-# ---------------------------------------------------------------------------
-# Public BingX REST market data
-# ---------------------------------------------------------------------------
-
-class SlidingRateLimiter:
-    def __init__(self,max_calls: int=82,window_seconds: float=10.0)->None:
-        self.max_calls=max_calls; self.window=window_seconds
-        self.calls: Deque[float]=deque(); self.lock=threading.Lock()
-    def acquire(self)->None:
-        while True:
-            with self.lock:
-                now=time.monotonic()
-                while self.calls and now-self.calls[0]>=self.window:
-                    self.calls.popleft()
-                if len(self.calls)<self.max_calls:
-                    self.calls.append(now); return
-                wait=max(.01,self.window-(now-self.calls[0])+.01)
-            time.sleep(min(wait,1.0))
-
-API_LIMITER=SlidingRateLimiter()
-KLINE_CACHE: Dict[str,Tuple[float,Optional[List[Dict[str,float]]]]]={}
-TICKER_CACHE: Tuple[float,List[Dict[str,Any]]]=(0.0,[])
-
-def api_get(path: str,params: Optional[Dict[str,Any]]=None)->Optional[Dict[str,Any]]:
-    err="unknown"
-    for attempt in range(API_RETRIES):
-        API_LIMITER.acquire()
-        try:
-            RUNTIME["api_calls"]+=1
-            r=requests.get(BINGX_BASE_URL+path,params=params or {},timeout=REQUEST_TIMEOUT_SECONDS)
-            if r.status_code in {408,425,429,500,502,503,504}:
-                err=f"HTTP {r.status_code} {path}"; time.sleep(.25*(attempt+1)); continue
-            r.raise_for_status()
-            payload=r.json()
-            if isinstance(payload,dict) and payload.get("code") in (None,0,"0"):
-                return payload
-            err=f"BingX {path}: {str(payload)[:180]}"
-        except Exception as exc:
-            err=f"{path}: {exc!r}"
-            time.sleep(.3*(attempt+1))
-    RUNTIME["api_errors"]+=1
-    set_runtime_error(err)
-    return None
-
-def normalize_symbol(symbol: str)->str:
-    s=str(symbol or "").upper().replace("/","-").replace("_","-")
-    if "-" not in s and s.endswith("USDT"):
-        s=s[:-4]+"-USDT"
-    return s
-
-def good_symbol(symbol: str)->bool:
-    s=normalize_symbol(symbol)
-    if not s.endswith("-USDT"): return False
-    base=s.split("-",1)[0]
-    if not base or base in {"USDT","USDC","FDUSD","TUSD","DAI"}: return False
-    if any(tag in base for tag in ("BULL","BEAR","UP","DOWN")): return False
-    return True
-
-def _first_float(item: Dict[str,Any],names: Sequence[str])->float:
-    for n in names:
-        try:
-            v=float(item.get(n) or 0)
-            if math.isfinite(v) and v!=0: return v
-        except Exception: pass
-    return 0.0
-
-def fetch_tickers(force: bool=False)->List[Dict[str,Any]]:
-    global TICKER_CACHE
-    with CACHE_LOCK:
-        if not force and time.time()-TICKER_CACHE[0]<45 and TICKER_CACHE[1]:
-            return list(TICKER_CACHE[1])
-    payload=api_get("/openApi/swap/v2/quote/ticker")
-    data=payload.get("data") if isinstance(payload,dict) else None
-    if isinstance(data,dict): data=[data]
-    out=[]
-    if isinstance(data,list):
-        for item in data:
-            if not isinstance(item,dict): continue
-            symbol=normalize_symbol(str(item.get("symbol") or item.get("s") or ""))
-            if not good_symbol(symbol): continue
-            last=_first_float(item,("lastPrice","last","price","close"))
-            quote=_first_float(item,("quoteVolume","quoteVol","quoteVolume24h","quoteAssetVolume","turnover","amount"))
-            basevol=_first_float(item,("volume","vol","volume24h"))
-            if quote<=0 and last>0 and basevol>0: quote=last*basevol
-            if last<=0 or quote<=0: continue
-            out.append({"symbol":symbol,"last":last,"quote_volume_24h":quote})
-    out.sort(key=lambda x:x["quote_volume_24h"],reverse=True)
-    with CACHE_LOCK:
-        if out: TICKER_CACHE=(time.time(),list(out))
-    return out
-
-def liquid_universe()->List[Dict[str,Any]]:
-    rows=[x for x in fetch_tickers() if x["quote_volume_24h"]>=MIN_24H_QUOTE_VOLUME_USDT][:MAX_UNIVERSE]
-    total=max(1,len(rows)-1)
-    for i,row in enumerate(rows):
-        row["liquidity_rank"]=1.0-i/total
-    return rows
-
-def parse_klines(raw: Any)->Optional[List[Dict[str,float]]]:
-    if not raw: return None
-    out=[]
-    for item in raw:
-        try:
-            if isinstance(item,dict):
-                c={
-                    "time":int(item.get("time") or item.get("openTime") or item.get("T") or 0),
-                    "open":float(item.get("open")),
-                    "high":float(item.get("high")),
-                    "low":float(item.get("low")),
-                    "close":float(item.get("close")),
-                    "volume":float(item.get("volume") or item.get("vol") or 0),
-                }
-            elif isinstance(item,(list,tuple)) and len(item)>=6:
-                c={"time":int(item[0]),"open":float(item[1]),"high":float(item[2]),
-                   "low":float(item[3]),"close":float(item[4]),"volume":float(item[5])}
-            else: continue
-            if all(c[k]>0 for k in ("open","high","low","close")): out.append(c)
-        except Exception: continue
-    out.sort(key=lambda x:x["time"])
-    return out if len(out)>=40 else None
-
-def get_klines(symbol: str,limit: int=90,cache_seconds: int=35)->Optional[List[Dict[str,float]]]:
-    s=normalize_symbol(symbol); key=f"{s}:1m:{limit}"
-    with CACHE_LOCK:
-        cached=KLINE_CACHE.get(key)
-        if cached and time.time()-cached[0]<cache_seconds: return cached[1]
-    for ep in ("/openApi/swap/v3/quote/klines","/openApi/swap/v2/quote/klines"):
-        payload=api_get(ep,{"symbol":s,"interval":"1m","limit":limit})
-        candles=parse_klines(payload.get("data") if isinstance(payload,dict) else None)
-        if candles:
-            with CACHE_LOCK: KLINE_CACHE[key]=(time.time(),candles)
-            return candles
-    with CACHE_LOCK: KLINE_CACHE[key]=(time.time(),None)
-    return None
-
-def _book_level(level: Any)->Tuple[float,float]:
-    try:
-        if isinstance(level,dict):
-            return float(level.get("price") or level.get("p") or 0),float(level.get("quantity") or level.get("qty") or level.get("q") or 0)
-        if isinstance(level,(list,tuple)) and len(level)>=2:
-            return float(level[0]),float(level[1])
-    except Exception: pass
-    return 0.0,0.0
-
-def get_book(symbol: str,include_depth: bool=False)->Dict[str,Any]:
-    s=normalize_symbol(symbol)
-    payload=api_get("/openApi/swap/v2/quote/bookTicker",{"symbol":s})
-    data=payload.get("data") if isinstance(payload,dict) else None
-    if isinstance(data,list): data=data[0] if data else None
-    bid=ask=bq=aq=0.0
-    if isinstance(data,dict):
-        bid=_first_float(data,("bidPrice","bid","b")); ask=_first_float(data,("askPrice","ask","a"))
-        bq=_first_float(data,("bidQty","bidQuantity","B")); aq=_first_float(data,("askQty","askQuantity","A"))
-    bids=[]; asks=[]
-    if include_depth:
-        depth=api_get("/openApi/swap/v2/quote/depth",{"symbol":s,"limit":5})
-        dd=depth.get("data") if isinstance(depth,dict) else None
-        if isinstance(dd,dict):
-            bids=list(dd.get("bids") or [])[:5]; asks=list(dd.get("asks") or [])[:5]
-            if bids and asks:
-                bid,bq=_book_level(bids[0]); ask,aq=_book_level(asks[0])
-    if bid<=0 or ask<=bid:
-        return {"ok":False,"bid":0.0,"ask":0.0,"spread_bps":999.0,"depth_usdt":0.0}
-    mid=(bid+ask)/2
-    spread=(ask-bid)/max(mid,1e-12)*10000
-    if bids and asks:
-        bd=sum(p*q for p,q in map(_book_level,bids)); ad=sum(p*q for p,q in map(_book_level,asks))
-    else:
-        bd=bid*max(0,bq); ad=ask*max(0,aq)
-    return {"ok":True,"bid":bid,"ask":ask,"spread_bps":spread,"depth_usdt":min(bd,ad)}
-
-def get_books(symbols: Sequence[str])->Dict[str,Dict[str,Any]]:
-    wanted={normalize_symbol(s) for s in symbols if s}
-    if not wanted: return {}
-    payload=api_get("/openApi/swap/v2/quote/bookTicker")
-    raw=payload.get("data") if isinstance(payload,dict) else None
-    if isinstance(raw,dict): raw=[raw]
-    books={}
-    if isinstance(raw,list):
-        for item in raw:
-            if not isinstance(item,dict): continue
-            s=normalize_symbol(str(item.get("symbol") or item.get("s") or ""))
-            if s not in wanted: continue
-            bid=_first_float(item,("bidPrice","bid","b")); ask=_first_float(item,("askPrice","ask","a"))
-            if bid<=0 or ask<=bid: continue
-            bq=_first_float(item,("bidQty","bidQuantity","B")); aq=_first_float(item,("askQty","askQuantity","A"))
-            mid=(bid+ask)/2
-            books[s]={"ok":True,"bid":bid,"ask":ask,
-                      "spread_bps":(ask-bid)/max(mid,1e-12)*10000,
-                      "depth_usdt":min(bid*bq,ask*aq)}
-    missing=sorted(wanted.difference(books))
-    if missing:
-        with ThreadPoolExecutor(max_workers=min(4,len(missing))) as pool:
-            fs={pool.submit(get_book,s,False):s for s in missing}
-            for f in as_completed(fs):
-                s=fs[f]
-                try: books[s]=f.result()
-                except Exception: books[s]={"ok":False}
-    return books
-
-
-# ---------------------------------------------------------------------------
-# Features / signal protocol
-# ---------------------------------------------------------------------------
-
-def _median(values: Iterable[float],default: float=0.0)->float:
-    clean=[]
-    for x in values:
-        try:
-            v=float(x)
-            if math.isfinite(v): clean.append(v)
-        except Exception: pass
-    return statistics.median(clean) if clean else default
-
-def ema(values: Sequence[float],period: int)->float:
-    if not values: return 0.0
-    a=2/(max(1,period)+1); v=float(values[0])
-    for x in values[1:]: v=a*float(x)+(1-a)*v
-    return v
-
-def ema_series(values: Sequence[float],period: int)->List[float]:
-    if not values:return []
-    a=2/(max(1,period)+1);out=[float(values[0])]
-    for x in values[1:]:out.append(a*float(x)+(1-a)*out[-1])
-    return out
-
-def adx14(candles: Sequence[Dict[str,float]],period: int=14)->float:
-    """Wilder ADX on completed candles; returns 0 when history is insufficient."""
-    if len(candles)<period*2+2:return 0.0
-    tr: List[float]=[];plus_dm: List[float]=[];minus_dm: List[float]=[]
-    for i in range(1,len(candles)):
-        cur=candles[i];prev=candles[i-1]
-        up=cur["high"]-prev["high"];down=prev["low"]-cur["low"]
-        plus_dm.append(up if up>down and up>0 else 0.0)
-        minus_dm.append(down if down>up and down>0 else 0.0)
-        tr.append(max(cur["high"]-cur["low"],abs(cur["high"]-prev["close"]),abs(cur["low"]-prev["close"])))
-    sm_tr=sum(tr[:period]);sm_plus=sum(plus_dm[:period]);sm_minus=sum(minus_dm[:period])
-    dx: List[float]=[]
-    for i in range(period-1,len(tr)):
-        if i>=period:
-            sm_tr=sm_tr-sm_tr/period+tr[i]
-            sm_plus=sm_plus-sm_plus/period+plus_dm[i]
-            sm_minus=sm_minus-sm_minus/period+minus_dm[i]
-        if sm_tr<=0:dx.append(0.0);continue
-        plus_di=100*sm_plus/sm_tr;minus_di=100*sm_minus/sm_tr
-        den=plus_di+minus_di
-        dx.append(100*abs(plus_di-minus_di)/den if den>0 else 0.0)
-    if len(dx)<period:return 0.0
-    value=statistics.fmean(dx[:period])
-    for x in dx[period:]:value=((period-1)*value+x)/period
-    return float(value)
-
-def vwap(candles: Sequence[Dict[str,float]],bars: int=20)->float:
-    part=list(candles[-bars:]); vol=sum(max(0,r["volume"]) for r in part)
-    if vol<=0: return part[-1]["close"] if part else 0
-    return sum(((r["high"]+r["low"]+r["close"])/3)*max(0,r["volume"]) for r in part)/vol
-
-def atr_percent(candles: Sequence[Dict[str,float]],bars: int=14)->float:
-    if len(candles)<bars+1:return 0
-    rs=[]
-    for i in range(len(candles)-bars,len(candles)):
-        r=candles[i]; pc=candles[i-1]["close"]
-        rs.append(max(r["high"]-r["low"],abs(r["high"]-pc),abs(r["low"]-pc)))
-    return statistics.fmean(rs)/max(candles[-1]["close"],1e-12)
-
-def directional_return(candles: Sequence[Dict[str,float]],bars: int)->float:
-    if len(candles)<=bars:return 0
-    return (candles[-1]["close"]-candles[-1-bars]["close"])/max(candles[-1-bars]["close"],1e-12)
-
-def close_location(c: Dict[str,float])->float:
-    return (c["close"]-c["low"])/max(c["high"]-c["low"],1e-12)
-
-def completed_volume_ratio(candles: Sequence[Dict[str,float]])->float:
-    if len(candles)<24:return 0
-    ref=_median((r["volume"] for r in candles[-22:-2]),0)
-    return candles[-2]["volume"]/ref if ref>0 else 0
-
-def completed_range_ratio(candles: Sequence[Dict[str,float]])->float:
-    if len(candles)<24:return 0
-    ref=_median((r["high"]-r["low"] for r in candles[-22:-2]),0)
-    return (candles[-2]["high"]-candles[-2]["low"])/ref if ref>0 else 0
-
-def continuity_features(candles: Sequence[Dict[str,float]])->Tuple[float,float]:
-    part=list(candles[-60:])
-    if not part:return 0,0
-    active=sum(1 for r in part if r["volume"]>0)/len(part)
-    unique=len({round(r["close"],10) for r in part})/len(part)
-    return active,unique
-
-def btc_context()->Dict[str,Any]:
-    c=get_klines("BTC-USDT",90,45)
-    if not c:return {"regime":"UNKNOWN","ret15":0.0,"ret60":0.0}
-    r15=directional_return(c,15); r60=directional_return(c,60)
-    if r15>=.003 and r60>=0: regime="BULL"
-    elif r15<=-.003 and r60<=0: regime="BEAR"
-    else: regime="RANGE"
-    return {"regime":regime,"ret15":r15,"ret60":r60}
-
-def build_broad_candidate(ticker: Dict[str,Any],candles: Sequence[Dict[str,float]],btc: Dict[str,Any])->Optional[Dict[str,Any]]:
-    if len(candles)<65:return None
-    r1=directional_return(candles,1)
-    r3=directional_return(candles,3)
-    r15=directional_return(candles,15)
-    if r3==0 or r15==0 or r3*r15<=0:return None
-    side="LONG" if r3>0 else "SHORT"
-    d1=abs(r1); d3=abs(r3); d15=abs(r15)
-    if not BROAD_MIN_DIRECTIONAL_3M<=d3<=BROAD_MAX_DIRECTIONAL_3M:return None
-    if not BROAD_MIN_DIRECTIONAL_15M<=d15<=BROAD_MAX_DIRECTIONAL_15M:return None
-    active,unique=continuity_features(candles)
-    if active<MIN_ACTIVE_CANDLE_FRACTION or unique<MIN_UNIQUE_CLOSE_FRACTION:return None
-
-    last=candles[-1]
-    completed=candles[-2]
-    span=max(completed["high"]-completed["low"],1e-12)
-    body=abs(completed["close"]-completed["open"])/span
-    loc=close_location(completed)
-    e9=ema([r["close"] for r in candles[-30:]],9)
-    vw=vwap(candles,20)
-    vol1=completed_volume_ratio(candles)
-    range1=completed_range_ratio(candles)
-    atr=atr_percent(candles)
-    stop=min(MAX_STOP_MOVE,max(MIN_STOP_MOVE,atr*ATR_STOP_MULTIPLIER))
-    current=last["close"]
-    vwap_distance=abs(current-vw)/max(vw,1e-12)
-    d3_share=d3/max(d15,1e-12)
-
-    completed_aligned=(side=="LONG" and completed["close"]>completed["open"]) or (side=="SHORT" and completed["close"]<completed["open"])
-    current_aligned=(side=="LONG" and r1>0) or (side=="SHORT" and r1<0)
-    location_aligned=(side=="LONG" and loc>=PAPER_LONG_MIN_CLOSE_LOCATION) or (side=="SHORT" and loc<=PAPER_SHORT_MAX_CLOSE_LOCATION)
-    avg_aligned=(side=="LONG" and current>e9 and current>vw) or (side=="SHORT" and current<e9 and current<vw)
-    btc_opposite=(side=="LONG" and btc.get("regime")=="BEAR") or (side=="SHORT" and btc.get("regime")=="BULL")
-
-    return {
-        "created_at":now_ts(),
-        "cluster_id":now_ts()//INDEPENDENT_CLUSTER_SECONDS,
-        "symbol":ticker["symbol"],"side":side,"strategy":STRATEGY_MOMENTUM,
-        "last_price":float(current),
-        "quote_volume_24h":float(ticker["quote_volume_24h"]),
-        "liquidity_rank":float(ticker.get("liquidity_rank",0)),
-        "stop_move":stop,
-        "features":{
-            "directional_1m":d1,"signed_1m":r1,
-            "directional_3m":d3,"signed_3m":r3,
-            "directional_15m":d15,"signed_15m":r15,
-            "directional_30m":abs(directional_return(candles,30)),
-            "d3_share_of_d15":d3_share,
-            "vol1":vol1,"range1":range1,
-            "body_fraction":body,"close_location":loc,
-            "ema9":e9,"vwap20":vw,"vwap_distance":vwap_distance,
-            "atr_pct":atr,"active_fraction":active,"unique_close_fraction":unique,
-            "completed_candle_aligned":completed_aligned,
-            "current_1m_aligned":current_aligned,
-            "aligned_location":location_aligned,
-            "aligned_average":avg_aligned,
-            "btc_regime":btc.get("regime","UNKNOWN"),
-            "btc_ret15":float(btc.get("ret15",0) or 0),
-            "btc_ret60":float(btc.get("ret60",0) or 0),
-            "btc_opposite":btc_opposite,
-        }
-    }
-
-def build_pullback_candidate(
-    ticker: Dict[str,Any],
-    candles: Sequence[Dict[str,float]],
-    btc: Dict[str,Any],
-)->Optional[Dict[str,Any]]:
-    """Build a fixed, closed-candle trend/pullback/reclaim challenger.
-
-    The last kline can still be forming, so all pattern decisions use
-    candles[:-1].  This avoids one of the old bot's main sources of unstable
-    signals: treating an unfinished one-minute candle as final evidence.
-    """
-    if len(candles)<70:return None
-    closed=list(candles[:-1])
-    if len(closed)<65:return None
-    r1=directional_return(closed,1);r3=directional_return(closed,3)
-    r15=directional_return(closed,15);r30=directional_return(closed,30)
-    if r15==0 or r30==0 or r15*r30<=0:return None
-    side="LONG" if r30>0 else "SHORT"
-    d1=abs(r1);d3=abs(r3);d15=abs(r15);d30=abs(r30)
-    # Broad diagnostic range only. The fixed PAPER rules are applied below.
-    if not .0040<=d15<=.0800 or not .0060<=d30<=.1200:return None
-    active,unique=continuity_features(closed)
-    if active<MIN_ACTIVE_CANDLE_FRACTION or unique<MIN_UNIQUE_CLOSE_FRACTION:return None
-
-    closes=[r["close"] for r in closed]
-    e9=ema(closes,9);e20=ema(closes,20);e50=ema(closes,50)
-    e20_prev=ema(closes[:-3],20) if len(closes)>3 else e20
-    vw=vwap(closed,20);atr=atr_percent(closed);adx=adx14(closed)
-    trigger=closed[-1];pull_window=closed[-3:-1]
-    trigger_span=max(trigger["high"]-trigger["low"],1e-12)
-    trigger_body=abs(trigger["close"]-trigger["open"])/trigger_span
-    trigger_loc=close_location(trigger)
-    vol1=completed_volume_ratio(candles)
-    range1=completed_range_ratio(candles)
-    tolerance=max(atr,1e-8)*PULLBACK_EMA20_TOLERANCE_ATR
-
-    anchor=float(closed[-12]["close"])
-    if side=="LONG":
-        impulse_extreme=max(r["high"] for r in closed[-11:-2])
-        impulse_move=max(0.0,(impulse_extreme-anchor)/max(anchor,1e-12))
-        pull_extreme=min(r["low"] for r in pull_window)
-        retrace=(impulse_extreme-pull_extreme)/max(impulse_extreme-anchor,1e-12)
-        trend_stack=e9>e20>e50 and e20>e20_prev
-        pullback_present=any(r["close"]<r["open"] for r in pull_window)
-        ema_retest=pull_extreme<=e9*(1+tolerance) and min(r["close"] for r in pull_window)>=e20*(1-tolerance)
-        reclaim=(trigger["close"]>max(r["high"] for r in pull_window) and trigger["close"]>trigger["open"])
-        location_ok=trigger_loc>=PULLBACK_LONG_MIN_CLOSE_LOCATION
-        average_ok=trigger["close"]>e9 and trigger["close"]>vw
-        btc_opposite=btc.get("regime")=="BEAR"
-    else:
-        impulse_extreme=min(r["low"] for r in closed[-11:-2])
-        impulse_move=max(0.0,(anchor-impulse_extreme)/max(anchor,1e-12))
-        pull_extreme=max(r["high"] for r in pull_window)
-        retrace=(pull_extreme-impulse_extreme)/max(anchor-impulse_extreme,1e-12)
-        trend_stack=e9<e20<e50 and e20<e20_prev
-        pullback_present=any(r["close"]>r["open"] for r in pull_window)
-        ema_retest=pull_extreme>=e9*(1-tolerance) and max(r["close"] for r in pull_window)<=e20*(1+tolerance)
-        reclaim=(trigger["close"]<min(r["low"] for r in pull_window) and trigger["close"]<trigger["open"])
-        location_ok=trigger_loc<=PULLBACK_SHORT_MAX_CLOSE_LOCATION
-        average_ok=trigger["close"]<e9 and trigger["close"]<vw
-        btc_opposite=btc.get("regime")=="BULL"
-
-    stop=min(MAX_STOP_MOVE,max(MIN_STOP_MOVE,atr*ATR_STOP_MULTIPLIER))
-    return {
-        "created_at":now_ts(),"cluster_id":now_ts()//INDEPENDENT_CLUSTER_SECONDS,
-        "symbol":ticker["symbol"],"side":side,"strategy":STRATEGY_PULLBACK,
-        "last_price":float(candles[-1]["close"]),
-        "quote_volume_24h":float(ticker["quote_volume_24h"]),
-        "liquidity_rank":float(ticker.get("liquidity_rank",0)),"stop_move":stop,
-        "features":{
-            "directional_1m":d1,"signed_1m":r1,
-            "directional_3m":d3,"signed_3m":r3,
-            "directional_15m":d15,"signed_15m":r15,
-            "directional_30m":d30,"signed_30m":r30,
-            "vol1":vol1,"range1":range1,"adx14":adx,
-            "ema9":e9,"ema20":e20,"ema50":e50,"vwap20":vw,
-            "atr_pct":atr,"trigger_close":trigger["close"],
-            "trigger_body_fraction":trigger_body,"trigger_close_location":trigger_loc,
-            "impulse_move":impulse_move,"pullback_retrace":retrace,
-            "trend_stack":trend_stack,"pullback_present":pullback_present,
-            "ema_retest":ema_retest,"reclaim_trigger":reclaim,
-            "aligned_location":location_ok,"aligned_average":average_ok,
-            "active_fraction":active,"unique_close_fraction":unique,
-            "btc_regime":btc.get("regime","UNKNOWN"),"btc_opposite":btc_opposite,
-        },
-    }
-
-def net_payoff_ratio(stop_move: float)->float:
-    """Net TP3 winner divided by the absolute net SL loser.
-
-    Entry/exit spread is represented by executable bid/ask prices.  This
-    protocol also subtracts two taker fees plus a conservative slippage
-    allowance, so the gate cannot advertise a gross RR that disappears after
-    execution costs.
-    """
-    stop=max(float(stop_move),1e-12)
-    net_reward=max(0.0,TP3_MOVE-ROUND_TRIP_COST_MOVE)
-    net_loss=stop+ROUND_TRIP_COST_MOVE
-    return net_reward/max(net_loss,1e-12)
-
-def apply_execution_and_paper_gate(
-    candidate: Dict[str,Any],
-    book: Dict[str,Any],
-    adaptive_policy: Optional[Dict[str,Any]] = None,
-)->Dict[str,Any]:
-    item=dict(candidate);f=dict(item["features"]);side=item["side"]
-    strategy=str(item.get("strategy") or STRATEGY_MOMENTUM)
-    ok=bool(book.get("ok")); bid=float(book.get("bid",0) or 0); ask=float(book.get("ask",0) or 0)
-    fallback=float(item["last_price"])
-    entry=ask if side=="LONG" and ask>0 else bid if side=="SHORT" and bid>0 else fallback
-    item.update({
-        "entry_price":entry,"entry_bid":bid,"entry_ask":ask,
-        "spread_bps":float(book.get("spread_bps",999) or 999),
-        "depth_usdt":float(book.get("depth_usdt",0) or 0),
-    })
-    f.update({"book_ok":ok,"spread_bps":item["spread_bps"],"depth_usdt":item["depth_usdt"],"executable_entry":entry})
-    item["features"]=f
-
-    reasons=[]
-    d1=float(f["directional_1m"]);d3=float(f["directional_3m"]);d15=float(f["directional_15m"])
-    if strategy==STRATEGY_PULLBACK:
-        d30=float(f["directional_30m"]);adx=float(f["adx14"])
-        retrace=float(f["pullback_retrace"]);atr=max(float(f["atr_pct"]),1e-8)
-        trigger_close=max(float(f["trigger_close"]),1e-12)
-        chase=((entry-trigger_close)/trigger_close if side=="LONG" else (trigger_close-entry)/trigger_close)
-        chase_atr=max(0.0,chase)/atr
-        f["entry_chase_atr"]=chase_atr
-        if not PULLBACK_MIN_ADX14<=adx<=PULLBACK_MAX_ADX14:reasons.append("adx")
-        if not PULLBACK_MIN_DIRECTIONAL_15M<=d15<=PULLBACK_MAX_DIRECTIONAL_15M:reasons.append("directional_15m")
-        if not PULLBACK_MIN_DIRECTIONAL_30M<=d30<=PULLBACK_MAX_DIRECTIONAL_30M:reasons.append("directional_30m")
-        if not f["trend_stack"]:reasons.append("ema_trend")
-        if not f["pullback_present"]:reasons.append("no_pullback")
-        if not PULLBACK_MIN_RETRACE<=retrace<=PULLBACK_MAX_RETRACE:reasons.append("retrace")
-        if not f["ema_retest"]:reasons.append("ema_retest")
-        if not f["reclaim_trigger"]:reasons.append("no_reclaim")
-        if not f["aligned_location"]:reasons.append("close_location")
-        if not f["aligned_average"]:reasons.append("ema_vwap")
-        if float(f["trigger_body_fraction"])<PULLBACK_MIN_TRIGGER_BODY:reasons.append("trigger_body")
-        if not PULLBACK_MIN_VOL1<=float(f["vol1"])<=PULLBACK_MAX_VOL1:reasons.append("vol1")
-        if not PULLBACK_MIN_RANGE1<=float(f["range1"])<=PULLBACK_MAX_RANGE1:reasons.append("range1")
-        if chase_atr>PULLBACK_MAX_ENTRY_CHASE_ATR:reasons.append("entry_chase")
-        score=(
-            min(1,adx/35)*14+min(1,d15/.025)*14+min(1,d30/.045)*12+
-            (12 if f["trend_stack"] else 0)+(12 if f["ema_retest"] else 0)+
-            (14 if f["reclaim_trigger"] else 0)+(8 if f["aligned_average"] else 0)+
-            min(1,float(item["liquidity_rank"]))*8+max(0,6-abs(retrace-.28)*20)
-        )
-    else:
-        share=float(f["d3_share_of_d15"])
-        if not PAPER_MIN_DIRECTIONAL_1M<=d1<=PAPER_MAX_DIRECTIONAL_1M:reasons.append("fresh_1m")
-        if not PAPER_MIN_DIRECTIONAL_3M<=d3<=PAPER_MAX_DIRECTIONAL_3M:reasons.append("directional_3m")
-        if not PAPER_MIN_DIRECTIONAL_15M<=d15<=PAPER_MAX_DIRECTIONAL_15M:reasons.append("directional_15m")
-        if share<PAPER_MIN_ACCELERATION:reasons.append("weak_acceleration")
-        if share>PAPER_MAX_D3_SHARE_OF_D15:reasons.append("exhaustion")
-        if not PAPER_MIN_VOL1<=float(f["vol1"])<=PAPER_MAX_VOL1:reasons.append("vol1")
-        if not PAPER_MIN_RANGE1<=float(f["range1"])<=PAPER_MAX_RANGE1:reasons.append("range1")
-        if not f["completed_candle_aligned"]:reasons.append("completed_candle")
-        if not f["current_1m_aligned"]:reasons.append("current_1m_reversal")
-        if not f["aligned_location"]:reasons.append("close_location")
-        if not f["aligned_average"]:reasons.append("ema_vwap")
-        if float(f["body_fraction"])<PAPER_MIN_BODY_FRACTION:reasons.append("body")
-        if float(f["vwap_distance"])>PAPER_MAX_VWAP_DISTANCE:reasons.append("chase")
-        score=(
-            min(1,d1/.005)*15+min(1,d3/.015)*20+min(1,d15/.03)*15+
-            min(1,float(f["vol1"])/1.5)*12+min(1,float(f["range1"])/2.0)*10+
-            (8 if f["current_1m_aligned"] else 0)+(8 if f["aligned_average"] else 0)+
-            (6 if not f["btc_opposite"] else 0)+min(1,float(item["liquidity_rank"]))*6
-        )
-    if f["btc_opposite"]:reasons.append("btc_opposite")
-    if float(item["quote_volume_24h"])<PAPER_MIN_24H_QUOTE_VOLUME_USDT: reasons.append("quote_volume")
-    if not ok: reasons.append("book")
-    if item["spread_bps"]>PAPER_MAX_SPREAD_BPS: reasons.append("spread")
-    if item["depth_usdt"]<PAPER_MIN_DEPTH_USDT: reasons.append("depth")
-    payoff=net_payoff_ratio(float(item["stop_move"]))
-    f["net_tp3_to_sl_payoff_ratio"]=payoff
-    if payoff<PAPER_MIN_NET_PAYOFF_RATIO: reasons.append("net_payoff")
-
-    # The base ranking remains fixed and interpretable.  Adaptation is a
-    # prospective, pre-registered floor/cooldown policy applied only after a
-    # full 25-trade block; it cannot rewrite this score formula.
-    policy = (
-        normalize_adaptive_policy(adaptive_policy)
-        if adaptive_policy is not None else adaptive_policy_state()
-    )
-    lane = adaptive_lane_policy(strategy, policy)
-    score_floor = float(lane["min_quality_score"])
-    if score < score_floor:
-        reasons.append("adaptive_quality_floor")
-    item["policy_revision"] = int(lane["revision"])
-    item["policy_hash"] = str(lane["policy_hash"])
-    item["adaptive_cooldown_seconds"] = int(
-        round(PAPER_SYMBOL_COOLDOWN_SECONDS * float(lane["cooldown_multiplier"]))
-    )
-    f.update({
-        "adaptive_policy_schema": ADAPTIVE_POLICY_SCHEMA,
-        "adaptive_global_revision": int(policy["global_revision"]),
-        "adaptive_policy_revision": int(lane["revision"]),
-        "adaptive_policy_hash": str(lane["policy_hash"]),
-        "adaptive_level": int(lane["level"]),
-        "adaptive_min_quality_score": score_floor,
-        "adaptive_cooldown_multiplier": float(lane["cooldown_multiplier"]),
-    })
-    item["features"]=f
-    item["quality_score"]=round(score,3)
-    item["paper_reject_reason"]=",".join(reasons)
-    item["paper_gate_pass"]=not reasons
-    return item
-
-
-# ---------------------------------------------------------------------------
-# Metrics/readiness
-# ---------------------------------------------------------------------------
-
-def metrics(rows: Sequence[Dict[str,Any]])->Dict[str,Any]:
-    # DATA_GAP is not silently counted as expired. It is a data-quality failure.
-    valid=[r for r in rows if str(r.get("outcome",""))!="data_gap"]
-    outcomes=Counter(str(r.get("outcome","")) for r in rows)
-    pnl=[float(r.get("pnl_r",0) or 0) for r in valid]
-    wins=[x for x in pnl if x>0]; losses=[x for x in pnl if x<0]
-    eq=peak=dd=0.0
-    for x in pnl:
-        eq+=x; peak=max(peak,eq); dd=max(dd,peak-eq)
-    n=len(valid); expectancy=statistics.fmean(pnl) if pnl else 0
-    std=statistics.stdev(pnl) if len(pnl)>=2 else 0
-    lcb=expectancy-1.645*std/math.sqrt(n) if n else -999
-    pf=sum(wins)/abs(sum(losses)) if losses else (999 if wins else 0)
-
-    # A fifteen-minute cluster may contain one LONG and one SHORT observation.
-    # Treating both as independent understates uncertainty, so readiness also
-    # uses an LCB calculated from equal-weight cluster means.
-    cluster_values: Dict[int,List[float]]={}
-    for row in valid:
-        cluster_values.setdefault(int(row.get("cluster_id",0) or 0),[]).append(
-            float(row.get("pnl_r",0) or 0)
-        )
-    cluster_means=[statistics.fmean(values) for values in cluster_values.values()]
-    cluster_expectancy=statistics.fmean(cluster_means) if cluster_means else 0.0
-    cluster_std=statistics.stdev(cluster_means) if len(cluster_means)>=2 else 0.0
-    cluster_lcb=(
-        cluster_expectancy-1.645*cluster_std/math.sqrt(len(cluster_means))
-        if cluster_means else -999.0
-    )
-
-    side_rows={side:[r for r in valid if str(r.get("side","")).upper()==side]
-               for side in ("LONG","SHORT")}
-    side_counts={side:len(values) for side,values in side_rows.items()}
-    side_expectancy={
-        side:(statistics.fmean(float(r.get("pnl_r",0) or 0) for r in values) if values else 0.0)
-        for side,values in side_rows.items()
-    }
-    side_tp3={
-        side:(sum(str(r.get("outcome",""))=="profit" for r in values)/len(values) if values else 0.0)
-        for side,values in side_rows.items()
-    }
-    side_profit_counts={
-        side:sum(str(r.get("outcome",""))=="profit" for r in values)
-        for side,values in side_rows.items()
-    }
-
-    regimes=set()
-    for row in valid:
-        raw=row.get("features_json")
-        try:
-            features=raw if isinstance(raw,dict) else json.loads(raw or "{}")
-        except Exception:
-            features={}
-        regime=str(features.get("btc_regime","UNKNOWN") or "UNKNOWN").upper()
-        if regime in {"BULL","BEAR","RANGE"}:
-            regimes.add(regime)
-
-    raw_n=len(rows)
-    return {
-        "n":n,
-        "raw_n":raw_n,
-        "profit":outcomes["profit"],"sl":outcomes["sl"],"expired":outcomes["expired"],
-        "data_gap":outcomes["data_gap"],
-        "data_gap_rate":outcomes["data_gap"]/raw_n if raw_n else 0.0,
-        "tp3_rate":outcomes["profit"]/n if n else 0,
-        "expectancy_r":expectancy,"expectancy_lcb90_r":lcb,
-        "cluster_expectancy_r":cluster_expectancy,
-        "cluster_expectancy_lcb90_r":cluster_lcb,
-        "profit_factor":pf,"max_drawdown_r":dd,
-        "unique_symbols":len({str(r.get("symbol","")) for r in valid}),
-        "unique_clusters":len({int(r.get("cluster_id",0) or 0) for r in valid}),
-        "active_days":len({int(r.get("created_at",0) or 0)//86400 for r in valid}),
-        "market_regimes":sorted(regimes),
-        "market_regime_count":len(regimes),
-        "side_counts":side_counts,
-        "side_expectancy_r":side_expectancy,
-        "side_tp3_rate":side_tp3,
-        "side_profit_counts":side_profit_counts,
-        "max_sample_gap_seconds":max([int(r.get("max_sample_gap_seconds",0) or 0) for r in valid] or [0]),
-    }
-
-def wilson_interval(wins: int,total: int,z: float=1.96)->Tuple[float,float]:
-    if total<=0:return 0,1
-    p=wins/total; den=1+z*z/total
-    center=(p+z*z/(2*total))/den
-    half=z*math.sqrt(p*(1-p)/total+z*z/(4*total*total))/den
-    return max(0,center-half),min(1,center+half)
-
-def rows_for_current_policy(strategy: str) -> List[Dict[str, Any]]:
-    lane = adaptive_lane_policy(strategy)
-    revision = int(lane["revision"])
-    policy_hash = str(lane["policy_hash"])
+def _normalize(rows: Sequence[Sequence[float]], mean: Sequence[float], std: Sequence[float]) -> List[List[float]]:
     return [
-        row for row in primary_rows("paper", True, strategy)
-        if int(row.get("policy_revision", -1) or 0) == revision
-        and str(row.get("policy_hash", "")) == policy_hash
+        [(value - mean[j]) / max(std[j], 1e-8) for j, value in enumerate(row)]
+        for row in rows
     ]
 
-def apply_bounded_adaptation(block_end: int) -> Dict[str, Any]:
-    """Apply at most one pre-registered tightening step per lane.
 
-    The decision uses only independent outcomes inside the just-completed,
-    non-overlapping block of 25 visible PAPER trades.  Changes are prospective
-    and idempotent.  Positive/mixed blocks never loosen an earlier filter.
-    """
-    block_end = max(0, int(block_end))
-    block_start = max(0, block_end - AUDIT_BLOCK_SIZE)
-    policy_before = adaptive_policy_state()
-    history = meta_get("adaptive_history", [])
-    if not isinstance(history, list):
-        history = []
-    if block_end <= int(policy_before.get("last_completed_block_end", 0) or 0):
-        for saved in reversed(history):
-            if isinstance(saved, dict) and int(saved.get("block_end", -1)) == block_end:
-                result = json.loads(json.dumps(saved, ensure_ascii=False))
-                result["idempotent"] = True
-                return result
-        return {
-            "at": now_ts(),
-            "block_start": block_start + 1,
-            "block_end": block_end,
-            "status": "ALREADY_APPLIED",
-            "policy_changed": False,
-            "changes": [],
-            "lanes": {},
-            "idempotent": True,
-        }
+def _train_logistic(
+    x_train: Sequence[Sequence[float]],
+    y_train: Sequence[int],
+    epochs: int = 600,
+    learning_rate: float = 0.035,
+    l2: float = 0.04,
+) -> List[float]:
+    random.seed(1337)
+    n_features = len(FEATURE_NAMES)
+    weights = [0.0] * (n_features + 1)
 
-    all_paper = sorted(
-        primary_rows("paper"),
-        key=lambda row: (
-            int(row.get("primary_closed_at", 0) or 0),
-            int(row.get("episode_id", 0) or 0),
-        ),
-    )
-    if len(all_paper) < block_end or block_end - block_start != AUDIT_BLOCK_SIZE:
-        return {
-            "at": now_ts(),
-            "block_start": block_start + 1,
-            "block_end": block_end,
-            "status": "INCOMPLETE_BLOCK",
-            "policy_changed": False,
-            "changes": [],
-            "lanes": {},
-            "idempotent": False,
-        }
+    positives = sum(y_train)
+    negatives = len(y_train) - positives
+    pos_weight = len(y_train) / max(2.0 * positives, 1.0)
+    neg_weight = len(y_train) / max(2.0 * negatives, 1.0)
 
-    block = all_paper[block_start:block_end]
-    policy_after = json.loads(json.dumps(policy_before, ensure_ascii=False))
-    changes: List[Dict[str, Any]] = []
-    lane_reports: Dict[str, Any] = {}
-    changed_at = now_ts()
+    order = list(range(len(x_train)))
+    for epoch in range(epochs):
+        random.shuffle(order)
+        lr = learning_rate / (1.0 + epoch / 300.0)
+        grad = [0.0] * len(weights)
 
-    for strategy in STRATEGIES:
-        rows = [
-            row for row in block
-            if str(row.get("strategy", "")) == strategy
-            and bool(row.get("independent"))
-        ]
-        lane_metrics = metrics(rows)
-        revisions = sorted({
-            int(row.get("policy_revision", 0) or 0) for row in rows
-        })
-        old_lane = dict(policy_before["lanes"][strategy])
-        action = "HOLD"
-        reason = "positive_or_mixed_block"
+        for idx in order:
+            x = x_train[idx]
+            y = y_train[idx]
+            z = weights[0] + sum(weights[j + 1] * x[j] for j in range(n_features))
+            p = _sigmoid(z)
+            sample_weight = pos_weight if y == 1 else neg_weight
+            error = (p - y) * sample_weight
+            grad[0] += error
+            for j in range(n_features):
+                grad[j + 1] += error * x[j]
 
-        if lane_metrics["n"] < ADAPTIVE_MIN_INDEPENDENT_PER_LANE_BLOCK:
-            action = "HOLD_INSUFFICIENT_INDEPENDENT"
-            reason = (
-                f"need_{ADAPTIVE_MIN_INDEPENDENT_PER_LANE_BLOCK}_valid_independent_"
-                f"got_{lane_metrics['n']}"
-            )
-        elif len(revisions) != 1 or revisions[0] != int(old_lane["revision"]):
-            action = "HOLD_MIXED_POLICY_REVISIONS"
-            reason = f"block_policy_revisions_{revisions}_current_{old_lane['revision']}"
-        elif lane_metrics["data_gap_rate"] > ADAPTIVE_MAX_DATA_GAP_RATE:
-            action = "HOLD_DATA_QUALITY"
-            reason = f"data_gap_rate_{lane_metrics['data_gap_rate']:.3f}"
-        elif (
-            lane_metrics["expectancy_r"] < 0.0
-            and lane_metrics["profit"] <= lane_metrics["sl"] + lane_metrics["expired"]
-        ):
-            old_level = int(old_lane["level"])
-            new_level = min(old_level + 1, len(ADAPTIVE_LEVELS) - 1)
-            if new_level > old_level:
-                level = ADAPTIVE_LEVELS[new_level]
-                new_lane = dict(old_lane)
-                new_lane.update({
-                    "revision": int(old_lane["revision"]) + 1,
-                    "level": new_level,
-                    "min_quality_score": float(level["min_quality_score"]),
-                    "cooldown_multiplier": float(level["cooldown_multiplier"]),
-                    "last_action": "TIGHTEN_ONE_LEVEL",
-                    "last_reason": (
-                        f"block_expectancy_{lane_metrics['expectancy_r']:+.3f}R_"
-                        f"tp3_{lane_metrics['profit']}_vs_rest_"
-                        f"{lane_metrics['sl'] + lane_metrics['expired']}"
-                    ),
-                    "applied_after_paper_count": block_end,
-                    "changed_at": changed_at,
-                })
-                new_lane["policy_hash"] = _lane_policy_hash(strategy, new_lane)
-                policy_after["lanes"][strategy] = new_lane
-                action = "TIGHTEN_ONE_LEVEL"
-                reason = str(new_lane["last_reason"])
-                changes.append({
-                    "strategy": strategy,
-                    "action": action,
-                    "old_revision": int(old_lane["revision"]),
-                    "new_revision": int(new_lane["revision"]),
-                    "old_level": old_level,
-                    "new_level": new_level,
-                    "old_min_quality_score": float(old_lane["min_quality_score"]),
-                    "new_min_quality_score": float(new_lane["min_quality_score"]),
-                    "old_cooldown_multiplier": float(old_lane["cooldown_multiplier"]),
-                    "new_cooldown_multiplier": float(new_lane["cooldown_multiplier"]),
-                    "reason": reason,
-                })
-            else:
-                action = "HOLD_MAX_SELECTIVITY"
-                reason = "maximum_pre_registered_selectivity_reached"
+        n = max(len(x_train), 1)
+        weights[0] -= lr * grad[0] / n
+        for j in range(1, len(weights)):
+            regularized = grad[j] / n + l2 * weights[j]
+            weights[j] -= lr * regularized
 
-        lane_reports[strategy] = {
-            "action": action,
-            "reason": reason,
-            "independent_metrics": lane_metrics,
-            "policy_revisions_in_block": revisions,
-            "policy_before": old_lane,
-            "policy_after": dict(policy_after["lanes"][strategy]),
-        }
-
-    if changes:
-        policy_after["global_revision"] = int(policy_before["global_revision"]) + 1
-    policy_after["last_completed_block_end"] = block_end
-    policy_after["updated_at"] = changed_at
-    policy_after = normalize_adaptive_policy(policy_after)
-    event = {
-        "at": changed_at,
-        "block_start": block_start + 1,
-        "block_end": block_end,
-        "visible_paper_in_block": len(block),
-        "status": "POLICY_TIGHTENED" if changes else "POLICY_HELD",
-        "policy_changed": bool(changes),
-        "changes": changes,
-        "lanes": lane_reports,
-        "policy_before_global_revision": int(policy_before["global_revision"]),
-        "policy_after_global_revision": int(policy_after["global_revision"]),
-        "automatic_loosening": False,
-        "real_money_enabled": False,
-        "idempotent": False,
-    }
-    meta_set("adaptive_policy", policy_after)
-    meta_set("adaptive_history", (history + [event])[-200:])
-    return event
-
-def review_gate(strategy: Optional[str]=None)->Dict[str,Any]:
-    if strategy in STRATEGIES:
-        rows=rows_for_current_policy(str(strategy))
-        lane_policy=adaptive_lane_policy(str(strategy))
-    else:
-        rows=[]
-        lane_policy={"revision":-1,"policy_hash":"per_strategy_required"}
-    current=metrics(rows)
-    valid_rows=[r for r in rows if str(r.get("outcome",""))!="data_gap"]
-    recent=metrics(valid_rows[-REVIEW_RECENT_WINDOW:])
-    stability_size=REVIEW_STABILITY_BLOCKS*REVIEW_RECENT_WINDOW
-    stability_tail=valid_rows[-stability_size:]
-    stability_blocks=(
-        [
-            metrics(stability_tail[i:i+REVIEW_RECENT_WINDOW])
-            for i in range(0,stability_size,REVIEW_RECENT_WINDOW)
-        ]
-        if len(stability_tail)>=stability_size else []
-    )
-    stable_blocks_pass=bool(stability_blocks) and all(
-        block["profit"]>block["sl"]+block["expired"]
-        and block["expectancy_r"]>0.0
-        for block in stability_blocks
-    )
-    lower,upper=wilson_interval(current["profit"],current["n"])
-    side_majority=all(
-        int(current["side_profit_counts"].get(side,0))
-        > int(current["side_counts"].get(side,0))-int(current["side_profit_counts"].get(side,0))
-        for side in ("LONG","SHORT")
-    )
-    side_expectancy_positive=all(
-        float(current["side_expectancy_r"].get(side,0.0))>0.0
-        for side in ("LONG","SHORT")
-    )
-    checks={
-        "protocol_hash_exact":all(str(r.get("protocol_hash",""))==PROTOCOL_HASH for r in rows),
-        "single_current_policy_revision":bool(rows) and all(
-            int(r.get("policy_revision",-1))==int(lane_policy["revision"])
-            and str(r.get("policy_hash",""))==str(lane_policy["policy_hash"])
-            for r in rows
-        ),
-        "enough_independent_paper":current["n"]>=REVIEW_MIN_INDEPENDENT_PAPER,
-        "enough_unique_symbols":current["unique_symbols"]>=REVIEW_MIN_UNIQUE_SYMBOLS,
-        "enough_unique_clusters":current["unique_clusters"]>=REVIEW_MIN_UNIQUE_CLUSTERS,
-        "enough_active_days":current["active_days"]>=REVIEW_MIN_ACTIVE_DAYS,
-        "enough_market_regimes":current["market_regime_count"]>=REVIEW_MIN_MARKET_REGIMES,
-        "enough_per_side":min(current["side_counts"].values() or [0])>=REVIEW_MIN_PER_SIDE,
-        "each_side_tp3_majority":side_majority,
-        "each_side_expectancy_positive":side_expectancy_positive,
-        "tp3_gt_sl_plus_expired":current["profit"]>(current["sl"]+current["expired"]),
-        "tp3_rate":current["tp3_rate"]>=REVIEW_MIN_TP3_RATE,
-        "tp3_wilson_lower_above_50":lower>0.50,
-        "expectancy":current["expectancy_r"]>=REVIEW_MIN_EXPECTANCY_R,
-        "expectancy_lcb_positive":current["expectancy_lcb90_r"]>0,
-        "cluster_expectancy_lcb_positive":current["cluster_expectancy_lcb90_r"]>0,
-        "profit_factor":current["profit_factor"]>=REVIEW_MIN_PROFIT_FACTOR,
-        "drawdown":current["max_drawdown_r"]<=REVIEW_MAX_DRAWDOWN_R,
-        "recent_complete":recent["n"]>=REVIEW_RECENT_WINDOW,
-        "recent_tp3_gt_rest":recent["profit"]>(recent["sl"]+recent["expired"]),
-        "recent_expectancy_positive":recent["expectancy_r"]>0,
-        "three_nonoverlapping_blocks_positive":stable_blocks_pass,
-        "path_sampling_ok":current["max_sample_gap_seconds"]<=8,
-        "data_gap_rate_ok":current["data_gap_rate"]<=REVIEW_MAX_DATA_GAP_RATE,
-    }
-    passed=bool(checks) and all(checks.values())
-    return {
-        "research_pass":passed,
-        "micro_live_candidate":passed,
-        "real_money_enabled":False,
-        "checks":checks,"metrics":current,"recent":recent,
-        "stability_blocks":stability_blocks,
-        "wilson95":{"lower":lower,"upper":upper},
-        "strategy":strategy or "ALL",
-        "policy_revision":int(lane_policy["revision"]),
-        "policy_hash":str(lane_policy["policy_hash"]),
-        "note":"Passing only authorizes a separate reviewed micro-LIVE build. This program never places orders."
-    }
-
-def fixed_horizon_review(strategy: str)->Dict[str,Any]:
-    """Compare pre-registered holding horizons without rewriting the 6m label."""
-    lane=adaptive_lane_policy(strategy)
-    by_horizon={
-        horizon:metrics([
-            row for row in horizon_rows(horizon,"paper",True,strategy)
-            if int(row.get("policy_revision",-1))==int(lane["revision"])
-            and str(row.get("policy_hash",""))==str(lane["policy_hash"])
-        ])
-        for horizon in HORIZONS_SECONDS
-    }
-    eligible=[
-        horizon for horizon,item in by_horizon.items()
-        if item["n"]>=REVIEW_RECENT_WINDOW
-        and item["data_gap_rate"]<=max(REVIEW_MAX_DATA_GAP_RATE,0.05)
-    ]
-    best=(
-        max(
-            eligible,
-            key=lambda horizon:(
-                by_horizon[horizon]["cluster_expectancy_lcb90_r"],
-                by_horizon[horizon]["expectancy_r"],
-            ),
-        )
-        if eligible else None
-    )
-    return {
-        "by_horizon":by_horizon,
-        "best_research_horizon_seconds":best,
-        "primary_horizon_unchanged":PRIMARY_HORIZON_SECONDS,
-        "rules_changed":False,
-    }
-
-def champion_challenger_review(persist: bool=False)->Dict[str,Any]:
-    """Compare lanes under their current prospective policy revisions.
-
-    Core signal/TP/SL rules stay immutable.  A separate bounded adaptation
-    function may only tighten selectivity between non-overlapping blocks.
-    """
-    lanes: Dict[str,Any]={}
-    for strategy in STRATEGIES:
-        history_rows=primary_rows("paper",True,strategy)
-        rows=rows_for_current_policy(strategy)
-        lanes[strategy]={
-            "all":metrics(rows),
-            "all_history":metrics(history_rows),
-            "last_25":metrics(rows[-AUDIT_BLOCK_SIZE:]),
-            "last_50":metrics(rows[-REVIEW_RECENT_WINDOW:]),
-            "gate":review_gate(strategy),
-            "horizons":fixed_horizon_review(strategy),
-            "policy":adaptive_lane_policy(strategy),
-        }
-    enough_for_rank=all(lanes[s]["all"]["n"]>=AUDIT_BLOCK_SIZE for s in STRATEGIES)
-    enough_for_compare=all(lanes[s]["all"]["n"]>=MIN_LANE_COMPARISON_SAMPLE for s in STRATEGIES)
-    ranked=sorted(
-        STRATEGIES,
-        key=lambda s:(lanes[s]["all"]["expectancy_lcb90_r"],lanes[s]["all"]["expectancy_r"]),
-        reverse=True,
-    )
-    leader=ranked[0] if enough_for_rank else "INSUFFICIENT_DATA"
-    runner=ranked[1] if enough_for_rank else "INSUFFICIENT_DATA"
-    advantage=(
-        lanes[leader]["all"]["expectancy_lcb90_r"]-lanes[runner]["all"]["expectancy_lcb90_r"]
-        if enough_for_rank else 0.0
-    )
-    recommended="NONE"
-    status="COLLECTING_FIRST_25_PER_LANE"
-    if enough_for_rank:status="AUDITING_FIXED_RULES"
-    if enough_for_compare:
-        leader_pass=bool(lanes[leader]["gate"]["research_pass"])
-        if leader_pass and advantage>=MIN_LCB_ADVANTAGE_R:
-            recommended=leader
-            status="RESEARCH_WINNER_REQUIRES_EXTERNAL_MICRO_LIVE_REVIEW"
-        else:
-            status="NO_PROVEN_EDGE_CONTINUE_PAPER"
-    review={
-        "at":now_ts(),"audit_block":AUDIT_BLOCK_SIZE,
-        "leader":leader,"runner_up":runner,"lcb_advantage_r":advantage,
-        "recommended_for_external_review":recommended,
-        "status":status,"lanes":lanes,
-        "base_rules_changed":False,"real_money_enabled":False,
-        "bounded_policy":adaptive_policy_state(),
-        "explanation":"Every 25 visible closes may tighten the next block by one pre-registered level; automatic loosening and same-block relabelling are forbidden.",
-    }
-    if persist:
-        meta_set("research_leader",leader)
-        meta_set("last_adaptive_review",review)
-    return review
-
-def metric_line(m: Dict[str,Any])->str:
-    pf=float(m.get("profit_factor",0) or 0)
-    return (
-        f"{int(m.get('profit',0))} TP3+ / {int(m.get('sl',0))} SL / "
-        f"{int(m.get('expired',0))} expired / {int(m.get('data_gap',0))} data-gap · "
-        f"TP3 {float(m.get('tp3_rate',0))*100:.1f}% · "
-        f"{float(m.get('expectancy_r',0)):+.3f}R · PF {'∞' if pf>=900 else f'{pf:.2f}'} · "
-        f"cluster-LCB90 {float(m.get('cluster_expectancy_lcb90_r',-999)):+.3f}R · "
-        f"DD {float(m.get('max_drawdown_r',0)):.2f}R"
-    )
+    return weights
 
 
-# ---------------------------------------------------------------------------
-# Messages
-# ---------------------------------------------------------------------------
-
-def format_price(value: Any)->str:
-    try:n=float(value)
-    except Exception:return "?"
-    if n>=1000:return f"{n:.2f}"
-    if n>=1:return f"{n:.5f}"
-    if n>=.01:return f"{n:.7f}"
-    return f"{n:.10f}".rstrip("0")
-
-def price_target(entry: float,side: str,move: float)->float:
-    return entry*(1+move) if side=="LONG" else entry*(1-move)
-
-def stop_price(entry: float,side: str,move: float)->float:
-    return entry*(1-move) if side=="LONG" else entry*(1+move)
-
-def entry_message(e: Dict[str,Any])->str:
-    f=json.loads(e["features_json"]); entry=float(e["entry_price"]); side=e["side"]
-    paper=e["tier"]=="paper"
-    icon="📋" if paper else "🔎"
-    title="PAPER-КАНДИДАТ" if paper else "OBSERVER — НЕ ПРОШЁЛ PAPER"
-    reason="" if paper else f"\nПричина observer: {e['paper_reject_reason'] or 'broad_only'}"
-    strategy=str(e.get("strategy") or "?")
-    setup=(
-        f"ADX14 {float(f.get('adx14',0)):.1f} · retrace {float(f.get('pullback_retrace',0))*100:.1f}% · "
-        f"reclaim {'ДА' if f.get('reclaim_trigger') else 'НЕТ'}"
-        if strategy==STRATEGY_PULLBACK else
-        f"acceleration 3m/15m {float(f.get('d3_share_of_d15',0)):.2f} · fresh continuation"
-    )
-    trade_no=paper_trade_number(int(e["id"])) if paper else 0
-    number_text=f" · СДЕЛКА #{trade_no}" if paper else ""
-    return (
-        f"{icon} V18.4 {title}{number_text}\n"
-        f"{side} {e['symbol']} · score {float(e['quality_score']):.1f}\n"
-        f"Стратегия: {strategy}\n"
-        f"Независимый: {'ДА' if int(e['independent']) else 'НЕТ'} · protocol {PROTOCOL_HASH}"
-        f"{reason}\n\n"
-        f"Исполнимый вход: {format_price(entry)}\n"
-        f"TP1 {format_price(price_target(entry,side,TP1_MOVE))} · "
-        f"TP2 {format_price(price_target(entry,side,TP2_MOVE))}\n"
-        f"TP3 {format_price(price_target(entry,side,TP3_MOVE))} ← PROFIT начинается здесь\n"
-        f"TP4 {format_price(price_target(entry,side,TP4_MOVE))} · "
-        f"TP5 {format_price(price_target(entry,side,TP5_MOVE))}\n"
-        f"SL {format_price(stop_price(entry,side,float(e['stop_move'])))} "
-        f"({float(e['stop_move'])*100:.2f}%)\n\n"
-        f"Net TP3/SL payoff after cost model: "
-        f"{float(f.get('net_tp3_to_sl_payoff_ratio',net_payoff_ratio(float(e['stop_move'])))):.2f}\n"
-        f"1m {float(f['directional_1m'])*100:.2f}% · "
-        f"3m {float(f['directional_3m'])*100:.2f}% · "
-        f"15m {float(f['directional_15m'])*100:.2f}% · "
-        f"Vol1 x{float(f['vol1']):.2f} · Range1 x{float(f['range1']):.2f}\n"
-        f"{setup}\n"
-        f"Spread {float(e['spread_bps']):.1f} bps · depth ≈ {float(e['depth_usdt']):.0f} USDT\n"
-        f"Policy rev {int(e.get('policy_revision',0) or 0)} · {str(e.get('policy_hash',''))}\n"
-        "Основной PAPER-результат — 6 минут. Эта сделка не скрывается и войдёт в файл после блока 25."
-    )
-
-def result_message(e: Dict[str,Any])->str:
-    labels={"profit":"✅ TP3+","sl":"❌ STOP LOSS","expired":"⏱ EXPIRED 6M","data_gap":"⚠️ DATA GAP"}
-    trade_no=paper_trade_number(int(e["id"]))
-    return (
-        f"📊 V18.4 СДЕЛКА #{trade_no} · {e['tier'].upper()} РЕЗУЛЬТАТ: {labels.get(str(e['primary_outcome']),'?')}\n"
-        f"{e['side']} {e['symbol']}\nСтратегия: {e.get('strategy','?')}\n"
-        f"Итог после fee+slippage model: {float(e['primary_pnl_r'] or 0):+.3f}R\n"
-        f"MFE {float(e['max_favorable_move'])*100:.2f}% · MAE {float(e['max_adverse_move'])*100:.2f}%\n"
-        f"Path samples {int(e.get('path_samples',0) or 0)} · max gap {int(e.get('max_sample_gap_seconds',0) or 0)}s\n"
-        "TP1/TP2 не считаются положительным исходом."
-    )
-
-def final_message(e: Dict[str,Any])->str:
-    with DB_LOCK,db_connect() as conn:
-        rows=conn.execute("SELECT * FROM horizon_results WHERE episode_id=? ORDER BY horizon_seconds",(e["id"],)).fetchall()
-    bits=[]
-    for r in rows:
-        bits.append(f"• {int(r['horizon_seconds'])//60}м: {r['outcome']} · {float(r['pnl_r']):+.2f}R · late {int(r['lateness_seconds'])}s")
-    trade_no=paper_trade_number(int(e["id"]))
-    return (
-        f"🔬 V18.4 СДЕЛКА #{trade_no} · ПОЛНЫЙ ПУТЬ {e['tier'].upper()}\n{e['side']} {e['symbol']}\nСтратегия: {e.get('strategy','?')}\n"
-        +("\n".join(bits) if bits else "нет снимков")
-        +"\n6-минутный основной исход не переписывается."
-    )
-
-def notify_visible_episode(episode_id: int, stage: str) -> bool:
-    """Send or durably queue one visible PAPER notification exactly once."""
-    stage_map = {
-        "entry": ("entry_notified", entry_message),
-        "primary": ("primary_notified", result_message),
-        "final": ("final_notified", final_message),
-    }
-    if stage not in stage_map:
-        raise ValueError("unsupported notification stage")
-    flag, builder = stage_map[stage]
-    with NOTIFY_LOCK:
-        episode = get_episode(int(episode_id))
-        if not episode or episode.get("tier") != "paper":
-            return False
-        if int(episode.get(flag, 0) or 0):
-            return True
-        if stage == "primary" and not episode.get("primary_outcome"):
-            return False
-        if stage == "final" and episode.get("status") != "closed":
-            return False
-        if send_text(builder(episode), critical=True):
-            update_episode(int(episode_id), {flag: 1})
-            return True
-        return False
-
-def reconcile_visible_notifications(limit: int = 50) -> Dict[str, int]:
-    """Recover notifications missed by a restart or a short network outage."""
-    with DB_LOCK, db_connect() as conn:
-        rows = conn.execute(
-            "SELECT id,entry_notified,primary_outcome,primary_notified,status,final_notified "
-            "FROM episodes WHERE cohort_id=? AND tier='paper' AND ("
-            "entry_notified=0 OR (primary_outcome IS NOT NULL AND primary_notified=0) OR "
-            "(status='closed' AND final_notified=0)) ORDER BY id LIMIT ?",
-            (COHORT_ID, max(1, int(limit))),
-        ).fetchall()
-    sent = failed = 0
+def _predict_matrix(weights: Sequence[float], rows: Sequence[Sequence[float]]) -> List[float]:
+    out: List[float] = []
     for row in rows:
-        stages: List[str] = []
-        if not int(row["entry_notified"] or 0):
-            stages.append("entry")
-        if row["primary_outcome"] is not None and not int(row["primary_notified"] or 0):
-            stages.append("primary")
-        if row["status"] == "closed" and not int(row["final_notified"] or 0):
-            stages.append("final")
-        for stage in stages:
-            if notify_visible_episode(int(row["id"]), stage):
-                sent += 1
-            else:
-                failed += 1
-                return {"sent_or_queued": sent, "failed": failed, "episodes": len(rows)}
-    return {"sent_or_queued": sent, "failed": failed, "episodes": len(rows)}
+        z = weights[0] + sum(weights[j + 1] * row[j] for j in range(len(row)))
+        out.append(_sigmoid(z))
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Scan and execution path
-# ---------------------------------------------------------------------------
+def _choose_threshold(labels: Sequence[int], probabilities: Sequence[float], pnl_r: Sequence[float]) -> Tuple[float, Dict[str, float]]:
+    best_threshold = MIN_SIGNAL_PROBABILITY
+    best_score = -1e9
+    best_metrics: Dict[str, float] = {}
 
-def run_scan()->Dict[str,Any]:
-    if not SCAN_LOCK.acquire(blocking=False):return {"skipped":"scan_locked"}
-    started=time.time()
-    try:
-        universe=liquid_universe(); btc=btc_context(); candidates=[]; errors=0
-        policy=adaptive_policy_state()
-        def analyze(ticker):
-            try:
-                c=get_klines(ticker["symbol"],90,35)
-                if not c:return [],None
-                broad=[
-                    build_broad_candidate(ticker,c,btc),
-                    build_pullback_candidate(ticker,c,btc),
-                ]
-                broad=[x for x in broad if x]
-                if not broad:return [],None
-                book=get_book(ticker["symbol"],True)
-                return [apply_execution_and_paper_gate(x,book,policy) for x in broad],None
-            except Exception as exc:return [],repr(exc)
-        if universe:
-            with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS,len(universe))) as pool:
-                fs={pool.submit(analyze,t):t for t in universe}
-                for f in as_completed(fs):
-                    found,err=f.result()
-                    if err:errors+=1
-                    candidates.extend(found)
-        candidates.sort(key=lambda x:float(x["quality_score"]),reverse=True)
+    low = int(MIN_SIGNAL_PROBABILITY * 100)
+    high = int(MAX_SIGNAL_PROBABILITY * 100)
 
-        paper=observer=correlated=skipped=0
-        rejects=Counter(); slots=max(0,MAX_OPEN_EPISODES-open_episode_count())
-        for c in candidates:
-            if slots<=0:break
-            symbol,side,strategy=c["symbol"],c["side"],c["strategy"]
-            tier="paper" if c["paper_gate_pass"] else "observer"
+    for raw in range(low, high + 1):
+        threshold = raw / 100.0
+        chosen = [i for i, p in enumerate(probabilities) if p >= threshold]
+        coverage = len(chosen) / max(len(labels), 1)
+        if len(chosen) < 5 or coverage < MIN_VALIDATION_COVERAGE:
+            continue
 
-            adaptive_cooldown=int(c.get("adaptive_cooldown_seconds",PAPER_SYMBOL_COOLDOWN_SECONDS))
-            if tier=="paper" and recent_episode_exists(symbol,side,strategy,"paper",adaptive_cooldown):
-                # Keep the duplicate for diagnostics, but never call it a new PAPER trade.
-                tier="observer"
-                c["paper_reject_reason"]=(c["paper_reject_reason"]+",paper_cooldown").strip(",")
-            if tier=="observer" and recent_episode_exists(symbol,side,strategy,"observer",OBSERVER_SYMBOL_COOLDOWN_SECONDS):
-                skipped+=1; continue
+        wins = sum(labels[i] for i in chosen)
+        wr = wins / len(chosen)
+        expectancy = sum(pnl_r[i] for i in chosen) / len(chosen)
 
-            c["tier"]=tier
-            c["independent"]=independent_slot_available(int(c["cluster_id"]),side,strategy) if tier=="paper" else False
-            for reason in str(c.get("paper_reject_reason","")).split(","):
-                if reason:rejects[reason]+=1
-            e=insert_episode(c)
-            if not e:continue
-            slots-=1
-            if tier=="paper":
-                paper+=1
-                if not int(e["independent"]):correlated+=1
-            else: observer+=1
-
-            # Every actual PAPER trade is visible. OBSERVER is a rejected
-            # diagnostic candidate, never a hidden/SHADOW trade.
-            if tier == "paper":
-                notify_visible_episode(int(e["id"]), "entry")
-
-        result={
-            "at":now_ts(),"universe":len(universe),"btc":btc,
-            "adaptive_policy":policy,
-            "broad_candidates":len(candidates),"observer_created":observer,
-            "paper_created":paper,"correlated_paper":correlated,
-            "cooldown_skipped":skipped,"open":open_episode_count(),
-            "errors":errors,"reject_reasons":dict(rejects.most_common(12)),
-            "top":[{"symbol":x["symbol"],"side":x["side"],"strategy":x["strategy"],"score":x["quality_score"],
-                    "paper":x["paper_gate_pass"],"reason":x["paper_reject_reason"]} for x in candidates[:10]],
-            "elapsed":time.time()-started,
-        }
-        RUNTIME["scan_count"]+=1;RUNTIME["last_scan"]=result;RUNTIME["last_scan_at"]=result["at"]
-        return result
-    finally:
-        SCAN_LOCK.release()
-
-def directional_move(e: Dict[str,Any],exit_price: float)->float:
-    entry=float(e["entry_price"])
-    return (exit_price-entry)/max(entry,1e-12) if e["side"]=="LONG" else (entry-exit_price)/max(entry,1e-12)
-
-def first_passage_outcome(e: Dict[str,Any],cutoff: int)->str:
-    tp3=e.get("tp3_hit_at"); sl=e.get("sl_hit_at")
-    t_ok=tp3 is not None and int(tp3)<=cutoff
-    s_ok=sl is not None and int(sl)<=cutoff
-    # With sampled BBO data the order is unknowable when both barriers first
-    # appear in the same sample.  Labelling that event as a winner or a normal
-    # expiry would manufacture evidence.  Keep it out of promotion statistics.
-    if t_ok and s_ok and int(tp3)==int(sl):return "data_gap"
-    if t_ok and (not s_ok or int(tp3)<int(sl)):return "profit"
-    if s_ok and (not t_ok or int(sl)<int(tp3)):return "sl"
-    return "expired"
-
-def pnl_r(e: Dict[str,Any],outcome: str,move: float)->float:
-    risk=max(float(e["stop_move"]),1e-8)
-    if outcome=="profit":return (TP3_MOVE-ROUND_TRIP_COST_MOVE)/risk
-    if outcome=="sl":return -(risk+ROUND_TRIP_COST_MOVE)/risk
-    if outcome=="data_gap":return 0.0
-    return (move-ROUND_TRIP_COST_MOVE)/risk
-
-def track_open_episodes(current_time: Optional[int]=None)->Dict[str,int]:
-    if not TRACK_LOCK.acquire(blocking=False):return {"skipped":1}
-    try:
-        current=int(current_time or now_ts())
-        episodes=get_open_episodes()
-        books=get_books(sorted({e["symbol"] for e in episodes}))
-        pclosed=fclosed=gaps=0
-
-        for original in episodes:
-            e=dict(original); book=books.get(e["symbol"],{"ok":False})
-            if not book.get("ok"):
-                gaps+=1
-                update_episode(int(e["id"]),{"data_gap_count":int(e["data_gap_count"] or 0)+1})
-                continue
-
-            last_seen=int(e.get("last_seen_at") or e["created_at"])
-            sample_gap=max(0,current-last_seen)
-            exit_price=float(book["bid"] if e["side"]=="LONG" else book["ask"])
-            move=directional_move(e,exit_price)
-            mfe=max(float(e.get("max_favorable_move",0) or 0),move)
-            mae=max(float(e.get("max_adverse_move",0) or 0),-move)
-
-            updates={
-                "max_favorable_move":mfe,"max_adverse_move":mae,
-                "last_exit_price":exit_price,"last_seen_at":current,
-                "path_samples":int(e.get("path_samples",0) or 0)+1,
-                "max_sample_gap_seconds":max(int(e.get("max_sample_gap_seconds",0) or 0),sample_gap),
+        # Prefer expectancy and stability, not win-rate alone.
+        score = expectancy * 2.0 + wr * 0.5 + coverage * 0.15
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+            best_metrics = {
+                "coverage": coverage,
+                "selected_wr": wr,
+                "selected_count": float(len(chosen)),
+                "expectancy_r": expectancy,
+                "objective": score,
             }
-            for i,target in enumerate(TARGET_MOVES,1):
-                key=f"tp{i}_hit_at"
-                if e.get(key) is None and move>=target:
-                    updates[key]=current;e[key]=current
-            if e.get("sl_hit_at") is None and move<=-float(e["stop_move"]):
-                updates["sl_hit_at"]=current;e["sl_hit_at"]=current
-            e.update(updates)
 
-            age=current-int(e["created_at"])
-            # Primary: first-passage TP3/SL or 6-minute executable mark.
-            if e.get("primary_outcome") is None:
-                early=first_passage_outcome(e,int(e["created_at"])+PRIMARY_HORIZON_SECONDS)
-                if early in {"profit","sl","data_gap"} or age>=PRIMARY_HORIZON_SECONDS:
-                    # If path had a large sampling hole before primary close, do not
-                    # pretend the 6m outcome is trustworthy.
-                    if early=="data_gap" or int(e.get("max_sample_gap_seconds",0) or 0)>8:
-                        out="data_gap"; pr=0.0
-                    else:
-                        out=early if early in {"profit","sl"} else "expired"
-                        pr=pnl_r(e,out,move)
-                    updates.update({"primary_outcome":out,"primary_pnl_r":pr,"primary_closed_at":current})
-                    e.update(updates);pclosed+=1
+    if not best_metrics:
+        best_metrics = {
+            "coverage": 1.0,
+            "selected_wr": sum(labels) / max(len(labels), 1),
+            "selected_count": float(len(labels)),
+            "expectancy_r": sum(pnl_r) / max(len(pnl_r), 1),
+            "objective": -999.0,
+        }
 
-            update_episode(int(e["id"]),updates)
-
-            # Immutable horizon snapshots. Late snapshots become DATA_GAP.
-            for horizon in HORIZONS_SECONDS:
-                if age<horizon or horizon_exists(int(e["id"]),horizon):continue
-                lateness=age-horizon
-                cutoff=int(e["created_at"])+horizon
-                if lateness>MAX_HORIZON_LATENESS_SECONDS:
-                    out="data_gap"
-                else:
-                    out=first_passage_outcome(e,cutoff)
-                result={
-                    "episode_id":int(e["id"]),"horizon_seconds":horizon,
-                    "observed_at":current,"exit_price":exit_price,
-                    "net_move":move-ROUND_TRIP_COST_MOVE,
-                    "mfe_move":mfe,"mae_move":mae,
-                    "tp1_hit":int(e.get("tp1_hit_at") is not None and int(e["tp1_hit_at"])<=cutoff),
-                    "tp2_hit":int(e.get("tp2_hit_at") is not None and int(e["tp2_hit_at"])<=cutoff),
-                    "tp3_hit":int(e.get("tp3_hit_at") is not None and int(e["tp3_hit_at"])<=cutoff),
-                    "sl_hit":int(e.get("sl_hit_at") is not None and int(e["sl_hit_at"])<=cutoff),
-                    "outcome":out,"pnl_r":pnl_r(e,out,move),
-                    "lateness_seconds":lateness,
-                }
-                insert_horizon(result)
-
-            refreshed=get_episode(int(e["id"])) or e
-            # Telegram result notifications are only for real PAPER trades.
-            if (
-                refreshed.get("tier") == "paper"
-                and refreshed.get("primary_outcome")
-                and not int(refreshed.get("primary_notified", 0))
-            ):
-                notify_visible_episode(int(refreshed["id"]), "primary")
-
-            if age>=FINAL_HORIZON_SECONDS:
-                update_episode(int(e["id"]),{"status":"closed","finalized_at":current})
-                fclosed+=1
-                refreshed=get_episode(int(e["id"])) or e
-                if (
-                    refreshed.get("tier") == "paper"
-                    and not int(refreshed.get("final_notified", 0))
-                ):
-                    notify_visible_episode(int(refreshed["id"]), "final")
-
-        RUNTIME["last_track_at"]=current
-        if pclosed:maybe_send_milestones()
-        reconcile_visible_notifications()
-        return {"open":len(episodes),"primary_closed":pclosed,"final_closed":fclosed,"gaps":gaps}
-    finally:
-        TRACK_LOCK.release()
+    return best_threshold, best_metrics
 
 
-# ---------------------------------------------------------------------------
-# Reports/backups
-# ---------------------------------------------------------------------------
+def maybe_retrain(force: bool = False) -> Dict[str, Any]:
+    init_adaptive_db()
+    state = get_model_state()
 
-def build_research_report(
-    audit_event: Optional[Dict[str, Any]] = None,
-    block_end: Optional[int] = None,
-)->str:
-    allm=metrics(primary_rows()); obs=metrics(primary_rows("observer"))
-    pap=metrics(primary_rows("paper")); ind=metrics(primary_rows("paper",True))
-    review=champion_challenger_review()
-    lines=[
-        "🧠 V18.4 — АУДИТ + БЕЗОПАСНАЯ АВТОАДАПТАЦИЯ",
-        f"Protocol {PROTOCOL_HASH}",
-        f"Закрыт блок №{max(1,int(block_end or primary_count('paper'))//AUDIT_BLOCK_SIZE)}: "
-        f"{int(block_end or primary_count('paper'))} PAPER-исходов накопительно.",
-        "Периодический анализ: каждые 25 PAPER; решения строятся только по независимой части и действуют со следующего блока.",
-        f"Текущая политика: {adaptive_policy_summary()}",
-        "",
-        f"ВСЕ: {metric_line(allm)}",
-        f"OBSERVER: {metric_line(obs)}",
-        f"PAPER все: {metric_line(pap)}",
-        f"PAPER независимые: {metric_line(ind)}",
-        ""
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, label, pnl_r, features_json
+            FROM adaptive_trades
+            ORDER BY closed_at ASC, id ASC
+            """
+        ).fetchall()
+
+    closed_count = len(rows)
+    if closed_count < MIN_TRAIN_TRADES:
+        return {
+            "trained": False,
+            "reason": "warmup",
+            "closed_count": closed_count,
+            "needed": MIN_TRAIN_TRADES,
+        }
+
+    if (
+        not force
+        and state.last_trained_closed_count > 0
+        and closed_count - state.last_trained_closed_count < RETRAIN_EVERY
+    ):
+        return {
+            "trained": False,
+            "reason": "waiting_for_more_trades",
+            "closed_count": closed_count,
+            "next_at": state.last_trained_closed_count + RETRAIN_EVERY,
+        }
+
+    rows = rows[-MAX_TRAIN_ROWS:]
+    labels = [int(row["label"]) for row in rows]
+    pnl_r = [float(row["pnl_r"]) for row in rows]
+    vectors = [_vector_from_dict(json.loads(row["features_json"])) for row in rows]
+
+    positives = sum(labels)
+    negatives = len(labels) - positives
+    if positives < MIN_POSITIVE_ROWS or negatives < MIN_NEGATIVE_ROWS:
+        return {
+            "trained": False,
+            "reason": "class_imbalance",
+            "positives": positives,
+            "negatives": negatives,
+        }
+
+    validation_size = max(MIN_VALIDATION_ROWS, int(len(rows) * VALIDATION_FRACTION))
+    validation_size = min(validation_size, len(rows) // 2)
+    train_size = len(rows) - validation_size
+
+    x_train_raw = vectors[:train_size]
+    y_train = labels[:train_size]
+    x_val_raw = vectors[train_size:]
+    y_val = labels[train_size:]
+    pnl_val = pnl_r[train_size:]
+
+    if sum(y_train) < 4 or (len(y_train) - sum(y_train)) < 4:
+        return {"trained": False, "reason": "train_split_too_small"}
+
+    mean, std = _mean_std(x_train_raw)
+    x_train = _normalize(x_train_raw, mean, std)
+    x_val = _normalize(x_val_raw, mean, std)
+
+    weights = _train_logistic(x_train, y_train)
+    val_prob = _predict_matrix(weights, x_val)
+
+    train_base_rate = min(0.95, max(0.05, sum(y_train) / len(y_train)))
+    base_prob = [train_base_rate] * len(y_val)
+    base_loss = _logloss(y_val, base_prob)
+    model_loss = _logloss(y_val, val_prob)
+    improvement = base_loss - model_loss
+
+    threshold, threshold_metrics = _choose_threshold(y_val, val_prob, pnl_val)
+    activate = (
+        improvement >= MIN_MODEL_IMPROVEMENT
+        and threshold_metrics["selected_count"] >= 5
+        and threshold_metrics["coverage"] >= MIN_VALIDATION_COVERAGE
+        and threshold_metrics["expectancy_r"] > 0
+    )
+
+    new_state = ModelState(
+        version=state.version + 1,
+        active=bool(activate),
+        threshold=threshold,
+        trained_rows=len(rows),
+        validation_rows=len(y_val),
+        base_logloss=base_loss,
+        model_logloss=model_loss,
+        validation_win_rate=sum(y_val) / max(len(y_val), 1),
+        validation_coverage=threshold_metrics["coverage"],
+        validation_selected_wr=threshold_metrics["selected_wr"],
+        validation_selected_count=int(threshold_metrics["selected_count"]),
+        weights=list(weights),
+        mean=list(mean),
+        std=list(std),
+        last_trained_closed_count=closed_count,
+        created_at=int(time.time()),
+    )
+    _save_model_state(new_state)
+
+    payload = {
+        "version": new_state.version,
+        "active": new_state.active,
+        "closed_count": closed_count,
+        "trained_rows": new_state.trained_rows,
+        "validation_rows": new_state.validation_rows,
+        "base_logloss": round(base_loss, 6),
+        "model_logloss": round(model_loss, 6),
+        "improvement": round(improvement, 6),
+        "threshold": round(threshold, 3),
+        "coverage": round(threshold_metrics["coverage"], 3),
+        "selected_wr": round(threshold_metrics["selected_wr"], 3),
+        "selected_count": int(threshold_metrics["selected_count"]),
+        "expectancy_r": round(threshold_metrics["expectancy_r"], 4),
+        "shadow_only": SHADOW_ONLY,
+    }
+    _event(
+        "model_retrained",
+        "Adaptive model retrained and activated" if activate else "Adaptive model retrained but not activated",
+        payload,
+    )
+    return {"trained": True, **payload}
+
+
+def adaptive_report() -> str:
+    init_adaptive_db()
+    state = get_model_state()
+
+    with _LOCK, _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades").fetchone()["n"]
+        wins = conn.execute("SELECT COUNT(*) AS n FROM adaptive_trades WHERE label=1").fetchone()["n"]
+        losses = total - wins
+        by_strategy = conn.execute(
+            """
+            SELECT strategy,
+                   COUNT(*) AS n,
+                   SUM(label) AS wins,
+                   AVG(pnl_r) AS expectancy_r
+            FROM adaptive_trades
+            GROUP BY strategy
+            HAVING COUNT(*) >= 3
+            ORDER BY expectancy_r DESC, n DESC
+            LIMIT 10
+            """
+        ).fetchall()
+        shadow = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS n,
+                SUM(CASE WHEN shadow_accepted=1 THEN 1 ELSE 0 END) AS accepted,
+                SUM(CASE WHEN shadow_accepted=1 AND label=1 THEN 1 ELSE 0 END) AS accepted_wins
+            FROM adaptive_trades
+            WHERE shadow_accepted IS NOT NULL
+            """
+        ).fetchone()
+
+    wr = wins / total * 100 if total else 0.0
+    lines = [
+        "🧠 Adaptive Learning Report",
+        f"Closed trades: {total}",
+        f"Profit labels: {wins} · Non-profit labels: {losses} · WR: {wr:.1f}%",
+        f"Model version: {state.version}",
+        f"Active: {state.active}",
+        f"Shadow only: {SHADOW_ONLY}",
+        f"Threshold: {state.threshold:.3f}",
+        f"Train rows: {state.trained_rows} · Validation rows: {state.validation_rows}",
+        f"Validation logloss: model {state.model_logloss:.4f} vs base {state.base_logloss:.4f}",
+        f"Validation selected WR: {state.validation_selected_wr*100:.1f}%",
+        f"Validation coverage: {state.validation_coverage*100:.1f}%",
     ]
-    for strategy in STRATEGIES:
-        lane=review["lanes"][strategy]
-        lane_metrics=lane["all"]
-        history_metrics=lane["all_history"]
-        policy=lane["policy"]
-        best_horizon=lane["horizons"].get("best_research_horizon_seconds")
-        lines += [
-            f"{strategy}:",
-            f"• вся история: {metric_line(history_metrics)}",
-            f"• текущая rev{int(policy['revision'])}: {metric_line(lane_metrics)}",
-            f"• последние 25 текущей rev: {metric_line(lane['last_25'])}",
-            f"• LONG/SHORT: {lane_metrics['side_counts']['LONG']}/"
-            f"{lane_metrics['side_counts']['SHORT']} · дней {lane_metrics['active_days']} · "
-            f"режимы {','.join(lane_metrics['market_regimes']) or 'нет'}",
-            f"• лучший фиксированный research-horizon: "
-            f"{int(best_horizon)//60}м" if best_horizon else
-            "• лучший фиксированный research-horizon: ещё мало данных",
-        ]
-    if isinstance(audit_event, dict):
-        lines += ["", f"Автоизменение: {audit_event.get('status','?')}"]
-        for strategy in STRATEGIES:
-            decision=(audit_event.get("lanes") or {}).get(strategy,{})
-            if decision:
-                lines.append(
-                    f"• {strategy}: {decision.get('action','HOLD')} · "
-                    f"{decision.get('reason','')}"
-                )
-        if audit_event.get("changes"):
-            for change in audit_event["changes"]:
-                lines.append(
-                    f"→ {change['strategy']}: level {change['old_level']}→{change['new_level']}, "
-                    f"score {change['old_min_quality_score']:.1f}→{change['new_min_quality_score']:.1f}, "
-                    f"cooldown ×{change['old_cooldown_multiplier']:.1f}→×{change['new_cooldown_multiplier']:.1f}"
-                )
-        else:
-            lines.append("→ Параметры не изменены: данных для безопасного ужесточения нет или блок не отрицательный.")
-    leader=review["leader"]
-    lane_gate=(review["lanes"][leader]["gate"] if leader in STRATEGIES else review_gate())
-    failed=[k for k,v in lane_gate["checks"].items() if not v]
-    ready=review["recommended_for_external_review"]!="NONE"
-    lines += [
-        "",
-        f"Исследовательский лидер: {review['leader']}",
-        f"Статус: {review['status']}",
-        f"Рекомендован для отдельной micro-LIVE проверки: {review['recommended_for_external_review']}",
-        f"Готовность к отдельному micro-LIVE: {ready}",
-        "Не пройдены: "+(", ".join(failed) if failed else "нет"),
-        "Важно: V18.4 меняет только будущую PAPER-селективность, не переписывает исходы/TP/SL и не может отправлять реальные ордера."
-    ]
+
+    if shadow and shadow["n"]:
+        accepted = int(shadow["accepted"] or 0)
+        accepted_wins = int(shadow["accepted_wins"] or 0)
+        shadow_wr = accepted_wins / accepted * 100 if accepted else 0.0
+        lines.append(
+            f"Shadow decisions: {int(shadow['n'])} · accepted {accepted} · accepted WR {shadow_wr:.1f}%"
+        )
+
+    if by_strategy:
+        lines.append("\nStrategies:")
+        for row in by_strategy:
+            n = int(row["n"])
+            w = int(row["wins"] or 0)
+            exp_r = float(row["expectancy_r"] or 0.0)
+            lines.append(
+                f"{row['strategy']}: {w}/{n} wins · WR {w/n*100:.1f}% · expectancy {exp_r:+.3f}R"
+            )
+
+    if total < MIN_TRAIN_TRADES:
+        lines.append(f"\nWarm-up: need {MIN_TRAIN_TRADES-total} more closed trades before first training.")
+    elif not state.active:
+        lines.append("\nModel is not allowed to block signals because validation improvement is not yet strong enough.")
+
     return "\n".join(lines)
 
-def diagnostics_text()->str:
-    rt=runtime_snapshot();scan=rt.get("last_scan") or {}
-    review=champion_challenger_review()
-    return (
-        "🧪 V18.4 Visible + Bounded Adaptive\n"
-        f"Protocol {PROTOCOL_HASH} · scans {rt.get('scan_count',0)}\n"
-        f"Policy: {adaptive_policy_summary()}\n"
-        f"Universe {scan.get('universe',0)} · broad {scan.get('broad_candidates',0)} · "
-        f"PAPER new {scan.get('paper_created',0)} · OBSERVER new {scan.get('observer_created',0)} · "
-        f"open {scan.get('open',open_episode_count())} · {scan.get('elapsed',0):.0f}s\n"
-        f"OBSERVER: {metric_line(metrics(primary_rows('observer')))}\n"
-        f"PAPER: {metric_line(metrics(primary_rows('paper')))}\n"
-        f"PAPER independent: {metric_line(metrics(primary_rows('paper',True)))}\n"
-        f"CHAMPION: {metric_line(metrics(primary_rows('paper',True,STRATEGY_MOMENTUM)))}\n"
-        f"CHALLENGER: {metric_line(metrics(primary_rows('paper',True,STRATEGY_PULLBACK)))}\n"
-        f"Research leader: {review['leader']} · {review['status']}\n"
-        f"Rejects: {scan.get('reject_reasons',{}) or 'нет'}\n"
-        f"API {rt.get('api_calls',0)}/{rt.get('api_errors',0)} · "
-        f"Telegram {rt.get('telegram_sent',0)}/{rt.get('telegram_errors',0)} · outbox {table_count('outbox')}\n"
-        f"Last error: {rt.get('last_error','')}"
-    )
 
-def maybe_send_milestones()->Dict[str,Any]:
-    total=primary_count();paper=primary_count("paper");independent=primary_count("paper",True)
-    last_audit=int(meta_get("last_audit_paper",0) or 0)
-    last_backup=int(meta_get("last_backup_paper",0) or 0)
-    rs=bs=False
-    audit_events: List[Dict[str,Any]]=[]
-    audit_files: List[str]=[]
-    # Trigger is what the user can count in Telegram: 25 closed PAPER trades.
-    # Promotion metrics still use only the independent subset.
-    next_block=last_audit+AUDIT_BLOCK_SIZE
-    while paper>=next_block:
-        event=apply_bounded_adaptation(next_block)
-        if event.get("status")=="INCOMPLETE_BLOCK":
-            set_runtime_error(f"milestone incomplete block {next_block}")
-            break
-        champion_challenger_review(persist=True)
-        rs=send_text(build_research_report(event,next_block),True)
-        fn=f"adaptive_seed_v18_4_after_{next_block}_closed_paper_{now_ts()}.json"
-        data=export_bytes(
-            {"last_audit_paper":next_block,"last_backup_paper":next_block},
-            event,
+def recent_adaptive_events(limit: int = 20) -> List[Dict[str, Any]]:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT created_at, event_type, message, payload_json
+            FROM adaptive_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 100)),),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "created_at": int(row["created_at"]),
+                "event_type": row["event_type"],
+                "message": row["message"],
+                "payload": json.loads(row["payload_json"] or "{}"),
+            }
         )
-        bs=send_document(
-            data,fn,
-            f"V18.4 · {next_block} закрытых PAPER накопительно · полный журнал + изменения следующего блока · {PROTOCOL_HASH}",
-            True,
-        )
-        if not (rs and bs):
-            break
-        meta_set("last_audit_paper",next_block)
-        meta_set("last_backup_paper",next_block)
-        last_audit=last_backup=next_block
-        audit_events.append(event)
-        audit_files.append(fn)
-        next_block+=AUDIT_BLOCK_SIZE
+    return out
 
-    if not audit_events and paper>=last_backup+BACKUP_EVERY_PRIMARY:
-        data=export_bytes();fn=f"v18_4_checkpoint_{paper}_paper_{now_ts()}.json"
-        bs=send_document(
-            data,fn,
-            f"V18.4 checkpoint · {paper} closed PAPER / {independent} independent · {PROTOCOL_HASH}",
-            True,
-        )
-        if bs:meta_set("last_backup_paper",paper)
+
+# ============================================================
+# V13.28 — MARKET DUMP + AERO STYLE SCALPER
+# Professional goal:
+# Trade only short-lived market situations with immediate edge.
+# No trend prediction, no market phase guessing.
+#
+# Core idea:
+# hot coin -> fresh imbalance -> micro pullback/liquidity grab -> EMA/VWAP reclaim/reject
+# -> immediate continuation -> compact 5-target exit.
+#
+# If the trade does not start paying quickly, it is not the setup and gets expired.
+# Important: this bot sends signals/alerts. It does not guarantee profit.
+# V13.25 fix: adds a trader-pattern gate based on the user examples.
+# The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
+# ============================================================
+
+APP_NAME = "Professional Adaptive Futures Bot AUTO V15 SHADOW LEARNING"
+DEPLOY_MARKER = "V15_SHADOW_LEARNING_2026_07_31"
+
+app = FastAPI(title=APP_NAME)
+
+BINGX_BASE_URL = "https://open-api.bingx.com"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+STATE_FILE = os.getenv("STATE_FILE", "bot_state_v13_29_local_stop_dump_scalper.json")
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
+
+# --- Scan stability ---
+AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() == "true"
+AUTO_TRACK_ENABLED = os.getenv("AUTO_TRACK_ENABLED", "true").lower() == "true"
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "15"))
+AUTO_TRACK_SECONDS = int(os.getenv("AUTO_TRACK_SECONDS", "3"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
+API_RETRIES = int(os.getenv("API_RETRIES", "3"))
+API_THROTTLE_SECONDS = float(os.getenv("API_THROTTLE_SECONDS", "0.04"))
+MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "450"))
+MAX_ANALYZE_SYMBOLS = int(os.getenv("MAX_ANALYZE_SYMBOLS", "180"))
+HOT_SYMBOLS_TO_ANALYZE = int(os.getenv("HOT_SYMBOLS_TO_ANALYZE", "60"))
+DIAG_SECONDS = int(os.getenv("DIAG_SECONDS", "1200"))
+
+# --- Signal limits ---
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "88"))
+B_MIN_SCORE = int(os.getenv("B_MIN_SCORE", "80"))
+MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "2"))
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "2"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "600"))
+STRATEGY_COOLDOWN_SECONDS = int(os.getenv("STRATEGY_COOLDOWN_SECONDS", "90"))
+
+# --- Fast burst requirements ---
+FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
+FAST_MIN_15M_MOVE = float(os.getenv("FAST_MIN_15M_MOVE", "0.0045"))        # 1.0% in 15m
+FAST_MIN_30M_MOVE = float(os.getenv("FAST_MIN_30M_MOVE", "0.0070"))        # 1.6% in 30m
+FAST_MAX_30M_MOVE = float(os.getenv("FAST_MAX_30M_MOVE", "0.090"))        # avoid late vertical chase
+FAST_MIN_RANGE_RATIO = float(os.getenv("FAST_MIN_RANGE_RATIO", "0.82"))   # current 5m range expansion
+FAST_MIN_VOLUME_RATIO = float(os.getenv("FAST_MIN_VOLUME_RATIO", "0.35")) # current 15m volume expansion
+FAST_MIN_1M_CONFIRM = float(os.getenv("FAST_MIN_1M_CONFIRM", "0.00055"))   # 0.15% last 3m direction
+# V13.19: fast scalps can be either continuation OR blow-off reversal.
+# Example from diagnostics: 30m +16%, last 3m -1% can be a valid SHORT scalp, not a rejection.
+REVERSAL_ENABLED = os.getenv("REVERSAL_ENABLED", "true").lower() == "true"
+REVERSAL_MIN_30M_MOVE = float(os.getenv("REVERSAL_MIN_30M_MOVE", "0.018"))
+REVERSAL_MIN_LIVE_COUNTER_MOVE = float(os.getenv("REVERSAL_MIN_LIVE_COUNTER_MOVE", "0.0012"))
+LIVE_BYPASS_VOLUME_MOVE = float(os.getenv("LIVE_BYPASS_VOLUME_MOVE", "0.0035"))
+LIVE_BYPASS_RANGE_RATIO = float(os.getenv("LIVE_BYPASS_RANGE_RATIO", "1.35"))
+FAST_MAX_SPREAD_PROXY = float(os.getenv("FAST_MAX_SPREAD_PROXY", "0.030"))# current 5m candle too wide/chase block
+EDGE_MIN_PRIOR_COMPRESSION = float(os.getenv("EDGE_MIN_PRIOR_COMPRESSION", "99.0")) # prior 5m range should be smaller before expansion
+EDGE_MIN_BREAKOUT_DISTANCE = float(os.getenv("EDGE_MIN_BREAKOUT_DISTANCE", "0.00005")) # 0.12% micro break beyond prior 1m structure
+EDGE_REQUIRE_MICRO_SWEEP = os.getenv("EDGE_REQUIRE_MICRO_SWEEP", "false").lower() == "true"
+
+# --- Realtime pressure gate ---
+# Previous versions expired because they detected a pattern after the flow had already died.
+# These filters require live 1m pressure at the exact signal moment.
+HOT_MIN_SCORE = float(os.getenv("HOT_MIN_SCORE", "14"))
+HOT_MIN_LIVE_MOVE_3M = float(os.getenv("HOT_MIN_LIVE_MOVE_3M", "0.0006"))
+HOT_MIN_LIVE_RANGE_OR_VOLUME = float(os.getenv("HOT_MIN_LIVE_RANGE_OR_VOLUME", "0.70"))
+HOT_STALE_PENALTY_ENABLED = os.getenv("HOT_STALE_PENALTY_ENABLED", "true").lower() == "true"
+REALTIME_MIN_1M_RANGE_RATIO = float(os.getenv("REALTIME_MIN_1M_RANGE_RATIO", "0.45"))
+REALTIME_MIN_1M_VOLUME_RATIO = float(os.getenv("REALTIME_MIN_1M_VOLUME_RATIO", "0.20"))
+REALTIME_MIN_2M_MOVE = float(os.getenv("REALTIME_MIN_2M_MOVE", "0.00045"))
+REALTIME_CLOSE_LOCATION_LONG = float(os.getenv("REALTIME_CLOSE_LOCATION_LONG", "0.57"))
+REALTIME_CLOSE_LOCATION_SHORT = float(os.getenv("REALTIME_CLOSE_LOCATION_SHORT", "0.43"))
+REALTIME_REQUIRE_TWO_1M_CANDLES = os.getenv("REALTIME_REQUIRE_TWO_1M_CANDLES", "false").lower() == "true"
+EDGE_MIN_TP5_FEASIBILITY = float(os.getenv("EDGE_MIN_TP5_FEASIBILITY", "0.50")) # recent 15m move should cover most of TP5 distance
+
+# --- Pullback/retest requirements ---
+PULLBACK_MIN = float(os.getenv("PULLBACK_MIN", "0.0015"))                 # 0.25%
+PULLBACK_MAX = float(os.getenv("PULLBACK_MAX", "0.0400"))                 # 3.0%
+RECLAIM_BUFFER = float(os.getenv("RECLAIM_BUFFER", "0.0005"))
+CLOSE_LOCATION_MIN_LONG = float(os.getenv("CLOSE_LOCATION_MIN_LONG", "0.52"))
+CLOSE_LOCATION_MAX_SHORT = float(os.getenv("CLOSE_LOCATION_MAX_SHORT", "0.48"))
+
+# --- Compact ladder TPs for fast 10-minute realization style ---
+# These are intentionally more compact than slow ladder targets.
+# Trader-example ladder: AERO/PORTAL/HOME/VELVET style targets are not tiny 0.3% scalps.
+# TP1 should be reachable quickly, but TP5 should represent a real 3-4% move when volatility allows.
+TP1_MOVE = float(os.getenv("TP1_MOVE", "0.0065"))
+TP2_MOVE = float(os.getenv("TP2_MOVE", "0.0120"))
+TP3_MOVE = float(os.getenv("TP3_MOVE", "0.0185"))
+TP4_MOVE = float(os.getenv("TP4_MOVE", "0.0260"))
+TP5_MOVE = float(os.getenv("TP5_MOVE", "0.0350"))
+
+# --- Risk / stop ---
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "0.80"))
+MIN_SL_MOVE = float(os.getenv("MIN_SL_MOVE", "0.0100"))                  # min 1.0% price risk
+MAX_SL_MOVE = float(os.getenv("MAX_SL_MOVE", "0.0260"))                  # technical invalidation cap for example-style ladder
+
+# V13.29: for fast scalps we use a LOCAL execution stop, not the distant invalidation/averaging zone.
+# This keeps AERO-style / dump scalps alive while still blocking XMR-style wide-risk trades.
+LOCAL_SCALP_STOP_ENABLED = os.getenv("LOCAL_SCALP_STOP_ENABLED", "true").lower() == "true"
+LOCAL_SCALP_MAX_SL_MOVE = float(os.getenv("LOCAL_SCALP_MAX_SL_MOVE", "0.0145"))  # 1.45% price risk cap; x20 ≈ 29% ROI
+LOCAL_SCALP_MIN_SL_MOVE = float(os.getenv("LOCAL_SCALP_MIN_SL_MOVE", "0.0065"))  # keep stop not too tight
+LOCAL_STOP_MODES = {"MARKET_DUMP_SHORT", "INSTANT_MOMENTUM_SHORT", "INSTANT_MOMENTUM_LONG", "AERO_STYLE_SHORT", "AERO_STYLE_LONG"}
+FAST_RISK_MULT = float(os.getenv("FAST_RISK_MULT", "0.08"))
+A_RISK_MULT = float(os.getenv("A_RISK_MULT", "0.14"))
+
+# --- V13.22 professional quality gate ---
+# Blocks mathematically bad scalps like: TP1 small, SL huge, weak live volume, poor ladder RR.
+MAX_SCALP_SL_ROI = float(os.getenv("MAX_SCALP_SL_ROI", "32.0"))
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "0.20"))
+MIN_LADDER_RR_HARD = float(os.getenv("MIN_LADDER_RR_HARD", "0.62"))
+MIN_FINAL_RR_HARD = float(os.getenv("MIN_FINAL_RR_HARD", "1.15"))
+MIN_LIVE_VOL_NORMAL = float(os.getenv("MIN_LIVE_VOL_NORMAL", "0.50"))
+MIN_LIVE_VOL_STRONG_PRICE = float(os.getenv("MIN_LIVE_VOL_STRONG_PRICE", "0.30"))
+STRONG_1M3_MOVE = float(os.getenv("STRONG_1M3_MOVE", "0.0050"))
+STRONG_RANGE1 = float(os.getenv("STRONG_RANGE1", "1.25"))
+HEAVY_MIN_FINAL_RR = float(os.getenv("HEAVY_MIN_FINAL_RR", "1.25"))
+HEAVY_MAX_SL_ROI = float(os.getenv("HEAVY_MAX_SL_ROI", "13.0"))
+HEAVY_MIN_LIVE_VOL = float(os.getenv("HEAVY_MIN_LIVE_VOL", "0.70"))
+HEAVY_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK", "AVAX",
+    "DOT", "LTC", "BCH", "XMR", "GMX", "AAVE", "UNI", "ATOM", "ETC", "FIL"
+}
+
+# --- V13.24 Instant Edge fallback ---
+# This mode catches the examples-style micro-moment when the coin is moving NOW,
+# but the older pullback/EMA/VWAP setup is too slow and returns no_fast.
+# It is not a loose mode: final RR/SL/live-volume quality gate still applies after trade construction.
+INSTANT_EDGE_ENABLED = os.getenv("INSTANT_EDGE_ENABLED", "true").lower() == "true"
+INSTANT_MIN_1M3_MOVE = float(os.getenv("INSTANT_MIN_1M3_MOVE", "0.0055"))
+INSTANT_MIN_15M_MOVE = float(os.getenv("INSTANT_MIN_15M_MOVE", "0.0040"))
+INSTANT_MIN_VOL1 = float(os.getenv("INSTANT_MIN_VOL1", "0.45"))
+INSTANT_MIN_RANGE1 = float(os.getenv("INSTANT_MIN_RANGE1", "0.85"))
+INSTANT_MIN_VOL5 = float(os.getenv("INSTANT_MIN_VOL5", "0.55"))
+INSTANT_MIN_RANGE5 = float(os.getenv("INSTANT_MIN_RANGE5", "0.70"))
+INSTANT_CLOSE_LONG = float(os.getenv("INSTANT_CLOSE_LONG", "0.60"))
+INSTANT_CLOSE_SHORT = float(os.getenv("INSTANT_CLOSE_SHORT", "0.40"))
+INSTANT_MIN_BODY = float(os.getenv("INSTANT_MIN_BODY", "0.34"))
+INSTANT_MAX_30M_CHASE = float(os.getenv("INSTANT_MAX_30M_CHASE", "0.065"))
+INSTANT_ALLOW_STRONG_1M_EXCEPTION = os.getenv("INSTANT_ALLOW_STRONG_1M_EXCEPTION", "true").lower() == "true"
+
+# --- V13.25 trader-pattern quality gate ---
+# Built from the examples: AERO/PORTAL/HOME/WLD/VELVET are not random hot ticks.
+# They are either continuation after a controlled pullback/reject, or a leader/laggard relative-strength exception.
+TRADER_PATTERN_GATE_ENABLED = os.getenv("TRADER_PATTERN_GATE_ENABLED", "true").lower() == "true"
+TRADER_MIN_SCORE = int(os.getenv("TRADER_MIN_SCORE", "82"))
+TRADER_ALLOW_B_SCORE = os.getenv("TRADER_ALLOW_B_SCORE", "true").lower() == "true"
+TRADER_MIN_ABS_1M3 = float(os.getenv("TRADER_MIN_ABS_1M3", "0.0048"))
+TRADER_MIN_ABS_15M = float(os.getenv("TRADER_MIN_ABS_15M", "0.0055"))
+TRADER_MIN_ABS_30M = float(os.getenv("TRADER_MIN_ABS_30M", "0.0080"))
+TRADER_MIN_VOL1 = float(os.getenv("TRADER_MIN_VOL1", "0.52"))
+TRADER_MIN_VOL5 = float(os.getenv("TRADER_MIN_VOL5", "0.52"))
+TRADER_MIN_RANGE1 = float(os.getenv("TRADER_MIN_RANGE1", "0.85"))
+TRADER_MIN_RANGE5 = float(os.getenv("TRADER_MIN_RANGE5", "0.75"))
+TRADER_MIN_TP5_FEASIBILITY = float(os.getenv("TRADER_MIN_TP5_FEASIBILITY", "0.50"))
+TRADER_NEED_5M_DIRECTION = os.getenv("TRADER_NEED_5M_DIRECTION", "false").lower() == "true"
+TRADER_BLOCK_WEAK_CONTINUATION = os.getenv("TRADER_BLOCK_WEAK_CONTINUATION", "true").lower() == "true"
+TRADER_MAX_COUNTER_30M = float(os.getenv("TRADER_MAX_COUNTER_30M", "0.0100"))
+TRADER_REQUIRE_MICRO_BREAK = os.getenv("TRADER_REQUIRE_MICRO_BREAK", "true").lower() == "true"
+TRADER_CLOSE_LONG = float(os.getenv("TRADER_CLOSE_LONG", "0.57"))
+TRADER_CLOSE_SHORT = float(os.getenv("TRADER_CLOSE_SHORT", "0.43"))
+TRADER_HEAVY_ONLY_A_PLUS = os.getenv("TRADER_HEAVY_ONLY_A_PLUS", "true").lower() == "true"
+
+# --- V13.27 AERO-style trader gate ---
+# This is built from the user's AERO example: short after a controlled upper pullback/reject,
+# not a random late short at the bottom. It allows quality B+ trades if the tape shows a true
+# pullback -> rejection -> breakdown structure, while keeping RR/SL quality gate active.
+AERO_STYLE_GATE_ENABLED = os.getenv("AERO_STYLE_GATE_ENABLED", "true").lower() == "true"
+AERO_SHORT_ENABLED = os.getenv("AERO_SHORT_ENABLED", "true").lower() == "true"
+AERO_LONG_ENABLED = os.getenv("AERO_LONG_ENABLED", "true").lower() == "true"
+AERO_MIN_PULLBACK = float(os.getenv("AERO_MIN_PULLBACK", "0.0045"))       # recent high/low must be away from entry
+AERO_MAX_PULLBACK = float(os.getenv("AERO_MAX_PULLBACK", "0.0850"))       # avoid extreme manipulated spikes
+AERO_MIN_1M3 = float(os.getenv("AERO_MIN_1M3", "0.0038"))                 # current 3m pressure
+AERO_MIN_RECENT_RANGE = float(os.getenv("AERO_MIN_RECENT_RANGE", "0.0140")) # recent 30m range expansion
+AERO_MIN_VOL1 = float(os.getenv("AERO_MIN_VOL1", "0.35"))
+AERO_MIN_VOL5 = float(os.getenv("AERO_MIN_VOL5", "0.45"))
+AERO_MIN_RANGE1 = float(os.getenv("AERO_MIN_RANGE1", "0.60"))
+AERO_MIN_RANGE5 = float(os.getenv("AERO_MIN_RANGE5", "0.65"))
+AERO_CLOSE_SHORT = float(os.getenv("AERO_CLOSE_SHORT", "0.48"))
+AERO_CLOSE_LONG = float(os.getenv("AERO_CLOSE_LONG", "0.52"))
+AERO_REQUIRE_EMA_REJECT = os.getenv("AERO_REQUIRE_EMA_REJECT", "true").lower() == "true"
+AERO_ALLOW_B_SCORE = os.getenv("AERO_ALLOW_B_SCORE", "true").lower() == "true"
+
+# --- V13.28 Market Dump SHORT fallback ---
+# Used when BTC/ETH/alt market is actively selling off and old fast/aero gates are too
+# selective. This catches dump continuation, but still avoids shorting a dead bottom:
+# it needs live 1m pressure, 5m participation and fresh continuation/reject evidence.
+MARKET_DUMP_SHORT_ENABLED = os.getenv("MARKET_DUMP_SHORT_ENABLED", "true").lower() == "true"
+DUMP_MIN_1M3 = float(os.getenv("DUMP_MIN_1M3", "0.0048"))
+DUMP_MIN_15M = float(os.getenv("DUMP_MIN_15M", "0.0035"))
+DUMP_MIN_VOL1 = float(os.getenv("DUMP_MIN_VOL1", "0.35"))
+DUMP_MIN_VOL5 = float(os.getenv("DUMP_MIN_VOL5", "0.48"))
+DUMP_MIN_RANGE1 = float(os.getenv("DUMP_MIN_RANGE1", "0.40"))
+DUMP_MIN_RANGE5 = float(os.getenv("DUMP_MIN_RANGE5", "0.60"))
+DUMP_CLOSE_SHORT = float(os.getenv("DUMP_CLOSE_SHORT", "0.58"))
+DUMP_MIN_RECENT_RANGE = float(os.getenv("DUMP_MIN_RECENT_RANGE", "0.0100"))
+DUMP_MAX_LATE_30M = float(os.getenv("DUMP_MAX_LATE_30M", "0.095"))
+DUMP_REQUIRE_REJECT_OR_BREAK = os.getenv("DUMP_REQUIRE_REJECT_OR_BREAK", "false").lower() == "true"
+
+
+# --- Time stop / no-stall logic ---
+FAST_MAX_MINUTES_TO_TP1 = int(os.getenv("FAST_MAX_MINUTES_TO_TP1", "6"))
+FAST_HARD_EXPIRE_MINUTES = int(os.getenv("FAST_HARD_EXPIRE_MINUTES", "11"))
+FAST_MIN_PROGRESS_TO_KEEP = float(os.getenv("FAST_MIN_PROGRESS_TO_KEEP", "0.25"))
+FAST_CANCEL_IF_NO_PROGRESS = os.getenv("FAST_CANCEL_IF_NO_PROGRESS", "true").lower() == "true"
+
+# --- Market shock context ---
+# We do not trade market phase/trend. BTC is used only as a shock filter.
+BTC_SHOCK_15M_BLOCK = float(os.getenv("BTC_SHOCK_15M_BLOCK", "0.020")) # avoid alt scalp during violent BTC shock
+
+# --- Side control / professional LONG repair ---
+# SHORT is already working in live stats. LONG is now stricter and must look like a real reclaim,
+# not a late buy at the end of a pump.
+ALLOW_LONG = os.getenv("ALLOW_LONG", "true").lower() == "true"
+ALLOW_SHORT = os.getenv("ALLOW_SHORT", "true").lower() == "true"
+LONG_BLOCK_BTC_BEAR = os.getenv("LONG_BLOCK_BTC_BEAR", "false").lower() == "true"
+LONG_MIN_1M_VOLUME_RATIO = float(os.getenv("LONG_MIN_1M_VOLUME_RATIO", "0.75"))
+LONG_MIN_1M_RANGE_RATIO = float(os.getenv("LONG_MIN_1M_RANGE_RATIO", "0.80"))
+LONG_MIN_3M_CONFIRM = float(os.getenv("LONG_MIN_3M_CONFIRM", "0.0012"))     # 0.12% in 3m
+LONG_MIN_CLOSE_LOCATION = float(os.getenv("LONG_MIN_CLOSE_LOCATION", "0.72"))
+LONG_MAX_15M_CHASE = float(os.getenv("LONG_MAX_15M_CHASE", "0.040"))        # above this needs pullback/sweep
+LONG_MAX_30M_CHASE = float(os.getenv("LONG_MAX_30M_CHASE", "0.070"))
+LONG_MIN_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MIN_PULLBACK_AFTER_PUMP", "0.0055"))
+LONG_MAX_PULLBACK_AFTER_PUMP = float(os.getenv("LONG_MAX_PULLBACK_AFTER_PUMP", "0.038"))
+LONG_REQUIRE_SWEEP_OR_RECLAIM = os.getenv("LONG_REQUIRE_SWEEP_OR_RECLAIM", "true").lower() == "true"
+LONG_REQUIRE_HIGHER_LOW = os.getenv("LONG_REQUIRE_HIGHER_LOW", "true").lower() == "true"
+LONG_STATS_PROTECTION = os.getenv("LONG_STATS_PROTECTION", "true").lower() == "true"
+LONG_STATS_MIN_CLOSED = int(os.getenv("LONG_STATS_MIN_CLOSED", "4"))
+LONG_STATS_MIN_WR = float(os.getenv("LONG_STATS_MIN_WR", "40"))
+
+# --- V13.21 context-adaptive rules ---
+# Professional idea: BTC direction is not a simple long/short switch.
+# LONG is allowed in a bearish market only if the coin is showing clear relative strength
+# and live reclaim pressure. SHORT is prioritized during BTC dump, but not chased without
+# a bounce/reject structure.
+CONTEXT_ADAPTIVE_ENABLED = os.getenv("CONTEXT_ADAPTIVE_ENABLED", "true").lower() == "true"
+BTC_DUMP_SHORT_BIAS_ENABLED = os.getenv("BTC_DUMP_SHORT_BIAS_ENABLED", "true").lower() == "true"
+BTC_DUMP_1H = float(os.getenv("BTC_DUMP_1H", "-0.012"))
+BTC_DUMP_6H = float(os.getenv("BTC_DUMP_6H", "-0.025"))
+LONG_ALLOW_BEAR_RELATIVE_STRENGTH = os.getenv("LONG_ALLOW_BEAR_RELATIVE_STRENGTH", "true").lower() == "true"
+LONG_BEAR_MIN_ALT_15M = float(os.getenv("LONG_BEAR_MIN_ALT_15M", "0.0065"))
+LONG_BEAR_MIN_ALT_30M = float(os.getenv("LONG_BEAR_MIN_ALT_30M", "0.0100"))
+LONG_BEAR_MIN_1M3 = float(os.getenv("LONG_BEAR_MIN_1M3", "0.0020"))
+LONG_BEAR_MIN_REL_STRENGTH_1H = float(os.getenv("LONG_BEAR_MIN_REL_STRENGTH_1H", "0.010"))
+LONG_BEAR_MIN_VOL1 = float(os.getenv("LONG_BEAR_MIN_VOL1", "0.90"))
+LONG_BEAR_MIN_RANGE1 = float(os.getenv("LONG_BEAR_MIN_RANGE1", "0.95"))
+LONG_BEAR_MIN_CLOSE_LOCATION = float(os.getenv("LONG_BEAR_MIN_CLOSE_LOCATION", "0.76"))
+SHORT_DUMP_ALLOW_EXTENDED_30M = float(os.getenv("SHORT_DUMP_ALLOW_EXTENDED_30M", "0.145"))
+SHORT_DUMP_MIN_LIVE_1M3 = float(os.getenv("SHORT_DUMP_MIN_LIVE_1M3", "-0.0014"))
+SHORT_DUMP_MIN_BOUNCE = float(os.getenv("SHORT_DUMP_MIN_BOUNCE", "0.0025"))
+
+
+# --- Ultra-risk blocks ---
+ULTRA_RISK_5M_CANDLE = float(os.getenv("ULTRA_RISK_5M_CANDLE", "0.095"))
+ULTRA_RISK_15M_CANDLE = float(os.getenv("ULTRA_RISK_15M_CANDLE", "0.140"))
+
+SCALP_STRATEGIES = {"PRO_SCALPING_EDGE_LONG", "PRO_SCALPING_EDGE_SHORT"}
+
+QUALITY_BASES = {
+    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
+    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "MATIC", "TON", "LTC", "BCH", "ETC", "FIL", "ATOM",
+    "UNI", "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI",
+    "PORTAL", "HOME", "TAC", "VELVET", "BEAT", "BLESS"
+}
+
+# Do not include VELVET here; user gave a successful VELVET long example.
+ULTRA_RISK_KEYWORDS = {
+    "1000", "PEPE", "BONK", "WIF", "MEME", "DOGS", "CATI", "HMSTR", "GOBLIN", "MOG", "TURBO",
+    "BOME", "NEIRO", "PNUT", "MOODENG", "ACT", "GOAT", "FIGHT", "BLEND", "MAGMA"
+}
+
+FALLBACK_SYMBOLS = [f"{b}-USDT" for b in [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "AVAX", "AAVE", "SUI", "TAO", "NEAR", "INJ",
+    "OP", "ARB", "APT", "TIA", "ADA", "DOT", "LTC", "BCH", "ETC", "FIL", "ATOM", "UNI",
+    "RUNE", "SEI", "FET", "WLD", "DOGE", "TRX", "ENA", "JUP", "ORDI", "BEAT", "BLESS",
+    "KAITO", "XLM", "WLFI", "PUMP", "PORTAL", "HOME", "TAC", "VELVET"
+]]
+
+STATE: Dict[str, Any] = {}
+KLINE_CACHE: Dict[str, Tuple[float, Optional[List[Dict[str, float]]]]] = {}
+TICKER_CACHE: Dict[str, Tuple[float, Optional[List[str]]]] = {}
+
+# ============================================================
+# State / utilities
+# ============================================================
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def normalize_symbol(symbol: str) -> str:
+    s = symbol.replace("/", "-").upper()
+    if s.endswith("USDT") and "-" not in s:
+        s = s.replace("USDT", "-USDT")
+    return s
+
+
+def display_symbol(symbol: str) -> str:
+    return normalize_symbol(symbol).replace("-", "/")
+
+
+def base_asset(symbol: str) -> str:
+    return normalize_symbol(symbol).split("-")[0]
+
+
+def default_state() -> Dict[str, Any]:
     return {
-        "total":total,"paper":paper,"independent":independent,
-        "report_sent":rs,"backup_sent":bs,
-        "audit_events":audit_events,"audit_files":audit_files,
+        "active_signals": [],
+        "stats": {
+            "total": {"profit": 0, "sl": 0, "expired": 0},
+            "side": {},
+            "grade": {},
+            "strategy": {},
+            "symbol": {},
+            "type": {},
+        },
+        "pair_cooldown": {},
+        "strategy_cooldown": {},
+        "last_scan": {},
+        "last_diag_ts": 0,
+        "last_error": "",
     }
 
-def startup_message()->str:
+
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_FILE):
+        return default_state()
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        base = default_state()
+        if isinstance(data, dict):
+            base.update(data)
+        return base
+    except Exception:
+        return default_state()
+
+
+def save_state() -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def inc_stat(bucket: str, key: str, result: str) -> None:
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    d = stats.setdefault(bucket, {})
+    item = d.setdefault(key, {"profit": 0, "sl": 0, "expired": 0})
+    item[result] = item.get(result, 0) + 1
+
+
+def apply_result(signal: Dict[str, Any], result: str) -> None:
+    if result not in ("profit", "sl", "expired"):
+        return
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    stats.setdefault("total", {"profit": 0, "sl": 0, "expired": 0})[result] += 1
+    inc_stat("side", signal.get("side", "?"), result)
+    inc_stat("grade", signal.get("grade", "?"), result)
+    inc_stat("strategy", signal.get("strategy", "?"), result)
+    inc_stat("symbol", signal.get("symbol", "?"), result)
+    inc_stat("type", signal.get("trade_type", "?"), result)
+    save_state()
+
+
+def wr_text(item: Dict[str, int]) -> str:
+    p = int(item.get("profit", 0))
+    sl = int(item.get("sl", 0))
+    exp = int(item.get("expired", 0))
+    closed = p + sl + exp
+    wr = p / closed * 100 if closed else 0.0
+    return f"{p} профит / {sl} SL / {exp} expired / WR {wr:.1f}%"
+
+
+def build_stats_text() -> str:
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    lines = ["📊 Статистика", f"Итого: {wr_text(stats.get('total', {}))}"]
+    for title, key in [("Стороны", "side"), ("Классы", "grade"), ("Стратегии", "strategy"), ("Типы", "type")]:
+        data = stats.get(key, {})
+        if data:
+            lines.append(f"\n{title}:")
+            for k, v in sorted(data.items(), key=lambda kv: -(kv[1].get("profit", 0) + kv[1].get("sl", 0) + kv[1].get("expired", 0)))[:12]:
+                lines.append(f"{k}: {wr_text(v)}")
+    return "\n".join(lines)
+
+# ============================================================
+# Telegram / API
+# ============================================================
+
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        STATE["last_error"] = "Telegram env missing: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+        save_state()
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]}, timeout=10)
+        if not r.ok:
+            STATE["last_error"] = f"Telegram error {r.status_code}: {r.text[:250]}"
+            save_state()
+            return False
+        return True
+    except Exception as e:
+        STATE["last_error"] = f"Telegram exception: {repr(e)}"
+        save_state()
+        return False
+
+
+def get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    url = BINGX_BASE_URL + path
+    last_err = None
+    for attempt in range(API_RETRIES):
+        try:
+            time.sleep(API_THROTTLE_SECONDS)
+            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code} {path}"
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            return r.json()
+        except Exception as e:
+            last_err = f"get_json {path}: {repr(e)}"
+            time.sleep(0.35 * (attempt + 1))
+    STATE["last_error"] = last_err or "unknown API error"
+    save_state()
+    return None
+
+
+def parse_klines(raw: Any) -> Optional[List[Dict[str, float]]]:
+    if not raw:
+        return None
+    candles: List[Dict[str, float]] = []
+    for c in raw:
+        try:
+            if isinstance(c, dict):
+                candles.append({
+                    "time": int(c.get("time") or c.get("openTime") or c.get("T") or 0),
+                    "open": float(c.get("open")),
+                    "high": float(c.get("high")),
+                    "low": float(c.get("low")),
+                    "close": float(c.get("close")),
+                    "volume": float(c.get("volume") or c.get("vol") or 0),
+                })
+            elif isinstance(c, (list, tuple)) and len(c) >= 6:
+                candles.append({
+                    "time": int(c[0]),
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "volume": float(c[5]),
+                })
+        except Exception:
+            continue
+    candles = [x for x in candles if x["open"] > 0 and x["high"] > 0 and x["low"] > 0 and x["close"] > 0]
+    candles.sort(key=lambda x: x["time"])
+    return candles if len(candles) >= 30 else None
+
+
+def get_klines(symbol: str, interval: str, limit: int = 180, cache_seconds: int = 20) -> Optional[List[Dict[str, float]]]:
+    symbol = normalize_symbol(symbol)
+    key = f"{symbol}:{interval}:{limit}"
+    cached = KLINE_CACHE.get(key)
+    if cached and time.time() - cached[0] < cache_seconds:
+        return cached[1]
+    for ep in ["/openApi/swap/v3/quote/klines", "/openApi/swap/v2/quote/klines"]:
+        data = get_json(ep, {"symbol": symbol, "interval": interval, "limit": limit})
+        if not data:
+            continue
+        candles = parse_klines(data.get("data"))
+        if candles:
+            KLINE_CACHE[key] = (time.time(), candles)
+            return candles
+    KLINE_CACHE[key] = (time.time(), None)
+    return None
+
+
+def is_good_contract_symbol(symbol: str) -> bool:
+    s = normalize_symbol(symbol)
+    if not s.endswith("-USDT"):
+        return False
+    b = base_asset(s)
+    if any(x in b for x in ["USD", "USDC", "BULL", "BEAR"]):
+        return False
+    return True
+
+
+def get_symbols() -> List[str]:
+    cached = TICKER_CACHE.get("symbols")
+    if cached and time.time() - cached[0] < 600:
+        return cached[1] or FALLBACK_SYMBOLS
+    data = get_json("/openApi/swap/v2/quote/contracts")
+    out: List[str] = []
+    if data and isinstance(data.get("data"), list):
+        for item in data.get("data", []):
+            s = item.get("symbol")
+            if s and is_good_contract_symbol(s):
+                out.append(normalize_symbol(s))
+    if not out:
+        out = FALLBACK_SYMBOLS[:]
+    # Ensure important user examples are always included if contracts exist/fallback is needed.
+    for s in FALLBACK_SYMBOLS:
+        if s not in out:
+            out.append(s)
+    random.shuffle(out)
+    quality = [s for s in out if base_asset(s) in QUALITY_BASES]
+    rest = [s for s in out if base_asset(s) not in QUALITY_BASES]
+    result = (quality + rest)[:MAX_CONTRACTS]
+    TICKER_CACHE["symbols"] = (time.time(), result)
+    return result
+
+# ============================================================
+# Indicators
+# ============================================================
+
+def closes(c: List[Dict[str, float]]) -> List[float]:
+    return [x["close"] for x in c]
+
+
+def ema(values: List[float], period: int) -> float:
+    if not values:
+        return 0.0
+    if len(values) < period:
+        return sum(values) / len(values)
+    k = 2 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def vwap(candles: List[Dict[str, float]], n: int = 48) -> float:
+    part = candles[-n:] if len(candles) >= n else candles
+    pv = sum(((x["high"] + x["low"] + x["close"]) / 3) * max(x["volume"], 0) for x in part)
+    vv = sum(max(x["volume"], 0) for x in part)
+    return pv / vv if vv > 0 else (part[-1]["close"] if part else 0.0)
+
+
+def atr(candles: List[Dict[str, float]], n: int = 14) -> float:
+    if len(candles) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    part = trs[-n:] if len(trs) >= n else trs
+    return sum(part) / len(part) if part else 0.0
+
+
+def percent_change(candles: List[Dict[str, float]], bars: int) -> float:
+    if len(candles) <= bars:
+        return 0.0
+    a = candles[-bars]["close"]
+    b = candles[-1]["close"]
+    return (b - a) / a if a else 0.0
+
+
+def volume_ratio(candles: List[Dict[str, float]], n: int = 30) -> float:
+    if len(candles) < n + 2:
+        return 1.0
+    cur = candles[-1]["volume"]
+    avg = sum(x["volume"] for x in candles[-n - 1:-1]) / n
+    return cur / avg if avg > 0 else 1.0
+
+
+def candle_range(c: Dict[str, float]) -> float:
+    return max(c["high"] - c["low"], 0.0)
+
+
+def candle_range_ratio(candles: List[Dict[str, float]], n: int = 20) -> float:
+    if len(candles) < n + 2:
+        return 1.0
+    cur = candle_range(candles[-1])
+    avg = sum(candle_range(x) for x in candles[-n - 1:-1]) / n
+    return cur / avg if avg > 0 else 1.0
+
+
+def close_location(c: Dict[str, float]) -> float:
+    rng = max(c["high"] - c["low"], 1e-12)
+    return (c["close"] - c["low"]) / rng
+
+
+def prior_compression_ratio(c5: List[Dict[str, float]], n: int = 6) -> float:
+    """Lower values mean the market compressed before the impulse.
+    A good scalp often comes after short compression then range expansion.
+    """
+    if len(c5) < n + 8:
+        return 1.0
+    prior = c5[-n-1:-1]
+    older = c5[-n-8:-n-1]
+    prior_avg = sum(candle_range(x) for x in prior) / max(len(prior), 1)
+    older_avg = sum(candle_range(x) for x in older) / max(len(older), 1)
+    return prior_avg / older_avg if older_avg > 0 else 1.0
+
+
+def micro_structure_break(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
+    """Require immediate 1m continuation, not a slow/stuck drift.
+    LONG: latest close must break above recent 1m highs.
+    SHORT: latest close must break below recent 1m lows.
+    """
+    if len(c1) < 12:
+        return False, "not enough 1m structure"
+    last = c1[-1]
+    prev_window = c1[-9:-1]
+    if side == "LONG":
+        ref = max(x["high"] for x in prev_window)
+        distance = (last["close"] - ref) / max(ref, 1e-12)
+        ok = last["close"] > ref * (1 + EDGE_MIN_BREAKOUT_DISTANCE) and last["close"] > last["open"]
+        return ok, f"1m break LONG {distance*100:+.2f}%"
+    ref = min(x["low"] for x in prev_window)
+    distance = (ref - last["close"]) / max(ref, 1e-12)
+    ok = last["close"] < ref * (1 - EDGE_MIN_BREAKOUT_DISTANCE) and last["close"] < last["open"]
+    return ok, f"1m break SHORT {distance*100:+.2f}%"
+
+
+def micro_sweep_reclaim(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
+    """Liquidity-grab filter. We want a tiny stop-hunt / failed micro move, then reclaim/reject.
+    This is optional but enabled by default because it matches discretionary scalping better.
+    """
+    if not EDGE_REQUIRE_MICRO_SWEEP:
+        return True, "micro sweep disabled"
+    if len(c1) < 16:
+        return False, "not enough 1m for sweep"
+    last = c1[-1]
+    recent = c1[-13:-1]
+    if side == "LONG":
+        swept = min(x["low"] for x in c1[-6:-1]) <= min(x["low"] for x in recent) * 1.001
+        reclaimed = last["close"] > last["open"] and close_location(last) >= 0.62
+        return swept and reclaimed, "micro sweep/reclaim LONG" if swept and reclaimed else "no micro sweep/reclaim LONG"
+    swept = max(x["high"] for x in c1[-6:-1]) >= max(x["high"] for x in recent) * 0.999
+    rejected = last["close"] < last["open"] and close_location(last) <= 0.38
+    return swept and rejected, "micro sweep/reject SHORT" if swept and rejected else "no micro sweep/reject SHORT"
+
+
+def tp5_feasible(c5: List[Dict[str, float]], side: str) -> Tuple[bool, str]:
+    """If recent velocity cannot realistically cover TP5, skip.
+    The examples reached all takes quickly; this blocks slow setups.
+    """
+    if len(c5) < 8:
+        return False, "not enough candles for TP5 feasibility"
+    recent_abs_15m = abs(percent_change(c5, 3))
+    needed = TP5_MOVE * EDGE_MIN_TP5_FEASIBILITY
+    return recent_abs_15m >= needed, f"TP5 feasibility recent15m {recent_abs_15m*100:.2f}% / need {needed*100:.2f}%"
+
+
+def upper_wick_ratio(c: Dict[str, float]) -> float:
+    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+    rng = max(h - l, 1e-12)
+    return (h - max(o, cl)) / rng
+
+
+def lower_wick_ratio(c: Dict[str, float]) -> float:
+    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+    rng = max(h - l, 1e-12)
+    return (min(o, cl) - l) / rng
+
+
+def trend_state(candles: List[Dict[str, float]]) -> str:
+    cs = closes(candles)
+    if len(cs) < 60:
+        return "UNKNOWN"
+    e21 = ema(cs, 21)
+    e55 = ema(cs, 55)
+    price = cs[-1]
+    ch = percent_change(candles, min(20, len(candles) - 1))
+    if price > e21 > e55 and ch > 0.003:
+        return "UP"
+    if price < e21 < e55 and ch < -0.003:
+        return "DOWN"
+    return "RANGE"
+
+
+def btc_context() -> Dict[str, Any]:
+    c15 = get_klines("BTC-USDT", "15m", 120, cache_seconds=45)
+    c1h = get_klines("BTC-USDT", "1h", 120, cache_seconds=120)
+    if not c15 or not c1h:
+        return {"ok": False, "direction": "UNKNOWN", "text": "BTC data unavailable", "ch1h": 0.0}
+    ch1h = percent_change(c15, 4)
+    ch6h = percent_change(c15, 24)
+    t1h = trend_state(c1h)
+    direction = "RANGE"
+    if ch1h < -0.004 or ch6h < -0.018 or t1h == "DOWN":
+        direction = "BEAR"
+    elif ch1h > 0.004 or ch6h > 0.018 or t1h == "UP":
+        direction = "BULL"
+    return {
+        "ok": True,
+        "direction": direction,
+        "ch1h": ch1h,
+        "ch6h": ch6h,
+        "t1h": t1h,
+        "text": f"BTC {direction}: 1h {ch1h*100:+.2f}%, 6h {ch6h*100:+.2f}%, 1H {t1h}",
+    }
+
+# ============================================================
+# Hot symbol selection
+# ============================================================
+
+def ultra_risk_symbol(symbol: str, c5: List[Dict[str, float]], c15: List[Dict[str, float]]) -> bool:
+    b = base_asset(symbol)
+    if any(k in b for k in ULTRA_RISK_KEYWORDS):
+        return True
+    for c in c5[-18:]:
+        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_5M_CANDLE:
+            return True
+    for c in c15[-10:]:
+        if (c["high"] - c["low"]) / max(c["open"], 1e-12) > ULTRA_RISK_15M_CANDLE:
+            return True
+    return False
+
+
+def hot_score(symbol: str) -> Tuple[float, str]:
+    """Live-first hot score.
+    V13.19 intentionally avoids using 15m candles here to keep scans fast.
+    Deep analysis still loads 15m/1h only for selected candidates.
+    """
+    c1 = get_klines(symbol, "1m", 60, cache_seconds=8)
+    c5 = get_klines(symbol, "5m", 80, cache_seconds=18)
+    if not c1 or not c5:
+        return 0.0, "no candles"
+
+    ch3m_signed = percent_change(c1, 3)
+    ch3m = abs(ch3m_signed)
+    ch15m_signed = percent_change(c5, 3)
+    ch30m_signed = percent_change(c5, 6)
+    ch15m = abs(ch15m_signed)
+    ch30m = abs(ch30m_signed)
+    vr1 = volume_ratio(c1, 20)
+    vr5 = volume_ratio(c5, 20)
+    rr1 = candle_range_ratio(c1, 20)
+    rr5 = candle_range_ratio(c5, 20)
+
+    # Real-time pressure matters more than old 30m movement.
+    live_score = ch3m * 14000 + min(rr1, 5.0) * 14 + min(vr1, 5.0) * 7
+    recent_score = ch15m * 700 + ch30m * 320 + min(rr5, 5.0) * 7 + min(vr5, 5.0) * 4
+
+    # Reversal bonus: coin was stretched one way, but 1m flow is now counter-moving.
+    reversal_bonus = 0.0
+    if REVERSAL_ENABLED:
+        if ch30m_signed > REVERSAL_MIN_30M_MOVE and ch3m_signed < -REVERSAL_MIN_LIVE_COUNTER_MOVE:
+            reversal_bonus = 35 + abs(ch3m_signed) * 7000
+        elif ch30m_signed < -REVERSAL_MIN_30M_MOVE and ch3m_signed > REVERSAL_MIN_LIVE_COUNTER_MOVE:
+            reversal_bonus = 35 + abs(ch3m_signed) * 7000
+
+    score = live_score + recent_score + reversal_bonus
+
+    # Penalize coins that moved earlier but are dead right now.
+    dead_now = ch3m < HOT_MIN_LIVE_MOVE_3M and rr1 < 0.35 and vr1 < 0.45
+    stale = ch30m >= 0.012 and ch3m < HOT_MIN_LIVE_MOVE_3M and rr1 < HOT_MIN_LIVE_RANGE_OR_VOLUME and vr1 < HOT_MIN_LIVE_RANGE_OR_VOLUME
+    if HOT_STALE_PENALTY_ENABLED and stale and reversal_bonus <= 0:
+        score *= 0.25
+    if dead_now and reversal_bonus <= 0:
+        score *= 0.12
+
+    # Huge volume without range/movement is absorption, not immediate scalp flow.
+    if vr1 > 20 and ch3m < 0.0005 and rr1 < 0.5:
+        score *= 0.20
+
+    if base_asset(symbol) in QUALITY_BASES:
+        score += 2
+
+    live_tag = "LIVE" if not dead_now and (ch3m >= HOT_MIN_LIVE_MOVE_3M or rr1 >= 0.8 or vr1 >= 0.8 or reversal_bonus > 0) else "STALE"
+    mode_tag = "REV" if reversal_bonus > 0 else "MOM"
+    note = (
+        f"{live_tag}/{mode_tag}: 1m3 {ch3m_signed*100:+.2f}%, "
+        f"15m {ch15m_signed*100:+.2f}%, 30m {ch30m_signed*100:+.2f}%, "
+        f"vol1 x{vr1:.2f}, vol5 x{vr5:.2f}, range1 x{rr1:.2f}, range5 x{rr5:.2f}"
+    )
+    return score, note
+
+def select_hot_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
+    scored: List[Tuple[float, str, str]] = []
+    notes: List[str] = []
+    for sym in symbols[:MAX_ANALYZE_SYMBOLS]:
+        try:
+            sc, note = hot_score(sym)
+            if sc > 0:
+                scored.append((sc, sym, note))
+        except Exception as e:
+            STATE["last_error"] = f"hot_score {sym}: {repr(e)}"
+    scored.sort(reverse=True, key=lambda x: x[0])
+
+    for sc, sym, note in scored[:12]:
+        notes.append(f"{display_symbol(sym)} hot {sc:.1f}: {note}")
+
+    selected = [sym for sc, sym, _ in scored if sc >= HOT_MIN_SCORE][:HOT_SYMBOLS_TO_ANALYZE]
+
+    # Keep the bot alive: if the market is quiet and strict hot score returns too few,
+    # still analyze the best live-ranked names. The deeper fast filters remain in place.
+    min_live_candidates = min(HOT_SYMBOLS_TO_ANALYZE, 50)
+    if len(selected) < min_live_candidates:
+        seen = set(selected)
+        for sc, sym, _ in scored:
+            if sym not in seen:
+                selected.append(sym)
+                seen.add(sym)
+            if len(selected) >= min_live_candidates:
+                break
+
+    return selected[:MAX_ANALYZE_SYMBOLS], notes
+
+# ============================================================
+# Setup logic
+# ============================================================
+
+def realtime_pressure_ok(c1: List[Dict[str, float]], side: str) -> Tuple[bool, str, Dict[str, float]]:
+    """Live 1m pressure gate.
+    This is the key V13.18 fix: a signal is allowed only if the coin is moving right now.
+    Expired signals usually came from patterns where the flow had already stopped.
+    """
+    if len(c1) < 30:
+        return False, "not enough 1m pressure data", {}
+
+    last = c1[-1]
+    prev = c1[-2]
+    ch2m = (last["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12)
+    ch3m = percent_change(c1, 3)
+    rr1 = candle_range_ratio(c1, 20)
+    vr1 = volume_ratio(c1, 20)
+    loc = close_location(last)
+    body = abs(last["close"] - last["open"]) / max(last["high"] - last["low"], 1e-12)
+
+    same_two_long = last["close"] > last["open"] and prev["close"] >= prev["open"]
+    same_two_short = last["close"] < last["open"] and prev["close"] <= prev["open"]
+
+    metrics = {"ch2m": ch2m, "ch3m": ch3m, "range1": rr1, "vol1": vr1, "loc": loc, "body": body}
+
+    if rr1 < REALTIME_MIN_1M_RANGE_RATIO:
+        return False, f"1m range not live x{rr1:.2f}", metrics
+    if vr1 < REALTIME_MIN_1M_VOLUME_RATIO:
+        return False, f"1m volume not live x{vr1:.2f}", metrics
+    if body < 0.35:
+        return False, f"1m body weak {body:.2f}", metrics
+
+    if side == "LONG":
+        if ch2m < REALTIME_MIN_2M_MOVE:
+            return False, f"LONG 2m pressure weak {ch2m*100:.2f}%", metrics
+        if loc < REALTIME_CLOSE_LOCATION_LONG:
+            return False, f"LONG 1m close not near high {loc:.2f}", metrics
+        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_long:
+            return False, "LONG lacks two 1m bullish candles", metrics
+    else:
+        if ch2m > -REALTIME_MIN_2M_MOVE:
+            return False, f"SHORT 2m pressure weak {ch2m*100:.2f}%", metrics
+        if loc > REALTIME_CLOSE_LOCATION_SHORT:
+            return False, f"SHORT 1m close not near low {loc:.2f}", metrics
+        if REALTIME_REQUIRE_TWO_1M_CANDLES and not same_two_short:
+            return False, "SHORT lacks two 1m bearish candles", metrics
+
+    return True, f"live pressure ok: 2m {ch2m*100:+.2f}%, 3m {ch3m*100:+.2f}%, range1 x{rr1:.2f}, vol1 x{vr1:.2f}", metrics
+
+
+def fast_context_ok(c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], side: str, vol: float) -> Tuple[bool, str, Dict[str, float]]:
+    """V13.19 fast context.
+    Allows two professional scalp types:
+    1) continuation: 15m/30m and 1m pressure agree;
+    2) blow-off reversal: 30m is stretched one way, but live 1m pressure flips hard the other way.
+    This fixes the prior issue where TIMI-like +16% 30m then -1% 1m dump was rejected as no_fast_short.
+    """
+    if len(c1) < 20 or len(c5) < 36 or len(c15) < 24:
+        return False, "not enough candles", {}
+
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    ch3m_1m = percent_change(c1, 3)
+    rr = candle_range_ratio(c5, 20)
+    compression = prior_compression_ratio(c5, 6)
+    last = c5[-1]
+    candle_move = (last["high"] - last["low"]) / max(last["open"], 1e-12)
+
+    metrics = {
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m_1m,
+        "range_ratio": rr,
+        "compression": compression,
+        "candle_move": candle_move,
+        "vol": vol,
+        "setup_mode": "unknown",
+    }
+
+    if candle_move > FAST_MAX_SPREAD_PROXY:
+        return False, f"last 5m candle too wide/chase risk {candle_move*100:.2f}%", metrics
+
+    if compression > EDGE_MIN_PRIOR_COMPRESSION and rr < 1.75:
+        return False, f"no compression-to-expansion edge: compression x{compression:.2f}, range x{rr:.2f}", metrics
+
+    micro_ok, micro_reason = micro_structure_break(c1, side)
+    if not micro_ok:
+        return False, micro_reason, metrics
+
+    pressure_ok, pressure_reason, pressure_metrics = realtime_pressure_ok(c1, side)
+    metrics.update(pressure_metrics)
+    if not pressure_ok:
+        return False, pressure_reason, metrics
+
+    sweep_ok, sweep_reason = micro_sweep_reclaim(c1, side)
+    if not sweep_ok:
+        return False, sweep_reason, metrics
+
+    feasible_ok, feasible_reason = tp5_feasible(c5, side)
+    if not feasible_ok:
+        return False, feasible_reason, metrics
+
+    # continuation vs blow-off reversal classification
+    if side == "LONG":
+        continuation = ch15m >= FAST_MIN_15M_MOVE and ch30m >= FAST_MIN_30M_MOVE and ch3m_1m >= FAST_MIN_1M_CONFIRM
+        reversal = REVERSAL_ENABLED and ch30m <= -REVERSAL_MIN_30M_MOVE and ch3m_1m >= REVERSAL_MIN_LIVE_COUNTER_MOVE
+        if not (continuation or reversal):
+            return False, f"no LONG edge: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%", metrics
+        if ch30m > FAST_MAX_30M_MOVE:
+            return False, f"late LONG chase 30m {ch30m*100:.2f}%", metrics
+        if last["close"] <= last["open"] and not reversal:
+            return False, "last 5m not bullish for continuation", metrics
+        if close_location(last) < CLOSE_LOCATION_MIN_LONG and not reversal:
+            return False, f"LONG close location weak {close_location(last):.2f}", metrics
+        metrics["setup_mode"] = "REVERSAL_LONG" if reversal else "CONTINUATION_LONG"
+    else:
+        btc_dump_context = BTC_DUMP_SHORT_BIAS_ENABLED and ch15m <= -FAST_MIN_15M_MOVE * 0.70 and ch3m_1m <= -FAST_MIN_1M_CONFIRM
+        continuation = (ch15m <= -FAST_MIN_15M_MOVE and ch30m <= -FAST_MIN_30M_MOVE and ch3m_1m <= -FAST_MIN_1M_CONFIRM) or btc_dump_context
+        reversal = REVERSAL_ENABLED and ch30m >= REVERSAL_MIN_30M_MOVE and ch3m_1m <= -REVERSAL_MIN_LIVE_COUNTER_MOVE
+        if not (continuation or reversal):
+            return False, f"no SHORT edge: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, 1m3 {ch3m_1m*100:+.2f}%", metrics
+        if ch30m < -FAST_MAX_30M_MOVE:
+            # During market-wide dumps many examples realize quickly to the downside.
+            # Still avoid blind chasing: require a small bounce/reject structure before continuing.
+            recent_low = min(x["low"] for x in c5[-8:])
+            bounce = (max(x["high"] for x in c5[-5:]) - recent_low) / max(recent_low, 1e-12)
+            if not (BTC_DUMP_SHORT_BIAS_ENABLED and ch30m >= -SHORT_DUMP_ALLOW_EXTENDED_30M and ch3m_1m <= SHORT_DUMP_MIN_LIVE_1M3 and bounce >= SHORT_DUMP_MIN_BOUNCE):
+                return False, f"late SHORT chase 30m {ch30m*100:.2f}%", metrics
+            metrics["dump_bounce"] = bounce
+        if last["close"] >= last["open"] and not reversal:
+            return False, "last 5m not bearish for continuation", metrics
+        if close_location(last) > CLOSE_LOCATION_MAX_SHORT and not reversal:
+            return False, f"SHORT close location weak {close_location(last):.2f}", metrics
+        metrics["setup_mode"] = "REVERSAL_SHORT" if reversal else "CONTINUATION_SHORT"
+
+    # For fast scalps, live velocity/range can bypass weak 15m volume.
+    live_bypass = abs(ch3m_1m) >= LIVE_BYPASS_VOLUME_MOVE or metrics.get("range1", 1.0) >= LIVE_BYPASS_RANGE_RATIO
+
+    if rr < FAST_MIN_RANGE_RATIO and not live_bypass:
+        return False, f"range expansion weak x{rr:.2f}", metrics
+    if vol < FAST_MIN_VOLUME_RATIO and not live_bypass:
+        return False, f"volume weak x{vol:.2f}", metrics
+
+    return True, (
+        f"{metrics['setup_mode']} edge ok: 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, "
+        f"1m3 {ch3m_1m*100:+.2f}%, range5 x{rr:.2f}, vol15 x{vol:.2f}, "
+        f"range1 x{metrics.get('range1', 1.0):.2f}, vol1 x{metrics.get('vol1', 1.0):.2f}; "
+        f"{micro_reason}; {pressure_reason}; {sweep_reason}; {feasible_reason}"
+    ), metrics
+
+
+def long_live_stats_ok() -> Tuple[bool, str]:
+    """Protect the bot from repeatedly taking bad LONGs while still allowing recovery later.
+    If live LONG stats are poor, allow only very high-quality LONGs by blocking B-class setups upstream.
+    """
+    if not LONG_STATS_PROTECTION:
+        return True, "long stats protection disabled"
+    stats = STATE.setdefault("stats", default_state()["stats"])
+    item = stats.get("side", {}).get("LONG", {})
+    closed = int(item.get("profit", 0)) + int(item.get("sl", 0)) + int(item.get("expired", 0))
+    if closed < LONG_STATS_MIN_CLOSED:
+        return True, "not enough LONG stats"
+    wr = int(item.get("profit", 0)) / max(closed, 1) * 100.0
+    if wr < LONG_STATS_MIN_WR:
+        return False, f"LONG stats weak: WR {wr:.1f}% after {closed}"
+    return True, "LONG stats ok"
+
+
+def professional_long_reclaim_gate(
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    btc: Dict[str, Any],
+    metrics: Dict[str, float],
+    setup_mode: str,
+    e1: float,
+    e5: float,
+    vw5: float,
+) -> Tuple[bool, str]:
+    """Strict LONG-only repair.
+
+    Live results showed LONG was buying weak bounces / late pumps.
+    A valid LONG now needs a real reclaim pattern:
+    - BTC must not be BEAR by default;
+    - strong 1m pressure, close near high, volume/range alive;
+    - price must reclaim 1m EMA and be near/above 5m EMA/VWAP;
+    - no buying vertical 15m/30m extension unless there was a controlled pullback;
+    - prefer liquidity sweep / higher-low reclaim.
+    """
+    if len(c1) < 24 or len(c5) < 24 or len(c15) < 10:
+        return False, "LONG gate: not enough candles"
+
+    btc_dir = str(btc.get("direction", "UNKNOWN"))
+    btc_ch1h = float(btc.get("ch1h", 0.0))
+    btc_ch6h = float(btc.get("ch6h", 0.0))
+
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    price = last1["close"]
+    ch3m = percent_change(c1, 3)
+    ch15m = metrics.get("ch15m", percent_change(c5, 3))
+    ch30m = metrics.get("ch30m", percent_change(c5, 6))
+    vol1 = metrics.get("vol1", volume_ratio(c1, 20))
+    range1 = metrics.get("range1", candle_range_ratio(c1, 20))
+    loc1 = close_location(last1)
+
+    # BTC bearish does not automatically forbid LONG. But a LONG against a bearish BTC
+    # must be a leader/relative-strength coin, not a weak bounce. This is how coins like
+    # VELVET can still be traded LONG while the general market is heavy.
+    bear_rs_long = False
+    if btc_dir == "BEAR":
+        rel_strength_1h = ch15m - btc_ch1h
+        bear_rs_long = (
+            LONG_ALLOW_BEAR_RELATIVE_STRENGTH
+            and ch15m >= LONG_BEAR_MIN_ALT_15M
+            and ch30m >= LONG_BEAR_MIN_ALT_30M
+            and ch3m >= LONG_BEAR_MIN_1M3
+            and rel_strength_1h >= LONG_BEAR_MIN_REL_STRENGTH_1H
+            and vol1 >= LONG_BEAR_MIN_VOL1
+            and range1 >= LONG_BEAR_MIN_RANGE1
+            and loc1 >= LONG_BEAR_MIN_CLOSE_LOCATION
+        )
+        if LONG_BLOCK_BTC_BEAR and not bear_rs_long:
+            return False, (
+                f"LONG gate: BTC BEAR and coin has no relative strength: "
+                f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, "
+                f"1m3 {ch3m*100:+.2f}%, rel1h {rel_strength_1h*100:+.2f}%"
+            )
+
+    if ch3m < LONG_MIN_3M_CONFIRM:
+        return False, f"LONG gate: weak 3m confirm {ch3m*100:.2f}%"
+    if btc_dir == "BEAR" and LONG_ALLOW_BEAR_RELATIVE_STRENGTH and not bear_rs_long:
+        return False, (
+            f"LONG gate: BTC BEAR, only relative-strength longs allowed; "
+            f"alt15m {ch15m*100:+.2f}%, alt30m {ch30m*100:+.2f}%, 1m3 {ch3m*100:+.2f}%"
+        )
+    if vol1 < LONG_MIN_1M_VOLUME_RATIO:
+        return False, f"LONG gate: weak 1m volume x{vol1:.2f}"
+    if range1 < LONG_MIN_1M_RANGE_RATIO:
+        return False, f"LONG gate: weak 1m range x{range1:.2f}"
+    if loc1 < LONG_MIN_CLOSE_LOCATION:
+        return False, f"LONG gate: 1m close not strong {loc1:.2f}"
+    if last1["close"] <= last1["open"]:
+        return False, "LONG gate: last 1m not bullish"
+    if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
+        return False, "LONG gate: did not reclaim prior red candle"
+
+    # Must reclaim micro trend. For continuation LONG, also avoid being below 5m EMA/VWAP.
+    if price < e1 * (1 + RECLAIM_BUFFER):
+        return False, "LONG gate: no 1m EMA reclaim"
+    if setup_mode == "CONTINUATION_LONG" and (price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER)):
+        return False, "LONG gate: no 5m EMA/VWAP reclaim"
+
+    # Liquidity sweep / higher-low reclaim. This avoids buying a random bounce with no trap.
+    recent = c1[-16:-4]
+    last_zone = c1[-5:]
+    swept_low = min(x["low"] for x in last_zone[:-1]) <= min(x["low"] for x in recent) * 1.0015 if recent else False
+    reclaimed = last1["close"] > max(x["close"] for x in c1[-5:-1]) and loc1 >= LONG_MIN_CLOSE_LOCATION
+    higher_low = min(x["low"] for x in c1[-4:]) > min(x["low"] for x in c1[-10:-4]) * 0.998 if len(c1) >= 12 else False
+
+    if LONG_REQUIRE_SWEEP_OR_RECLAIM and not (swept_low or reclaimed):
+        return False, "LONG gate: no sweep/reclaim trigger"
+    if LONG_REQUIRE_HIGHER_LOW and not (higher_low or swept_low):
+        return False, "LONG gate: no higher-low/sweep structure"
+
+    # Anti-chase: after a big pump, only buy if there was a real controlled pullback first.
+    recent_high = max(x["high"] for x in c5[-18:])
+    recent_low = min(x["low"] for x in c5[-10:])
+    pullback = (recent_high - recent_low) / max(recent_high, 1e-12)
+    if ch15m > LONG_MAX_15M_CHASE or ch30m > LONG_MAX_30M_CHASE:
+        if not (LONG_MIN_PULLBACK_AFTER_PUMP <= pullback <= LONG_MAX_PULLBACK_AFTER_PUMP and (swept_low or reclaimed)):
+            return False, f"LONG gate: late pump chase blocked 15m {ch15m*100:.2f}%, 30m {ch30m*100:.2f}%, pullback {pullback*100:.2f}%"
+
+    # Avoid buying into a distribution wick.
+    last5 = c5[-1]
+    if upper_wick_ratio(last5) > 0.48 and close_location(last5) < 0.68:
+        return False, "LONG gate: 5m upper wick/distribution"
+
+    return True, (
+        f"LONG professional gate ok: BTC {btc_dir}, 3m {ch3m*100:+.2f}%, "
+        f"vol1 x{vol1:.2f}, range1 x{range1:.2f}, closeLoc {loc1:.2f}, "
+        f"bearRS {bear_rs_long}, sweep {swept_low}, reclaim {reclaimed}, higherLow {higher_low}"
+    )
+
+def fast_burst_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    """Scalping Edge setup: no trend prediction.
+    We only require a tradable micro-event: fresh imbalance + micro sweep/reclaim + immediate continuation.
+    BTC/1H are informational, not directional gates, except violent BTC shock.
+    """
+    if not FAST_BURST_ENABLED:
+        return None
+    if len(c1) < 30 or len(c5) < 48 or len(c15) < 40 or len(c1h) < 60:
+        return None
+
+    price = c1[-1]["close"]
+    e5 = ema(closes(c5), 21)
+    e1 = ema(closes(c1), 9)
+    vw5 = vwap(c5, 36)
+    vol = volume_ratio(c15, 24)
+    t1h = trend_state(c1h)
+
+    # Market phase is not traded as a prediction. BTC is a context filter:
+    # - during BTC shock down, avoid LONG unless the coin later passes relative-strength LONG gate;
+    # - allow SHORT during dump because that is exactly when many alts realize quickly.
+    btc_ch1h = float(btc.get("ch1h", 0.0))
+    if abs(btc_ch1h) >= BTC_SHOCK_15M_BLOCK and side == "LONG":
+        # Do not hard-block here; professional_long_reclaim_gate can still allow an exceptional RS long.
+        pass
+
+    fast_ok, fast_reason, metrics = fast_context_ok(c1, c5, c15, side, vol)
+    if not fast_ok:
+        return None
+    setup_mode = str(metrics.get("setup_mode", ""))
+    is_reversal = setup_mode.startswith("REVERSAL")
+
+    if side == "LONG":
+        long_gate_ok, long_gate_reason = professional_long_reclaim_gate(symbol, c1, c5, c15, btc, metrics, setup_mode, e1, e5, vw5)
+        if not long_gate_ok:
+            return None
+        metrics["long_gate_reason"] = long_gate_reason
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+
+    if side == "LONG":
+        recent_high = max(x["high"] for x in c5[-18:])
+        pullback_low = min(x["low"] for x in c5[-10:])
+        pullback = (recent_high - pullback_low) / max(recent_high, 1e-12)
+        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
+            return None
+        if is_reversal:
+            # Blow-off reversal LONG: do not wait for 5m EMA/VWAP reclaim; that is often too late.
+            # Require live 1m reclaim only; fast_context already confirmed pressure and micro break.
+            if price < e1:
+                return None
+        else:
+            if price < e1 or price < e5 * (1 + RECLAIM_BUFFER) or price < vw5 * (1 + RECLAIM_BUFFER):
+                return None
+            # Entry must be continuation, not a mid-range hesitation.
+            if last5["close"] <= prev5["high"] * 0.999 and last5["close"] <= prev5["close"]:
+                return None
+            if upper_wick_ratio(last5) > 0.42 and close_location(last5) < 0.72:
+                return None
+        level = min(pullback_low, min(x["low"] for x in c1[-12:]))
+        strategy = "PRO_SCALPING_EDGE_LONG"
+        trade_type = "SCALPING EDGE LONG"
+        reason = (
+            f"SCALPING EDGE LONG: не прогноз рынка, а короткая ситуация. "
+            f"Режим {setup_mode}: свежий дисбаланс вверх, микро-откат/перехват {pullback*100:.2f}%, "
+            f"live 1m pressure, sweep/reclaim и немедленное продолжение. {fast_reason}. "
+            f"{metrics.get('long_gate_reason', '')}."
+        )
+    else:
+        recent_low = min(x["low"] for x in c5[-18:])
+        bounce_high = max(x["high"] for x in c5[-10:])
+        pullback = (bounce_high - recent_low) / max(recent_low, 1e-12)
+        if pullback < PULLBACK_MIN or pullback > PULLBACK_MAX:
+            return None
+        if is_reversal:
+            # Blow-off reversal SHORT: do not wait for 5m EMA/VWAP loss; that is often too late.
+            # Require live 1m reject only; fast_context already confirmed pressure and micro break.
+            if price > e1:
+                return None
+        else:
+            if price > e1 or price > e5 * (1 - RECLAIM_BUFFER) or price > vw5 * (1 - RECLAIM_BUFFER):
+                return None
+            if last5["close"] >= prev5["low"] * 1.001 and last5["close"] >= prev5["close"]:
+                return None
+            if lower_wick_ratio(last5) > 0.42 and close_location(last5) > 0.28:
+                return None
+        level = max(bounce_high, max(x["high"] for x in c1[-12:]))
+        strategy = "PRO_SCALPING_EDGE_SHORT"
+        trade_type = "SCALPING EDGE SHORT"
+        reason = (
+            f"SCALPING EDGE SHORT: не прогноз рынка, а короткая ситуация. "
+            f"Режим {setup_mode}: свежий дисбаланс вниз, микро-отскок/перехват {pullback*100:.2f}%, "
+            f"live 1m pressure и немедленное продолжение. {fast_reason}."
+        )
+
+    strong = vol >= 1.55 and metrics.get("range_ratio", 1.0) >= 1.55 and abs(metrics.get("ch3m_1m", 0)) >= FAST_MIN_1M_CONFIRM * 1.4
+    score = 74
+    score += min(12, int(abs(metrics.get("ch15m", 0)) * 650))
+    score += min(10, int(abs(metrics.get("ch30m", 0)) * 430))
+    score += min(8, int((vol - 1.0) * 7))
+    score += min(8, int((metrics.get("range_ratio", 1.0) - 1.0) * 7))
+    score += min(8, int((metrics.get("vol1", 1.0) - 1.0) * 7))
+    score += min(8, int((metrics.get("range1", 1.0) - 1.0) * 7))
+    # Market phase does not add or subtract. Only actual speed/liquidity edge matters.
+    if strong:
+        score += 7
+    if base_asset(symbol) in QUALITY_BASES:
+        score += 1
+    score = max(0, min(100, score))
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "trade_type": trade_type,
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol >= 1.45 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": pullback,
+        "volume_ratio": vol,
+        "range_ratio": metrics.get("range_ratio", 1.0),
+        "compression": metrics.get("compression", 1.0),
+        "ch15m": metrics.get("ch15m", 0.0),
+        "ch30m": metrics.get("ch30m", 0.0),
+        "ch3m_1m": metrics.get("ch3m_1m", 0.0),
+        "vol1": metrics.get("vol1", 1.0),
+        "range1": metrics.get("range1", 1.0),
+        "ch2m": metrics.get("ch2m", 0.0),
+        "setup_mode": setup_mode,
+        "t1h": t1h,
+        "btc_text": btc.get("text", ""),
+    }
+
+
+
+def instant_edge_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    """V13.24 fallback: instant momentum/reclaim scalp.
+
+    This is for situations visible in diagnostics such as SYRUP/FOLKS:
+    live 1m impulse is present, but the older fast_burst setup rejects the trade because it
+    waits for a perfect 5m pullback/reclaim. We still keep strict quality filters after this.
+    """
+    if not INSTANT_EDGE_ENABLED:
+        return None
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
+        return None
+
+    price = c1[-1]["close"]
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    ch3m = percent_change(c1, 3)
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol1 = volume_ratio(c1, 20)
+    range1 = candle_range_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range5 = candle_range_ratio(c5, 20)
+    loc = close_location(last1)
+    body = abs(last1["close"] - last1["open"]) / max(last1["high"] - last1["low"], 1e-12)
+    t1h = trend_state(c1h)
+
+    # Live impulse must be real, not a dead hot-list artifact.
+    if side == "LONG":
+        if ch3m < INSTANT_MIN_1M3_MOVE:
+            return None
+        if ch15m < INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and ch3m >= INSTANT_MIN_1M3_MOVE * 1.45):
+            return None
+        if ch30m > INSTANT_MAX_30M_CHASE and ch3m < INSTANT_MIN_1M3_MOVE * 1.35:
+            return None
+        if loc < INSTANT_CLOSE_LONG or last1["close"] <= last1["open"]:
+            return None
+        if prev1["close"] < prev1["open"] and last1["close"] <= prev1["open"]:
+            return None
+        # Avoid buying after multiple vertical green candles without any micro reset.
+        had_reset = any(x["close"] < x["open"] for x in c1[-7:-1]) or min(x["low"] for x in c1[-5:]) <= min(x["low"] for x in c1[-14:-5]) * 1.002
+        if not had_reset and ch30m > 0.025:
+            return None
+        level = min(x["low"] for x in c1[-10:])
+        strategy = "PRO_INSTANT_EDGE_LONG"
+        trade_type = "INSTANT EDGE LONG"
+        setup_mode = "INSTANT_MOMENTUM_LONG"
+        direction_text = "вверх"
+    else:
+        if ch3m > -INSTANT_MIN_1M3_MOVE:
+            return None
+        if ch15m > -INSTANT_MIN_15M_MOVE and not (INSTANT_ALLOW_STRONG_1M_EXCEPTION and abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.45):
+            return None
+        if ch30m < -INSTANT_MAX_30M_CHASE and abs(ch3m) < INSTANT_MIN_1M3_MOVE * 1.35:
+            return None
+        if loc > INSTANT_CLOSE_SHORT or last1["close"] >= last1["open"]:
+            return None
+        if prev1["close"] > prev1["open"] and last1["close"] >= prev1["open"]:
+            return None
+        had_reset = any(x["close"] > x["open"] for x in c1[-7:-1]) or max(x["high"] for x in c1[-5:]) >= max(x["high"] for x in c1[-14:-5]) * 0.998
+        if not had_reset and ch30m < -0.025:
+            return None
+        level = max(x["high"] for x in c1[-10:])
+        strategy = "PRO_INSTANT_EDGE_SHORT"
+        trade_type = "INSTANT EDGE SHORT"
+        setup_mode = "INSTANT_MOMENTUM_SHORT"
+        direction_text = "вниз"
+
+    if body < INSTANT_MIN_BODY:
+        return None
+    if range1 < INSTANT_MIN_RANGE1:
+        return None
+    if vol1 < INSTANT_MIN_VOL1 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and range1 >= 1.15):
+        return None
+    if range5 < INSTANT_MIN_RANGE5:
+        return None
+    if vol5 < INSTANT_MIN_VOL5 and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.60):
+        return None
+
+    # Keep a micro structure break; this prevents entering the middle of a random candle.
+    micro_ok, micro_reason = micro_structure_break(c1, side)
+    if not micro_ok:
+        return None
+
+    # BTC is context, not a hard phase filter. Against BTC pressure, demand stronger live impulse.
+    btc_dir = str(btc.get("direction", "UNKNOWN"))
+    if side == "LONG" and btc_dir == "BEAR" and not (ch3m >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m >= INSTANT_MIN_15M_MOVE * 1.2):
+        return None
+    if side == "SHORT" and btc_dir == "BULL" and not (abs(ch3m) >= INSTANT_MIN_1M3_MOVE * 1.35 and ch15m <= -INSTANT_MIN_15M_MOVE * 1.2):
+        return None
+
+    score = 78
+    score += min(10, int(abs(ch3m) * 1000))
+    score += min(8, int(abs(ch15m) * 700))
+    score += min(6, int(max(0.0, vol1 - 0.8) * 6))
+    score += min(6, int(max(0.0, range1 - 1.0) * 6))
+    score += min(5, int(max(0.0, range5 - 1.0) * 4))
+    score = max(0, min(100, score))
+
+    reason = (
+        f"INSTANT EDGE {side}: профессиональный fallback для живого импульса. "
+        f"Цена движется {direction_text} сейчас: 1m3 {ch3m*100:+.2f}%, 15m {ch15m*100:+.2f}%, "
+        f"30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, "
+        f"Vol5 x{vol5:.2f}, Range5 x{range5:.2f}, closeLoc {loc:.2f}. "
+        f"{micro_reason}. Сделка всё равно проходит RR/SL/live-volume quality gate."
+    )
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "trade_type": trade_type,
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 1.20 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": setup_mode,
+        "t1h": t1h,
+        "btc_text": btc.get("text", ""),
+    }
+
+def market_dump_short_setup(symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], c1h: List[Dict[str, float]], btc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """V13.28 fallback: market-dump continuation SHORT.
+
+    This is for active market selloff sessions when BTC/ETH and many alts are falling.
+    The old setup logic often waits for a perfect AERO pullback/reject and returns no_fast,
+    while the tape is already giving a clean dump continuation. We still pass the final
+    RR/SL/live-volume and trader-pattern gates after this setup is constructed.
+    """
+    if not MARKET_DUMP_SHORT_ENABLED or not ALLOW_SHORT:
+        return None
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 40:
+        return None
+
+    side = "SHORT"
+    price = c1[-1]["close"]
+    last1 = c1[-1]
+    prev1 = c1[-2]
+    ch3m = percent_change(c1, 3)
+    ch15m = percent_change(c5, 3)
+    ch30m = percent_change(c5, 6)
+    vol1 = volume_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range1 = candle_range_ratio(c1, 20)
+    range5 = candle_range_ratio(c5, 20)
+    loc = close_location(last1)
+    recent_range = (max(x["high"] for x in c5[-6:]) - min(x["low"] for x in c5[-6:])) / max(price, 1e-12)
+    btc_1h = float(btc.get("ch1h", 0.0) or 0.0)
+    btc_6h = float(btc.get("ch6h", 0.0) or 0.0)
+
+    # Must be real downside pressure now.
+    if ch3m > -DUMP_MIN_1M3:
+        return None
+
+    # Either the alt itself is already selling on 15m, or BTC has a clear dump context.
+    market_dump_context = btc_1h <= -0.0025 or btc_6h <= -0.0100 or str(btc.get("direction", "")) == "BEAR"
+    alt_dump_context = ch15m <= -DUMP_MIN_15M or ch30m <= -DUMP_MIN_15M * 1.25
+    if not (market_dump_context or alt_dump_context):
+        return None
+
+    # Avoid very late shorts after an extreme 30m collapse unless the live tape is still exceptional.
+    if ch30m < -DUMP_MAX_LATE_30M and not (abs(ch3m) >= DUMP_MIN_1M3 * 2.0 and range1 >= 1.35):
+        return None
+
+    if vol1 < DUMP_MIN_VOL1:
+        return None
+    if vol5 < DUMP_MIN_VOL5 and not (abs(ch3m) >= DUMP_MIN_1M3 * 1.65):
+        return None
+    if range1 < DUMP_MIN_RANGE1:
+        return None
+    if range5 < DUMP_MIN_RANGE5:
+        return None
+    if recent_range < DUMP_MIN_RECENT_RANGE:
+        return None
+
+    # Do not short a weak doji. In a dump, close below mid/low half is enough; exact low-close is too strict.
+    if loc > DUMP_CLOSE_SHORT or last1["close"] >= last1["open"]:
+        return None
+
+    fresh_low_break = last1["close"] < min(x["low"] for x in c1[-7:-1])
+    failed_bounce = any(x["close"] > x["open"] for x in c1[-8:-1]) and last1["close"] < prev1["close"]
+    lower_high_reject = max(x["high"] for x in c1[-4:]) < max(x["high"] for x in c1[-14:-4]) and last1["close"] < prev1["close"]
+    if DUMP_REQUIRE_REJECT_OR_BREAK and not (fresh_low_break or failed_bounce or lower_high_reject):
+        return None
+
+    level = max(x["high"] for x in c1[-10:])
+    score = 80
+    score += min(10, int(abs(ch3m) * 1100))
+    score += min(8, int(abs(min(ch15m, 0.0)) * 700))
+    score += min(6, int(max(0.0, vol1 - 0.60) * 6))
+    score += min(7, int(max(0.0, range1 - 0.80) * 5))
+    score += min(6, int(max(0.0, range5 - 1.00) * 4))
+    if market_dump_context:
+        score += 3
+    if fresh_low_break:
+        score += 3
+    score = max(0, min(100, score))
+
+    reason = (
+        f"MARKET DUMP SHORT: активный рыночный слив, не прогноз, а dump-continuation. "
+        f"BTC context {btc.get('text', '')}; alt pressure 1m3 {ch3m*100:+.2f}%, "
+        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, Vol1 x{vol1:.2f}, "
+        f"Vol5 x{vol5:.2f}, Range1 x{range1:.2f}, Range5 x{range5:.2f}. "
+        f"Break/reject: freshLow {fresh_low_break}, failedBounce {failed_bounce}, lowerHighReject {lower_high_reject}. "
+        f"Дальше сделка обязана пройти RR/SL/live-volume/trader quality gates."
+    )
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "strategy": "PRO_MARKET_DUMP_SHORT",
+        "trade_type": "MARKET DUMP SHORT",
+        "score": score,
+        "grade": "A+" if score >= A_PLUS_MIN_SCORE and vol1 >= 0.85 and range1 >= 1.15 else "B",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": 1.0,
+        "ch15m": ch15m,
+        "ch30m": ch30m,
+        "ch3m_1m": ch3m,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": (c1[-1]["close"] - c1[-3]["close"]) / max(c1[-3]["close"], 1e-12),
+        "setup_mode": "MARKET_DUMP_SHORT",
+        "t1h": trend_state(c1h),
+        "btc_text": btc.get("text", ""),
+    }
+
+
+def calculate_fast_trade(setup: Dict[str, Any], c1: List[Dict[str, float]], c5: List[Dict[str, float]]) -> Optional[Dict[str, Any]]:
+    side = setup["side"]
+    entry = setup["entry"]
+    level = setup["level"]
+    a = atr(c5, 14)
+    instant = str(setup.get("setup_mode", "")).startswith("INSTANT")
+    buffer = max(entry * (0.0016 if instant else 0.0022), a * (0.55 if instant else SL_ATR_MULT))
+
+    if side == "LONG":
+        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
+        recent_low = min(x["low"] for x in recent_source)
+        sl = min(level, recent_low) - buffer
+        sl = min(sl, entry * (1 - MIN_SL_MOVE))
+        tp1 = entry * (1 + TP1_MOVE)
+        tp2 = entry * (1 + TP2_MOVE)
+        tp3 = entry * (1 + TP3_MOVE)
+        tp4 = entry * (1 + TP4_MOVE)
+        tp5 = entry * (1 + TP5_MOVE)
+    else:
+        recent_source = c1[-10:] + (c5[-2:] if instant else c5[-4:])
+        recent_high = max(x["high"] for x in recent_source)
+        sl = max(level, recent_high) + buffer
+        sl = max(sl, entry * (1 + MIN_SL_MOVE))
+        tp1 = entry * (1 - TP1_MOVE)
+        tp2 = entry * (1 - TP2_MOVE)
+        tp3 = entry * (1 - TP3_MOVE)
+        tp4 = entry * (1 - TP4_MOVE)
+        tp5 = entry * (1 - TP5_MOVE)
+
+    risk = abs(entry - sl)
+    risk_move = risk / max(entry, 1e-12)
+
+    # V13.29 professional scalp rule:
+    # The public trader examples use a far invalidation/averaging zone, but the signal itself
+    # must be managed by a local scalp stop. If the structural stop is too far, compress it
+    # to a local stop for fast execution instead of discarding every live dump candidate.
+    setup_mode = str(setup.get("setup_mode", ""))
+    if LOCAL_SCALP_STOP_ENABLED and risk_move > LOCAL_SCALP_MAX_SL_MOVE and setup_mode in LOCAL_STOP_MODES:
+        local_move = max(LOCAL_SCALP_MIN_SL_MOVE, min(LOCAL_SCALP_MAX_SL_MOVE, max(TP1_MOVE * 1.20, abs(float(setup.get("ch3m_1m", 0.0) or 0.0)) * 1.10)))
+        if side == "LONG":
+            sl = entry * (1 - local_move)
+        else:
+            sl = entry * (1 + local_move)
+        setup["local_stop_used"] = True
+        setup["original_sl_move"] = risk_move
+        risk = abs(entry - sl)
+        risk_move = risk / max(entry, 1e-12)
+
+    if risk_move > MAX_SL_MOVE:
+        return None
+
+    rewards = [abs(tp1 - entry), abs(tp2 - entry), abs(tp3 - entry), abs(tp4 - entry), abs(tp5 - entry)]
+    rr = rewards[0] / risk if risk > 0 else 0.0
+    ladder_rr = (sum(rewards) / len(rewards)) / risk if risk > 0 else 0.0
+    final_rr = rewards[-1] / risk if risk > 0 else 0.0
+    roi_tp1 = rewards[0] / entry * LEVERAGE * 100
+    roi_sl = risk / entry * LEVERAGE * 100
+
+    return {
+        **setup,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "tp4": tp4,
+        "tp5": tp5,
+        "rr": rr,
+        "ladder_rr": ladder_rr,
+        "final_rr": final_rr,
+        "roi_tp1": roi_tp1,
+        "roi_sl": roi_sl,
+        "risk_mult": A_RISK_MULT if setup["grade"] == "A+" else FAST_RISK_MULT,
+        "local_stop_used": bool(setup.get("local_stop_used", False)),
+        "original_sl_move": float(setup.get("original_sl_move", 0.0) or 0.0),
+        "created_at": now_ts(),
+        "status": "active",
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "tp4_hit": False,
+        "tp5_hit": False,
+    }
+
+
+
+def professional_quality_gate(trade: Dict[str, Any], symbol: str) -> Tuple[bool, str, str]:
+    """Final professional quality filter.
+
+    This is intentionally hard. A fast scalp is not allowed when:
+    - stop risk is much larger than the reward ladder;
+    - TP5 does not at least compensate risk;
+    - live 1m volume is weak without a strong price/range exception;
+    - heavy/slow coins have wide SL and weak RR.
+    """
+    side = trade.get("side", "?")
+    base = base_asset(symbol)
+    rr = float(trade.get("rr", 0.0) or 0.0)
+    ladder_rr = float(trade.get("ladder_rr", 0.0) or 0.0)
+    final_rr = float(trade.get("final_rr", 0.0) or 0.0)
+    roi_sl = float(trade.get("roi_sl", 999.0) or 999.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    ch3m = abs(float(trade.get("ch3m_1m", 0.0) or 0.0))
+
+    # Hard stop check is price-based first, because ROI depends on chosen leverage.
+    # At x20 a normal 1.1% local scalp stop looks like 22% ROI, which should not be blocked
+    # if final RR and ladder RR are healthy.
+    sl_price_move = roi_sl / max(LEVERAGE * 100.0, 1e-12)
+    if sl_price_move > LOCAL_SCALP_MAX_SL_MOVE * 1.10:
+        return False, "sl_price_too_high_block", f"{display_symbol(symbol)} {side}: SL price risk too high {sl_price_move*100:.2f}%"
+
+    if roi_sl > MAX_SCALP_SL_ROI:
+        return False, "sl_roi_too_high_block", f"{display_symbol(symbol)} {side}: SL risk too high {roi_sl:.1f}% ROI"
+
+    if rr < MIN_TP1_RR:
+        return False, "tp1_rr_hard_block", f"{display_symbol(symbol)} {side}: TP1 RR too weak {rr:.2f}"
+
+    if ladder_rr < MIN_LADDER_RR_HARD:
+        return False, "ladder_rr_hard_block", f"{display_symbol(symbol)} {side}: ladder RR too weak {ladder_rr:.2f}"
+
+    if final_rr < MIN_FINAL_RR_HARD:
+        return False, "final_rr_hard_block", f"{display_symbol(symbol)} {side}: final RR too weak {final_rr:.2f}"
+
+    if vol1 < MIN_LIVE_VOL_NORMAL:
+        strong_price_exception = (
+            vol1 >= MIN_LIVE_VOL_STRONG_PRICE
+            and ch3m >= STRONG_1M3_MOVE
+            and range1 >= STRONG_RANGE1
+        )
+        if not strong_price_exception:
+            return (
+                False,
+                "weak_live_volume_block",
+                f"{display_symbol(symbol)} {side}: weak live volume x{vol1:.2f}, 1m3 {ch3m*100:.2f}%, range1 x{range1:.2f}"
+            )
+
+    if base in HEAVY_BASES:
+        if roi_sl > HEAVY_MAX_SL_ROI:
+            return False, "heavy_coin_sl_block", f"{display_symbol(symbol)} {side}: heavy coin SL too wide {roi_sl:.1f}% ROI"
+        if final_rr < HEAVY_MIN_FINAL_RR:
+            return False, "heavy_coin_rr_block", f"{display_symbol(symbol)} {side}: heavy coin final RR too weak {final_rr:.2f}"
+        if vol1 < HEAVY_MIN_LIVE_VOL:
+            return False, "heavy_coin_volume_block", f"{display_symbol(symbol)} {side}: heavy coin live volume weak x{vol1:.2f}"
+
+    return True, "ok", "quality ok"
+
+
+
+def aero_style_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """V13.27 AERO/PORTAL-style gate.
+
+    Looks for the specific trader structure:
+    - SHORT: recent upper pullback/stop-hunt -> loss of momentum -> 1m breakdown.
+    - LONG: recent lower sweep -> reclaim -> 1m breakout.
+
+    This does not replace RR/SL filters. It is a structure-quality exception so the bot
+    can catch examples-style trades without accepting random weak B signals.
+    """
+    if not AERO_STYLE_GATE_ENABLED:
+        return False, "aero_disabled", "aero-style disabled"
+    if len(c1) < 35 or len(c5) < 20:
+        return False, "aero_no_candles", f"{display_symbol(symbol)}: not enough candles for AERO-style gate"
+
+    side = str(trade.get("side", ""))
+    if side == "SHORT" and not AERO_SHORT_ENABLED:
+        return False, "aero_short_disabled", f"{display_symbol(symbol)} SHORT: AERO short disabled"
+    if side == "LONG" and not AERO_LONG_ENABLED:
+        return False, "aero_long_disabled", f"{display_symbol(symbol)} LONG: AERO long disabled"
+
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    if entry <= 0:
+        return False, "aero_bad_entry", f"{display_symbol(symbol)} {side}: bad entry"
+
+    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
+    loc = close_location(c1[-1])
+    e1 = ema([x["close"] for x in c1[-25:]], 9)
+    e5 = ema([x["close"] for x in c5[-30:]], 9)
+    recent_1m = c1[-18:]
+    recent_5m = c5[-8:]
+    recent_high = max(x["high"] for x in recent_1m + recent_5m[-3:])
+    recent_low = min(x["low"] for x in recent_1m + recent_5m[-3:])
+    recent_range = (recent_high - recent_low) / max(entry, 1e-12)
+
+    if recent_range < AERO_MIN_RECENT_RANGE:
+        return False, "aero_recent_range_block", f"{display_symbol(symbol)} {side}: recent range too small {recent_range*100:.2f}%"
+    if vol1 < AERO_MIN_VOL1:
+        return False, "aero_vol1_block", f"{display_symbol(symbol)} {side}: vol1 too weak x{vol1:.2f}"
+    if vol5 < AERO_MIN_VOL5:
+        return False, "aero_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
+    if range1 < AERO_MIN_RANGE1:
+        return False, "aero_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
+    if range5 < AERO_MIN_RANGE5:
+        return False, "aero_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
+
+    if side == "SHORT":
+        pullback = (recent_high - entry) / max(entry, 1e-12)
+        if pullback < AERO_MIN_PULLBACK:
+            return False, "aero_pullback_block", f"{display_symbol(symbol)} SHORT: no upper pullback/reject; pullback {pullback*100:.2f}%"
+        if pullback > AERO_MAX_PULLBACK:
+            return False, "aero_spike_block", f"{display_symbol(symbol)} SHORT: spike too extreme {pullback*100:.2f}%"
+        if ch3m > -AERO_MIN_1M3:
+            return False, "aero_pressure_block", f"{display_symbol(symbol)} SHORT: no live breakdown 1m3 {ch3m*100:+.2f}%"
+        if loc > AERO_CLOSE_SHORT or c1[-1]["close"] >= c1[-1]["open"]:
+            return False, "aero_reject_close_block", f"{display_symbol(symbol)} SHORT: last 1m not rejected near low"
+        if c1[-1]["close"] >= min(x["low"] for x in c1[-7:-1]):
+            return False, "aero_breakdown_block", f"{display_symbol(symbol)} SHORT: no fresh local breakdown"
+        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] < e1 or c1[-1]["close"] < e5):
+            return False, "aero_ema_reject_block", f"{display_symbol(symbol)} SHORT: no EMA/VWAP-style rejection"
+        return True, "aero_style_short_ok", (
+            f"AERO-style SHORT ok: upper pullback/reject {pullback*100:.2f}%, "
+            f"live breakdown 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
+            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+        )
+
+    if side == "LONG":
+        sweep = (entry - recent_low) / max(entry, 1e-12)
+        if sweep < AERO_MIN_PULLBACK:
+            return False, "aero_sweep_block", f"{display_symbol(symbol)} LONG: no lower sweep/reclaim; sweep {sweep*100:.2f}%"
+        if sweep > AERO_MAX_PULLBACK:
+            return False, "aero_spike_block", f"{display_symbol(symbol)} LONG: spike too extreme {sweep*100:.2f}%"
+        if ch3m < AERO_MIN_1M3:
+            return False, "aero_pressure_block", f"{display_symbol(symbol)} LONG: no live reclaim 1m3 {ch3m*100:+.2f}%"
+        if loc < AERO_CLOSE_LONG or c1[-1]["close"] <= c1[-1]["open"]:
+            return False, "aero_reclaim_close_block", f"{display_symbol(symbol)} LONG: last 1m not reclaimed near high"
+        if c1[-1]["close"] <= max(x["high"] for x in c1[-7:-1]):
+            return False, "aero_breakout_block", f"{display_symbol(symbol)} LONG: no fresh local breakout"
+        if AERO_REQUIRE_EMA_REJECT and not (c1[-1]["close"] > e1 or c1[-1]["close"] > e5):
+            return False, "aero_ema_reclaim_block", f"{display_symbol(symbol)} LONG: no EMA/VWAP-style reclaim"
+        return True, "aero_style_long_ok", (
+            f"AERO-style LONG ok: lower sweep/reclaim {sweep*100:.2f}%, "
+            f"live reclaim 1m3 {ch3m*100:+.2f}%, range {recent_range*100:.2f}%, "
+            f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+        )
+
+    return False, "aero_side_block", f"{display_symbol(symbol)}: unknown side {side}"
+
+def trader_pattern_gate(trade: Dict[str, Any], symbol: str, c1: List[Dict[str, float]], c5: List[Dict[str, float]], c15: List[Dict[str, float]], btc: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """Example-style final gate.
+
+    The goal is to block signals that are technically valid but not trader-quality:
+    - weak B-class entries with no live volume;
+    - tiny or stale continuation;
+    - counter-direction entries without true reversal strength;
+    - target ladders that require more movement than the recent market has shown;
+    - heavy coins unless the setup is genuinely A+.
+    """
+    if not TRADER_PATTERN_GATE_ENABLED:
+        return True, "ok", "trader pattern gate disabled"
+
+    side = str(trade.get("side", ""))
+    base = base_asset(symbol)
+    score = int(trade.get("score", 0) or 0)
+    grade = str(trade.get("grade", "B"))
+    setup_mode = str(trade.get("setup_mode", ""))
+    ch3m = float(trade.get("ch3m_1m", 0.0) or 0.0)
+    ch15m = float(trade.get("ch15m", 0.0) or 0.0)
+    ch30m = float(trade.get("ch30m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 1.0) or 1.0)
+    vol5 = float(trade.get("volume_ratio", trade.get("vol5", 1.0)) or 1.0)
+    range1 = float(trade.get("range1", 1.0) or 1.0)
+    range5 = float(trade.get("range_ratio", trade.get("range5", 1.0)) or 1.0)
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    tp5 = float(trade.get("tp5", 0.0) or 0.0)
+
+    aero_ok, aero_block, aero_reason = aero_style_gate(trade, symbol, c1, c5, c15, btc)
+
+    if grade != "A+" and not TRADER_ALLOW_B_SCORE:
+        return False, "trader_grade_block", f"{display_symbol(symbol)} {side}: B-class skipped by env; set TRADER_ALLOW_B_SCORE=true to allow B+"
+
+    if score < TRADER_MIN_SCORE:
+        if not (aero_ok and AERO_ALLOW_B_SCORE and score >= max(72, TRADER_MIN_SCORE - 10)):
+            return False, "trader_score_block", f"{display_symbol(symbol)} {side}: trader score too low {score} < {TRADER_MIN_SCORE}"
+
+    # Balanced B+ mode: B setups are allowed, but only if the current tape is alive.
+    # This keeps the bot from going silent while still blocking random weak B entries.
+    if grade != "A+":
+        if abs(ch3m) < TRADER_MIN_ABS_1M3 * 1.20 and vol1 < TRADER_MIN_VOL1 * 1.20 and range1 < TRADER_MIN_RANGE1 * 1.15:
+            if not aero_ok:
+                return False, "trader_bplus_quality_block", (
+                    f"{display_symbol(symbol)} {side}: B+ not strong enough; 1m3 {ch3m*100:+.2f}%, "
+                    f"vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+                )
+
+    if base in HEAVY_BASES and TRADER_HEAVY_ONLY_A_PLUS and grade != "A+":
+        return False, "trader_heavy_grade_block", f"{display_symbol(symbol)} {side}: heavy coin requires A+"
+
+    # Directional pressure must exist now. Examples are not slow predictions.
+    if side == "LONG":
+        if ch3m < TRADER_MIN_ABS_1M3:
+            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} LONG: weak live pressure 1m3 {ch3m*100:+.2f}%"
+        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] <= c5[-2]["close"]:
+            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} LONG: last 5m not confirming up"
+        if close_location(c1[-1]) < TRADER_CLOSE_LONG:
+            return False, "trader_close_location_block", f"{display_symbol(symbol)} LONG: 1m close not near high"
+        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] <= max(x["high"] for x in c1[-6:-1]):
+            return False, "trader_micro_break_block", f"{display_symbol(symbol)} LONG: no fresh 1m high break"
+        aligned = ch15m >= TRADER_MIN_ABS_15M and ch30m >= -TRADER_MAX_COUNTER_30M
+        reversal_exception = setup_mode.startswith("REVERSAL") and ch3m >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
+    else:
+        if ch3m > -TRADER_MIN_ABS_1M3:
+            return False, "trader_live_pressure_block", f"{display_symbol(symbol)} SHORT: weak live pressure 1m3 {ch3m*100:+.2f}%"
+        if TRADER_NEED_5M_DIRECTION and c5[-1]["close"] >= c5[-2]["close"]:
+            return False, "trader_5m_direction_block", f"{display_symbol(symbol)} SHORT: last 5m not confirming down"
+        if close_location(c1[-1]) > TRADER_CLOSE_SHORT:
+            return False, "trader_close_location_block", f"{display_symbol(symbol)} SHORT: 1m close not near low"
+        dump_exception = setup_mode.startswith("MARKET_DUMP") and ch3m <= -TRADER_MIN_ABS_1M3 * 1.10 and range1 >= max(0.45, TRADER_MIN_RANGE1 * 0.60)
+        if TRADER_REQUIRE_MICRO_BREAK and c1[-1]["close"] >= min(x["low"] for x in c1[-6:-1]) and not dump_exception:
+            return False, "trader_micro_break_block", f"{display_symbol(symbol)} SHORT: no fresh 1m low break"
+        aligned = ch15m <= -TRADER_MIN_ABS_15M and ch30m <= TRADER_MAX_COUNTER_30M
+        reversal_exception = setup_mode.startswith("REVERSAL") and abs(ch3m) >= TRADER_MIN_ABS_1M3 * 1.5 and range1 >= TRADER_MIN_RANGE1 * 1.25
+
+    if TRADER_BLOCK_WEAK_CONTINUATION and not (aligned or reversal_exception or aero_ok or setup_mode.startswith("MARKET_DUMP")):
+        return False, "trader_structure_block", (
+            f"{display_symbol(symbol)} {side}: weak structure; 15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, mode {setup_mode}"
+        )
+
+    if vol1 < TRADER_MIN_VOL1 and not aero_ok:
+        return False, "trader_vol1_block", f"{display_symbol(symbol)} {side}: live vol1 too weak x{vol1:.2f}"
+    if vol5 < TRADER_MIN_VOL5 and not aero_ok:
+        return False, "trader_vol5_block", f"{display_symbol(symbol)} {side}: vol5 too weak x{vol5:.2f}"
+    if range1 < TRADER_MIN_RANGE1 and not aero_ok:
+        return False, "trader_range1_block", f"{display_symbol(symbol)} {side}: range1 too weak x{range1:.2f}"
+    if range5 < TRADER_MIN_RANGE5 and not aero_ok:
+        return False, "trader_range5_block", f"{display_symbol(symbol)} {side}: range5 too weak x{range5:.2f}"
+
+    # TP5 should be plausible from current market expansion, not a fantasy target.
+    if entry > 0 and tp5 > 0:
+        need = abs(entry - tp5) / entry
+        recent_move = max(abs(ch15m), abs(ch30m), abs(percent_change(c5, 6)))
+        if recent_move < need * TRADER_MIN_TP5_FEASIBILITY:
+            return False, "trader_tp5_feasibility_block", (
+                f"{display_symbol(symbol)} {side}: TP5 move {need*100:.2f}% not feasible vs recent {recent_move*100:.2f}%"
+            )
+
+    style_note = aero_reason if aero_ok else "standard trader-pattern ok"
+    return True, "ok", (
+        f"{style_note}; score {score}, grade {grade}, 1m3 {ch3m*100:+.2f}%, "
+        f"15m {ch15m*100:+.2f}%, 30m {ch30m*100:+.2f}%, vol1 x{vol1:.2f}, range1 x{range1:.2f}"
+    )
+
+def cooldown_ok(symbol: str, strategy: str) -> Tuple[bool, str]:
+    t = now_ts()
+    if t < STATE.setdefault("pair_cooldown", {}).get(symbol, 0):
+        return False, "pair cooldown"
+    if t < STATE.setdefault("strategy_cooldown", {}).get(strategy, 0):
+        return False, "strategy cooldown"
+    return True, "ok"
+
+
+def analyze_symbol(symbol: str, btc: Dict[str, Any], blocks: Dict[str, int], near_miss: List[str]) -> Optional[Dict[str, Any]]:
+    symbol = normalize_symbol(symbol)
+    c1 = get_klines(symbol, "1m", 120, cache_seconds=6)
+    c5 = get_klines(symbol, "5m", 120, cache_seconds=15)
+    c15 = get_klines(symbol, "15m", 120, cache_seconds=30)
+    c1h = get_klines(symbol, "1h", 120, cache_seconds=90)
+
+    if not c1 or not c5 or not c15 or not c1h:
+        blocks["no_candles"] = blocks.get("no_candles", 0) + 1
+        return None
+
+    if ultra_risk_symbol(symbol, c5, c15):
+        blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+    for side in ("LONG", "SHORT"):
+        if side == "LONG" and not ALLOW_LONG:
+            blocks["long_disabled"] = blocks.get("long_disabled", 0) + 1
+            continue
+        if side == "SHORT" and not ALLOW_SHORT:
+            blocks["short_disabled"] = blocks.get("short_disabled", 0) + 1
+            continue
+        setup = fast_burst_setup(symbol, c1, c5, c15, c1h, btc, side)
+        if not setup:
+            setup = instant_edge_setup(symbol, c1, c5, c15, c1h, btc, side)
+            if setup:
+                blocks[f"instant_edge_{side.lower()}"] = blocks.get(f"instant_edge_{side.lower()}", 0) + 1
+        if not setup and side == "SHORT":
+            setup = market_dump_short_setup(symbol, c1, c5, c15, c1h, btc)
+            if setup:
+                blocks["market_dump_short"] = blocks.get("market_dump_short", 0) + 1
+        if not setup:
+            blocks[f"no_fast_{side.lower()}"] = blocks.get(f"no_fast_{side.lower()}", 0) + 1
+            continue
+
+        if side == "LONG":
+            long_stats_ok, long_stats_reason = long_live_stats_ok()
+            if not long_stats_ok and setup.get("grade") != "A+":
+                blocks["long_stats_protection_block"] = blocks.get("long_stats_protection_block", 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(f"{display_symbol(symbol)} LONG: {long_stats_reason}; B-class long skipped")
+                continue
+
+        co, reason = cooldown_ok(symbol, setup["strategy"])
+        if not co:
+            blocks["cooldown_block"] = blocks.get("cooldown_block", 0) + 1
+            continue
+
+        trade = calculate_fast_trade(setup, c1, c5)
+        if not trade:
+            blocks["sl_too_far_block"] = blocks.get("sl_too_far_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side}: SL too far")
+            continue
+
+        if trade["score"] < B_MIN_SCORE:
+            blocks["score_block"] = blocks.get("score_block", 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(f"{display_symbol(symbol)} {side}: score {trade['score']}, vol x{trade['volume_ratio']:.2f}, range x{trade['range_ratio']:.2f}")
+            continue
+
+        # V13.23 balanced professional quality gate.
+        # Still blocks XMR-style bad scalps: huge SL, weak RR, weak live volume.
+        # But thresholds are not over-tight, so the bot can remain alive during the day.
+        q_ok, q_block, q_reason = professional_quality_gate(trade, symbol)
+        if not q_ok:
+            blocks[q_block] = blocks.get(q_block, 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(q_reason)
+            continue
+
+        t_ok, t_block, t_reason = trader_pattern_gate(trade, symbol, c1, c5, c15, btc)
+        if not t_ok:
+            blocks[t_block] = blocks.get(t_block, 0) + 1
+            if len(near_miss) < 8:
+                near_miss.append(t_reason)
+            continue
+        trade["trader_pattern_reason"] = t_reason
+
+        # Adaptive model starts in shadow mode. During warm-up it never blocks signals.
+        try:
+            adaptive_ok, adaptive_reason, adaptive_probability = adaptive_gate(trade)
+            trade["adaptive_reason"] = adaptive_reason
+            if adaptive_probability is not None:
+                trade["adaptive_probability"] = adaptive_probability
+            if not adaptive_ok:
+                blocks["adaptive_model_block"] = blocks.get("adaptive_model_block", 0) + 1
+                if len(near_miss) < 8:
+                    near_miss.append(f"{display_symbol(symbol)} {side}: {adaptive_reason}")
+                continue
+        except Exception as e:
+            # Learning failure must never stop the market scanner.
+            trade["adaptive_reason"] = f"adaptive error bypass: {repr(e)}"
+            STATE["last_error"] = trade["adaptive_reason"]
+
+        candidates.append(trade)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
+    return candidates[0]
+
+# ============================================================
+# Formatting / scanning / tracking
+# ============================================================
+
+def format_price(x: Optional[float]) -> str:
+    if x is None:
+        return "-"
+    if x >= 100:
+        return f"{x:.2f}"
+    if x >= 1:
+        return f"{x:.5f}".rstrip("0").rstrip(".")
+    return f"{x:.8f}".rstrip("0").rstrip(".")
+
+
+def build_signal_message(s: Dict[str, Any]) -> str:
+    arrow = "🟢" if s["side"] == "LONG" else "🔴"
     return (
-        f"✅ {APP_NAME} активирован.\n"
-        f"Deploy marker: {DEPLOY_MARKER}\nProtocol: {PROTOCOL_HASH}\n\n"
-        "Режим: RESEARCH + PAPER/OBSERVER ONLY. Ордеров BingX в коде нет.\n"
-        "Каждая PAPER-сделка получает номер и видна в Telegram: вход, основной итог и полный путь. Скрытых SHADOW-сделок нет.\n"
-        "OBSERVER — отклонённый диагностический кандидат, а не сделка; он не входит в торговую статистику.\n"
-        f"CHAMPION: {STRATEGY_MOMENTUM} — неизменённый liquid momentum.\n"
-        f"CHALLENGER: {STRATEGY_PULLBACK} — EMA trend + ADX + controlled pullback + closed-candle reclaim.\n"
-        "Обе стратегии проходят одинаковую проверку spread/depth, fee/slippage и получают отдельную статистику.\n"
-        f"Tracking executable BBO: каждые ~{TRACK_INTERVAL_SECONDS}s.\n"
-        f"Costs in readiness: fee {ROUND_TRIP_FEE_MOVE*100:.2f}% + assumed slippage "
-        f"{ASSUMED_SLIPPAGE_MOVE*100:.2f}% = {ROUND_TRIP_COST_MOVE*100:.2f}% round trip.\n"
-        f"PAPER liquidity: turnover ≥ {PAPER_MIN_24H_QUOTE_VOLUME_USDT/1e6:.0f}M, "
-        f"spread ≤ {PAPER_MAX_SPREAD_BPS:.0f}bps, depth ≥ {PAPER_MIN_DEPTH_USDT:.0f} USDT.\n"
-        f"TP: 0.65/1.20/1.85/2.60/3.50%; only TP3+ = profit. SL {MIN_STOP_MOVE*100:.2f}%–{MAX_STOP_MOVE*100:.2f}%. "
-        f"Net TP3/SL payoff must be ≥ {PAPER_MIN_NET_PAYOFF_RATIO:.2f}.\n"
-        f"Micro-LIVE review only after ≥{REVIEW_MIN_INDEPENDENT_PAPER} independent PAPER, "
-        f"TP3+ > SL+expired, TP3 ≥ {REVIEW_MIN_TP3_RATE*100:.0f}%, expectancy ≥ {REVIEW_MIN_EXPECTANCY_R:.2f}R, "
-        f"PF ≥ {REVIEW_MIN_PROFIT_FACTOR:.2f}, Wilson95 lower > 50%, cluster-LCB90 > 0.\n"
-        f"Regime guard: ≥{REVIEW_MIN_ACTIVE_DAYS} UTC days, ≥{REVIEW_MIN_MARKET_REGIMES} BTC regimes, "
-        f"≥{REVIEW_MIN_PER_SIDE} independent outcomes per side, three separate "
-        f"{REVIEW_RECENT_WINDOW}-trade blocks positive, data-gap ≤ {REVIEW_MAX_DATA_GAP_RATE*100:.1f}%.\n"
-        f"Текущая авто-политика: {adaptive_policy_summary()}.\n"
-        f"Безопасный checkpoint: JSON каждые {BACKUP_EVERY_PRIMARY} закрытых PAPER. После каждых "
-        f"{AUDIT_BLOCK_SIZE} закрытых PAPER бот отправляет Telegram-файл со всеми PAPER-сделками, "
-        "аудитом и точными изменениями для следующего блока.\n"
-        "Отрицательный независимый блок может только на один уровень повысить score-floor и cooldown; автоматическое ослабление запрещено. "
-        "25 сделок не включают реальные деньги; продвижение считает только текущую неизменную policy revision. "
-        f"сравнение допускается после ≥{MIN_LANE_COMPARISON_SAMPLE} на каждую стратегию.\n"
-        f"Storage {DB_PATH}. Seed: {runtime_snapshot().get('seed_restore',{})}"
+        f"{arrow} {s['side']} {display_symbol(s['symbol'])}\n"
+        f"Класс: {s['grade']} · Score {s['score']} · {s['trade_type']}\n"
+        f"Стратегия: {s['strategy']}\n\n"
+        f"Вход: {format_price(s['entry'])}\n"
+        f"TP1: {format_price(s['tp1'])} · ≈ {s['roi_tp1']:.1f}% ROI x{LEVERAGE}\n"
+        f"TP2: {format_price(s['tp2'])}\n"
+        f"TP3: {format_price(s['tp3'])}\n"
+        f"TP4: {format_price(s['tp4'])}\n"
+        f"TP5: {format_price(s['tp5'])}\n"
+        f"SL: {format_price(s['sl'])} · риск до SL ≈ {s['roi_sl']:.1f}% ROI x{LEVERAGE}\n"
+        f"RR TP1: {s['rr']:.2f} · Ladder RR: {s['ladder_rr']:.2f} · Final RR: {s['final_rr']:.2f}\n"
+        f"Риск: multiplier x{s['risk_mult']:.2f}\n"
+        f"Adaptive: {s.get('adaptive_reason', 'warm-up')}\n\n"
+        f"📌 Логика:\n{s['reason']}\n"
+        f"15m: {s['ch15m']*100:+.2f}% · 30m: {s['ch30m']*100:+.2f}% · 1m3: {s['ch3m_1m']*100:+.2f}%\n"
+        f"Volume15 x{s['volume_ratio']:.2f} · Range5 x{s['range_ratio']:.2f} · Vol1 x{s.get('vol1', 1.0):.2f} · Range1 x{s.get('range1', 1.0):.2f}\n"
+        f"BTC: {s['btc_text']}\n\n"
+        f"⏱ Scalping rule: если за {FAST_MAX_MINUTES_TO_TP1} минут нет движения к TP1 — сигнал expired. Фаза рынка не важна; важна быстрая реализация."
     )
 
 
-# ---------------------------------------------------------------------------
-# Service
-# ---------------------------------------------------------------------------
+def build_diagnostic(scan: Dict[str, Any]) -> str:
+    blocks = scan.get("blocks", {})
+    block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:12]]
+    hot = scan.get("hot_notes", [])[:8]
+    near = scan.get("near_miss", [])[:8]
+    return (
+        f"🧪 Диагностика V13.29 Local Stop Dump Scalper\n"
+        f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
+        f"Кандидатов: {scan.get('candidates', 0)} · отправлено: {scan.get('sent', 0)} · время: {scan.get('elapsed', 0):.0f}с\n"
+        f"BTC: {scan.get('btc', 'unknown')}\n"
+        f"Статистика: {wr_text(STATE.get('stats', {}).get('total', {}))}\n\n"
+        f"Hot symbols:\n" + ("\n".join(hot) if hot else "нет") +
+        f"\n\nГлавные блокировки:\n" + ("\n".join(block_lines) if block_lines else "нет") +
+        ("\n\nПочти прошли:\n" + "\n".join(near) if near else "") +
+        f"\n\nLast error: {STATE.get('last_error', '')}"
+    )
+
+
+def add_active_signal(s: Dict[str, Any]) -> None:
+    STATE.setdefault("active_signals", []).append(s)
+    STATE.setdefault("pair_cooldown", {})[s["symbol"]] = now_ts() + PAIR_COOLDOWN_SECONDS
+    STATE.setdefault("strategy_cooldown", {})[s["strategy"]] = now_ts() + STRATEGY_COOLDOWN_SECONDS
+    save_state()
+
+
+def run_scan(manual: bool = False) -> Dict[str, Any]:
+    start = time.time()
+    blocks: Dict[str, int] = {}
+    near_miss: List[str] = []
+    btc = btc_context()
+    symbols = get_symbols()
+    selected, hot_notes = select_hot_symbols(symbols)
+
+    scan = {
+        "checked": 0,
+        "universe": len(symbols),
+        "candidates": 0,
+        "sent": 0,
+        "blocks": blocks,
+        "near_miss": near_miss,
+        "hot_notes": hot_notes,
+        "btc": btc.get("text", "BTC unknown"),
+        "elapsed": 0,
+    }
+
+    if not btc.get("ok"):
+        blocks["btc_data_problem"] = 1
+        STATE["last_scan"] = scan
+        save_state()
+        return scan
+
+    # Before scanning, refresh old active signals so expired/TP/SL positions do not block the market scan.
+    try:
+        track_active_signals()
+    except Exception as e:
+        STATE["last_error"] = f"pre-scan track_active_signals: {repr(e)}"
+        save_state()
+
+    found: List[Dict[str, Any]] = []
+    for sym in selected:
+        try:
+            s = analyze_symbol(sym, btc, blocks, near_miss)
+            scan["checked"] += 1
+            if s:
+                found.append(s)
+        except Exception as e:
+            blocks["analyze_exception"] = blocks.get("analyze_exception", 0) + 1
+            STATE["last_error"] = f"analyze {sym}: {repr(e)}"
+
+    found.sort(key=lambda x: (x["grade"] == "A+", x["score"], x["ladder_rr"]), reverse=True)
+    scan["candidates"] = len(found)
+
+    sent = 0
+    free_slots = max(0, MAX_ACTIVE_SIGNALS - len(STATE.get("active_signals", [])))
+    send_limit = min(MAX_SIGNALS_PER_SCAN, free_slots)
+    if send_limit <= 0 and found:
+        blocks["active_slots_full_send_block"] = blocks.get("active_slots_full_send_block", 0) + 1
+        if len(near_miss) < 8:
+            near_miss.append(f"found {len(found)} candidate(s), but active slots are full")
+    for s in found[:send_limit]:
+        add_active_signal(s)
+        send_telegram(build_signal_message(s))
+        sent += 1
+
+    scan["sent"] = sent
+    scan["elapsed"] = time.time() - start
+    STATE["last_scan"] = scan
+    save_state()
+
+    if manual or (sent == 0 and now_ts() - STATE.get("last_diag_ts", 0) >= DIAG_SECONDS):
+        send_telegram(build_diagnostic(scan))
+        STATE["last_diag_ts"] = now_ts()
+        save_state()
+
+    return scan
+
+
+def current_price(symbol: str) -> Optional[float]:
+    c = get_klines(symbol, "1m", 80, cache_seconds=4)
+    return c[-1]["close"] if c else None
+
+
+def target_hit(side: str, price: float, target: float) -> bool:
+    return price >= target if side == "LONG" else price <= target
+
+
+def sl_hit(side: str, price: float, sl: float) -> bool:
+    return price <= sl if side == "LONG" else price >= sl
+
+
+def directional_progress_ratio(s: Dict[str, Any], p: float) -> Tuple[bool, float]:
+    entry = s["entry"]
+    tp1 = s["tp1"]
+    full = abs(tp1 - entry)
+    if full <= 0:
+        return False, 0.0
+    if s["side"] == "LONG":
+        directional = p > entry
+        progress = max(0.0, p - entry) / full
+    else:
+        directional = p < entry
+        progress = max(0.0, entry - p) / full
+    return directional, progress
+
+
+def safe_record_learning_result(signal: Dict[str, Any], result: str) -> None:
+    """Persist a closed trade and retrain safely without interrupting the bot."""
+    try:
+        report = record_closed_trade(signal, result)
+        if report.get("trained"):
+            send_telegram(
+                "🧠 Adaptive model retrained\n"
+                f"Version: {report.get('version')}\n"
+                f"Active: {report.get('active')}\n"
+                f"Closed trades: {report.get('closed_count')}\n"
+                f"Model logloss: {report.get('model_logloss')}\n"
+                f"Base logloss: {report.get('base_logloss')}\n"
+                f"Threshold: {report.get('threshold')}\n"
+                f"Selected WR: {float(report.get('selected_wr', 0))*100:.1f}%\n"
+                f"Coverage: {float(report.get('coverage', 0))*100:.1f}%\n"
+                f"Shadow only: {report.get('shadow_only')}"
+            )
+    except Exception as e:
+        STATE["last_error"] = f"adaptive record error: {repr(e)}"
+        save_state()
+
+
+def track_active_signals() -> None:
+    active = STATE.setdefault("active_signals", [])
+    if not active:
+        return
+
+    remaining = []
+    changed = False
+
+    for s in active:
+        p = current_price(s["symbol"])
+        if p is None:
+            remaining.append(s)
+            continue
+
+        side = s["side"]
+        age_minutes = (now_ts() - int(s.get("created_at", now_ts()))) / 60.0
+
+        if sl_hit(side, p, s["sl"]):
+            apply_result(s, "sl")
+            safe_record_learning_result(s, "sl")
+            send_telegram(
+                f"❌ Stop Loss\n"
+                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\n"
+                f"Вход: {format_price(s['entry'])}\n"
+                f"SL: {format_price(s['sl'])}\n"
+                f"Текущая цена: {format_price(p)}\n\n"
+                f"{build_stats_text()}"
+            )
+            changed = True
+            continue
+
+        if FAST_CANCEL_IF_NO_PROGRESS and not s.get("tp1_hit") and age_minutes >= FAST_MAX_MINUTES_TO_TP1:
+            directional, progress = directional_progress_ratio(s, p)
+            if (not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP:
+                apply_result(s, "expired")
+                safe_record_learning_result(s, "expired")
+                send_telegram(
+                    f"⏱ FAST TRADE EXPIRED\n"
+                    f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                    f"Стратегия: {s['strategy']}\n"
+                    f"Цена не реализовалась за {FAST_MAX_MINUTES_TO_TP1} минут.\n"
+                    f"Вход: {format_price(s['entry'])}\n"
+                    f"Текущая цена: {format_price(p)}\n"
+                    f"TP1: {format_price(s['tp1'])}\n"
+                    f"Прогресс к TP1: {progress*100:.1f}%\n\n"
+                    f"{build_stats_text()}"
+                )
+                changed = True
+                continue
+
+        if age_minutes >= FAST_HARD_EXPIRE_MINUTES and not s.get("tp1_hit"):
+            apply_result(s, "expired")
+            safe_record_learning_result(s, "expired")
+            send_telegram(
+                f"⏱ HARD EXPIRE\n"
+                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\n"
+                f"TP1 не достигнут за {FAST_HARD_EXPIRE_MINUTES} минут.\n"
+                f"Текущая цена: {format_price(p)}\n\n"
+                f"{build_stats_text()}"
+            )
+            changed = True
+            continue
+
+        hit_any = False
+        for key in ["tp1", "tp2", "tp3", "tp4"]:
+            if s.get(key) and not s.get(f"{key}_hit") and target_hit(side, p, s[key]):
+                s[f"{key}_hit"] = True
+                hit_any = True
+                send_telegram(
+                    f"🎯 {key.upper()} HIT\n"
+                    f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                    f"Стратегия: {s['strategy']}\n"
+                    f"{key.upper()}: {format_price(s[key])}\n"
+                    f"Текущая цена: {format_price(p)}"
+                )
+
+        if s.get("tp5") and target_hit(side, p, s["tp5"]):
+            s["tp5_hit"] = True
+            apply_result(s, "profit")
+            safe_record_learning_result(s, "profit")
+            send_telegram(
+                f"✅ FULL LADDER TAKE PROFIT\n"
+                f"{s['grade']} · {side} {display_symbol(s['symbol'])}\n"
+                f"Стратегия: {s['strategy']}\n"
+                f"TP5 достигнут: {format_price(p)}\n"
+                f"Время в сделке: {age_minutes:.1f} мин\n\n"
+                f"{build_stats_text()}"
+            )
+            changed = True
+            continue
+
+        if hit_any:
+            changed = True
+
+        remaining.append(s)
+
+    if changed:
+        STATE["active_signals"] = remaining
+        save_state()
+
+# ============================================================
+# Background tasks / HTTP endpoints
+# ============================================================
 
 async def scan_loop():
     await asyncio.sleep(3)
+    send_telegram(
+        f"✅ {APP_NAME} активирован.\n"
+        f"Deploy marker: {DEPLOY_MARKER}\n\n"
+        f"Mode: MARKET DUMP + AERO STYLE + LOCAL STOP SCALPER.\n"
+        f"Логика: торгуем не фазу рынка, а только короткий дисбаланс: hot coin → sweep/reclaim → EMA/VWAP → immediate continuation → 5 TP.\n"
+        f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
+        f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
+        f"Risk multiplier: B x{FAST_RISK_MULT:.2f}, A+ x{A_RISK_MULT:.2f}."
+    )
+    try:
+        scan = run_scan(manual=True)
+        send_telegram(build_diagnostic(scan))
+    except Exception as e:
+        STATE["last_error"] = f"first scan exception: {repr(e)}"
+        save_state()
+        send_telegram(f"⚠️ Ошибка первого скана: {repr(e)}")
+
     while True:
-        try: await asyncio.to_thread(run_scan)
-        except Exception as exc:
-            set_runtime_error(f"scan_loop:{exc!r}")
-            send_text(f"⚠️ V18.4 scan error: {exc!r}",True)
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        try:
+            if AUTO_SCAN_ENABLED:
+                run_scan(manual=False)
+        except Exception as e:
+            STATE["last_error"] = f"scan_loop: {repr(e)}"
+            save_state()
+            send_telegram(f"⚠️ Ошибка auto-scan: {repr(e)}")
+        await asyncio.sleep(AUTO_SCAN_SECONDS)
+
 
 async def track_loop():
-    await asyncio.sleep(5)
+    await asyncio.sleep(8)
     while True:
         try:
-            await asyncio.to_thread(track_open_episodes)
-            await asyncio.to_thread(flush_outbox)
-        except Exception as exc:set_runtime_error(f"track_loop:{exc!r}")
-        await asyncio.sleep(TRACK_INTERVAL_SECONDS)
+            if AUTO_TRACK_ENABLED:
+                track_active_signals()
+        except Exception as e:
+            STATE["last_error"] = f"track_loop: {repr(e)}"
+            save_state()
+        await asyncio.sleep(AUTO_TRACK_SECONDS)
 
-async def diagnostic_loop():
-    await asyncio.sleep(20)
-    while True:
-        try:
-            send_text(diagnostics_text(),False)
-            RUNTIME["last_diagnostic_at"]=now_ts()
-        except Exception as exc:set_runtime_error(f"diagnostic_loop:{exc!r}")
-        await asyncio.sleep(DIAGNOSTIC_INTERVAL_SECONDS)
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    init_db();restore_seed_if_empty();send_text(startup_message(),True)
-    reconcile_visible_notifications()
-    maybe_send_milestones()
-    tasks=[asyncio.create_task(scan_loop()),asyncio.create_task(track_loop()),asyncio.create_task(diagnostic_loop())]
-    try:yield
-    finally:
-        for t in tasks:t.cancel()
-        await asyncio.gather(*tasks,return_exceptions=True)
+@app.on_event("startup")
+async def startup_event():
+    global STATE
+    STATE = load_state()
+    try:
+        init_adaptive_db()
+    except Exception as e:
+        STATE["last_error"] = f"adaptive DB init error: {repr(e)}"
+        save_state()
+    asyncio.create_task(scan_loop())
+    asyncio.create_task(track_loop())
 
-app=FastAPI(title=APP_NAME,lifespan=lifespan)
-
-def authorized(key: str)->bool:
-    return bool(ADMIN_KEY) and secrets.compare_digest(str(key),ADMIN_KEY)
 
 @app.get("/")
-def root()->HTMLResponse:
-    return HTMLResponse(f"<h3>{APP_NAME}</h3><p>{DEPLOY_MARKER}</p><p>Protocol {PROTOCOL_HASH}. Research/PAPER only.</p>")
+def root():
+    return HTMLResponse(
+        f"<h3>{APP_NAME}</h3>"
+        f"<p>{DEPLOY_MARKER}</p>"
+        f"<p>Use /health /version /scan /auto-status /stats /adaptive-report /adaptive-retrain /adaptive-events /test-telegram</p>"
+    )
+
 
 @app.get("/health")
-def health()->Dict[str,Any]:
-    return {"ok":True,"app":APP_NAME,"deploy_marker":DEPLOY_MARKER,"protocol_hash":PROTOCOL_HASH,
-            "episodes":table_count("episodes"),"primary_closed":primary_count(),
-            "open":open_episode_count(),"last_error":runtime_snapshot().get("last_error","")}
+def health():
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "deploy": DEPLOY_MARKER,
+        "active": len(STATE.get("active_signals", [])),
+        "last_error": STATE.get("last_error", ""),
+    }
 
-@app.get("/status")
-def status()->JSONResponse:
-    return JSONResponse({"runtime":runtime_snapshot(),
-                         "observer":metrics(primary_rows("observer")),
-                         "paper":metrics(primary_rows("paper")),
-                         "paper_independent":metrics(primary_rows("paper",True)),
-                         "strategies":{
-                             s:metrics(primary_rows("paper",True,s)) for s in STRATEGIES
-                         },
-                         "adaptive_policy":adaptive_policy_state(),
-                         "adaptive_review":champion_challenger_review(),
-                         "review_gates":{s:review_gate(s) for s in STRATEGIES}})
 
-@app.get("/diagnostic")
-def diagnostic()->HTMLResponse:
-    return HTMLResponse("<pre>"+diagnostics_text()+"</pre>")
+@app.get("/version")
+def version():
+    return {"app": APP_NAME, "deploy_marker": DEPLOY_MARKER}
 
-@app.post("/scan")
-def manual_scan(key: str=Query(""))->JSONResponse:
-    if not authorized(key):return JSONResponse({"ok":False,"error":"unauthorized"},status_code=403)
-    return JSONResponse(run_scan())
 
-@app.get("/export")
-def export(key: str=Query(""))->Response:
-    if not authorized(key):return JSONResponse({"ok":False,"error":"unauthorized"},status_code=403)
-    return Response(export_bytes(),media_type="application/json",
-                    headers={"Content-Disposition":f"attachment; filename=v18_4_research_{primary_count()}.json"})
+@app.get("/auto-status")
+def auto_status():
+    return JSONResponse({
+        "app": APP_NAME,
+        "deploy": DEPLOY_MARKER,
+        "active_signals": STATE.get("active_signals", []),
+        "last_scan": STATE.get("last_scan", {}),
+        "last_error": STATE.get("last_error", ""),
+        "stats": STATE.get("stats", {}),
+    })
 
-@app.get("/trades")
-def trades(key: str=Query(""))->JSONResponse:
-    if not authorized(key):return JSONResponse({"ok":False,"error":"unauthorized"},status_code=403)
-    ledger=paper_trade_ledger()
-    return JSONResponse({"count":len(ledger),"paper_trades":ledger})
 
-@app.post("/telegram-backup")
-def telegram_backup(key: str=Query(""))->JSONResponse:
-    if not authorized(key):return JSONResponse({"ok":False,"error":"unauthorized"},status_code=403)
-    count=primary_count();fn=f"v18_4_manual_{count}_{now_ts()}.json"
-    sent=send_document(export_bytes(),fn,"Manual V18.4 full trade ledger + adaptive state")
-    return JSONResponse({"ok":sent,"filename":fn,"primary_count":count})
+@app.get("/scan")
+def manual_scan(send: bool = Query(True)):
+    scan = run_scan(manual=True)
+    if send:
+        send_telegram(build_diagnostic(scan))
+    return JSONResponse(scan)
 
-if __name__=="__main__":
+
+@app.get("/stats")
+def stats():
+    return HTMLResponse("<pre>" + build_stats_text() + "</pre>")
+
+
+@app.get("/adaptive-report")
+def adaptive_report_endpoint():
+    try:
+        return HTMLResponse("<pre>" + adaptive_report() + "</pre>")
+    except Exception as e:
+        return HTMLResponse("<pre>Adaptive report error: " + repr(e) + "</pre>", status_code=500)
+
+
+@app.get("/adaptive-retrain")
+def adaptive_retrain_endpoint():
+    try:
+        return JSONResponse(maybe_retrain(force=True))
+    except Exception as e:
+        return JSONResponse({"trained": False, "error": repr(e)}, status_code=500)
+
+
+@app.get("/adaptive-events")
+def adaptive_events_endpoint(limit: int = Query(20, ge=1, le=100)):
+    try:
+        return JSONResponse(recent_adaptive_events(limit))
+    except Exception as e:
+        return JSONResponse({"error": repr(e)}, status_code=500)
+
+
+@app.get("/test-telegram")
+def test_telegram():
+    ok = send_telegram(f"✅ Test Telegram OK\n{APP_NAME}\n{DEPLOY_MARKER}")
+    return {"sent": ok, "last_error": STATE.get("last_error", "")}
+
+
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app,host="0.0.0.0",port=PORT,log_level="info")
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
