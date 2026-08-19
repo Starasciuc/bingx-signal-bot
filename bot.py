@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.3
+# VERIFIED GITHUB DEPLOY FILE — V17.3.1 READINESS HOTFIX
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -8,6 +8,7 @@ import asyncio
 import io
 import secrets
 import hashlib
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2584,7 +2585,7 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.3 ACTIVE TRADER PATTERN PAPER"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V17.3.1 ACTIVE TRADER PATTERN + READINESS HOTFIX"
 DEPLOY_MARKER = "V17_3_1_ACTIVE_TRADER_PATTERN_READINESS_HOTFIX_2026_08_20"
 
 app = FastAPI(title=APP_NAME)
@@ -9576,7 +9577,7 @@ async def scan_loop():
         except Exception as e:
             STATE["last_error"] = f"scan_loop: {repr(e)}"
             save_state()
-            send_telegram(f"⚠️ Ошибка auto-scan: {repr(e)}")
+            send_telegram(f"⚠️ Ошибка auto-scan: {repr(e)}\n{traceback.format_exc()[-2500:]}")
         await asyncio.sleep(AUTO_SCAN_SECONDS)
 
 
