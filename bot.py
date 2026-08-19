@@ -2585,7 +2585,7 @@ def build_export_bytes() -> bytes:
 # ============================================================
 
 APP_NAME = "Professional Adaptive Futures Bot AUTO V17.3 ACTIVE TRADER PATTERN PAPER"
-DEPLOY_MARKER = "V17_3_ACTIVE_TRADER_PATTERN_PAPER_2026_08_19"
+DEPLOY_MARKER = "V17_3_1_ACTIVE_TRADER_PATTERN_READINESS_HOTFIX_2026_08_20"
 
 app = FastAPI(title=APP_NAME)
 
@@ -4243,7 +4243,7 @@ def real_money_readiness() -> Dict[str, Any]:
     init_adaptive_db()
     with _LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT id, result, pnl_r, symbol FROM adaptive_trades "
+            "SELECT id, result, pnl_r, symbol, side FROM adaptive_trades "
             "WHERE COALESCE(decision_reason, '')=? "
             "ORDER BY closed_at ASC, id ASC",
             (PAPER_VALIDATION_REASON,),
