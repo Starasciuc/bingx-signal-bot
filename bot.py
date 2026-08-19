@@ -2585,7 +2585,7 @@ def build_export_bytes() -> bytes:
 # ============================================================
 
 APP_NAME = "Professional Adaptive Futures Bot AUTO V17.2.1 MEASURED EDGE FORWARD"
-DEPLOY_MARKER = "V17_2_1_MEASURED_EDGE_FORWARD_500_2026_08_12"
+DEPLOY_MARKER = "V17_2_1_MEASURED_EDGE_FORWARD_VISIBLE_TRADES_2026_08_19"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2930,7 +2930,7 @@ SHADOW_COOLDOWN_SECONDS = int(os.getenv("SHADOW_COOLDOWN_SECONDS", "600"))
 # V16.7: extra near-miss probes remain disabled. Forward learning now uses only
 # explicitly confirmed and visible PAPER candidates plus genuine LIVE results.
 # The implementation remains available for controlled experiments via env.
-SHADOW_PROBE_ENABLED = os.getenv("SHADOW_PROBE_ENABLED", "false").lower() == "true"
+SHADOW_PROBE_ENABLED = os.getenv("SHADOW_PROBE_ENABLED", "true").lower() == "true"
 SHADOW_PROBE_PER_SCAN = int(os.getenv("SHADOW_PROBE_PER_SCAN", "3"))
 SHADOW_PROBE_MAX_ACTIVE = int(os.getenv("SHADOW_PROBE_MAX_ACTIVE", "6"))
 SHADOW_PROBE_COOLDOWN_SECONDS = int(os.getenv("SHADOW_PROBE_COOLDOWN_SECONDS", "1800"))
