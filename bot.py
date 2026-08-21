@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V18.1 ACTIVE MOVER TRIGGER WATCH
+# VERIFIED GITHUB DEPLOY FILE — V18.1.1 ACTIVE MOVER QUIET WATCH
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2585,8 +2585,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V18.0 DUAL-LANE SCALPER PAPER"
-DEPLOY_MARKER = "V18_1_DUAL_LANE_ACTIVE_MOVER_TRIGGER_WATCH_2026_08_21"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V18.1.1 ACTIVE MOVER QUIET WATCH"
+DEPLOY_MARKER = "V18_1_1_DUAL_LANE_QUIET_WATCH_2026_08_21"
 
 app = FastAPI(title=APP_NAME)
 
@@ -6660,13 +6660,9 @@ def add_active_mover_watch(setup: Dict[str, Any]) -> bool:
         item["watch_stage"] = "WAIT_PULLBACK"
         watches.append(item)
         save_state()
-    if VISIBLE_SHADOW_NOTIFICATIONS:
-        send_telegram(
-            "🧲🟣 ACTIVE MOVER WATCH V18.1\n"
-            f"{item.get('side','?')} {display_symbol(item.get('symbol','?'))}\n"
-            f"HOT найден около {format_price(ref)}.\n"
-            "Сделки ЕЩЁ НЕТ: бот ждёт откат/паузу → возврат уровня → повторное ускорение."
-        )
+    # V18.1.1 QUIET WATCH:
+    # Keep preliminary HOT/WATCH candidates internal. Telegram receives only
+    # confirmed PAPER entries and their results, not every candidate being watched.
     return True
 
 
@@ -10164,7 +10160,7 @@ async def scan_loop():
         f"Anti-chase: no delayed 90%–100% reclaim entry; the failed V17.2 retest path is excluded.\n"
         f"V17.3.2 selector: broad V17.3.1 entries stay as paired CONTROL; only follow-through score ≥ {V17_3_2_MIN_SCORE:.0f} enters new PAPER.\n"
         f"SHORT official PAPER: {V17_3_2_SHORT_PAPER_ENABLED}; when False, SHORT remains visible CONTROL/SHADOW only.\n"
-        f"Telegram lanes: ⚡🟡 FOLLOW-THROUGH = быстрый импульс; 🧲🟣 ACTIVE MOVER V18.1 = HOT → WATCH → pullback/reclaim → re-acceleration → PAPER.\n"
+        f"Telegram lanes: ⚡🟡 FOLLOW-THROUGH = быстрый импульс; 🧲🟣 ACTIVE MOVER V18.1 = HOT → WATCH → pullback/reclaim → re-acceleration → PAPER. Предварительные WATCH скрыты; Telegram получает только подтверждённые PAPER-входы и результаты.\n"
         f"ACTIVE MOVER horizon: soft {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES} мин · hard {ACTIVE_MOVER_HARD_EXPIRE_MINUTES} мин · TP ladder {ACTIVE_TP1_MOVE*100:.1f}/{ACTIVE_TP2_MOVE*100:.1f}/{ACTIVE_TP3_MOVE*100:.1f}/{ACTIVE_TP4_MOVE*100:.1f}/{ACTIVE_TP5_MOVE*100:.1f}%.\n"
         f"Every PAPER entry/result is visible in Telegram; SHADOW near-miss observations are visible too.\n"
         f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
