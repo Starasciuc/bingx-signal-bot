@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.3.1 READINESS HOTFIX
+# VERIFIED GITHUB DEPLOY FILE — V17.3.2 FORWARD FOLLOW-THROUGH SELECTOR
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2099,7 +2099,7 @@ def format_training_attempt_message(report: Dict[str, Any]) -> str:
     if all_dataset:
         lines.append(f"ВСЯ ТЕЛЕМЕТРИЯ: {_metrics_line(all_dataset)}")
     if paper_dataset:
-        lines.append(f"DIRECT MEASURED PAPER V17.3: {_metrics_line(paper_dataset)}")
+        lines.append(f"FOLLOW-THROUGH PAPER V17.3.2: {_metrics_line(paper_dataset)}")
     if reason == "forward_validation_freeze":
         lines.append(
             f"Зафиксированная проверка: {int(report.get('paper_collected', 0) or 0)}/"
@@ -2456,8 +2456,8 @@ def format_source_audit_message(window: int = 25) -> str:
     lines.extend(
         [
             "",
-            f"CONTROL V17.3: {_metrics_line(control_metrics)}",
-            f"DIRECT MEASURED PAPER V17.3: {_metrics_line(reclaim_metrics)} · "
+            f"CONTROL V17.3.1: {_metrics_line(control_metrics)}",
+            f"FOLLOW-THROUGH PAPER V17.3.2: {_metrics_line(reclaim_metrics)} · "
             f"собрано {int(reclaim_metrics.get('n', 0))}/"
             f"{paper_progress_target(int(reclaim_metrics.get('n', 0) or 0))}",
             watch_audit_summary(),
@@ -2585,8 +2585,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.3.1 ACTIVE TRADER PATTERN + READINESS HOTFIX"
-DEPLOY_MARKER = "V17_3_1_ACTIVE_TRADER_PATTERN_READINESS_HOTFIX_2026_08_20"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V17.3.2 FORWARD FOLLOW-THROUGH PAPER"
+DEPLOY_MARKER = "V17_3_2_FORWARD_FOLLOWTHROUGH_25_2026_08_21"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2678,9 +2678,11 @@ PAPER_NOTIFY_RESULTS = os.getenv("PAPER_NOTIFY_RESULTS", "true").lower() == "tru
 VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
     "VISIBLE_SHADOW_NOTIFICATIONS", "true"
 ).lower() == "true"
-PAPER_VALIDATION_REASON = "direct_measured_paper_v17_2_2"
-PAPER_CONTROL_REASON = "direct_measured_control_v17_2_2"
-REAL_MONEY_LIVE_REASON = "direct_measured_micro_live_v17_2_2"
+PAPER_VALIDATION_REASON = "followthrough_paper_v17_3_2"
+PAPER_CONTROL_REASON = "direct_measured_control_v17_3_1"
+REAL_MONEY_LIVE_REASON = "followthrough_micro_live_v17_3_2"
+LEGACY_V17_3_1_PAPER_VALIDATION_REASON = "direct_measured_paper_v17_2_2"
+LEGACY_V17_3_1_CONTROL_REASON = "direct_measured_control_v17_2_2"
 LEGACY_V17_2_1_PAPER_VALIDATION_REASON = "measured_edge_paper_v17_2_1"
 LEGACY_V17_2_1_CONTROL_REASON = "measured_edge_control_v17_2_1"
 LEGACY_V17_1_PAPER_VALIDATION_REASON = "moderate_reclaim_v17_1"
@@ -2968,6 +2970,46 @@ SHADOW_PROBE_MIN_EVIDENCE_SCORE = float(os.getenv("SHADOW_PROBE_MIN_EVIDENCE_SCO
 LADDER_FOLLOWUP_MINUTES = int(os.getenv("LADDER_FOLLOWUP_MINUTES", "90"))
 AUTO_TELEGRAM_BACKUP = os.getenv("AUTO_TELEGRAM_BACKUP", "true").lower() == "true"
 AUTO_BACKUP_EVERY_CLOSED = int(os.getenv("AUTO_BACKUP_EVERY_CLOSED", "25"))
+
+
+# --- V17.3.2 forward follow-through selector ---
+# First unchanged V17.3.1 PAPER cohort: 25 outcomes = 2 TP3+ / 8 SL / 15 expired.
+# The new selector keeps the broad V17.3.1 detector as a paired CONTROL and
+# admits a much smaller PAPER subset only when the impulse is still accelerating.
+# SHORT remains visible CONTROL/SHADOW by default because the first forward
+# cohort produced 0 TP3+ / 5 SL / 5 expired on SHORT.
+V17_3_2_SELECTOR_ENABLED = os.getenv(
+    "V17_3_2_SELECTOR_ENABLED", "true"
+).lower() == "true"
+V17_3_2_SHORT_PAPER_ENABLED = os.getenv(
+    "V17_3_2_SHORT_PAPER_ENABLED", "false"
+).lower() == "true"
+V17_3_2_MIN_DIRECTIONAL_3M = float(
+    os.getenv("V17_3_2_MIN_DIRECTIONAL_3M", "0.0090")
+)
+V17_3_2_MIN_DIRECTIONAL_15M = float(
+    os.getenv("V17_3_2_MIN_DIRECTIONAL_15M", "0.0100")
+)
+V17_3_2_MIN_DIRECTIONAL_30M = float(
+    os.getenv("V17_3_2_MIN_DIRECTIONAL_30M", "-0.0025")
+)
+V17_3_2_MIN_VOL1 = float(os.getenv("V17_3_2_MIN_VOL1", "0.75"))
+V17_3_2_MIN_VOL5 = float(os.getenv("V17_3_2_MIN_VOL5", "0.25"))
+V17_3_2_MIN_RANGE1 = float(os.getenv("V17_3_2_MIN_RANGE1", "1.30"))
+V17_3_2_MIN_RANGE5 = float(os.getenv("V17_3_2_MIN_RANGE5", "0.65"))
+V17_3_2_MIN_PACE_RATIO = float(
+    os.getenv("V17_3_2_MIN_PACE_RATIO", "0.90")
+)
+V17_3_2_EXCEPTIONAL_3M = float(
+    os.getenv("V17_3_2_EXCEPTIONAL_3M", "0.0220")
+)
+V17_3_2_EXCEPTIONAL_15M = float(
+    os.getenv("V17_3_2_EXCEPTIONAL_15M", "0.0250")
+)
+V17_3_2_MIN_SCORE = float(os.getenv("V17_3_2_MIN_SCORE", "72.0"))
+V17_3_2_CONTROL_VISIBLE = os.getenv(
+    "V17_3_2_CONTROL_VISIBLE", "true"
+).lower() == "true"
 
 # --- Fast burst requirements ---
 FAST_BURST_ENABLED = os.getenv("FAST_BURST_ENABLED", "true").lower() == "true"
@@ -3267,7 +3309,7 @@ def base_asset(symbol: str) -> str:
 
 def default_watch_audit() -> Dict[str, Any]:
     return {
-        "version": "V17.3",
+        "version": "V17.3.2",
         "liquidity_checked": 0,
         "liquidity_passed": 0,
         "liquidity_rejected": 0,
@@ -4160,7 +4202,7 @@ def paper_lane_metrics() -> Dict[str, Dict[str, Any]]:
             "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
             (PAPER_VALIDATION_REASON,),
         ).fetchall()
-    return {"DIRECT_MEASURED": _outcome_metrics(rows)}
+    return {"FOLLOW_THROUGH": _outcome_metrics(rows)}
 
 
 def control_validation_metrics() -> Dict[str, Any]:
@@ -4429,13 +4471,13 @@ def format_paper_cohort_report(window: int = 25) -> str:
         decision = "Параметры остаются замороженными до полной forward-проверки."
 
     return (
-        "🧾 V17.3 — ОТЧЁТ DIRECT MEASURED PAPER\n"
+        "🧾 V17.3.2 — ОТЧЁТ FOLLOW-THROUGH PAPER\n"
         f"Этап: {stage}\n"
         f"Последний блок: ID {first_id}–{last_id} · {_metrics_line(block)} · "
         f"уникальных монет {unique_block}\n"
-        f"Накоплено V17.3 PAPER: {_metrics_line(cumulative)} · "
+        f"Накоплено V17.3.2 PAPER: {_metrics_line(cumulative)} · "
         f"уникальных монет {unique_total}\n"
-        f"DIRECT MEASURED: {_metrics_line(lanes['DIRECT_MEASURED'])}\n"
+        f"FOLLOW-THROUGH: {_metrics_line(lanes['FOLLOW_THROUGH'])}\n"
         f"{watch_audit_summary()}\n"
         f"Решение: {decision}\n"
         "Важно: отчёт ничего не меняет автоматически и не разрешает реальную торговлю."
@@ -4477,10 +4519,10 @@ def closed_outcome_progress_message(
         f"ВСЕГО: {_metrics_line(metrics['all'])}\n"
         f"LIVE: {_metrics_line(metrics['live'])}\n"
         f"SHADOW/PAPER: {_metrics_line(metrics['shadow'])}\n"
-        f"CONTROL V17.3: {_metrics_line(control_metrics)}\n"
-        f"DIRECT MEASURED PAPER V17.3: {_metrics_line(paper_metrics)} · "
+        f"CONTROL V17.3.1: {_metrics_line(control_metrics)}\n"
+        f"FOLLOW-THROUGH PAPER V17.3.2: {_metrics_line(paper_metrics)} · "
         f"{paper_count}/{paper_target}\n"
-        f"Допустимых для модели V17.3 PAPER: {adaptive_model_data_count()}\n"
+        f"Допустимых для модели V17.3.2 PAPER: {adaptive_model_data_count()}\n"
         f"Готовность micro-LIVE: {readiness.get('ready', False)} · "
         f"разрешающий флаг: {readiness.get('live_flag', False)}\n"
         f"{watch_audit_summary()}\n"
@@ -6493,13 +6535,108 @@ def direct_measured_setup(
         "setup_mode": f"V17_2_2_DIRECT_MEASURED_{side}",
         "t1h": trend_state(c1h),
         "btc_text": btc.get("text", ""),
-        "paper_setup_lane": "DIRECT_MEASURED",
+        "paper_setup_lane": "FOLLOW_THROUGH",
         "paper_validation_only": True,
         "paper_validation_immediate": True,
         "paper_validation_lane": PAPER_VALIDATION_REASON,
         "watch_impulse": directional_3m,
         "paper_validation_origin": reason,
     }, "direct_band_and_structure_passed"
+
+
+
+def v17_3_2_followthrough_gate(
+    trade: Dict[str, Any],
+    btc: Dict[str, Any],
+) -> Tuple[bool, str, float]:
+    """Forward-only selector derived from the failed first 25 V17.3.1 outcomes.
+
+    It does not rewrite the broad detector. Every broad candidate remains a
+    paired V17.3.1 CONTROL observation. The selector only decides whether the
+    same candidate is strong enough to enter the new V17.3.2 PAPER cohort.
+    """
+    if not V17_3_2_SELECTOR_ENABLED:
+        return True, "selector disabled", 100.0
+
+    side = str(trade.get("side", "")).upper()
+    if side not in {"LONG", "SHORT"}:
+        return False, "unknown side", 0.0
+
+    if side == "SHORT" and not V17_3_2_SHORT_PAPER_ENABLED:
+        return False, "SHORT kept in CONTROL/SHADOW after 0 TP3+ / 10 forward outcomes", 0.0
+
+    direction = 1.0 if side == "LONG" else -1.0
+    d3 = direction * float(trade.get("ch3m_1m", 0.0) or 0.0)
+    d15 = direction * float(trade.get("ch15m", 0.0) or 0.0)
+    d30 = direction * float(trade.get("ch30m", 0.0) or 0.0)
+    vol1 = float(trade.get("vol1", 0.0) or 0.0)
+    vol5 = float(trade.get("volume_ratio", 0.0) or 0.0)
+    range1 = float(trade.get("range1", 0.0) or 0.0)
+    range5 = float(trade.get("range_ratio", 0.0) or 0.0)
+
+    # Compare the current 3m velocity with the average 15m velocity.
+    # 1.0 means the last 3 minutes are moving at the same per-minute pace
+    # as the full 15m window; >1 means acceleration.
+    if d15 > 1e-9:
+        pace_ratio = (d3 / 3.0) / (d15 / 15.0)
+    else:
+        pace_ratio = 0.0
+
+    btc_dir = str(btc.get("direction", "UNKNOWN")).upper()
+    btc_aligned = (
+        (side == "LONG" and btc_dir != "BEAR")
+        or (side == "SHORT" and btc_dir != "BULL")
+    )
+    exceptional = bool(
+        d3 >= V17_3_2_EXCEPTIONAL_3M
+        and d15 >= V17_3_2_EXCEPTIONAL_15M
+        and range1 >= max(V17_3_2_MIN_RANGE1, 1.50)
+    )
+
+    hard_failures: List[str] = []
+    if d3 < V17_3_2_MIN_DIRECTIONAL_3M:
+        hard_failures.append(f"3m {d3*100:.2f}% < {V17_3_2_MIN_DIRECTIONAL_3M*100:.2f}%")
+    if d15 < V17_3_2_MIN_DIRECTIONAL_15M:
+        hard_failures.append(f"15m {d15*100:.2f}% < {V17_3_2_MIN_DIRECTIONAL_15M*100:.2f}%")
+    if d30 < V17_3_2_MIN_DIRECTIONAL_30M:
+        hard_failures.append(f"30m {d30*100:.2f}% too counter-directional")
+    if vol1 < V17_3_2_MIN_VOL1:
+        hard_failures.append(f"Vol1 x{vol1:.2f} < x{V17_3_2_MIN_VOL1:.2f}")
+    if vol5 < V17_3_2_MIN_VOL5:
+        hard_failures.append(f"Vol5 x{vol5:.2f} < x{V17_3_2_MIN_VOL5:.2f}")
+    if range1 < V17_3_2_MIN_RANGE1:
+        hard_failures.append(f"Range1 x{range1:.2f} < x{V17_3_2_MIN_RANGE1:.2f}")
+    if range5 < V17_3_2_MIN_RANGE5:
+        hard_failures.append(f"Range5 x{range5:.2f} < x{V17_3_2_MIN_RANGE5:.2f}")
+    if pace_ratio < V17_3_2_MIN_PACE_RATIO and not exceptional:
+        hard_failures.append(
+            f"follow-through pace x{pace_ratio:.2f} < x{V17_3_2_MIN_PACE_RATIO:.2f}"
+        )
+    if not btc_aligned and not exceptional:
+        hard_failures.append(f"BTC {btc_dir} conflicts with {side}")
+
+    score = 45.0
+    score += min(15.0, max(0.0, (d3 - 0.006) / 0.020) * 15.0)
+    score += min(12.0, max(0.0, (d15 - 0.006) / 0.035) * 12.0)
+    score += min(6.0, max(0.0, (d30 + 0.0025) / 0.040) * 6.0)
+    score += min(6.0, max(0.0, (vol1 - 0.70) / 1.30) * 6.0)
+    score += min(5.0, max(0.0, (range1 - 1.20) / 1.20) * 5.0)
+    score += min(5.0, max(0.0, (range5 - 0.55) / 0.80) * 5.0)
+    score += min(4.0, max(0.0, (pace_ratio - 0.80) / 1.20) * 4.0)
+    score += 5.0 if btc_aligned else (2.0 if exceptional else 0.0)
+    score = max(0.0, min(100.0, score))
+
+    if hard_failures:
+        return False, "; ".join(hard_failures[:4]), score
+    if score < V17_3_2_MIN_SCORE:
+        return False, f"follow-through score {score:.1f} < {V17_3_2_MIN_SCORE:.1f}", score
+
+    return True, (
+        f"V17.3.2 follow-through ok: score {score:.1f}; "
+        f"3m {d3*100:.2f}%, 15m {d15*100:.2f}%, 30m {d30*100:.2f}%, "
+        f"pace x{pace_ratio:.2f}, Vol1 x{vol1:.2f}, Vol5 x{vol5:.2f}, "
+        f"Range1 x{range1:.2f}, Range5 x{range5:.2f}, BTC {btc_dir}"
+    ), score
 
 
 def direct_measured_risk_gate(
@@ -7281,7 +7418,9 @@ def rebuild_symbol_outcomes_from_adaptive_db() -> Dict[str, Any]:
             "near_miss_probe",
             PAPER_VALIDATION_REASON,
             PAPER_CONTROL_REASON,
-            LEGACY_V17_2_1_PAPER_VALIDATION_REASON,
+            LEGACY_V17_3_1_PAPER_VALIDATION_REASON,
+                LEGACY_V17_3_1_CONTROL_REASON,
+                LEGACY_V17_2_1_PAPER_VALIDATION_REASON,
             LEGACY_V17_2_1_CONTROL_REASON,
             LEGACY_V17_1_PAPER_VALIDATION_REASON,
             LEGACY_V17_1_CONTROL_REASON,
@@ -7465,8 +7604,8 @@ def analyze_symbol(
 
             independent, independence_reason = paper_symbol_independence_gate(trade)
             if not independent:
-                blocks["v17_2_2_correlated_repeat"] = blocks.get(
-                    "v17_2_2_correlated_repeat", 0
+                blocks["v17_3_2_correlated_repeat"] = blocks.get(
+                    "v17_3_2_correlated_repeat", 0
                 ) + 1
                 record_watch_audit(
                     trade, "rejected:symbol_repeat", independence_reason
@@ -7474,16 +7613,49 @@ def analyze_symbol(
                 continue
 
             trade["strategy"] = DIRECT_MEASURED_STRATEGIES[side]
-            trade["trade_type"] = f"DIRECT MEASURED A+ {side}"
-            trade["setup_mode"] = f"V17_2_2_DIRECT_MEASURED_{side}"
-            trade["paper_setup_lane"] = "DIRECT_MEASURED"
+            trade["trade_type"] = f"FOLLOW-THROUGH A+ {side}"
+            trade["setup_mode"] = f"V17_3_2_FOLLOWTHROUGH_{side}"
+            trade["paper_setup_lane"] = "FOLLOW_THROUGH"
             trade["paper_validation_lane"] = PAPER_VALIDATION_REASON
             trade["paper_validation_immediate"] = True
             trade["v17_2_risk_reason"] = risk_reason
+
+            # Pair the exact broad V17.3.1 candidate as CONTROL before applying
+            # the new selector. This gives a same-market benchmark instead of
+            # comparing different days or market regimes.
+            control = dict(trade)
+            control["trade_type"] = f"V17.3.1 BASELINE CONTROL {side}"
+            control["paper_setup_lane"] = "V17_3_1_BASELINE"
+            control["paper_validation_only"] = True
+            control["paper_validation_immediate"] = False
+            control["paper_validation_origin"] = (
+                f"V17.3.1 paired baseline · {detector_reason} · "
+                f"{entry_reason} · {risk_reason} · {independence_reason}"
+            )
+            add_shadow_signal(control, PAPER_CONTROL_REASON)
+
+            follow_ok, follow_reason, follow_score = v17_3_2_followthrough_gate(
+                trade, btc
+            )
+            trade["followthrough_score"] = follow_score
+            trade["followthrough_reason"] = follow_reason
+            if not follow_ok:
+                blocks["v17_3_2_followthrough_block"] = blocks.get(
+                    "v17_3_2_followthrough_block", 0
+                ) + 1
+                record_watch_audit(
+                    trade, "rejected:followthrough", follow_reason
+                )
+                if len(near_miss) < 8:
+                    near_miss.append(
+                        f"{display_symbol(symbol)} {side}: CONTROL only · {follow_reason}"
+                    )
+                continue
+
             trade["paper_validation_origin"] = (
-                f"V17.3 independent direct measured cohort · "
-                f"{detector_reason} · {entry_reason} · {risk_reason} · "
-                f"{independence_reason}"
+                f"V17.3.2 selected from paired V17.3.1 control · "
+                f"{follow_reason} · {detector_reason} · {entry_reason} · "
+                f"{risk_reason} · {independence_reason}"
             )
             # A promoted model may only influence a stable canary fraction of
             # LIVE alerts.  It never removes a candidate from the visible PAPER
@@ -7926,7 +8098,7 @@ def build_control_result_message(
         f"Цена наблюдения: {format_price(signal.get('entry'))} · "
         f"выход: {format_price(closing_price)}\n"
         f"Итог: {_estimate_pnl_r(signal, result):+.3f}R.\n"
-        "Это парный контроль старого немедленного входа; он видим, но не обучает модель."
+        "Это парный CONTROL исход V17.3.1 на тех же рыночных условиях; он видим, но не обучает V17.3.2."
     )
 
 
@@ -7985,7 +8157,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     paper_metrics = paper_validation_metrics()
     readiness = real_money_readiness()
     return (
-        f"🧪 Диагностика V17.3 Direct Measured Entry\n"
+        f"🧪 Диагностика V17.3.2 Follow-Through Selector\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -7998,8 +8170,8 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
         f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"LIVE история: {wr_text(STATE.get('stats', {}).get('total', {}))}\n"
-        f"CONTROL V17.3: {_metrics_line(control_metrics)}\n"
-        f"DIRECT MEASURED PAPER V17.3: {_metrics_line(paper_metrics)} · "
+        f"CONTROL V17.3.1: {_metrics_line(control_metrics)}\n"
+        f"FOLLOW-THROUGH PAPER V17.3.2: {_metrics_line(paper_metrics)} · "
         f"{int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))}\n"
         f"Micro-LIVE readiness: ready={readiness.get('ready', False)} · "
@@ -8226,7 +8398,7 @@ def watch_audit_summary() -> str:
         )
     lane_text = ", ".join(lane_bits) or "нет"
     return (
-        f"FUNNEL V17.3: liquidity={int(audit.get('liquidity_passed', 0) or 0)}/"
+        f"FUNNEL V17.3.2: liquidity={int(audit.get('liquidity_passed', 0) or 0)}/"
         f"{int(audit.get('liquidity_checked', 0) or 0)} · "
         f"detected={int(audit.get('started', 0) or 0)} · "
         f"execution={int(audit.get('execution_passed', 0) or 0)} · "
@@ -9074,6 +9246,8 @@ def safe_record_learning_result(
                 "near_miss_probe",
                 PAPER_VALIDATION_REASON,
                 PAPER_CONTROL_REASON,
+                LEGACY_V17_3_1_PAPER_VALIDATION_REASON,
+                LEGACY_V17_3_1_CONTROL_REASON,
                 LEGACY_V17_2_1_PAPER_VALIDATION_REASON,
                 LEGACY_V17_2_1_CONTROL_REASON,
                 LEGACY_V17_1_PAPER_VALIDATION_REASON,
@@ -9516,6 +9690,8 @@ async def scan_loop():
         f"Execution gate: spread ≤ {MEASURED_MAX_BOOK_SPREAD_BPS:.1f} bps · visible depth ≥ "
         f"{MEASURED_MIN_BOOK_DEPTH_USDT:.0f} USDT/side · 60m turnover proxy ≥ {MEASURED_MIN_QUOTE_60M:.0f}.\n"
         f"Anti-chase: no delayed 90%–100% reclaim entry; the failed V17.2 retest path is excluded.\n"
+        f"V17.3.2 selector: broad V17.3.1 entries stay as paired CONTROL; only follow-through score ≥ {V17_3_2_MIN_SCORE:.0f} enters new PAPER.\n"
+        f"SHORT official PAPER: {V17_3_2_SHORT_PAPER_ENABLED}; when False, SHORT remains visible CONTROL/SHADOW only.\n"
         f"Every PAPER entry/result is visible in Telegram; SHADOW near-miss observations are visible too.\n"
         f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
         f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
@@ -9523,8 +9699,8 @@ async def scan_loop():
         f"Reports: first quality checkpoint at {PAPER_PILOT_REQUIRED_OUTCOMES} · full review at "
         f"{PAPER_REVIEW_REQUIRED_OUTCOMES} · model remains frozen until at least "
         f"{PAPER_LANE_REQUIRED_OUTCOMES} unchanged PAPER outcomes.\n"
-        f"Data separation: old {source_counts['all']} outcomes and every pre-V17.3 row are audit-only; "
-        f"only new direct-measured PAPER can train.\n"
+        f"Data separation: old {source_counts['all']} outcomes and every pre-V17.3.2 row are audit-only; "
+        f"only new V17.3.2 follow-through PAPER can train.\n"
         f"Real-money readiness: ready={readiness.get('ready', False)} · env flag REAL_MONEY_SIGNALS="
         f"{readiness.get('live_flag', False)} · enabled={readiness.get('live_enabled', False)}. "
         f"Both evidence and manual flag are mandatory. This code never places exchange orders.\n"
