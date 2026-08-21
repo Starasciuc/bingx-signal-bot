@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V17.3.2 FORWARD FOLLOW-THROUGH SELECTOR
+# VERIFIED GITHUB DEPLOY FILE — V18.0 DUAL-LANE SCALPER PAPER
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2585,8 +2585,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V17.3.2 FORWARD FOLLOW-THROUGH PAPER"
-DEPLOY_MARKER = "V17_3_2_FORWARD_FOLLOWTHROUGH_25_2026_08_21"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V18.0 DUAL-LANE SCALPER PAPER"
+DEPLOY_MARKER = "V18_0_DUAL_LANE_FOLLOWTHROUGH_ACTIVE_MOVER_2026_08_21"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2679,6 +2679,7 @@ VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
     "VISIBLE_SHADOW_NOTIFICATIONS", "true"
 ).lower() == "true"
 PAPER_VALIDATION_REASON = "followthrough_paper_v17_3_2"
+TRADER_STYLE_PAPER_REASON = "active_mover_paper_v18"
 PAPER_CONTROL_REASON = "direct_measured_control_v17_3_1"
 REAL_MONEY_LIVE_REASON = "followthrough_micro_live_v17_3_2"
 LEGACY_V17_3_1_PAPER_VALIDATION_REASON = "direct_measured_paper_v17_2_2"
@@ -2971,6 +2972,41 @@ LADDER_FOLLOWUP_MINUTES = int(os.getenv("LADDER_FOLLOWUP_MINUTES", "90"))
 AUTO_TELEGRAM_BACKUP = os.getenv("AUTO_TELEGRAM_BACKUP", "true").lower() == "true"
 AUTO_BACKUP_EVERY_CLOSED = int(os.getenv("AUTO_BACKUP_EVERY_CLOSED", "25"))
 
+
+
+# --- V18 ACTIVE-MOVER experimental PAPER lane ---
+# Visual identity:
+# ⚡ = fast follow-through (old V17.3.2 logic)
+# 🧲 = active-mover / trader-style (slower realization allowed)
+#
+# This lane does NOT imitate averaging. It tracks a separate PAPER stop and a
+# longer time horizon so slower but valid moves are not automatically classified
+# as expired after six minutes.
+ACTIVE_MOVER_ENABLED = os.getenv("ACTIVE_MOVER_ENABLED", "true").lower() == "true"
+ACTIVE_MOVER_MIN_ABS_3M = float(os.getenv("ACTIVE_MOVER_MIN_ABS_3M", "0.0025"))
+ACTIVE_MOVER_MIN_ABS_15M = float(os.getenv("ACTIVE_MOVER_MIN_ABS_15M", "0.0060"))
+ACTIVE_MOVER_MIN_RECENT_RANGE = float(os.getenv("ACTIVE_MOVER_MIN_RECENT_RANGE", "0.0180"))
+ACTIVE_MOVER_MIN_VOL1 = float(os.getenv("ACTIVE_MOVER_MIN_VOL1", "0.35"))
+ACTIVE_MOVER_MIN_RANGE1 = float(os.getenv("ACTIVE_MOVER_MIN_RANGE1", "0.70"))
+ACTIVE_MOVER_MIN_VOL5 = float(os.getenv("ACTIVE_MOVER_MIN_VOL5", "0.18"))
+ACTIVE_MOVER_MIN_RANGE5 = float(os.getenv("ACTIVE_MOVER_MIN_RANGE5", "0.55"))
+ACTIVE_MOVER_MIN_BODY = float(os.getenv("ACTIVE_MOVER_MIN_BODY", "0.28"))
+ACTIVE_MOVER_MIN_BOOK_DEPTH_USDT = float(os.getenv("ACTIVE_MOVER_MIN_BOOK_DEPTH_USDT", "500"))
+ACTIVE_MOVER_MAX_BOOK_SPREAD_BPS = float(os.getenv("ACTIVE_MOVER_MAX_BOOK_SPREAD_BPS", "18.0"))
+ACTIVE_MOVER_MIN_QUOTE_60M = float(os.getenv("ACTIVE_MOVER_MIN_QUOTE_60M", "50000"))
+ACTIVE_MOVER_SOFT_EXPIRE_MINUTES = int(os.getenv("ACTIVE_MOVER_SOFT_EXPIRE_MINUTES", "30"))
+ACTIVE_MOVER_HARD_EXPIRE_MINUTES = int(os.getenv("ACTIVE_MOVER_HARD_EXPIRE_MINUTES", "120"))
+ACTIVE_MOVER_MIN_PROGRESS_AT_SOFT = float(os.getenv("ACTIVE_MOVER_MIN_PROGRESS_AT_SOFT", "0.15"))
+ACTIVE_MOVER_MAX_ACTIVE = int(os.getenv("ACTIVE_MOVER_MAX_ACTIVE", "5"))
+
+# Trader-style ladder from the supplied examples: roughly 0.8 / 1.4 / 2 / 3 / 4%.
+ACTIVE_TP1_MOVE = float(os.getenv("ACTIVE_TP1_MOVE", "0.0080"))
+ACTIVE_TP2_MOVE = float(os.getenv("ACTIVE_TP2_MOVE", "0.0140"))
+ACTIVE_TP3_MOVE = float(os.getenv("ACTIVE_TP3_MOVE", "0.0200"))
+ACTIVE_TP4_MOVE = float(os.getenv("ACTIVE_TP4_MOVE", "0.0300"))
+ACTIVE_TP5_MOVE = float(os.getenv("ACTIVE_TP5_MOVE", "0.0400"))
+ACTIVE_MIN_SL_MOVE = float(os.getenv("ACTIVE_MIN_SL_MOVE", "0.0120"))
+ACTIVE_MAX_SL_MOVE = float(os.getenv("ACTIVE_MAX_SL_MOVE", "0.0240"))
 
 # --- V17.3.2 forward follow-through selector ---
 # First unchanged V17.3.1 PAPER cohort: 25 outcomes = 2 TP3+ / 8 SL / 15 expired.
@@ -6404,6 +6440,229 @@ def v17_2_dual_paper_setup(
 #   new candidate in forward PAPER before any live routing.
 # - TP3+ remains the minimum profitable outcome.
 #
+
+def active_mover_paper_metrics() -> Dict[str, Any]:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT result, pnl_r, symbol FROM adaptive_trades "
+            "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
+            (TRADER_STYLE_PAPER_REASON,),
+        ).fetchall()
+    metrics = _outcome_metrics(rows)
+    metrics["unique_symbols"] = len(
+        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
+    )
+    return metrics
+
+
+def active_mover_setup(
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+    c15: List[Dict[str, float]],
+    c1h: List[Dict[str, float]],
+    btc: Dict[str, Any],
+    side: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Experimental trader-style PAPER detector.
+
+    Looks for an unusually active coin with enough intraday range, then accepts
+    either continuation OR a local reclaim/reject. Immediate 6-minute follow-
+    through is not mandatory; that is the key difference from ⚡ lane.
+    """
+    if not ACTIVE_MOVER_ENABLED:
+        return None, "disabled"
+    if len(c1) < 35 or len(c5) < 36 or len(c15) < 12 or len(c1h) < 30:
+        return None, "candles"
+
+    side = str(side).upper()
+    if side not in {"LONG", "SHORT"}:
+        return None, "side"
+
+    direction = 1.0 if side == "LONG" else -1.0
+    price = float(c1[-1]["close"])
+    last1 = c1[-1]
+    ch3 = percent_change(c1, 3)
+    ch15 = percent_change(c5, 3)
+    ch30 = percent_change(c5, 6)
+    d3 = direction * ch3
+    d15 = direction * ch15
+    vol1 = volume_ratio(c1, 20)
+    range1 = candle_range_ratio(c1, 20)
+    vol5 = volume_ratio(c5, 20)
+    range5 = candle_range_ratio(c5, 20)
+    recent_high = max(float(x["high"]) for x in c5[-12:])
+    recent_low = min(float(x["low"]) for x in c5[-12:])
+    recent_range = (recent_high - recent_low) / max(price, 1e-12)
+    body = abs(last1["close"] - last1["open"]) / max(last1["high"] - last1["low"], 1e-12)
+    loc = close_location(last1)
+
+    # "Hot coin" first: substantial recent range plus live participation.
+    if recent_range < ACTIVE_MOVER_MIN_RECENT_RANGE:
+        return None, "recent_range"
+    if vol1 < ACTIVE_MOVER_MIN_VOL1 or range1 < ACTIVE_MOVER_MIN_RANGE1:
+        return None, "live_participation"
+    if vol5 < ACTIVE_MOVER_MIN_VOL5 or range5 < ACTIVE_MOVER_MIN_RANGE5:
+        return None, "5m_participation"
+    if body < ACTIVE_MOVER_MIN_BODY:
+        return None, "body"
+
+    ema9 = ema(closes(c1), 9)
+    vw = vwap(c1, 30)
+    recent = c1[-10:-1]
+
+    if side == "LONG":
+        continuation = (
+            d3 >= ACTIVE_MOVER_MIN_ABS_3M
+            and d15 >= ACTIVE_MOVER_MIN_ABS_15M
+            and last1["close"] > last1["open"]
+            and price >= ema9
+        )
+        swept = min(x["low"] for x in c1[-5:-1]) <= min(x["low"] for x in recent) * 1.0015
+        reclaim = (
+            last1["close"] > last1["open"]
+            and price >= ema9
+            and price >= vw * 0.998
+            and loc >= 0.58
+        )
+        local_turn = swept and reclaim
+        if not (continuation or local_turn):
+            return None, "no_long_trigger"
+        level = min(float(x["low"]) for x in c1[-12:])
+        trigger = "RECLAIM" if local_turn else "CONTINUATION"
+    else:
+        continuation = (
+            d3 >= ACTIVE_MOVER_MIN_ABS_3M
+            and d15 >= ACTIVE_MOVER_MIN_ABS_15M
+            and last1["close"] < last1["open"]
+            and price <= ema9
+        )
+        swept = max(x["high"] for x in c1[-5:-1]) >= max(x["high"] for x in recent) * 0.9985
+        reject = (
+            last1["close"] < last1["open"]
+            and price <= ema9
+            and price <= vw * 1.002
+            and loc <= 0.42
+        )
+        local_turn = swept and reject
+        if not (continuation or local_turn):
+            return None, "no_short_trigger"
+        level = max(float(x["high"]) for x in c1[-12:])
+        trigger = "REJECT" if local_turn else "CONTINUATION"
+
+    # At least one directional time window OR a true local turn must support the side.
+    if not local_turn and abs(ch3) < ACTIVE_MOVER_MIN_ABS_3M:
+        return None, "weak_3m"
+
+    score = 70.0
+    score += min(8.0, recent_range * 100.0)
+    score += min(6.0, max(0.0, vol1 - 0.35) * 4.0)
+    score += min(6.0, max(0.0, range1 - 0.70) * 4.0)
+    score += 5.0 if local_turn else 0.0
+    score += min(5.0, max(0.0, d3) * 300.0)
+    score = min(100.0, score)
+
+    reason = (
+        f"V18 🧲 ACTIVE MOVER {side}: {trigger}; recent range {recent_range*100:.2f}%, "
+        f"3m {ch3*100:+.2f}%, 15m {ch15*100:+.2f}%, 30m {ch30*100:+.2f}%, "
+        f"Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, Vol5 x{vol5:.2f}, "
+        f"Range5 x{range5:.2f}, closeLoc {loc:.2f}. Longer PAPER horizon."
+    )
+    return {
+        "symbol": normalize_symbol(symbol),
+        "side": side,
+        "strategy": f"PRO_ACTIVE_MOVER_{side}",
+        "trade_type": f"🧲 ACTIVE MOVER {side}",
+        "score": int(round(score)),
+        "grade": "A+",
+        "entry": price,
+        "level": level,
+        "reason": reason,
+        "pullback": 0.0,
+        "volume_ratio": vol5,
+        "range_ratio": range5,
+        "compression": prior_compression_ratio(c5),
+        "ch15m": ch15,
+        "ch30m": ch30,
+        "ch3m_1m": ch3,
+        "vol1": vol1,
+        "range1": range1,
+        "ch2m": percent_change(c1, 2),
+        "setup_mode": f"V18_ACTIVE_MOVER_{side}",
+        "t1h": trend_state(c1h),
+        "btc_text": btc.get("text", ""),
+        "paper_setup_lane": "🧲 ACTIVE MOVER",
+        "paper_style": "ACTIVE_MOVER",
+        "paper_validation_lane": TRADER_STYLE_PAPER_REASON,
+        "paper_validation_origin": reason,
+        "created_at": now_ts(),
+    }, "active_mover_ok"
+
+
+def calculate_active_mover_trade(
+    setup: Dict[str, Any],
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+) -> Optional[Dict[str, Any]]:
+    side = str(setup["side"]).upper()
+    entry = float(setup["entry"])
+    if entry <= 0:
+        return None
+
+    a = atr(c5, 14)
+    atr_move = (a / entry) if entry > 0 else 0.0
+    technical = abs(entry - float(setup.get("level", entry))) / entry
+    sl_move = max(ACTIVE_MIN_SL_MOVE, min(ACTIVE_MAX_SL_MOVE, max(technical * 1.05, atr_move * 1.25)))
+
+    if side == "LONG":
+        sl = entry * (1 - sl_move)
+        tp1 = entry * (1 + ACTIVE_TP1_MOVE)
+        tp2 = entry * (1 + ACTIVE_TP2_MOVE)
+        tp3 = entry * (1 + ACTIVE_TP3_MOVE)
+        tp4 = entry * (1 + ACTIVE_TP4_MOVE)
+        tp5 = entry * (1 + ACTIVE_TP5_MOVE)
+    else:
+        sl = entry * (1 + sl_move)
+        tp1 = entry * (1 - ACTIVE_TP1_MOVE)
+        tp2 = entry * (1 - ACTIVE_TP2_MOVE)
+        tp3 = entry * (1 - ACTIVE_TP3_MOVE)
+        tp4 = entry * (1 - ACTIVE_TP4_MOVE)
+        tp5 = entry * (1 - ACTIVE_TP5_MOVE)
+
+    rewards = [abs(tp1-entry), abs(tp2-entry), abs(tp3-entry), abs(tp4-entry), abs(tp5-entry)]
+    risk = abs(entry-sl)
+    if risk <= 0:
+        return None
+
+    trade = dict(setup)
+    trade.update({
+        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "tp5": tp5,
+        "rr": rewards[0]/risk,
+        "ladder_rr": (sum(rewards)/len(rewards))/risk,
+        "final_rr": rewards[-1]/risk,
+        "roi_tp1": ACTIVE_TP1_MOVE * LEVERAGE * 100,
+        "roi_sl": sl_move * LEVERAGE * 100,
+        "risk_mult": FAST_RISK_MULT,
+        "status": "active",
+        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "tp4_hit": False, "tp5_hit": False,
+    })
+    return trade
+
+
+def active_mover_execution_ok(trade: Dict[str, Any]) -> Tuple[bool, str]:
+    spread = float(trade.get("book_spread_bps", 0.0) or 0.0)
+    depth = float(trade.get("book_depth_usdt", 0.0) or 0.0)
+    quote60 = float(trade.get("liquidity_quote_60m", 0.0) or 0.0)
+    if spread > ACTIVE_MOVER_MAX_BOOK_SPREAD_BPS:
+        return False, f"spread {spread:.1f} bps > {ACTIVE_MOVER_MAX_BOOK_SPREAD_BPS:.1f}"
+    if depth < ACTIVE_MOVER_MIN_BOOK_DEPTH_USDT:
+        return False, f"depth {depth:.0f} < {ACTIVE_MOVER_MIN_BOOK_DEPTH_USDT:.0f}"
+    if quote60 and quote60 < ACTIVE_MOVER_MIN_QUOTE_60M:
+        return False, f"turn60 {quote60:.0f} < {ACTIVE_MOVER_MIN_QUOTE_60M:.0f}"
+    return True, "execution ok"
+
+
 def direct_measured_setup(
     symbol: str,
     c1: List[Dict[str, float]],
@@ -7531,6 +7790,59 @@ def analyze_symbol(
         blocks["no_candles"] = blocks.get("no_candles", 0) + 1
         return None
 
+    # V18 second lane: study trader-style active movers in PAPER even when the
+    # symbol would be too risky for the fast lane. This never creates exchange orders.
+    if ACTIVE_MOVER_ENABLED:
+        active_count = sum(
+            1 for item in STATE.setdefault("shadow_signals", [])
+            if str(item.get("shadow_reason", "")) == TRADER_STYLE_PAPER_REASON
+        )
+        if active_count < max(0, ACTIVE_MOVER_MAX_ACTIVE):
+            for active_side in ("LONG", "SHORT"):
+                am_setup, am_reason = active_mover_setup(
+                    symbol, c1, c5, c15, c1h, btc, active_side
+                )
+                if not am_setup:
+                    blocks[f"v18_active_{am_reason}_{active_side.lower()}"] = (
+                        blocks.get(f"v18_active_{am_reason}_{active_side.lower()}", 0) + 1
+                    )
+                    continue
+
+                # Reuse the public execution/liquidity snapshot logic.
+                entry_ok, entry_reason = measured_edge_entry_gate(
+                    am_setup, symbol, c1, c5
+                )
+                if not entry_ok:
+                    blocks["v18_active_execution_block"] = blocks.get(
+                        "v18_active_execution_block", 0
+                    ) + 1
+                    continue
+
+                am_trade = calculate_active_mover_trade(am_setup, c1, c5)
+                if not am_trade:
+                    continue
+
+                # measured_edge_entry_gate adds book/liquidity fields to setup/trade
+                # through the shared dict path; if unavailable, retain the captured values.
+                exec_ok, exec_reason = active_mover_execution_ok(am_trade)
+                if not exec_ok:
+                    blocks["v18_active_execution_quality_block"] = blocks.get(
+                        "v18_active_execution_quality_block", 0
+                    ) + 1
+                    continue
+
+                # Independent cooldown is lane-specific because this is a different hypothesis.
+                am_trade["paper_validation_origin"] = (
+                    f"{am_trade.get('paper_validation_origin','')} · {entry_reason} · {exec_reason}"
+                )
+                if add_shadow_signal(am_trade, TRADER_STYLE_PAPER_REASON):
+                    send_telegram(build_paper_signal_message(am_trade))
+                    blocks["v18_active_paper_sent"] = blocks.get("v18_active_paper_sent", 0) + 1
+                    active_count += 1
+                    if active_count >= max(0, ACTIVE_MOVER_MAX_ACTIVE):
+                        break
+
+    # Fast ⚡ lane keeps the existing ultra-risk protection.
     if ultra_risk_symbol(symbol, c5, c15):
         blocks["ultra_risk_block"] = blocks.get("ultra_risk_block", 0) + 1
         return None
@@ -8013,12 +8325,21 @@ def build_signal_message(s: Dict[str, Any]) -> str:
 
 
 def build_paper_signal_message(s: Dict[str, Any]) -> str:
+    is_active = str(s.get("paper_style", "")) == "ACTIVE_MOVER" or str(s.get("paper_validation_lane", "")) == TRADER_STYLE_PAPER_REASON
+    badge = "🧲🟣 ACTIVE MOVER" if is_active else "⚡🟡 FOLLOW-THROUGH"
+    horizon = (
+        f"до {ACTIVE_MOVER_HARD_EXPIRE_MINUTES} мин; мягкая проверка после {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES} мин"
+        if is_active
+        else f"быстрый режим: {FAST_MAX_MINUTES_TO_TP1}/{FAST_HARD_EXPIRE_MINUTES} мин"
+    )
     return (
-        "📋 PAPER-ВХОД V17.3 — НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
+        f"📋 PAPER-ВХОД V18 · {badge}\n"
+        "🚫 НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
         f"{s['side']} {display_symbol(s['symbol'])} · {s['grade']} · Score {s['score']}\n"
-        f"Линия: {s.get('paper_setup_lane', 'DIRECT_MEASURED')}\n"
+        f"Линия: {s.get('paper_setup_lane', '⚡ FOLLOW-THROUGH')}\n"
         f"Стратегия: {s['strategy']}\n"
-        "Статус: независимый A+ detector прошёл фиксированный диапазон, текущую структуру и проверку исполнения; только PAPER.\n\n"
+        f"Горизонт: {horizon}\n"
+        "Статус: виртуальная проверка стратегии; только PAPER.\n\n"
         f"Вход наблюдения: {format_price(s['entry'])}\n"
         f"TP1: {format_price(s['tp1'])}\n"
         f"TP2: {format_price(s['tp2'])}\n"
@@ -8033,13 +8354,15 @@ def build_paper_signal_message(s: Dict[str, Any]) -> str:
         f"Range1 x{float(s.get('range1', 0.0) or 0.0):.2f} · "
         f"3m {float(s.get('ch3m_1m', 0.0) or 0.0)*100:+.2f}%\n"
         f"Почему PAPER: {s.get('paper_validation_origin', 'forward challenger')}\n"
-        f"Следующий отчёт: {paper_progress_target(int(paper_validation_metrics().get('n', 0) or 0))} закрытых V17.3 PAPER."
+        f"Следующий отчёт: каждые 25 закрытых исходов сохраняется JSON."
     )
 
 
 def build_paper_result_message(
     signal: Dict[str, Any], result: str, closing_price: float
 ) -> str:
+    is_active = str(signal.get("paper_style", "")) == "ACTIVE_MOVER" or str(signal.get("shadow_reason", "")) == TRADER_STYLE_PAPER_REASON
+    badge = "🧲🟣 ACTIVE MOVER" if is_active else "⚡🟡 FOLLOW-THROUGH"
     labels = {
         "profit": "✅ TP3+",
         "sl": "❌ STOP LOSS",
@@ -8051,15 +8374,16 @@ def build_paper_result_message(
     age_minutes = max(
         0.0, (now_ts() - int(signal.get("created_at", now_ts()) or now_ts())) / 60.0
     )
-    paper_metrics = paper_validation_metrics()
+    paper_metrics = active_mover_paper_metrics() if is_active else paper_validation_metrics()
+    stats_name = "ACTIVE MOVER V18" if is_active else "FOLLOW-THROUGH V17.3.2"
     return (
-        f"📋 PAPER РЕЗУЛЬТАТ: {labels.get(result, result.upper())}\n"
+        f"📋 PAPER РЕЗУЛЬТАТ · {badge}: {labels.get(result, result.upper())}\n"
         f"{signal.get('side', '?')} {display_symbol(signal.get('symbol', '?'))}\n"
         f"Стратегия: {signal.get('strategy', '?')}\n"
         f"Вход: {format_price(signal.get('entry'))} · выход: {format_price(closing_price)}\n"
         f"Итог: {pnl_r:+.3f}R · время {age_minutes:.1f} мин.\n"
         "Это результат подтверждённого виртуального входа, не реальная сделка.\n"
-        f"Direct Measured PAPER V17.3: {_metrics_line(paper_metrics)} · "
+        f"{stats_name}: {_metrics_line(paper_metrics)} · "
         f"собрано {int(paper_metrics.get('n', 0))}/"
         f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
         f"уникальных монет {int(paper_metrics.get('unique_symbols', 0))}."
@@ -8157,7 +8481,7 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     paper_metrics = paper_validation_metrics()
     readiness = real_money_readiness()
     return (
-        f"🧪 Диагностика V17.3.2 Follow-Through Selector\n"
+        f"🧪 Диагностика V18 Dual-Lane · ⚡ Follow-Through + 🧲 Active Mover\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -8224,7 +8548,7 @@ def shadow_key(signal: Dict[str, Any]) -> str:
         or signal.get("paper_validation_lane")
         or ""
     )
-    if lane in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON}:
+    if lane in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}:
         return f"{base}:{lane}"
     return base
 
@@ -8242,7 +8566,7 @@ def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
         return False
     with STATE_IO_LOCK:
         shadows = STATE.setdefault("shadow_signals", [])
-        protected_lane = reason in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON}
+        protected_lane = reason in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
         ordinary_limit = max(0, SHADOW_MAX_ACTIVE - max(0, SHADOW_PAPER_RESERVED_SLOTS))
         if protected_lane and len(shadows) >= SHADOW_MAX_ACTIVE:
             return False
@@ -9309,7 +9633,7 @@ def track_shadow_signals() -> bool:
             safe_record_learning_result(signal, close_result, source="shadow")
             if (
                 PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
             ):
                 send_telegram(
                     build_paper_result_message(signal, close_result, effective_sl)
@@ -9328,7 +9652,7 @@ def track_shadow_signals() -> bool:
         if (
             PAPER_BREAKEVEN_AFTER_TP1
             and signal.get("tp1_hit")
-            and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+            and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
             and signal.get("protected_sl") is None
         ):
             entry = float(signal.get("entry", price) or price)
@@ -9351,7 +9675,7 @@ def track_shadow_signals() -> bool:
         # the only positive classification used by the quality target.
         if (
             signal.get("tp2_hit")
-            and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+            and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
             and not signal.get("tp2_protected")
         ):
             fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
@@ -9376,7 +9700,7 @@ def track_shadow_signals() -> bool:
             safe_record_learning_result(signal, "profit", source="shadow")
             if (
                 PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
             ):
                 send_telegram(
                     build_paper_result_message(
@@ -9393,19 +9717,32 @@ def track_shadow_signals() -> bool:
             continue
 
         directional, progress = directional_progress_ratio(signal, price)
-        fast_stop = (
-            FAST_CANCEL_IF_NO_PROGRESS
-            and age_minutes >= FAST_MAX_MINUTES_TO_TP1
-            and ((not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP)
+        is_active_mover = (
+            str(signal.get("paper_style", "")) == "ACTIVE_MOVER"
+            or str(signal.get("shadow_reason", "")) == TRADER_STYLE_PAPER_REASON
         )
+        if is_active_mover:
+            fast_stop = (
+                age_minutes >= ACTIVE_MOVER_SOFT_EXPIRE_MINUTES
+                and not signal.get("tp1_hit")
+                and ((not directional) or progress < ACTIVE_MOVER_MIN_PROGRESS_AT_SOFT)
+            )
+            hard_expire_minutes = ACTIVE_MOVER_HARD_EXPIRE_MINUTES
+        else:
+            fast_stop = (
+                FAST_CANCEL_IF_NO_PROGRESS
+                and age_minutes >= FAST_MAX_MINUTES_TO_TP1
+                and ((not directional) or progress < FAST_MIN_PROGRESS_TO_KEEP)
+            )
+            hard_expire_minutes = FAST_HARD_EXPIRE_MINUTES
         if signal.get("tp1_hit"):
             fast_stop = False
-        if fast_stop or age_minutes >= FAST_HARD_EXPIRE_MINUTES:
+        if fast_stop or age_minutes >= hard_expire_minutes:
             signal["_closing_price"] = price
             safe_record_learning_result(signal, "expired", source="shadow")
             if (
                 PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) == PAPER_VALIDATION_REASON
+                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
             ):
                 send_telegram(
                     build_paper_result_message(signal, "expired", float(price))
@@ -9692,6 +10029,8 @@ async def scan_loop():
         f"Anti-chase: no delayed 90%–100% reclaim entry; the failed V17.2 retest path is excluded.\n"
         f"V17.3.2 selector: broad V17.3.1 entries stay as paired CONTROL; only follow-through score ≥ {V17_3_2_MIN_SCORE:.0f} enters new PAPER.\n"
         f"SHORT official PAPER: {V17_3_2_SHORT_PAPER_ENABLED}; when False, SHORT remains visible CONTROL/SHADOW only.\n"
+        f"Telegram lanes: ⚡🟡 FOLLOW-THROUGH = быстрый импульс; 🧲🟣 ACTIVE MOVER = более долгий trader-style PAPER.\n"
+        f"ACTIVE MOVER horizon: soft {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES} мин · hard {ACTIVE_MOVER_HARD_EXPIRE_MINUTES} мин · TP ladder {ACTIVE_TP1_MOVE*100:.1f}/{ACTIVE_TP2_MOVE*100:.1f}/{ACTIVE_TP3_MOVE*100:.1f}/{ACTIVE_TP4_MOVE*100:.1f}/{ACTIVE_TP5_MOVE*100:.1f}%.\n"
         f"Every PAPER entry/result is visible in Telegram; SHADOW near-miss observations are visible too.\n"
         f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
         f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
