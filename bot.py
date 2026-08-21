@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V18.0 DUAL-LANE SCALPER PAPER
+# VERIFIED GITHUB DEPLOY FILE — V18.1 ACTIVE MOVER TRIGGER WATCH
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2586,7 +2586,7 @@ def build_export_bytes() -> bytes:
 # ============================================================
 
 APP_NAME = "Professional Adaptive Futures Bot AUTO V18.0 DUAL-LANE SCALPER PAPER"
-DEPLOY_MARKER = "V18_0_DUAL_LANE_FOLLOWTHROUGH_ACTIVE_MOVER_2026_08_21"
+DEPLOY_MARKER = "V18_1_DUAL_LANE_ACTIVE_MOVER_TRIGGER_WATCH_2026_08_21"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2998,6 +2998,18 @@ ACTIVE_MOVER_SOFT_EXPIRE_MINUTES = int(os.getenv("ACTIVE_MOVER_SOFT_EXPIRE_MINUT
 ACTIVE_MOVER_HARD_EXPIRE_MINUTES = int(os.getenv("ACTIVE_MOVER_HARD_EXPIRE_MINUTES", "120"))
 ACTIVE_MOVER_MIN_PROGRESS_AT_SOFT = float(os.getenv("ACTIVE_MOVER_MIN_PROGRESS_AT_SOFT", "0.15"))
 ACTIVE_MOVER_MAX_ACTIVE = int(os.getenv("ACTIVE_MOVER_MAX_ACTIVE", "5"))
+
+# V18.1: HOT -> WATCH -> TRIGGER. Detection and entry are deliberately separated.
+ACTIVE_WATCH_MIN_SECONDS = int(os.getenv("ACTIVE_WATCH_MIN_SECONDS", "20"))
+ACTIVE_WATCH_MAX_SECONDS = int(os.getenv("ACTIVE_WATCH_MAX_SECONDS", "600"))
+ACTIVE_WATCH_MAX_CANDIDATES = int(os.getenv("ACTIVE_WATCH_MAX_CANDIDATES", "16"))
+ACTIVE_WATCH_MIN_PULLBACK = float(os.getenv("ACTIVE_WATCH_MIN_PULLBACK", "0.0018"))
+ACTIVE_WATCH_MAX_PULLBACK = float(os.getenv("ACTIVE_WATCH_MAX_PULLBACK", "0.0120"))
+ACTIVE_WATCH_RECLAIM_FRACTION = float(os.getenv("ACTIVE_WATCH_RECLAIM_FRACTION", "0.45"))
+ACTIVE_WATCH_MIN_REACCEL_1M = float(os.getenv("ACTIVE_WATCH_MIN_REACCEL_1M", "0.0008"))
+ACTIVE_WATCH_MAX_CHASE = float(os.getenv("ACTIVE_WATCH_MAX_CHASE", "0.0060"))
+ACTIVE_WATCH_MIN_VOL1 = float(os.getenv("ACTIVE_WATCH_MIN_VOL1", "0.55"))
+ACTIVE_WATCH_MIN_RANGE1 = float(os.getenv("ACTIVE_WATCH_MIN_RANGE1", "0.75"))
 
 # Trader-style ladder from the supplied examples: roughly 0.8 / 1.4 / 2 / 3 / 4%.
 ACTIVE_TP1_MOVE = float(os.getenv("ACTIVE_TP1_MOVE", "0.0080"))
@@ -6465,11 +6477,10 @@ def active_mover_setup(
     btc: Dict[str, Any],
     side: str,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Experimental trader-style PAPER detector.
+    """V18.1 stage 1: detect an active coin, but DO NOT enter yet.
 
-    Looks for an unusually active coin with enough intraday range, then accepts
-    either continuation OR a local reclaim/reject. Immediate 6-minute follow-
-    through is not mandatory; that is the key difference from ⚡ lane.
+    A candidate only enters ACTIVE WATCH. The dedicated 10-second monitor waits
+    for a pullback/pause, reclaim/reject and fresh re-acceleration before PAPER.
     """
     if not ACTIVE_MOVER_ENABLED:
         return None, "disabled"
@@ -6486,8 +6497,7 @@ def active_mover_setup(
     ch3 = percent_change(c1, 3)
     ch15 = percent_change(c5, 3)
     ch30 = percent_change(c5, 6)
-    d3 = direction * ch3
-    d15 = direction * ch15
+    d3, d15, d30 = direction * ch3, direction * ch15, direction * ch30
     vol1 = volume_ratio(c1, 20)
     range1 = candle_range_ratio(c1, 20)
     vol5 = volume_ratio(c5, 20)
@@ -6495,79 +6505,38 @@ def active_mover_setup(
     recent_high = max(float(x["high"]) for x in c5[-12:])
     recent_low = min(float(x["low"]) for x in c5[-12:])
     recent_range = (recent_high - recent_low) / max(price, 1e-12)
-    body = abs(last1["close"] - last1["open"]) / max(last1["high"] - last1["low"], 1e-12)
-    loc = close_location(last1)
+    ema9 = ema(closes(c1), 9)
+    vw = vwap(c1, 30)
 
-    # "Hot coin" first: substantial recent range plus live participation.
     if recent_range < ACTIVE_MOVER_MIN_RECENT_RANGE:
         return None, "recent_range"
     if vol1 < ACTIVE_MOVER_MIN_VOL1 or range1 < ACTIVE_MOVER_MIN_RANGE1:
         return None, "live_participation"
     if vol5 < ACTIVE_MOVER_MIN_VOL5 or range5 < ACTIVE_MOVER_MIN_RANGE5:
         return None, "5m_participation"
-    if body < ACTIVE_MOVER_MIN_BODY:
-        return None, "body"
 
-    ema9 = ema(closes(c1), 9)
-    vw = vwap(c1, 30)
-    recent = c1[-10:-1]
-
+    # Direction is only a WATCH bias. We intentionally do not demand a finished
+    # continuation candle here; the trigger monitor decides the actual entry.
     if side == "LONG":
-        continuation = (
-            d3 >= ACTIVE_MOVER_MIN_ABS_3M
-            and d15 >= ACTIVE_MOVER_MIN_ABS_15M
-            and last1["close"] > last1["open"]
-            and price >= ema9
-        )
-        swept = min(x["low"] for x in c1[-5:-1]) <= min(x["low"] for x in recent) * 1.0015
-        reclaim = (
-            last1["close"] > last1["open"]
-            and price >= ema9
-            and price >= vw * 0.998
-            and loc >= 0.58
-        )
-        local_turn = swept and reclaim
-        if not (continuation or local_turn):
-            return None, "no_long_trigger"
-        level = min(float(x["low"]) for x in c1[-12:])
-        trigger = "RECLAIM" if local_turn else "CONTINUATION"
+        bias_ok = (d3 >= -0.0015 and (d15 >= 0.0015 or d30 >= 0.0030) and price >= vw * 0.992)
     else:
-        continuation = (
-            d3 >= ACTIVE_MOVER_MIN_ABS_3M
-            and d15 >= ACTIVE_MOVER_MIN_ABS_15M
-            and last1["close"] < last1["open"]
-            and price <= ema9
-        )
-        swept = max(x["high"] for x in c1[-5:-1]) >= max(x["high"] for x in recent) * 0.9985
-        reject = (
-            last1["close"] < last1["open"]
-            and price <= ema9
-            and price <= vw * 1.002
-            and loc <= 0.42
-        )
-        local_turn = swept and reject
-        if not (continuation or local_turn):
-            return None, "no_short_trigger"
-        level = max(float(x["high"]) for x in c1[-12:])
-        trigger = "REJECT" if local_turn else "CONTINUATION"
+        bias_ok = (d3 >= -0.0015 and (d15 >= 0.0015 or d30 >= 0.0030) and price <= vw * 1.008)
+    if not bias_ok:
+        return None, "direction_bias"
 
-    # At least one directional time window OR a true local turn must support the side.
-    if not local_turn and abs(ch3) < ACTIVE_MOVER_MIN_ABS_3M:
-        return None, "weak_3m"
-
-    score = 70.0
-    score += min(8.0, recent_range * 100.0)
-    score += min(6.0, max(0.0, vol1 - 0.35) * 4.0)
-    score += min(6.0, max(0.0, range1 - 0.70) * 4.0)
-    score += 5.0 if local_turn else 0.0
-    score += min(5.0, max(0.0, d3) * 300.0)
+    score = 65.0
+    score += min(10.0, recent_range * 120.0)
+    score += min(8.0, max(0.0, vol1 - 0.35) * 5.0)
+    score += min(8.0, max(0.0, range1 - 0.60) * 4.0)
+    score += min(6.0, max(0.0, d15) * 250.0)
     score = min(100.0, score)
 
     reason = (
-        f"V18 🧲 ACTIVE MOVER {side}: {trigger}; recent range {recent_range*100:.2f}%, "
-        f"3m {ch3*100:+.2f}%, 15m {ch15*100:+.2f}%, 30m {ch30*100:+.2f}%, "
-        f"Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, Vol5 x{vol5:.2f}, "
-        f"Range5 x{range5:.2f}, closeLoc {loc:.2f}. Longer PAPER horizon."
+        f"V18.1 🧲 HOT WATCH {side}: active coin detected; no entry yet. "
+        f"range60 {recent_range*100:.2f}%, 3m {ch3*100:+.2f}%, "
+        f"15m {ch15*100:+.2f}%, 30m {ch30*100:+.2f}%, "
+        f"Vol1 x{vol1:.2f}, Range1 x{range1:.2f}, Vol5 x{vol5:.2f}. "
+        f"Waiting pullback/pause → reclaim/reject → re-acceleration."
     )
     return {
         "symbol": normalize_symbol(symbol),
@@ -6577,19 +6546,16 @@ def active_mover_setup(
         "score": int(round(score)),
         "grade": "A+",
         "entry": price,
-        "level": level,
+        "watch_reference": price,
         "reason": reason,
-        "pullback": 0.0,
         "volume_ratio": vol5,
         "range_ratio": range5,
-        "compression": prior_compression_ratio(c5),
         "ch15m": ch15,
         "ch30m": ch30,
         "ch3m_1m": ch3,
         "vol1": vol1,
         "range1": range1,
-        "ch2m": percent_change(c1, 2),
-        "setup_mode": f"V18_ACTIVE_MOVER_{side}",
+        "setup_mode": f"V18_1_ACTIVE_WATCH_{side}",
         "t1h": trend_state(c1h),
         "btc_text": btc.get("text", ""),
         "paper_setup_lane": "🧲 ACTIVE MOVER",
@@ -6597,7 +6563,7 @@ def active_mover_setup(
         "paper_validation_lane": TRADER_STYLE_PAPER_REASON,
         "paper_validation_origin": reason,
         "created_at": now_ts(),
-    }, "active_mover_ok"
+    }, "active_watch_ok"
 
 
 def calculate_active_mover_trade(
@@ -6661,6 +6627,210 @@ def active_mover_execution_ok(trade: Dict[str, Any]) -> Tuple[bool, str]:
     if quote60 and quote60 < ACTIVE_MOVER_MIN_QUOTE_60M:
         return False, f"turn60 {quote60:.0f} < {ACTIVE_MOVER_MIN_QUOTE_60M:.0f}"
     return True, "execution ok"
+
+
+def active_watch_key(item: Dict[str, Any]) -> str:
+    return f"{normalize_symbol(str(item.get('symbol','?')))}:{str(item.get('side','?')).upper()}"
+
+
+def add_active_mover_watch(setup: Dict[str, Any]) -> bool:
+    """Register stage-1 HOT candidate. No PAPER trade is created here."""
+    with STATE_IO_LOCK:
+        watches = STATE.setdefault("active_mover_watch", [])
+        now = now_ts()
+        # Remove stale watches opportunistically.
+        watches[:] = [
+            x for x in watches
+            if now - int(x.get("watch_started_at", now) or now) <= ACTIVE_WATCH_MAX_SECONDS
+        ]
+        if len(watches) >= max(1, ACTIVE_WATCH_MAX_CANDIDATES):
+            return False
+        key = active_watch_key(setup)
+        if any(active_watch_key(x) == key for x in watches):
+            return False
+        item = dict(setup)
+        ref = float(item.get("entry", 0.0) or 0.0)
+        item["watch_started_at"] = now
+        item["watch_reference"] = ref
+        item["watch_extreme"] = ref
+        item["watch_retest"] = ref
+        item["watch_pullback_seen"] = False
+        item["watch_reclaim_seen"] = False
+        item["watch_best_pullback"] = 0.0
+        item["watch_stage"] = "WAIT_PULLBACK"
+        watches.append(item)
+        save_state()
+    if VISIBLE_SHADOW_NOTIFICATIONS:
+        send_telegram(
+            "🧲🟣 ACTIVE MOVER WATCH V18.1\n"
+            f"{item.get('side','?')} {display_symbol(item.get('symbol','?'))}\n"
+            f"HOT найден около {format_price(ref)}.\n"
+            "Сделки ЕЩЁ НЕТ: бот ждёт откат/паузу → возврат уровня → повторное ускорение."
+        )
+    return True
+
+
+def process_active_mover_watches() -> Dict[str, int]:
+    """V18.1 stage 2, called by the 10-second monitor.
+
+    Entry requires: a real pullback from a post-detection extreme, recovery of
+    part of that pullback, a fresh directional 1m push, EMA9 alignment and
+    acceptable public spread/depth. This is intentionally stricter than HOT detection.
+    """
+    stats = {"checked": 0, "triggered": 0, "expired": 0, "rejected": 0}
+    if not ACTIVE_MOVER_ENABLED:
+        return stats
+
+    with STATE_IO_LOCK:
+        snapshot = [dict(x) for x in STATE.setdefault("active_mover_watch", [])]
+
+    remaining = []
+    now = now_ts()
+    active_paper = sum(
+        1 for x in STATE.setdefault("shadow_signals", [])
+        if str(x.get("shadow_reason", "")) == TRADER_STYLE_PAPER_REASON
+    )
+
+    for item in snapshot:
+        stats["checked"] += 1
+        started = int(item.get("watch_started_at", now) or now)
+        age = max(0, now - started)
+        if age > ACTIVE_WATCH_MAX_SECONDS:
+            stats["expired"] += 1
+            continue
+
+        symbol = normalize_symbol(str(item.get("symbol", "")))
+        side = str(item.get("side", "")).upper()
+        ref = float(item.get("watch_reference", item.get("entry", 0.0)) or 0.0)
+        c1 = get_klines(symbol, "1m", 80, cache_seconds=4)
+        c5 = get_klines(symbol, "5m", 80, cache_seconds=8)
+        if not c1 or not c5 or ref <= 0:
+            remaining.append(item)
+            continue
+
+        price = float(c1[-1]["close"])
+        last = c1[-1]
+        prev = c1[-2]
+        direction = 1.0 if side == "LONG" else -1.0
+        ema9_now = ema(closes(c1[-30:]), 9)
+        vw_now = vwap(c1, 30)
+        vol1 = volume_ratio(c1, 20)
+        range1 = candle_range_ratio(c1, 20)
+        one_min = direction * percent_change(c1, 1)
+        three_min = direction * percent_change(c1, 3)
+        loc = close_location(last)
+
+        extreme = float(item.get("watch_extreme", ref) or ref)
+        retest = float(item.get("watch_retest", ref) or ref)
+        pullback_seen = bool(item.get("watch_pullback_seen"))
+
+        if side == "LONG":
+            if not pullback_seen:
+                extreme = max(extreme, price, float(last["high"]))
+                retest = min(extreme, price, float(last["low"]))
+            else:
+                retest = min(retest, price, float(last["low"]))
+            pullback = max(0.0, (extreme - retest) / max(extreme, 1e-12))
+            recovery = max(0.0, min(1.0, (price - retest) / max(extreme - retest, ref * 1e-8)))
+            candle_ok = last["close"] > last["open"] and last["close"] >= prev["close"] and loc >= 0.58
+            structure_ok = price > ema9_now and price >= vw_now * 0.998
+            chase = (price - ref) / ref
+        else:
+            if not pullback_seen:
+                extreme = min(extreme, price, float(last["low"]))
+                retest = max(extreme, price, float(last["high"]))
+            else:
+                retest = max(retest, price, float(last["high"]))
+            pullback = max(0.0, (retest - extreme) / max(extreme, 1e-12))
+            recovery = max(0.0, min(1.0, (retest - price) / max(retest - extreme, ref * 1e-8)))
+            candle_ok = last["close"] < last["open"] and last["close"] <= prev["close"] and loc <= 0.42
+            structure_ok = price < ema9_now and price <= vw_now * 1.002
+            chase = (ref - price) / ref
+
+        item["watch_extreme"] = extreme
+        item["watch_retest"] = retest
+        item["watch_best_pullback"] = max(float(item.get("watch_best_pullback", 0.0) or 0.0), pullback)
+
+        if not pullback_seen and ACTIVE_WATCH_MIN_PULLBACK <= pullback <= ACTIVE_WATCH_MAX_PULLBACK:
+            item["watch_pullback_seen"] = True
+            item["watch_pullback_seen_at"] = now
+            item["watch_stage"] = "WAIT_RECLAIM"
+            pullback_seen = True
+
+        if pullback > ACTIVE_WATCH_MAX_PULLBACK:
+            stats["rejected"] += 1
+            continue
+
+        if not pullback_seen or age < ACTIVE_WATCH_MIN_SECONDS:
+            remaining.append(item)
+            continue
+
+        reclaim_ok = recovery >= ACTIVE_WATCH_RECLAIM_FRACTION
+        reaccel_ok = (
+            one_min >= ACTIVE_WATCH_MIN_REACCEL_1M
+            and three_min > 0
+            and vol1 >= ACTIVE_WATCH_MIN_VOL1
+            and range1 >= ACTIVE_WATCH_MIN_RANGE1
+            and candle_ok
+            and structure_ok
+            and chase <= ACTIVE_WATCH_MAX_CHASE
+        )
+        if not (reclaim_ok and reaccel_ok):
+            remaining.append(item)
+            continue
+
+        if active_paper >= max(0, ACTIVE_MOVER_MAX_ACTIVE):
+            remaining.append(item)
+            continue
+
+        setup = dict(item)
+        setup["entry"] = price
+        setup["created_at"] = now
+        setup["ch3m_1m"] = direction * three_min
+        setup["ch2m"] = percent_change(c1, 2)
+        setup["vol1"] = vol1
+        setup["range1"] = range1
+        setup["volume_ratio"] = volume_ratio(c5, 20)
+        setup["range_ratio"] = candle_range_ratio(c5, 20)
+        setup["active_watch_age_seconds"] = age
+        setup["active_watch_pullback"] = pullback
+        setup["active_watch_recovery"] = recovery
+        setup["paper_validation_origin"] = (
+            f"V18.1 🧲 TRIGGER {side}: HOT→WATCH {age}s → pullback "
+            f"{pullback*100:.2f}% → recovery {recovery*100:.0f}% → "
+            f"1m reaccel {one_min*100:+.2f}% · 3m {three_min*100:+.2f}% · "
+            f"Vol1 x{vol1:.2f} · Range1 x{range1:.2f}"
+        )
+
+        gate_ok, gate_reason = measured_edge_entry_gate(setup, symbol, c1, c5)
+        if not gate_ok:
+            remaining.append(item)
+            continue
+
+        trade = calculate_active_mover_trade(setup, c1, c5)
+        if not trade:
+            remaining.append(item)
+            continue
+        exec_ok, exec_reason = active_mover_execution_ok(trade)
+        if not exec_ok:
+            remaining.append(item)
+            continue
+
+        trade["paper_validation_origin"] += f" · {gate_reason} · {exec_reason}"
+        if add_shadow_signal(trade, TRADER_STYLE_PAPER_REASON):
+            send_telegram(build_paper_signal_message(trade))
+            stats["triggered"] += 1
+            active_paper += 1
+            # Do not keep this watch after a confirmed PAPER entry.
+            continue
+        remaining.append(item)
+
+    with STATE_IO_LOCK:
+        STATE["active_mover_watch"] = remaining
+        STATE["last_active_watch"] = dict(stats)
+        save_state()
+    return stats
+
 
 
 def direct_measured_setup(
@@ -7790,57 +7960,22 @@ def analyze_symbol(
         blocks["no_candles"] = blocks.get("no_candles", 0) + 1
         return None
 
-    # V18 second lane: study trader-style active movers in PAPER even when the
-    # symbol would be too risky for the fast lane. This never creates exchange orders.
+    # V18.1 second lane: HOT detection only. Actual PAPER entry is made by
+    # process_active_mover_watches() after pullback/reclaim/re-acceleration.
     if ACTIVE_MOVER_ENABLED:
-        active_count = sum(
-            1 for item in STATE.setdefault("shadow_signals", [])
-            if str(item.get("shadow_reason", "")) == TRADER_STYLE_PAPER_REASON
-        )
-        if active_count < max(0, ACTIVE_MOVER_MAX_ACTIVE):
-            for active_side in ("LONG", "SHORT"):
-                am_setup, am_reason = active_mover_setup(
-                    symbol, c1, c5, c15, c1h, btc, active_side
+        for active_side in ("LONG", "SHORT"):
+            am_setup, am_reason = active_mover_setup(
+                symbol, c1, c5, c15, c1h, btc, active_side
+            )
+            if not am_setup:
+                blocks[f"v18_1_watch_{am_reason}_{active_side.lower()}"] = (
+                    blocks.get(f"v18_1_watch_{am_reason}_{active_side.lower()}", 0) + 1
                 )
-                if not am_setup:
-                    blocks[f"v18_active_{am_reason}_{active_side.lower()}"] = (
-                        blocks.get(f"v18_active_{am_reason}_{active_side.lower()}", 0) + 1
-                    )
-                    continue
-
-                # Reuse the public execution/liquidity snapshot logic.
-                entry_ok, entry_reason = measured_edge_entry_gate(
-                    am_setup, symbol, c1, c5
-                )
-                if not entry_ok:
-                    blocks["v18_active_execution_block"] = blocks.get(
-                        "v18_active_execution_block", 0
-                    ) + 1
-                    continue
-
-                am_trade = calculate_active_mover_trade(am_setup, c1, c5)
-                if not am_trade:
-                    continue
-
-                # measured_edge_entry_gate adds book/liquidity fields to setup/trade
-                # through the shared dict path; if unavailable, retain the captured values.
-                exec_ok, exec_reason = active_mover_execution_ok(am_trade)
-                if not exec_ok:
-                    blocks["v18_active_execution_quality_block"] = blocks.get(
-                        "v18_active_execution_quality_block", 0
-                    ) + 1
-                    continue
-
-                # Independent cooldown is lane-specific because this is a different hypothesis.
-                am_trade["paper_validation_origin"] = (
-                    f"{am_trade.get('paper_validation_origin','')} · {entry_reason} · {exec_reason}"
-                )
-                if add_shadow_signal(am_trade, TRADER_STYLE_PAPER_REASON):
-                    send_telegram(build_paper_signal_message(am_trade))
-                    blocks["v18_active_paper_sent"] = blocks.get("v18_active_paper_sent", 0) + 1
-                    active_count += 1
-                    if active_count >= max(0, ACTIVE_MOVER_MAX_ACTIVE):
-                        break
+                continue
+            if add_active_mover_watch(am_setup):
+                blocks["v18_1_active_watch_added"] = blocks.get(
+                    "v18_1_active_watch_added", 0
+                ) + 1
 
     # Fast ⚡ lane keeps the existing ultra-risk protection.
     if ultra_risk_symbol(symbol, c5, c15):
@@ -10029,7 +10164,7 @@ async def scan_loop():
         f"Anti-chase: no delayed 90%–100% reclaim entry; the failed V17.2 retest path is excluded.\n"
         f"V17.3.2 selector: broad V17.3.1 entries stay as paired CONTROL; only follow-through score ≥ {V17_3_2_MIN_SCORE:.0f} enters new PAPER.\n"
         f"SHORT official PAPER: {V17_3_2_SHORT_PAPER_ENABLED}; when False, SHORT remains visible CONTROL/SHADOW only.\n"
-        f"Telegram lanes: ⚡🟡 FOLLOW-THROUGH = быстрый импульс; 🧲🟣 ACTIVE MOVER = более долгий trader-style PAPER.\n"
+        f"Telegram lanes: ⚡🟡 FOLLOW-THROUGH = быстрый импульс; 🧲🟣 ACTIVE MOVER V18.1 = HOT → WATCH → pullback/reclaim → re-acceleration → PAPER.\n"
         f"ACTIVE MOVER horizon: soft {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES} мин · hard {ACTIVE_MOVER_HARD_EXPIRE_MINUTES} мин · TP ladder {ACTIVE_TP1_MOVE*100:.1f}/{ACTIVE_TP2_MOVE*100:.1f}/{ACTIVE_TP3_MOVE*100:.1f}/{ACTIVE_TP4_MOVE*100:.1f}/{ACTIVE_TP5_MOVE*100:.1f}%.\n"
         f"Every PAPER entry/result is visible in Telegram; SHADOW near-miss observations are visible too.\n"
         f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
@@ -10113,6 +10248,7 @@ def monitor_pending_and_dispatch() -> Dict[str, Any]:
     blocks: Dict[str, int] = {}
     near_miss: List[str] = []
     confirmed = process_pending_signals(blocks, near_miss)
+    active_watch_stats = process_active_mover_watches()
     paper_sent = 0
     non_paper_confirmed = 0
     for candidate in confirmed:
@@ -10132,6 +10268,7 @@ def monitor_pending_and_dispatch() -> Dict[str, Any]:
         "non_paper_confirmed": non_paper_confirmed,
         "blocks": blocks,
         "near_miss": near_miss[:8],
+        "active_watch": active_watch_stats,
     }
     STATE["last_pending_monitor"] = status
     save_state()
