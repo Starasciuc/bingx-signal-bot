@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V18.1.1 ACTIVE MOVER QUIET WATCH
+# VERIFIED GITHUB DEPLOY FILE — V18.2 PRO ACTIVE MOVER + 4H SQUEEZE EXHAUSTION
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2585,8 +2585,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V18.1.1 ACTIVE MOVER QUIET WATCH"
-DEPLOY_MARKER = "V18_1_1_DUAL_LANE_QUIET_WATCH_2026_08_21"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V18.2 PRO ACTIVE MOVER + 4H SQUEEZE EXHAUSTION"
+DEPLOY_MARKER = "V18_2_PRO_ACTIVE_MOVER_4H_SQUEEZE_EXHAUSTION_2026_08_30"
 
 app = FastAPI(title=APP_NAME)
 
@@ -2680,6 +2680,7 @@ VISIBLE_SHADOW_NOTIFICATIONS = os.getenv(
 ).lower() == "true"
 PAPER_VALIDATION_REASON = "followthrough_paper_v17_3_2"
 TRADER_STYLE_PAPER_REASON = "active_mover_paper_v18"
+EXHAUSTION_PAPER_REASON = "squeeze_exhaustion_paper_v18_2"
 PAPER_CONTROL_REASON = "direct_measured_control_v17_3_1"
 REAL_MONEY_LIVE_REASON = "followthrough_micro_live_v17_3_2"
 LEGACY_V17_3_1_PAPER_VALIDATION_REASON = "direct_measured_paper_v17_2_2"
@@ -2911,7 +2912,7 @@ PAPER_BREAKEVEN_AFTER_TP1 = os.getenv(
 ).lower() == "true"
 # Safety invariant for this build.  A Render environment variable cannot turn
 # an unvalidated V17.2 setup into a real/LIVE signal by accident.
-PRO_QUALITY_FORWARD_ENABLED = True
+PRO_QUALITY_FORWARD_ENABLED = False
 
 # Weak strategies are paused only in LIVE. They continue producing SHADOW
 # outcomes and automatically recover when the newest rolling evidence improves.
@@ -3019,6 +3020,50 @@ ACTIVE_TP4_MOVE = float(os.getenv("ACTIVE_TP4_MOVE", "0.0300"))
 ACTIVE_TP5_MOVE = float(os.getenv("ACTIVE_TP5_MOVE", "0.0400"))
 ACTIVE_MIN_SL_MOVE = float(os.getenv("ACTIVE_MIN_SL_MOVE", "0.0120"))
 ACTIVE_MAX_SL_MOVE = float(os.getenv("ACTIVE_MAX_SL_MOVE", "0.0240"))
+
+
+# --- V18.2 PROFESSIONAL 4H SQUEEZE EXHAUSTION REVERSAL ---
+# Purpose: do NOT short a huge green 4H candle merely because it is huge.
+# First detect an abnormal 4H squeeze/liquidation event, then wait for objective
+# exhaustion on 1m/5m/15m before opening a PAPER counter-move.
+SQUEEZE_4H_ENABLED = os.getenv("SQUEEZE_4H_ENABLED", "true").lower() == "true"
+SQUEEZE_4H_MIN_BODY_MOVE = float(os.getenv("SQUEEZE_4H_MIN_BODY_MOVE", "0.070"))
+SQUEEZE_4H_MIN_RANGE_MOVE = float(os.getenv("SQUEEZE_4H_MIN_RANGE_MOVE", "0.090"))
+SQUEEZE_4H_MIN_ATR_MULT = float(os.getenv("SQUEEZE_4H_MIN_ATR_MULT", "2.00"))
+SQUEEZE_4H_MIN_VOLUME_PACE = float(os.getenv("SQUEEZE_4H_MIN_VOLUME_PACE", "1.80"))
+SQUEEZE_4H_MIN_BODY_FRACTION = float(os.getenv("SQUEEZE_4H_MIN_BODY_FRACTION", "0.55"))
+SQUEEZE_4H_CLOSE_EXTREME = float(os.getenv("SQUEEZE_4H_CLOSE_EXTREME", "0.70"))
+SQUEEZE_4H_MIN_SCORE = float(os.getenv("SQUEEZE_4H_MIN_SCORE", "72.0"))
+SQUEEZE_4H_WATCH_MAX = int(os.getenv("SQUEEZE_4H_WATCH_MAX", "18"))
+SQUEEZE_4H_WATCH_SECONDS = int(os.getenv("SQUEEZE_4H_WATCH_SECONDS", "7200"))
+
+# Entry confirmation after the extreme. These thresholds are deliberately
+# based on loss-avoidance: a continuing squeeze is WATCH-only, never a SHORT.
+EXHAUST_MIN_WATCH_SECONDS = int(os.getenv("EXHAUST_MIN_WATCH_SECONDS", "30"))
+EXHAUST_MIN_RETRACE = float(os.getenv("EXHAUST_MIN_RETRACE", "0.0060"))
+EXHAUST_MAX_RETRACE_AT_ENTRY = float(os.getenv("EXHAUST_MAX_RETRACE_AT_ENTRY", "0.0400"))
+EXHAUST_MIN_REVERSAL_1M = float(os.getenv("EXHAUST_MIN_REVERSAL_1M", "0.0012"))
+EXHAUST_MIN_REVERSAL_3M = float(os.getenv("EXHAUST_MIN_REVERSAL_3M", "0.0025"))
+EXHAUST_MIN_CONFIRMATIONS = int(os.getenv("EXHAUST_MIN_CONFIRMATIONS", "6"))
+EXHAUST_RUNAWAY_RECENT_SECONDS = int(os.getenv("EXHAUST_RUNAWAY_RECENT_SECONDS", "25"))
+EXHAUST_RUNAWAY_MIN_1M = float(os.getenv("EXHAUST_RUNAWAY_MIN_1M", "0.0015"))
+EXHAUST_MIN_VOL1 = float(os.getenv("EXHAUST_MIN_VOL1", "0.45"))
+EXHAUST_MAX_SPREAD_BPS = float(os.getenv("EXHAUST_MAX_SPREAD_BPS", "18.0"))
+EXHAUST_MIN_DEPTH_USDT = float(os.getenv("EXHAUST_MIN_DEPTH_USDT", "500"))
+EXHAUST_MIN_QUOTE_60M = float(os.getenv("EXHAUST_MIN_QUOTE_60M", "50000"))
+EXHAUST_MIN_LIQUIDITY_RANK = float(os.getenv("EXHAUST_MIN_LIQUIDITY_RANK", "0.25"))
+
+# Correction targets. TP3 remains the minimum positive classification.
+EXHAUST_TP1_MOVE = float(os.getenv("EXHAUST_TP1_MOVE", "0.0080"))
+EXHAUST_TP2_MOVE = float(os.getenv("EXHAUST_TP2_MOVE", "0.0140"))
+EXHAUST_TP3_MOVE = float(os.getenv("EXHAUST_TP3_MOVE", "0.0220"))
+EXHAUST_TP4_MOVE = float(os.getenv("EXHAUST_TP4_MOVE", "0.0350"))
+EXHAUST_TP5_MOVE = float(os.getenv("EXHAUST_TP5_MOVE", "0.0500"))
+EXHAUST_MIN_SL_MOVE = float(os.getenv("EXHAUST_MIN_SL_MOVE", "0.0100"))
+EXHAUST_MAX_SL_MOVE = float(os.getenv("EXHAUST_MAX_SL_MOVE", "0.0250"))
+EXHAUST_SOFT_EXPIRE_MINUTES = int(os.getenv("EXHAUST_SOFT_EXPIRE_MINUTES", "45"))
+EXHAUST_HARD_EXPIRE_MINUTES = int(os.getenv("EXHAUST_HARD_EXPIRE_MINUTES", "180"))
+EXHAUST_MIN_PROGRESS_AT_SOFT = float(os.getenv("EXHAUST_MIN_PROGRESS_AT_SOFT", "0.12"))
 
 # --- V17.3.2 forward follow-through selector ---
 # First unchanged V17.3.1 PAPER cohort: 25 outcomes = 2 TP3+ / 8 SL / 15 expired.
@@ -6829,6 +6874,452 @@ def process_active_mover_watches() -> Dict[str, int]:
 
 
 
+def squeeze_exhaustion_metrics() -> Dict[str, Any]:
+    init_adaptive_db()
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT result, pnl_r, symbol FROM adaptive_trades "
+            "WHERE COALESCE(decision_reason, '')=? ORDER BY closed_at ASC, id ASC",
+            (EXHAUSTION_PAPER_REASON,),
+        ).fetchall()
+    metrics = _outcome_metrics(rows)
+    metrics["unique_symbols"] = len(
+        {normalize_symbol(str(row["symbol"] or "?")) for row in rows}
+    )
+    return metrics
+
+
+def _median(values: List[float]) -> float:
+    vals = sorted(float(x) for x in values if x is not None)
+    if not vals:
+        return 0.0
+    m = len(vals) // 2
+    return vals[m] if len(vals) % 2 else (vals[m - 1] + vals[m]) / 2.0
+
+
+def detect_4h_squeeze(
+    symbol: str,
+    c4h: List[Dict[str, float]],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Stage 1: identify an abnormal 4H squeeze/liquidation candle.
+
+    GREEN extreme => watch for a SHORT correction.
+    RED extreme   => watch for a LONG correction.
+    Detection itself NEVER creates a trade.
+    """
+    if not SQUEEZE_4H_ENABLED or len(c4h) < 35:
+        return None, "disabled_or_candles"
+
+    cur = c4h[-1]
+    prev = c4h[-21:-1]
+    o = float(cur["open"])
+    h = float(cur["high"])
+    l = float(cur["low"])
+    c = float(cur["close"])
+    if min(o, h, l, c) <= 0:
+        return None, "bad_price"
+
+    signed_body = (c - o) / o
+    body_move = abs(signed_body)
+    range_move = (h - l) / o
+    body_fraction = abs(c - o) / max(h - l, 1e-12)
+    loc = close_location(cur)
+
+    prev_atr = atr(c4h[:-1], 14)
+    atr_mult = (h - l) / max(prev_atr, o * 1e-6)
+
+    # Current 4H candle can be incomplete. Compare volume PACE, not raw volume.
+    now_ms = int(time.time() * 1000)
+    open_ms = int(cur.get("time", 0) or 0)
+    elapsed_fraction = (
+        (now_ms - open_ms) / float(4 * 60 * 60 * 1000)
+        if open_ms > 0 else 1.0
+    )
+    elapsed_fraction = max(0.15, min(1.0, elapsed_fraction))
+    prev_vol_med = _median([x["volume"] for x in prev])
+    projected_volume = float(cur["volume"]) / elapsed_fraction
+    volume_pace = projected_volume / max(prev_vol_med, 1e-12)
+
+    # Relative acceleration versus normal 4H bodies.
+    prev_bodies = [
+        abs(float(x["close"]) - float(x["open"])) / max(float(x["open"]), 1e-12)
+        for x in prev
+    ]
+    normal_body = max(_median(prev_bodies), 0.003)
+    body_acceleration = body_move / normal_body
+
+    same_dir_streak = 0
+    for row in reversed(c4h[-5:-1]):
+        row_dir = float(row["close"]) - float(row["open"])
+        if (signed_body > 0 and row_dir > 0) or (signed_body < 0 and row_dir < 0):
+            same_dir_streak += 1
+        else:
+            break
+
+    extreme_close = loc >= SQUEEZE_4H_CLOSE_EXTREME if signed_body > 0 else loc <= (1.0 - SQUEEZE_4H_CLOSE_EXTREME)
+    size_ok = body_move >= SQUEEZE_4H_MIN_BODY_MOVE or range_move >= SQUEEZE_4H_MIN_RANGE_MOVE
+    if not size_ok:
+        return None, "4h_size"
+    if atr_mult < SQUEEZE_4H_MIN_ATR_MULT:
+        return None, "4h_atr"
+    if volume_pace < SQUEEZE_4H_MIN_VOLUME_PACE:
+        return None, "4h_volume"
+    if body_fraction < SQUEEZE_4H_MIN_BODY_FRACTION:
+        return None, "4h_body"
+    if not extreme_close:
+        return None, "4h_close"
+
+    score = 55.0
+    score += min(12.0, max(0.0, (body_move - 0.05) * 120.0))
+    score += min(10.0, max(0.0, (atr_mult - 1.5) * 4.0))
+    score += min(10.0, max(0.0, (volume_pace - 1.3) * 4.0))
+    score += min(7.0, max(0.0, (body_acceleration - 2.0) * 1.5))
+    score += min(6.0, same_dir_streak * 2.0)
+    score = min(100.0, score)
+    if score < SQUEEZE_4H_MIN_SCORE:
+        return None, f"4h_score_{score:.1f}"
+
+    reversal_side = "SHORT" if signed_body > 0 else "LONG"
+    event = "SHORT-SQUEEZE / PARABOLIC UP" if reversal_side == "SHORT" else "LONG-LIQUIDATION / PARABOLIC DOWN"
+    reason = (
+        f"🔥 4H {event}: body {signed_body*100:+.1f}%, range {range_move*100:.1f}%, "
+        f"ATR x{atr_mult:.2f}, projected volume x{volume_pace:.2f}, "
+        f"body acceleration x{body_acceleration:.1f}, same-dir streak {same_dir_streak}. "
+        f"NO ENTRY YET — waiting for exhaustion confirmation."
+    )
+    return {
+        "symbol": normalize_symbol(symbol),
+        "side": reversal_side,
+        "strategy": f"PRO_4H_SQUEEZE_EXHAUSTION_{reversal_side}",
+        "trade_type": f"🔥 4H EXHAUSTION {reversal_side}",
+        "paper_style": "SQUEEZE_EXHAUSTION",
+        "paper_setup_lane": "🔥 4H EXHAUSTION",
+        "paper_validation_lane": EXHAUSTION_PAPER_REASON,
+        "grade": "A+",
+        "score": int(round(score)),
+        "reason": reason,
+        "paper_validation_origin": reason,
+        "squeeze_4h_body_move": signed_body,
+        "squeeze_4h_range_move": range_move,
+        "squeeze_4h_atr_mult": atr_mult,
+        "squeeze_4h_volume_pace": volume_pace,
+        "squeeze_4h_body_acceleration": body_acceleration,
+        "squeeze_4h_same_dir_streak": same_dir_streak,
+        "squeeze_4h_candle_time": int(cur.get("time", 0) or 0),
+        "watch_reference": c,
+        "created_at": now_ts(),
+    }, "4h_squeeze_detected"
+
+
+def squeeze_watch_key(item: Dict[str, Any]) -> str:
+    return (
+        f"{normalize_symbol(str(item.get('symbol','?')))}:"
+        f"{str(item.get('side','?')).upper()}:"
+        f"{int(item.get('squeeze_4h_candle_time',0) or 0)}"
+    )
+
+
+def add_squeeze_watch(setup: Dict[str, Any]) -> bool:
+    """Quiet stage-1 watch. Telegram sees only confirmed PAPER entries."""
+    with STATE_IO_LOCK:
+        watches = STATE.setdefault("squeeze_4h_watch", [])
+        now = now_ts()
+        watches[:] = [
+            x for x in watches
+            if now - int(x.get("watch_started_at", now) or now) <= SQUEEZE_4H_WATCH_SECONDS
+        ]
+        if len(watches) >= max(1, SQUEEZE_4H_WATCH_MAX):
+            return False
+        key = squeeze_watch_key(setup)
+        if any(squeeze_watch_key(x) == key for x in watches):
+            return False
+        item = dict(setup)
+        ref = float(item.get("watch_reference", 0.0) or 0.0)
+        item["watch_started_at"] = now
+        item["watch_extreme"] = ref
+        item["last_extreme_at"] = now
+        item["runaway_blocks"] = 0
+        item["max_retrace"] = 0.0
+        watches.append(item)
+        save_state()
+    return True
+
+
+def squeeze_execution_gate(
+    setup: Dict[str, Any],
+    symbol: str,
+    c1: List[Dict[str, float]],
+    c5: List[Dict[str, float]],
+) -> Tuple[bool, str]:
+    liquidity = candle_liquidity_snapshot(symbol, c1, c5)
+    cached = LIQUIDITY_SCAN_CACHE.get(normalize_symbol(symbol), {})
+    rank = float(cached.get("rank_percentile", 0.0) or 0.0)
+    quote60 = float(liquidity.get("quote_60m", 0.0) or 0.0)
+    if not bool(liquidity.get("ok")):
+        return False, f"liquidity: {liquidity.get('reason','unknown')}"
+    if rank < EXHAUST_MIN_LIQUIDITY_RANK:
+        return False, f"liq p{rank*100:.0f} < p{EXHAUST_MIN_LIQUIDITY_RANK*100:.0f}"
+    if quote60 < EXHAUST_MIN_QUOTE_60M:
+        return False, f"turn60 {quote60:.0f} < {EXHAUST_MIN_QUOTE_60M:.0f}"
+
+    book = execution_book_snapshot(symbol)
+    if not bool(book.get("ok")):
+        return False, str(book.get("reason", "book unavailable"))
+    spread = float(book.get("spread_bps", 999.0) or 999.0)
+    depth = float(book.get("depth_usdt", 0.0) or 0.0)
+    if spread > EXHAUST_MAX_SPREAD_BPS:
+        return False, f"spread {spread:.1f} > {EXHAUST_MAX_SPREAD_BPS:.1f}"
+    if depth < EXHAUST_MIN_DEPTH_USDT:
+        return False, f"depth {depth:.0f} < {EXHAUST_MIN_DEPTH_USDT:.0f}"
+
+    side = str(setup.get("side", "")).upper()
+    executable = float(
+        book.get("ask" if side == "LONG" else "bid", setup.get("entry", 0.0))
+        or setup.get("entry", 0.0)
+    )
+    if executable <= 0:
+        return False, "bad executable price"
+    setup["entry"] = executable
+    setup["book_spread_bps"] = spread
+    setup["book_depth_usdt"] = depth
+    setup["liquidity_quote_60m"] = quote60
+    setup["liquidity_rank_percentile"] = rank
+    return True, f"book ok: spread {spread:.1f}bps, depth {depth:.0f}, liq p{rank*100:.0f}"
+
+
+def calculate_exhaustion_trade(setup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    side = str(setup.get("side", "")).upper()
+    entry = float(setup.get("entry", 0.0) or 0.0)
+    extreme = float(setup.get("watch_extreme", entry) or entry)
+    if entry <= 0 or extreme <= 0:
+        return None
+
+    # Technical invalidation is beyond the squeeze extreme. If that requires
+    # a huge stop, skip the trade rather than "averaging" into a continuing squeeze.
+    if side == "SHORT":
+        technical_move = max(0.0, (extreme - entry) / entry) + 0.0025
+    else:
+        technical_move = max(0.0, (entry - extreme) / entry) + 0.0025
+    sl_move = max(EXHAUST_MIN_SL_MOVE, technical_move)
+    if sl_move > EXHAUST_MAX_SL_MOVE:
+        return None
+
+    if side == "SHORT":
+        sl = entry * (1 + sl_move)
+        tps = [
+            entry * (1 - EXHAUST_TP1_MOVE),
+            entry * (1 - EXHAUST_TP2_MOVE),
+            entry * (1 - EXHAUST_TP3_MOVE),
+            entry * (1 - EXHAUST_TP4_MOVE),
+            entry * (1 - EXHAUST_TP5_MOVE),
+        ]
+    else:
+        sl = entry * (1 - sl_move)
+        tps = [
+            entry * (1 + EXHAUST_TP1_MOVE),
+            entry * (1 + EXHAUST_TP2_MOVE),
+            entry * (1 + EXHAUST_TP3_MOVE),
+            entry * (1 + EXHAUST_TP4_MOVE),
+            entry * (1 + EXHAUST_TP5_MOVE),
+        ]
+
+    rewards = [abs(x - entry) for x in tps]
+    risk = abs(sl - entry)
+    trade = dict(setup)
+    trade.update({
+        "sl": sl,
+        "tp1": tps[0], "tp2": tps[1], "tp3": tps[2], "tp4": tps[3], "tp5": tps[4],
+        "rr": rewards[0] / max(risk, 1e-12),
+        "ladder_rr": (sum(rewards) / len(rewards)) / max(risk, 1e-12),
+        "final_rr": rewards[-1] / max(risk, 1e-12),
+        "risk_mult": FAST_RISK_MULT,
+        "roi_tp1": EXHAUST_TP1_MOVE * LEVERAGE * 100,
+        "roi_sl": sl_move * LEVERAGE * 100,
+        "status": "active",
+        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "tp4_hit": False, "tp5_hit": False,
+    })
+    return trade
+
+
+def process_squeeze_exhaustion_watches() -> Dict[str, int]:
+    """Stage 2: distinguish RUNAWAY squeeze from real exhaustion.
+
+    A continuing squeeze never enters countertrend. Entry requires a retrace,
+    loss of 1m structure, reversal momentum and multiple confirmations.
+    """
+    stats = {
+        "checked": 0, "runaway": 0, "triggered": 0,
+        "expired": 0, "risk_rejected": 0, "execution_rejected": 0,
+    }
+    if not SQUEEZE_4H_ENABLED:
+        return stats
+
+    with STATE_IO_LOCK:
+        snapshot = [dict(x) for x in STATE.setdefault("squeeze_4h_watch", [])]
+
+    now = now_ts()
+    remaining: List[Dict[str, Any]] = []
+
+    for item in snapshot:
+        stats["checked"] += 1
+        started = int(item.get("watch_started_at", now) or now)
+        age = max(0, now - started)
+        if age > SQUEEZE_4H_WATCH_SECONDS:
+            stats["expired"] += 1
+            continue
+
+        symbol = normalize_symbol(str(item.get("symbol", "")))
+        side = str(item.get("side", "")).upper()
+        if side not in {"LONG", "SHORT"}:
+            continue
+
+        c1 = get_klines(symbol, "1m", 90, cache_seconds=4)
+        c5 = get_klines(symbol, "5m", 90, cache_seconds=8)
+        c15 = get_klines(symbol, "15m", 60, cache_seconds=15)
+        if not c1 or not c5 or not c15:
+            remaining.append(item)
+            continue
+
+        price = float(c1[-1]["close"])
+        last = c1[-1]
+        prev3 = c1[-4:-1]
+        ema9_now = ema(closes(c1[-40:]), 9)
+        vol1 = volume_ratio(c1, 20)
+        range1 = candle_range_ratio(c1, 20)
+        loc = close_location(last)
+
+        reversal_dir = 1.0 if side == "LONG" else -1.0
+        rev1 = reversal_dir * percent_change(c1, 1)
+        rev3 = reversal_dir * percent_change(c1, 3)
+        rev5 = reversal_dir * percent_change(c1, 5)
+
+        extreme = float(item.get("watch_extreme", price) or price)
+        last_extreme_at = int(item.get("last_extreme_at", started) or started)
+
+        if side == "SHORT":
+            observed_extreme = max(extreme, float(last["high"]), price)
+            if observed_extreme > extreme * 1.0005:
+                extreme = observed_extreme
+                last_extreme_at = now
+            retrace = max(0.0, (extreme - price) / max(extreme, 1e-12))
+            candle_reverse = last["close"] < last["open"] and loc <= 0.45
+            ema_break = price < ema9_now
+            micro_break = price < min(float(x["close"]) for x in prev3)
+            wick = (float(last["high"]) - max(float(last["open"]), float(last["close"]))) / max(
+                float(last["high"]) - float(last["low"]), 1e-12
+            )
+            wick_confirm = wick >= 0.25
+            continuation_1m = percent_change(c1, 1)
+            runaway = (
+                now - last_extreme_at <= EXHAUST_RUNAWAY_RECENT_SECONDS
+                and continuation_1m >= EXHAUST_RUNAWAY_MIN_1M
+                and loc >= 0.72
+                and vol1 >= 0.80
+            )
+        else:
+            observed_extreme = min(extreme, float(last["low"]), price)
+            if observed_extreme < extreme * 0.9995:
+                extreme = observed_extreme
+                last_extreme_at = now
+            retrace = max(0.0, (price - extreme) / max(extreme, 1e-12))
+            candle_reverse = last["close"] > last["open"] and loc >= 0.55
+            ema_break = price > ema9_now
+            micro_break = price > max(float(x["close"]) for x in prev3)
+            wick = (min(float(last["open"]), float(last["close"])) - float(last["low"])) / max(
+                float(last["high"]) - float(last["low"]), 1e-12
+            )
+            wick_confirm = wick >= 0.25
+            continuation_1m = -percent_change(c1, 1)
+            runaway = (
+                now - last_extreme_at <= EXHAUST_RUNAWAY_RECENT_SECONDS
+                and continuation_1m >= EXHAUST_RUNAWAY_MIN_1M
+                and loc <= 0.28
+                and vol1 >= 0.80
+            )
+
+        item["watch_extreme"] = extreme
+        item["last_extreme_at"] = last_extreme_at
+        item["max_retrace"] = max(float(item.get("max_retrace", 0.0) or 0.0), retrace)
+
+        # Professional anti-squeeze rule: if price is still making extremes with
+        # strong closes/volume, keep watching. Never "average" against it.
+        if runaway:
+            item["runaway_blocks"] = int(item.get("runaway_blocks", 0) or 0) + 1
+            stats["runaway"] += 1
+            remaining.append(item)
+            continue
+
+        if age < EXHAUST_MIN_WATCH_SECONDS or retrace < EXHAUST_MIN_RETRACE:
+            remaining.append(item)
+            continue
+        if retrace > EXHAUST_MAX_RETRACE_AT_ENTRY:
+            # Correction already happened; do not chase a late reversal entry.
+            stats["expired"] += 1
+            continue
+
+        confirmations = 0
+        confirmations += 1 if candle_reverse else 0
+        confirmations += 1 if ema_break else 0
+        confirmations += 1 if micro_break else 0
+        confirmations += 1 if wick_confirm else 0
+        confirmations += 1 if rev1 >= EXHAUST_MIN_REVERSAL_1M else 0
+        confirmations += 1 if rev3 >= EXHAUST_MIN_REVERSAL_3M else 0
+        confirmations += 1 if rev5 > 0 else 0
+        confirmations += 1 if now - last_extreme_at >= 20 else 0
+        confirmations += 1 if vol1 >= EXHAUST_MIN_VOL1 else 0
+
+        if confirmations < EXHAUST_MIN_CONFIRMATIONS:
+            remaining.append(item)
+            continue
+
+        setup = dict(item)
+        setup["entry"] = price
+        setup["created_at"] = now
+        setup["vol1"] = vol1
+        setup["range1"] = range1
+        setup["volume_ratio"] = volume_ratio(c5, 20)
+        setup["range_ratio"] = candle_range_ratio(c5, 20)
+        setup["ch3m_1m"] = percent_change(c1, 3)
+        setup["ch15m"] = percent_change(c5, 3)
+        setup["ch30m"] = percent_change(c5, 6)
+        setup["exhaust_retrace"] = retrace
+        setup["exhaust_confirmations"] = confirmations
+        setup["exhaust_runaway_blocks"] = int(item.get("runaway_blocks", 0) or 0)
+        setup["paper_validation_origin"] = (
+            f"🔥 V18.2 confirmed {side} correction after 4H extreme: "
+            f"retrace {retrace*100:.2f}%, confirmations {confirmations}/9, "
+            f"rev1 {rev1*100:.2f}%, rev3 {rev3*100:.2f}%, "
+            f"Vol1 x{vol1:.2f}; runaway blocks {setup['exhaust_runaway_blocks']}."
+        )
+
+        exec_ok, exec_reason = squeeze_execution_gate(setup, symbol, c1, c5)
+        if not exec_ok:
+            stats["execution_rejected"] += 1
+            remaining.append(item)
+            continue
+
+        trade = calculate_exhaustion_trade(setup)
+        if not trade:
+            stats["risk_rejected"] += 1
+            remaining.append(item)
+            continue
+
+        trade["paper_validation_origin"] += f" · {exec_reason}"
+        if add_shadow_signal(trade, EXHAUSTION_PAPER_REASON):
+            send_telegram(build_paper_signal_message(trade))
+            stats["triggered"] += 1
+            continue
+
+        remaining.append(item)
+
+    with STATE_IO_LOCK:
+        STATE["squeeze_4h_watch"] = remaining
+        STATE["last_squeeze_watch"] = dict(stats)
+        save_state()
+    return stats
+
+
+
 def direct_measured_setup(
     symbol: str,
     c1: List[Dict[str, float]],
@@ -7951,10 +8442,24 @@ def analyze_symbol(
     c5 = get_klines(symbol, "5m", 120, cache_seconds=60)
     c15 = get_klines(symbol, "15m", 120, cache_seconds=30)
     c1h = get_klines(symbol, "1h", 120, cache_seconds=90)
+    c4h = get_klines(symbol, "4h", 80, cache_seconds=180)
 
     if not c1 or not c5 or not c15 or not c1h:
         blocks["no_candles"] = blocks.get("no_candles", 0) + 1
         return None
+
+    # V18.2 lane: 4H abnormal squeeze/liquidation detector.
+    # Detection is quiet; only a confirmed exhaustion reversal becomes PAPER.
+    if SQUEEZE_4H_ENABLED and c4h:
+        squeeze_setup, squeeze_reason = detect_4h_squeeze(symbol, c4h)
+        if squeeze_setup:
+            if add_squeeze_watch(squeeze_setup):
+                blocks["v18_2_4h_squeeze_watch_added"] = blocks.get(
+                    "v18_2_4h_squeeze_watch_added", 0
+                ) + 1
+        else:
+            key = f"v18_2_squeeze_{squeeze_reason}"
+            blocks[key] = blocks.get(key, 0) + 1
 
     # V18.1 second lane: HOT detection only. Actual PAPER entry is made by
     # process_active_mover_watches() after pullback/reclaim/re-acceleration.
@@ -8457,12 +8962,16 @@ def build_signal_message(s: Dict[str, Any]) -> str:
 
 def build_paper_signal_message(s: Dict[str, Any]) -> str:
     is_active = str(s.get("paper_style", "")) == "ACTIVE_MOVER" or str(s.get("paper_validation_lane", "")) == TRADER_STYLE_PAPER_REASON
-    badge = "🧲🟣 ACTIVE MOVER" if is_active else "⚡🟡 FOLLOW-THROUGH"
-    horizon = (
-        f"до {ACTIVE_MOVER_HARD_EXPIRE_MINUTES} мин; мягкая проверка после {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES} мин"
-        if is_active
-        else f"быстрый режим: {FAST_MAX_MINUTES_TO_TP1}/{FAST_HARD_EXPIRE_MINUTES} мин"
-    )
+    is_exhaust = str(s.get("paper_style", "")) == "SQUEEZE_EXHAUSTION" or str(s.get("paper_validation_lane", "")) == EXHAUSTION_PAPER_REASON
+    if is_exhaust:
+        badge = "🔥🔴 4H SQUEEZE EXHAUSTION"
+        horizon = f"до {EXHAUST_HARD_EXPIRE_MINUTES} мин; мягкая проверка после {EXHAUST_SOFT_EXPIRE_MINUTES} мин"
+    elif is_active:
+        badge = "🧲🟣 ACTIVE MOVER"
+        horizon = f"до {ACTIVE_MOVER_HARD_EXPIRE_MINUTES} мин; мягкая проверка после {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES} мин"
+    else:
+        badge = "⚡🟡 LEGACY FOLLOW-THROUGH"
+        horizon = f"быстрый режим: {FAST_MAX_MINUTES_TO_TP1}/{FAST_HARD_EXPIRE_MINUTES} мин"
     return (
         f"📋 PAPER-ВХОД V18 · {badge}\n"
         "🚫 НЕ ВХОДИТЬ РЕАЛЬНЫМИ ДЕНЬГАМИ\n"
@@ -8493,7 +9002,8 @@ def build_paper_result_message(
     signal: Dict[str, Any], result: str, closing_price: float
 ) -> str:
     is_active = str(signal.get("paper_style", "")) == "ACTIVE_MOVER" or str(signal.get("shadow_reason", "")) == TRADER_STYLE_PAPER_REASON
-    badge = "🧲🟣 ACTIVE MOVER" if is_active else "⚡🟡 FOLLOW-THROUGH"
+    is_exhaust = str(signal.get("paper_style", "")) == "SQUEEZE_EXHAUSTION" or str(signal.get("shadow_reason", "")) == EXHAUSTION_PAPER_REASON
+    badge = "🔥🔴 4H SQUEEZE EXHAUSTION" if is_exhaust else ("🧲🟣 ACTIVE MOVER" if is_active else "⚡🟡 LEGACY FOLLOW-THROUGH")
     labels = {
         "profit": "✅ TP3+",
         "sl": "❌ STOP LOSS",
@@ -8505,8 +9015,8 @@ def build_paper_result_message(
     age_minutes = max(
         0.0, (now_ts() - int(signal.get("created_at", now_ts()) or now_ts())) / 60.0
     )
-    paper_metrics = active_mover_paper_metrics() if is_active else paper_validation_metrics()
-    stats_name = "ACTIVE MOVER V18" if is_active else "FOLLOW-THROUGH V17.3.2"
+    paper_metrics = squeeze_exhaustion_metrics() if is_exhaust else (active_mover_paper_metrics() if is_active else paper_validation_metrics())
+    stats_name = "4H SQUEEZE EXHAUSTION V18.2" if is_exhaust else ("ACTIVE MOVER V18.1.1" if is_active else "LEGACY FOLLOW-THROUGH")
     return (
         f"📋 PAPER РЕЗУЛЬТАТ · {badge}: {labels.get(result, result.upper())}\n"
         f"{signal.get('side', '?')} {display_symbol(signal.get('symbol', '?'))}\n"
@@ -8608,11 +9118,13 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
     block_lines = [f"{k}: {v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])[:12]]
     hot = scan.get("hot_notes", [])[:8]
     near = scan.get("near_miss", [])[:8]
-    control_metrics = control_validation_metrics()
-    paper_metrics = paper_validation_metrics()
+    active_metrics = active_mover_paper_metrics()
+    exhaust_metrics = squeeze_exhaustion_metrics()
     readiness = real_money_readiness()
+    squeeze_watch = STATE.get("last_squeeze_watch", {}) if isinstance(STATE.get("last_squeeze_watch", {}), dict) else {}
+    active_watch = STATE.get("last_active_watch", {}) if isinstance(STATE.get("last_active_watch", {}), dict) else {}
     return (
-        f"🧪 Диагностика V18 Dual-Lane · ⚡ Follow-Through + 🧲 Active Mover\n"
+        f"🧪 Диагностика V18.2 PRO · 🧲 Active Mover + 🔥 4H Squeeze Exhaustion\n"
         f"Проверено: {scan.get('checked', 0)} из universe {scan.get('universe', 0)}\n"
         f"Найдено: {scan.get('candidates', 0)} · pending: {scan.get('pending_active', 0)} · "
         f"подтверждено: {scan.get('confirmed', 0)} · отправлено: {scan.get('sent', 0)} · "
@@ -8625,10 +9137,13 @@ def build_diagnostic(scan: Dict[str, Any]) -> str:
         f"время: {scan.get('elapsed', 0):.0f}с\n"
         f"BTC: {scan.get('btc', 'unknown')}\n"
         f"LIVE история: {wr_text(STATE.get('stats', {}).get('total', {}))}\n"
-        f"CONTROL V17.3.1: {_metrics_line(control_metrics)}\n"
-        f"FOLLOW-THROUGH PAPER V17.3.2: {_metrics_line(paper_metrics)} · "
-        f"{int(paper_metrics.get('n', 0))}/"
-        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))}\n"
+        f"🧲 ACTIVE MOVER V18.1.1: {_metrics_line(active_metrics)} · "
+        f"n={int(active_metrics.get('n', 0) or 0)}\n"
+        f"🔥 4H SQUEEZE EXHAUSTION V18.2: {_metrics_line(exhaust_metrics)} · "
+        f"n={int(exhaust_metrics.get('n', 0) or 0)}\n"
+        f"WATCH: 🧲 checked={int(active_watch.get('checked',0) or 0)} triggered={int(active_watch.get('triggered',0) or 0)} · "
+        f"🔥 checked={int(squeeze_watch.get('checked',0) or 0)} runaway-blocks={int(squeeze_watch.get('runaway',0) or 0)} "
+        f"triggered={int(squeeze_watch.get('triggered',0) or 0)}\n"
         f"Micro-LIVE readiness: ready={readiness.get('ready', False)} · "
         f"env flag={readiness.get('live_flag', False)} · "
         f"enabled={readiness.get('live_enabled', False)}\n"
@@ -8679,7 +9194,7 @@ def shadow_key(signal: Dict[str, Any]) -> str:
         or signal.get("paper_validation_lane")
         or ""
     )
-    if lane in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}:
+    if lane in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON, EXHAUSTION_PAPER_REASON}:
         return f"{base}:{lane}"
     return base
 
@@ -8697,7 +9212,7 @@ def add_shadow_signal(signal: Dict[str, Any], reason: str) -> bool:
         return False
     with STATE_IO_LOCK:
         shadows = STATE.setdefault("shadow_signals", [])
-        protected_lane = reason in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
+        protected_lane = reason in {PAPER_CONTROL_REASON, PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON, EXHAUSTION_PAPER_REASON}
         ordinary_limit = max(0, SHADOW_MAX_ACTIVE - max(0, SHADOW_PAPER_RESERVED_SLOTS))
         if protected_lane and len(shadows) >= SHADOW_MAX_ACTIVE:
             return False
@@ -9764,7 +10279,7 @@ def track_shadow_signals() -> bool:
             safe_record_learning_result(signal, close_result, source="shadow")
             if (
                 PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
+                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON, EXHAUSTION_PAPER_REASON}
             ):
                 send_telegram(
                     build_paper_result_message(signal, close_result, effective_sl)
@@ -9783,7 +10298,7 @@ def track_shadow_signals() -> bool:
         if (
             PAPER_BREAKEVEN_AFTER_TP1
             and signal.get("tp1_hit")
-            and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
+            and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON, EXHAUSTION_PAPER_REASON}
             and signal.get("protected_sl") is None
         ):
             entry = float(signal.get("entry", price) or price)
@@ -9806,7 +10321,7 @@ def track_shadow_signals() -> bool:
         # the only positive classification used by the quality target.
         if (
             signal.get("tp2_hit")
-            and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
+            and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON, EXHAUSTION_PAPER_REASON}
             and not signal.get("tp2_protected")
         ):
             fee_buffer = max(0.0, ROUND_TRIP_COST_MOVE)
@@ -9831,7 +10346,7 @@ def track_shadow_signals() -> bool:
             safe_record_learning_result(signal, "profit", source="shadow")
             if (
                 PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
+                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON, EXHAUSTION_PAPER_REASON}
             ):
                 send_telegram(
                     build_paper_result_message(
@@ -9852,7 +10367,18 @@ def track_shadow_signals() -> bool:
             str(signal.get("paper_style", "")) == "ACTIVE_MOVER"
             or str(signal.get("shadow_reason", "")) == TRADER_STYLE_PAPER_REASON
         )
-        if is_active_mover:
+        is_squeeze_exhaustion = (
+            str(signal.get("paper_style", "")) == "SQUEEZE_EXHAUSTION"
+            or str(signal.get("shadow_reason", "")) == EXHAUSTION_PAPER_REASON
+        )
+        if is_squeeze_exhaustion:
+            fast_stop = (
+                age_minutes >= EXHAUST_SOFT_EXPIRE_MINUTES
+                and not signal.get("tp1_hit")
+                and ((not directional) or progress < EXHAUST_MIN_PROGRESS_AT_SOFT)
+            )
+            hard_expire_minutes = EXHAUST_HARD_EXPIRE_MINUTES
+        elif is_active_mover:
             fast_stop = (
                 age_minutes >= ACTIVE_MOVER_SOFT_EXPIRE_MINUTES
                 and not signal.get("tp1_hit")
@@ -9873,7 +10399,7 @@ def track_shadow_signals() -> bool:
             safe_record_learning_result(signal, "expired", source="shadow")
             if (
                 PAPER_NOTIFY_RESULTS
-                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON}
+                and str(signal.get("shadow_reason", "")) in {PAPER_VALIDATION_REASON, TRADER_STYLE_PAPER_REASON, EXHAUSTION_PAPER_REASON}
             ):
                 send_telegram(
                     build_paper_result_message(signal, "expired", float(price))
@@ -10137,7 +10663,7 @@ async def scan_loop():
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: MEASURED A+ EDGE FORWARD + GUARDED MICRO-LIVE.\n"
+        f"Mode: PAPER RESEARCH · TWO PROFESSIONAL LANES · REAL MONEY LOCKED.\n"
         f"Логика: свежий A+ INSTANT импульс → измеренный диапазон объёма/амплитуды → "
         f"проверка публичного bid/ask и глубины → своевременный PAPER-вход → 5 TP.\n"
         f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
@@ -10158,10 +10684,13 @@ async def scan_loop():
         f"Execution gate: spread ≤ {MEASURED_MAX_BOOK_SPREAD_BPS:.1f} bps · visible depth ≥ "
         f"{MEASURED_MIN_BOOK_DEPTH_USDT:.0f} USDT/side · 60m turnover proxy ≥ {MEASURED_MIN_QUOTE_60M:.0f}.\n"
         f"Anti-chase: no delayed 90%–100% reclaim entry; the failed V17.2 retest path is excluded.\n"
-        f"V17.3.2 selector: broad V17.3.1 entries stay as paired CONTROL; only follow-through score ≥ {V17_3_2_MIN_SCORE:.0f} enters new PAPER.\n"
-        f"SHORT official PAPER: {V17_3_2_SHORT_PAPER_ENABLED}; when False, SHORT remains visible CONTROL/SHADOW only.\n"
-        f"Telegram lanes: ⚡🟡 FOLLOW-THROUGH = быстрый импульс; 🧲🟣 ACTIVE MOVER V18.1 = HOT → WATCH → pullback/reclaim → re-acceleration → PAPER. Предварительные WATCH скрыты; Telegram получает только подтверждённые PAPER-входы и результаты.\n"
-        f"ACTIVE MOVER horizon: soft {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES} мин · hard {ACTIVE_MOVER_HARD_EXPIRE_MINUTES} мин · TP ladder {ACTIVE_TP1_MOVE*100:.1f}/{ACTIVE_TP2_MOVE*100:.1f}/{ACTIVE_TP3_MOVE*100:.1f}/{ACTIVE_TP4_MOVE*100:.1f}/{ACTIVE_TP5_MOVE*100:.1f}%.\n"
+        f"Официальные PAPER-линии: 🧲 ACTIVE MOVER V18.1.1 + 🔥 4H SQUEEZE EXHAUSTION V18.2. Legacy Follow-Through отключён.\n"
+        f"🧲 ACTIVE MOVER: HOT → quiet WATCH → pullback/reclaim → re-acceleration → PAPER.\n"
+        f"🔥 4H EXHAUSTION: аномальная 4H свеча/объём → quiet WATCH → RUNAWAY guard → слом 1m структуры + reversal confirmations → PAPER против экстремума.\n"
+        f"🔥 Важно: большая зелёная свеча сама по себе НЕ SHORT. Пока high обновляется и импульс держится, бот блокирует контртрендовый вход как RUNAWAY squeeze.\n"
+        f"Universe: 4H detector работает на deep-check ротации; следующие сканы проходят остальные контракты полного universe.\n"
+        f"🧲 horizon: soft {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES}m / hard {ACTIVE_MOVER_HARD_EXPIRE_MINUTES}m · TP {ACTIVE_TP1_MOVE*100:.1f}/{ACTIVE_TP2_MOVE*100:.1f}/{ACTIVE_TP3_MOVE*100:.1f}/{ACTIVE_TP4_MOVE*100:.1f}/{ACTIVE_TP5_MOVE*100:.1f}%.\n"
+        f"🔥 horizon: soft {EXHAUST_SOFT_EXPIRE_MINUTES}m / hard {EXHAUST_HARD_EXPIRE_MINUTES}m · TP {EXHAUST_TP1_MOVE*100:.1f}/{EXHAUST_TP2_MOVE*100:.1f}/{EXHAUST_TP3_MOVE*100:.1f}/{EXHAUST_TP4_MOVE*100:.1f}/{EXHAUST_TP5_MOVE*100:.1f}%.\n"
         f"Every PAPER entry/result is visible in Telegram; SHADOW near-miss observations are visible too.\n"
         f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
         f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
@@ -10169,8 +10698,7 @@ async def scan_loop():
         f"Reports: first quality checkpoint at {PAPER_PILOT_REQUIRED_OUTCOMES} · full review at "
         f"{PAPER_REVIEW_REQUIRED_OUTCOMES} · model remains frozen until at least "
         f"{PAPER_LANE_REQUIRED_OUTCOMES} unchanged PAPER outcomes.\n"
-        f"Data separation: old {source_counts['all']} outcomes and every pre-V17.3.2 row are audit-only; "
-        f"only new V17.3.2 follow-through PAPER can train.\n"
+        f"Data separation: historical rows remain audit-only; 🧲 and 🔥 PAPER outcomes are tracked separately.\n"
         f"Real-money readiness: ready={readiness.get('ready', False)} · env flag REAL_MONEY_SIGNALS="
         f"{readiness.get('live_flag', False)} · enabled={readiness.get('live_enabled', False)}. "
         f"Both evidence and manual flag are mandatory. This code never places exchange orders.\n"
@@ -10245,6 +10773,7 @@ def monitor_pending_and_dispatch() -> Dict[str, Any]:
     near_miss: List[str] = []
     confirmed = process_pending_signals(blocks, near_miss)
     active_watch_stats = process_active_mover_watches()
+    squeeze_watch_stats = process_squeeze_exhaustion_watches()
     paper_sent = 0
     non_paper_confirmed = 0
     for candidate in confirmed:
@@ -10265,6 +10794,7 @@ def monitor_pending_and_dispatch() -> Dict[str, Any]:
         "blocks": blocks,
         "near_miss": near_miss[:8],
         "active_watch": active_watch_stats,
+        "squeeze_watch": squeeze_watch_stats,
     }
     STATE["last_pending_monitor"] = status
     save_state()
