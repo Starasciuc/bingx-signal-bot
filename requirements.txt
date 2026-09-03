@@ -1,0 +1,5 @@
+# V20.4.2 can run with Python stdlib only using: python bot.py
+# Optional faster HTTP backend:
+aiohttp>=3.9,<4
+# Only needed if you keep the old uvicorn Start Command:
+uvicorn>=0.30,<1
