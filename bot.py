@@ -1,4 +1,4 @@
-# VERIFIED GITHUB DEPLOY FILE — V20.3.5 RESEARCH SCALP PULLBACK · PRICE/VOLUME/OI/FLOW
+# VERIFIED GITHUB DEPLOY FILE — V20.3.5.1 FAST START · RESEARCH SCALP PULLBACK
 # Render must start this exact root file with: uvicorn bot:app ...
 import os
 import time
@@ -2655,8 +2655,8 @@ def build_export_bytes() -> bytes:
 # The bot should not send weak B-class noise: it needs leader/laggard pressure, real range, and a ladder that can realistically move 3-4%.
 # ============================================================
 
-APP_NAME = "Professional Adaptive Futures Bot AUTO V20.3.5 RESEARCH SCALP PULLBACK · PRICE/VOLUME/OI/FLOW"
-DEPLOY_MARKER = "V20_3_5_RESEARCH_SCALP_PULLBACK_PRICE_VOLUME_OI_FLOW_2026_09_04"
+APP_NAME = "Professional Adaptive Futures Bot AUTO V20.3.5.1 FAST START · RESEARCH SCALP PULLBACK"
+DEPLOY_MARKER = "V20_3_5_1_FAST_START_RESEARCH_SCALP_PULLBACK_2026_09_04"
 
 app = FastAPI(title=APP_NAME)
 
@@ -7128,8 +7128,13 @@ def active_watch_key(item: Dict[str, Any]) -> str:
 
 
 def add_active_mover_watch(setup: Dict[str, Any]) -> bool:
-    """Register stage-1 HOT candidate. No PAPER trade is created here."""
-    watch_oi = get_open_interest_value(str(setup.get("symbol", "")))
+    """Register stage-1 HOT candidate without any extra network request.
+
+    V20.3.5.1 FAST START/FAST SCAN: the OI baseline is captured lazily only
+    after a candidate has produced a real pullback. This prevents the full
+    universe scan from blocking on one HTTP call per new WATCH.
+    """
+    watch_oi = None
     with STATE_IO_LOCK:
         watches = STATE.setdefault("active_mover_watch", [])
         now = now_ts()
@@ -7250,6 +7255,12 @@ def process_active_mover_watches() -> Dict[str, int]:
             item["watch_pullback_seen"] = True
             item["watch_pullback_seen_at"] = now
             item["watch_stage"] = "WAIT_RECLAIM"
+            # OI becomes relevant only now; failure is neutral and never blocks.
+            if item.get("watch_open_interest") is None:
+                try:
+                    item["watch_open_interest"] = get_open_interest_value(symbol)
+                except Exception:
+                    item["watch_open_interest"] = None
             pullback_seen = True
 
         if pullback > ACTIVE_WATCH_MAX_PULLBACK:
@@ -7322,9 +7333,34 @@ def process_active_mover_watches() -> Dict[str, int]:
 
         # Expensive public derivatives/order-flow calls happen only after the
         # native pullback/reclaim/reacceleration trigger is already confirmed.
-        current_oi = get_open_interest_value(symbol)
-        funding = get_funding_rate_value(symbol)
-        taker_flow = recent_taker_imbalance(symbol, 120)
+        # Three independent public-data confirmations are fetched in parallel.
+        # One slow endpoint no longer serially stalls the 10-second monitor.
+        current_oi = None
+        funding = None
+        taker_flow = None
+        try:
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="scalp-context") as pool:
+                future_oi = pool.submit(get_open_interest_value, symbol)
+                future_funding = pool.submit(get_funding_rate_value, symbol)
+                future_flow = pool.submit(recent_taker_imbalance, symbol, 120)
+                try:
+                    current_oi = future_oi.result()
+                except Exception:
+                    current_oi = None
+                try:
+                    funding = future_funding.result()
+                except Exception:
+                    funding = None
+                try:
+                    taker_flow = future_flow.result()
+                except Exception:
+                    taker_flow = None
+        except Exception:
+            # Context is optional. Native pullback/reclaim/reacceleration remains valid.
+            current_oi = None
+            funding = None
+            taker_flow = None
+
         research = scalp_research_score(
             setup, c1, c5, c15,
             watch_oi=item.get("watch_open_interest"),
@@ -11786,116 +11822,40 @@ def track_active_signals() -> None:
 # ============================================================
 
 async def scan_loop():
-    await asyncio.sleep(3)
-    guard_state = get_evidence_guard_state()
-    model_state = get_model_state()
-    source_counts = adaptive_source_counts()
-    model_data_count = adaptive_model_data_count()
-    paper_metrics = paper_validation_metrics()
-    control_metrics = control_validation_metrics()
-    readiness = real_money_readiness()
-    restored_count = int(SEED_RESTORE_INFO.get("restored", 0) or 0)
-    restored_text = (
-        f"restored {restored_count} outcomes from {SEED_RESTORE_INFO.get('source', 'JSON')}"
-        if restored_count
-        else str(SEED_RESTORE_INFO.get("reason", "not needed"))
-    )
-    state_storage = str(Path(STATE_FILE))
-    db_storage = str(Path(DB_PATH))
-    storage_warning = (
-        "persistent /var/data paths configured"
-        if state_storage.startswith("/var/data/") and db_storage.startswith("/var/data/")
-        else "WARNING: configure Render Disk /var/data and absolute storage paths"
-    )
+    # Render should show a working bot immediately, not after a 60–90s universe scan.
+    await asyncio.sleep(1)
     send_telegram(
         f"✅ {APP_NAME} активирован.\n"
         f"Deploy marker: {DEPLOY_MARKER}\n\n"
-        f"Mode: PAPER RESEARCH · TWO PROFESSIONAL LANES · REAL MONEY LOCKED.\nЛогика V20.3.5: 🧲 ACTIVE MOVER ищет подтверждённый continuation после pullback/reclaim; 🚀 SPIKE REGIME различает CONTINUATION и EXHAUSTION; candle intelligence оценивает squeeze/overheat/climax; при конфликте режима = NO TRADE.\n"
-        f"Логика: свежий A+ INSTANT импульс → измеренный диапазон объёма/амплитуды → "
-        f"проверка публичного bid/ask и глубины → своевременный PAPER-вход → 5 TP.\n"
-        f"Time-stop: если TP1 не двигается за {FAST_MAX_MINUTES_TO_TP1} мин — expired.\n"
-        f"Compact targets: {TP1_MOVE*100:.2f}% / {TP2_MOVE*100:.2f}% / {TP3_MOVE*100:.2f}% / {TP4_MOVE*100:.2f}% / {TP5_MOVE*100:.2f}%.\n"
-        f"Result rule: TP1/TP2 intermediate; profit starts from TP3.\n"
-        f"Risk multiplier: PAPER A+ x{A_RISK_MULT:.2f}; первый micro-LIVE x{MICRO_LIVE_RISK_MULT:.2f} и не более 0.10% счёта на риск.\n"
-        f"Opportunity engine: analyze up to {MAX_ANALYZE_SYMBOLS} contracts · "
-        f"deep-check up to {HOT_SYMBOLS_TO_ANALYZE} liquidity-qualified names · "
-        f"parallel workers {HOT_SCAN_WORKERS}/{DEEP_SCAN_WORKERS}.\n"
-        f"Universe rotation: every scan advances through the full contract list; no fixed first-220 blind spot.\n"
-        f"Liquidity gate: top {V17_2_LIQUIDITY_KEEP_FRACTION*100:.0f}% by relative turnover/continuity · "
-        f"active candles ≥ {V17_2_MIN_ACTIVE_CANDLE_FRACTION*100:.0f}% · "
-        f"anomalies Vol1 > x{V17_2_MAX_CURRENT_VOL_RATIO:.0f} or Range1 > x{V17_2_MAX_CURRENT_RANGE_RATIO:.0f} rejected.\n"
-        f"Direct measured entry: independent of legacy instant/no_fast templates · Vol1 x{MEASURED_MIN_VOL1:.2f}–x{MEASURED_MAX_VOL1:.2f} · "
-        f"Range1 x{MEASURED_MIN_RANGE1:.2f}–x{MEASURED_MAX_RANGE1:.2f} · directional 3m "
-        f"{MEASURED_MIN_DIRECTIONAL_3M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_3M*100:.2f}% · "
-        f"15m {MEASURED_MIN_DIRECTIONAL_15M*100:.2f}%–{MEASURED_MAX_DIRECTIONAL_15M*100:.2f}%.\n"
-        f"Execution gate: spread ≤ {MEASURED_MAX_BOOK_SPREAD_BPS:.1f} bps · visible depth ≥ "
-        f"{MEASURED_MIN_BOOK_DEPTH_USDT:.0f} USDT/side · 60m turnover proxy ≥ {MEASURED_MIN_QUOTE_60M:.0f}.\n"
-        f"\n"
-        f"Официальные PAPER-линии: 🧲 RESEARCH SCALP PULLBACK V20.3.5 + 🚀 SPIKE REGIME (V20.3.3 logic preserved). Legacy Follow-Through/SHADOW отключены.\n"
-        f"Telegram CLEAN MODE: legacy SHADOW/near-miss/CONTROL уведомления жёстко отключены; hidden adaptive/guard audits не показываются пользователю.\n"
-        f"🧠 SELF-LEARNING: HARD ENABLED · SPIKE model/cohort preserved from V20.3.3 · hard-min warm-up {MIN_TRAIN_TRADES} · retrain каждые {RETRAIN_EVERY} · 2-pass validation · canary {ADAPTIVE_INITIAL_LIVE_FRACTION*100:.0f}%.\n"
-        f"🧠 TRADING INTELLIGENCE: candle anatomy + EMA/VWAP/ATR + RSI as context (not a reversal command) + CMF/OBV volume confirmation.\n"
-        f"🧲 RESEARCH SCALP PULLBACK: HOT → pullback/pause → reclaim → re-acceleration; then public taker flow + Open Interest change + funding are soft confirmations. Unknown derivative data never auto-rejects a setup.\n"
-        f"🎯 Active-Mover ladder remains trader-style ≈ 0.8 / 1.4 / 2.0 / 3.0 / 4.0%; no automatic averaging-down logic.\n"
-        f"Diagnostics V20.3.5: current two-lane summary every 12h (2 times/day); legacy V18/V17 labels removed.\n"
-        f"🧲 ACTIVE MOVER: HOT → quiet WATCH → pullback/reclaim → re-acceleration → PAPER.\n"        f"🧲 V20.3.5 ACTIVE MOVER: true 1m/3m/15m/30m returns + pullback/reclaim/re-acceleration + professional candle intelligence + liquidity + symbol/strategy guards.\n"
-        f"🚀 SPIKE REGIME: сначала ищет только настоящий spike (displacement + expansion + volume + distance from base), затем классифицирует CONTINUATION или EXHAUSTION и выбирает LONG/SHORT.\n"
-        f"🚀 Важно: UP spike может дать LONG continuation или SHORT exhaustion; DOWN spike — SHORT continuation или LONG exhaustion. Направление сделки выбирается после классификации режима.\n"        f"V20.3.5 SPIKE REGIME: true 1m/3m/5m/15m returns · RUNAWAY guard · symbol quarantine · 3h re-entry lock · strategy circuit breaker · exhaustion reversal/volume-fade/no-new-extreme · candle/squeeze intelligence · adaptive champion/challenger.\n"
-        f"Universe: REAL SPIKE radar работает по ротации полного universe; 5m/15m/1h/4h оцениваются относительно собственной истории каждой монеты.\n"
-        f"🧲 horizon: soft {ACTIVE_MOVER_SOFT_EXPIRE_MINUTES}m / hard {ACTIVE_MOVER_HARD_EXPIRE_MINUTES}m · TP {ACTIVE_TP1_MOVE*100:.1f}/{ACTIVE_TP2_MOVE*100:.1f}/{ACTIVE_TP3_MOVE*100:.1f}/{ACTIVE_TP4_MOVE*100:.1f}/{ACTIVE_TP5_MOVE*100:.1f}%.\n"
-        f"🔥 horizon: soft {EXHAUST_SOFT_EXPIRE_MINUTES}m / hard {EXHAUST_HARD_EXPIRE_MINUTES}m · TP {EXHAUST_TP1_MOVE*100:.1f}/{EXHAUST_TP2_MOVE*100:.1f}/{EXHAUST_TP3_MOVE*100:.1f}/{EXHAUST_TP4_MOVE*100:.1f}/{EXHAUST_TP5_MOVE*100:.1f}%.\n"
-        f"Every official PAPER entry/result is visible in Telegram; legacy SHADOW/near-miss/CONTROL are disabled and excluded from current stats.\n"
-        f"Forward PAPER: {PAPER_VALIDATION_ENABLED} · A+ LONG and SHORT · "
-        f"one registered outcome per symbol/{PAPER_SYMBOL_COOLDOWN_SECONDS/3600:.0f}h · "
-        f"every entry/result visible in Telegram; no forced daily PAPER quota.\n"
-        f"Reports: first quality checkpoint at {PAPER_PILOT_REQUIRED_OUTCOMES} · full review at "
-        f"{PAPER_REVIEW_REQUIRED_OUTCOMES} · model remains frozen until at least "
-        f"{PAPER_LANE_REQUIRED_OUTCOMES} unchanged PAPER outcomes.\n"
-        f"Data separation: historical rows remain audit-only; 🧲 and 🔥 PAPER outcomes are tracked separately.\n"
-        f"Real-money readiness: ready={readiness.get('ready', False)} · env flag REAL_MONEY_SIGNALS="
-        f"{readiness.get('live_flag', False)} · enabled={readiness.get('live_enabled', False)}. "
-        f"Both evidence and manual flag are mandatory. This code never places exchange orders.\n"
-        f"Side guard: LONG and SHORT are admitted separately after ≥ "
-        f"{REAL_MONEY_MIN_SIDE_FORWARD} fresh outcomes/side, TP3+ majority, positive expectancy "
-        f"and a positive newest {REAL_MONEY_SIDE_RECENT_WINDOW}-outcome side block.\n"
-        f"Micro-LIVE safety when enabled: ≤ {MAX_LIVE_SIGNALS_24H}/24h · ≤ "
-        f"{MAX_LIVE_SIGNALS_PER_SIDE_24H}/side · spacing ≥ {MIN_LIVE_SIGNAL_SPACING_SECONDS/60:.0f} min · "
-        f"simultaneously active ≤ {MAX_ACTIVE_SIGNALS}.\n"
-        f"Micro-LIVE kill switch: after {MICRO_LIVE_MAX_NONPROFIT_STREAK} consecutive "
-        f"non-profit outcomes, drawdown > {MICRO_LIVE_MAX_DRAWDOWN_R:.1f}R, or a weak "
-        f"rolling {MICRO_LIVE_GUARD_WINDOW}-outcome block, new LIVE alerts stop and return to PAPER.\n"
-        f"Reliable Telegram V17.1.1: immediate retries={TELEGRAM_SEND_ATTEMPTS} · "
-        f"ordered outbox={TELEGRAM_OUTBOX_ENABLED} · flush every "
-        f"{TELEGRAM_OUTBOX_FLUSH_SECONDS}s · diagnostics are replaceable and never block trades.\n"
-        f"Learning target: TP3+ > {ADAPTIVE_TARGET_SUCCESS_RATE*100:.0f}% of all closed selected outcomes; "
-        f"coverage ≥ {MIN_VALIDATION_COVERAGE*100:.0f}%.\n"
-        f"Adaptive model: active={model_state.active} · version={model_state.version} · "
-        f"LIVE routing remains locked until readiness passes.\n"
-        f"Internal PAPER tracker: two official lanes only · full JSON every "
-        f"{AUTO_BACKUP_EVERY_CLOSED} official outcomes · PAPER checkpoint every "
-        f"{PAPER_CHECKPOINT_EVERY} confirmed entries.\n"
-        f"Seed JSON: {restored_text}.\n"
-        f"Restored sources: LIVE={source_counts['live']} · SHADOW={source_counts['shadow']} · "
-        f"ALL={source_counts['all']}.\n"
-        f"Eligible V17.3 model data={model_data_count} · minimum before analysis "
-        f"{PAPER_LANE_REQUIRED_OUTCOMES}.\n"
-        f"CONTROL collected: {int(control_metrics.get('n', 0))} · "
-        f"{_metrics_line(control_metrics)}.\n"
-        f"Direct Measured PAPER V17.3 collected: {int(paper_metrics.get('n', 0))}/"
-        f"{paper_progress_target(int(paper_metrics.get('n', 0) or 0))} · "
-        f"{_metrics_line(paper_metrics)} · unique symbols="
-        f"{int(paper_metrics.get('unique_symbols', 0))}.\n"
-        f"{watch_audit_summary()}.\n"
-        f"Next JSON backup at {((source_counts['all'] // max(1, AUTO_BACKUP_EVERY_CLOSED)) + 1) * max(1, AUTO_BACKUP_EVERY_CLOSED)} total outcomes.\n"
-        f"Storage: STATE_FILE={STATE_FILE} · ADAPTIVE_DB_PATH={DB_PATH} · {storage_warning}."
+        f"Mode: PAPER RESEARCH · REAL MONEY LOCKED.\n"
+        f"🚀 FAST START: Render/Telegram are online; historical storage restores in background.\n"
+        f"🧲 SCALP PULLBACK: HOT → pullback/pause → reclaim → re-acceleration → "
+        f"research score (price/volume + CMF/OBV + optional OI/funding/taker flow).\n"
+        f"🚀 SPIKE REGIME: V20.3.3 logic/model preserved.\n"
+        f"🧠 SELF-LEARNING: enabled · warm-up {MIN_TRAIN_TRADES} · retrain every {RETRAIN_EVERY} · "
+        f"2-pass validation · canary {ADAPTIVE_INITIAL_LIVE_FRACTION*100:.0f}%.\n"
+        f"🎯 SCALP TP: {ACTIVE_TP1_MOVE*100:.1f}/{ACTIVE_TP2_MOVE*100:.1f}/"
+        f"{ACTIVE_TP3_MOVE*100:.1f}/{ACTIVE_TP4_MOVE*100:.1f}/{ACTIVE_TP5_MOVE*100:.1f}%.\n"
+        f"Первый полный scan запускается после bootstrap; startup больше не ждёт scan/SQLite/API."
     )
+
+    # Wait for storage bootstrap without blocking Uvicorn/health/Telegram.
+    waited = 0
+    while not RUNTIME_BOOTSTRAP_READY:
+        await asyncio.sleep(1)
+        waited += 1
+        if waited >= 90:
+            # Fail-open operationally: the supervised bootstrap keeps retrying.
+            break
+
+    # Give the web service a little margin before the first heavy universe scan.
+    await asyncio.sleep(2)
     try:
-        scan = await asyncio.to_thread(run_scan, True)
-        # V18.2.2: run_scan(manual=True) already sends the startup diagnostic; do not duplicate it.
+        if AUTO_SCAN_ENABLED:
+            await asyncio.to_thread(run_scan, False)
     except Exception as e:
-        STATE["last_error"] = f"first scan exception: {repr(e)}"
+        STATE["last_error"] = f"first background scan: {repr(e)}"
         save_state()
-        send_telegram(f"⚠️ Ошибка первого скана: {repr(e)}")
 
     while True:
         try:
@@ -11909,7 +11869,9 @@ async def scan_loop():
 
 
 async def track_loop():
-    await asyncio.sleep(8)
+    await asyncio.sleep(3)
+    while not RUNTIME_BOOTSTRAP_READY:
+        await asyncio.sleep(1)
     while True:
         try:
             if AUTO_TRACK_ENABLED:
@@ -11956,6 +11918,8 @@ def monitor_pending_and_dispatch() -> Dict[str, Any]:
 
 async def pending_monitor_loop():
     await asyncio.sleep(max(3, PAPER_PENDING_MONITOR_SECONDS))
+    while not RUNTIME_BOOTSTRAP_READY:
+        await asyncio.sleep(1)
     while True:
         try:
             if PRE_LIVE_CONFIRMATION_ENABLED:
@@ -11978,6 +11942,46 @@ async def telegram_outbox_loop():
 
 
 BACKGROUND_TASKS: List[asyncio.Task] = []
+RUNTIME_BOOTSTRAP_READY = False
+RUNTIME_BOOTSTRAP_ERROR = ""
+
+
+def _bootstrap_runtime_storage_sync() -> None:
+    """Restore DB/seed/symbol guards outside the ASGI startup handshake."""
+    global SEED_RESTORE_INFO
+    init_adaptive_db()
+    SEED_RESTORE_INFO = restore_adaptive_seed_if_empty()
+    if adaptive_closed_count() > 0:
+        rebuild_symbol_outcomes_from_adaptive_db()
+    save_state()
+
+
+async def bootstrap_runtime_loop() -> None:
+    """One-shot Render-safe bootstrap.
+
+    Uvicorn becomes healthy first; historical DB work is then performed in a
+    worker thread. If storage is temporarily unavailable, retry without killing
+    the web process.
+    """
+    global RUNTIME_BOOTSTRAP_READY, RUNTIME_BOOTSTRAP_ERROR
+    attempt = 0
+    while not RUNTIME_BOOTSTRAP_READY:
+        attempt += 1
+        try:
+            await asyncio.to_thread(_bootstrap_runtime_storage_sync)
+            RUNTIME_BOOTSTRAP_READY = True
+            RUNTIME_BOOTSTRAP_ERROR = ""
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            RUNTIME_BOOTSTRAP_ERROR = repr(exc)[:500]
+            try:
+                STATE["last_error"] = f"bootstrap attempt {attempt}: {repr(exc)}"
+                save_state()
+            except Exception:
+                pass
+            await asyncio.sleep(min(30, 3 * attempt))
 
 
 async def _supervise_background_task(name: str, worker_factory) -> None:
@@ -12021,15 +12025,14 @@ def _launch_background_task(name: str, worker_factory) -> None:
 
 @app.on_event("startup")
 async def startup_event():
-    """Render-safe startup.
+    """V20.3.5.1 instant Render startup.
 
-    No recoverable state/DB/background-worker problem is allowed to make the
-    ASGI application fail its startup handshake (which is what commonly leads
-    to Render/Uvicorn exit status 3).
+    The ASGI handshake performs no SQLite migration, historical rebuild,
+    exchange scan or derivatives request. Heavy work starts only after Uvicorn
+    has reported the service healthy.
     """
-    global STATE, SEED_RESTORE_INFO
+    global STATE, RUNTIME_BOOTSTRAP_READY, RUNTIME_BOOTSTRAP_ERROR
 
-    # 1) State restoration is non-fatal.
     try:
         loaded = load_state()
         STATE = loaded if isinstance(loaded, dict) else default_state()
@@ -12037,22 +12040,12 @@ async def startup_event():
         STATE = default_state()
         STATE["last_error"] = f"state restore fallback: {repr(exc)}"
 
-    # 2) DB restoration is non-fatal. The HTTP service must stay available.
-    try:
-        init_adaptive_db()
-        SEED_RESTORE_INFO = restore_adaptive_seed_if_empty()
-        if adaptive_closed_count() > 0:
-            rebuild_symbol_outcomes_from_adaptive_db()
-        save_state()
-    except Exception as exc:
-        try:
-            STATE["last_error"] = f"adaptive DB init error: {repr(exc)}"
-            save_state()
-        except Exception:
-            pass
+    RUNTIME_BOOTSTRAP_READY = False
+    RUNTIME_BOOTSTRAP_ERROR = ""
 
-    # 3) Every long-running worker is supervised and restarted on failure.
+    # Outbox can start immediately. Storage bootstrap runs independently.
     _launch_background_task("telegram_outbox_loop", telegram_outbox_loop)
+    _launch_background_task("bootstrap_runtime_loop", bootstrap_runtime_loop)
     _launch_background_task("scan_loop", scan_loop)
     _launch_background_task("track_loop", track_loop)
     _launch_background_task("pending_monitor_loop", pending_monitor_loop)
@@ -12066,6 +12059,8 @@ def render_health():
         "app": APP_NAME,
         "deploy": DEPLOY_MARKER,
         "state_loaded": isinstance(STATE, dict),
+        "bootstrap_ready": bool(RUNTIME_BOOTSTRAP_READY),
+        "bootstrap_error": RUNTIME_BOOTSTRAP_ERROR,
     }
 
 
