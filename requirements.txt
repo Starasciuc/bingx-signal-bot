@@ -1,6 +1,5 @@
-# V20.3.2 PRO TRADING INTELLIGENCE
-# External Python dependencies only. sqlite3, asyncio, math, etc. are built into Python.
+fastapi==0.141.1
 
-fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-requests>=2.32,<3
+uvicorn[standard]==0.52.4
+
+requests==2.34.2
